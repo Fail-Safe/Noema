@@ -41,24 +41,38 @@ func Execute() {
 	}
 }
 
+const (
+	groupTrace   = "trace"
+	groupCortex  = "cortex"
+	groupIface   = "interface"
+)
+
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cortexFlag, "cortex", "", "cortex name to use (overrides NOEMA_CORTEX and config default)")
 
-	rootCmd.AddCommand(
-		initCmd(),
-		useCmd(),
-		cortexCmd(),
-		addCmd(),
-		listCmd(),
-		getCmd(),
-		editCmd(),
-		removeCmd(),
-		searchCmd(),
-		archiveCmd(),
-		unarchiveCmd(),
-		serveCmd(),
-		tuiCmd(),
+	rootCmd.AddGroup(
+		&cobra.Group{ID: groupTrace, Title: "Trace commands:"},
+		&cobra.Group{ID: groupCortex, Title: "Cortex management:"},
+		&cobra.Group{ID: groupIface, Title: "Interface:"},
 	)
+
+	addGrouped(groupTrace,
+		addCmd(), listCmd(), getCmd(), editCmd(), removeCmd(),
+		searchCmd(), archiveCmd(), unarchiveCmd(),
+	)
+	addGrouped(groupCortex,
+		initCmd(), useCmd(), cortexCmd(),
+	)
+	addGrouped(groupIface,
+		serveCmd(), tuiCmd(), completionCmd(),
+	)
+}
+
+func addGrouped(group string, cmds ...*cobra.Command) {
+	for _, cmd := range cmds {
+		cmd.GroupID = group
+		rootCmd.AddCommand(cmd)
+	}
 }
 
 // resolveCortex returns an open Cortex using the priority chain:
