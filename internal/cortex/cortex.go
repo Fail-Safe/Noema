@@ -60,7 +60,14 @@ func Create(name, dir string) error {
 }
 
 // Open opens an existing Cortex by directory path.
+// It ensures the traces and archive/traces subdirectories exist, so
+// callers can safely write files without a separate mkdir step.
 func Open(name, dir string) (*Cortex, error) {
+	for _, sub := range []string{"traces", "archive/traces"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o750); err != nil {
+			return nil, fmt.Errorf("ensuring %s: %w", sub, err)
+		}
+	}
 	conn, err := db.Open(dir)
 	if err != nil {
 		return nil, err
