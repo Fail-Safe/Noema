@@ -1,0 +1,16 @@
+# Build output
+/noema
+
+# SQLite databases
+*.db
+*.db-shm
+*.db-wal
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+.idea/
+.vscode/
