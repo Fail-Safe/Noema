@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"runtime/debug"
 
 	"github.com/spf13/cobra"
 
@@ -10,11 +11,25 @@ import (
 	"github.com/Fail-Safe/Noema/internal/cortex"
 )
 
+// Version is set via -ldflags at build time; falls back to module info.
+var Version = ""
+
+func version() string {
+	if Version != "" {
+		return Version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return "dev"
+}
+
 var cortexFlag string
 
 var rootCmd = &cobra.Command{
-	Use:   "noema",
-	Short: "The intentional memory layer for your AI agents",
+	Use:     "noema",
+	Short:   "The intentional memory layer for your AI agents",
+	Version: version(),
 	CompletionOptions: cobra.CompletionOptions{
 		DisableDefaultCmd: true,
 	},
