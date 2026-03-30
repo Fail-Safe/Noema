@@ -45,6 +45,10 @@ func TestOpen_MigrationIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Open: %v", err)
 	}
+	var countAfterFirst int
+	if err := conn1.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&countAfterFirst); err != nil {
+		t.Fatalf("querying schema_migrations (first open): %v", err)
+	}
 	conn1.Close()
 
 	conn2, err := db.Open(dir)
@@ -53,12 +57,12 @@ func TestOpen_MigrationIdempotent(t *testing.T) {
 	}
 	defer conn2.Close()
 
-	var count int
-	if err := conn2.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
-		t.Fatalf("querying schema_migrations: %v", err)
+	var countAfterSecond int
+	if err := conn2.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&countAfterSecond); err != nil {
+		t.Fatalf("querying schema_migrations (second open): %v", err)
 	}
-	if count != 1 {
-		t.Errorf("schema_migrations count = %d after two Opens, want 1 (no re-application)", count)
+	if countAfterSecond != countAfterFirst {
+		t.Errorf("schema_migrations count grew from %d to %d on second Open (migrations re-applied)", countAfterFirst, countAfterSecond)
 	}
 }
 

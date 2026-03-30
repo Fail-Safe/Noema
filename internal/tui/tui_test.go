@@ -43,7 +43,7 @@ func loadedModel(t *testing.T, cx *cortex.Cortex) model {
 	m.width = 120
 	m.height = 30
 
-	msg := loadRows(cx, "", false)()
+	msg := loadRows(cx, "", false, false)()
 	result, _ := m.Update(msg)
 	return result.(model)
 }
@@ -307,19 +307,17 @@ func TestConfirm_Archive_No(t *testing.T) {
 	}
 }
 
-func TestConfirm_Delete_Yes(t *testing.T) {
+func TestConfirm_Trash_Yes(t *testing.T) {
 	cx := setupCortex(t)
-	tr := addTrace(t, cx, "Delete Me", "note")
+	tr := addTrace(t, cx, "Trash Me", "note")
 	m := loadedModel(t, cx)
 
-	m2, _ := m.updateList(tea.KeyMsg{Type: tea.KeyShiftUp}) // D key
-	// Use string representation instead
-	m2, _ = m.updateList(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("D")})
+	m2, _ := m.updateList(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("D")})
 	if m2.state != stateConfirm {
 		t.Fatalf("state after D: %v, want stateConfirm", m2.state)
 	}
-	if m2.confirm.action != "delete" {
-		t.Errorf("confirm.action = %q, want delete", m2.confirm.action)
+	if m2.confirm.action != "trash" {
+		t.Errorf("confirm.action = %q, want trash", m2.confirm.action)
 	}
 
 	m3, _ := m2.updateConfirm(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
@@ -327,10 +325,73 @@ func TestConfirm_Delete_Yes(t *testing.T) {
 		t.Errorf("state after y: %v, want stateList", m3.state)
 	}
 
-	// Verify the trace no longer exists in DB
+	// Trace should exist in DB but be trashed
+	row, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get after trash: %v", err)
+	}
+	if row.TrashedAt == "" {
+		t.Error("expected trace to be trashed")
+	}
+}
+
+func TestConfirm_Purge_Yes(t *testing.T) {
+	cx := setupCortex(t)
+	tr := addTrace(t, cx, "Purge Me", "note")
+	if err := cx.Trash(tr.ID); err != nil {
+		t.Fatalf("Trash: %v", err)
+	}
+
+	// Load model in trash view
+	m := loadedModel(t, cx)
+	m.showTrashed = true
+	msg := loadRows(cx, "", false, true)()
+	result, _ := m.Update(msg)
+	m = result.(model)
+
+	m2, _ := m.updateList(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("D")})
+	if m2.confirm.action != "purge" {
+		t.Errorf("confirm.action = %q, want purge", m2.confirm.action)
+	}
+
+	m3, _ := m2.updateConfirm(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	if m3.state != stateList {
+		t.Errorf("state after y: %v, want stateList", m3.state)
+	}
+
 	_, err := cx.Get(tr.ID)
 	if err == nil {
-		t.Error("expected error getting deleted trace, got nil")
+		t.Error("expected error getting purged trace, got nil")
+	}
+}
+
+func TestRecover(t *testing.T) {
+	cx := setupCortex(t)
+	tr := addTrace(t, cx, "Recover Me", "note")
+	if err := cx.Trash(tr.ID); err != nil {
+		t.Fatalf("Trash: %v", err)
+	}
+
+	m := loadedModel(t, cx)
+	m.showTrashed = true
+	msg := loadRows(cx, "", false, true)()
+	result, _ := m.Update(msg)
+	m = result.(model)
+
+	m2, cmd := m.updateList(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	if m2.err != nil {
+		t.Fatalf("recover error: %v", m2.err)
+	}
+	if cmd == nil {
+		t.Error("expected reload command after recover")
+	}
+
+	row, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get after recover: %v", err)
+	}
+	if row.TrashedAt != "" {
+		t.Error("expected TrashedAt to be cleared after recover")
 	}
 }
 

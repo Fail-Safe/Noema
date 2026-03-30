@@ -9,6 +9,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/Fail-Safe/Noema/internal/config"
 	"github.com/Fail-Safe/Noema/internal/db"
 	"github.com/Fail-Safe/Noema/internal/trace"
 )
@@ -60,10 +61,9 @@ func Create(name, dir string) error {
 }
 
 // Open opens an existing Cortex by directory path.
-// It ensures the traces and archive/traces subdirectories exist, so
-// callers can safely write files without a separate mkdir step.
+// It ensures required subdirectories exist and auto-purges expired trash.
 func Open(name, dir string) (*Cortex, error) {
-	for _, sub := range []string{"traces", "archive/traces"} {
+	for _, sub := range []string{"traces", "archive/traces", "trash/traces"} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0o750); err != nil {
 			return nil, fmt.Errorf("ensuring %s: %w", sub, err)
 		}
@@ -72,7 +72,17 @@ func Open(name, dir string) (*Cortex, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Cortex{Name: name, Dir: dir, DB: conn}, nil
+	cx := &Cortex{Name: name, Dir: dir, DB: conn}
+
+	// Auto-purge expired trash. Best-effort: errors are silently ignored.
+	cfg, _ := config.Load()
+	days := 30
+	if cfg != nil && cfg.TrashDays > 0 {
+		days = cfg.TrashDays
+	}
+	_ = cx.Purge(days)
+
+	return cx, nil
 }
 
 func (c *Cortex) Close() error {
@@ -87,12 +97,29 @@ func (c *Cortex) ArchiveDir() string {
 	return filepath.Join(c.Dir, "archive", "traces")
 }
 
+func (c *Cortex) TrashDir() string {
+	return filepath.Join(c.Dir, "trash", "traces")
+}
+
 // TraceFile returns the absolute path to a trace's markdown file.
 func (c *Cortex) TraceFile(id string, archived bool) string {
 	if archived {
 		return filepath.Join(c.ArchiveDir(), id+".md")
 	}
 	return filepath.Join(c.TracesDir(), id+".md")
+}
+
+// TrashFile returns the path for a trace in the trash.
+func (c *Cortex) TrashFile(id string) string {
+	return filepath.Join(c.TrashDir(), id+".md")
+}
+
+// filePath resolves the correct on-disk path for any row state.
+func (c *Cortex) filePath(r *Row) string {
+	if r.TrashedAt != "" {
+		return c.TrashFile(r.ID)
+	}
+	return c.TraceFile(r.ID, r.ArchivedAt != "")
 }
 
 // Add writes a new Trace to disk and inserts it into the DB.
@@ -142,28 +169,33 @@ type Row struct {
 	Author     string
 	Tags       []string
 	ArchivedAt string
+	TrashedAt  string
 	CreatedAt  string
 	UpdatedAt  string
 }
 
 type ListOptions struct {
-	Type       string
-	Author     string
-	Tag        string
-	Archived   bool // only archived
-	All        bool // active + archived
+	Type     string
+	Author   string
+	Tag      string
+	Archived bool // only archived (excludes trashed)
+	Trashed  bool // only trashed
+	All      bool // active + archived (excludes trashed)
 }
 
 func (c *Cortex) List(opts ListOptions) ([]Row, error) {
-	q := `SELECT id, title, type, author, archived_at, created_at, updated_at FROM traces WHERE 1=1`
+	q := `SELECT id, title, type, author, archived_at, trashed_at, created_at, updated_at FROM traces WHERE 1=1`
 	var args []any
 
-	if !opts.All {
-		if opts.Archived {
-			q += ` AND archived_at IS NOT NULL`
-		} else {
-			q += ` AND archived_at IS NULL`
-		}
+	switch {
+	case opts.Trashed:
+		q += ` AND trashed_at IS NOT NULL`
+	case opts.All:
+		q += ` AND trashed_at IS NULL`
+	case opts.Archived:
+		q += ` AND archived_at IS NOT NULL AND trashed_at IS NULL`
+	default:
+		q += ` AND archived_at IS NULL AND trashed_at IS NULL`
 	}
 	if opts.Type != "" {
 		q += ` AND type = ?`
@@ -188,21 +220,21 @@ func (c *Cortex) List(opts ListOptions) ([]Row, error) {
 }
 
 func (c *Cortex) Search(query string, opts ListOptions) ([]Row, error) {
-	// Use a subquery to get matching IDs from FTS5, then join back to traces.
-	// This avoids alias ambiguity with the MATCH operator and allows clean
-	// additional filtering on the traces table.
 	q := `
-		SELECT t.id, t.title, t.type, t.author, t.archived_at, t.created_at, t.updated_at
+		SELECT t.id, t.title, t.type, t.author, t.archived_at, t.trashed_at, t.created_at, t.updated_at
 		FROM traces t
 		WHERE t.id IN (SELECT id FROM traces_fts WHERE traces_fts MATCH ?)`
 	args := []any{query}
 
-	if !opts.All {
-		if opts.Archived {
-			q += ` AND t.archived_at IS NOT NULL`
-		} else {
-			q += ` AND t.archived_at IS NULL`
-		}
+	switch {
+	case opts.Trashed:
+		q += ` AND t.trashed_at IS NOT NULL`
+	case opts.All:
+		q += ` AND t.trashed_at IS NULL`
+	case opts.Archived:
+		q += ` AND t.archived_at IS NOT NULL AND t.trashed_at IS NULL`
+	default:
+		q += ` AND t.archived_at IS NULL AND t.trashed_at IS NULL`
 	}
 	if opts.Type != "" {
 		q += ` AND t.type = ?`
@@ -228,15 +260,18 @@ func (c *Cortex) Search(query string, opts ListOptions) ([]Row, error) {
 
 func (c *Cortex) Get(id string) (*Row, error) {
 	var r Row
-	var archivedAt *string
+	var archivedAt, trashedAt *string
 	err := c.DB.QueryRow(
-		`SELECT id, title, type, author, archived_at, created_at, updated_at FROM traces WHERE id = ?`, id,
-	).Scan(&r.ID, &r.Title, &r.Type, &r.Author, &archivedAt, &r.CreatedAt, &r.UpdatedAt)
+		`SELECT id, title, type, author, archived_at, trashed_at, created_at, updated_at FROM traces WHERE id = ?`, id,
+	).Scan(&r.ID, &r.Title, &r.Type, &r.Author, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
 	if archivedAt != nil {
 		r.ArchivedAt = *archivedAt
+	}
+	if trashedAt != nil {
+		r.TrashedAt = *trashedAt
 	}
 	r.Tags, err = c.tagsFor(id)
 	if err != nil {
@@ -245,23 +280,99 @@ func (c *Cortex) Get(id string) (*Row, error) {
 	return &r, nil
 }
 
+// Remove permanently deletes a trace from disk and the database.
+// Use Trash for recoverable deletion.
 func (c *Cortex) Remove(id string) error {
 	r, err := c.Get(id)
 	if err != nil {
 		return err
 	}
-	path := c.TraceFile(id, r.ArchivedAt != "")
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(c.filePath(r)); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("removing file: %w", err)
 	}
 	_, err = c.DB.Exec(`DELETE FROM traces WHERE id = ?`, id)
 	return err
 }
 
+// Trash moves a trace to the trash directory for deferred deletion.
+func (c *Cortex) Trash(id string) error {
+	r, err := c.Get(id)
+	if err != nil {
+		return err
+	}
+	if r.TrashedAt != "" {
+		return fmt.Errorf("trace %s is already in trash", id)
+	}
+	src := c.filePath(r)
+	dst := c.TrashFile(id)
+	if err := os.Rename(src, dst); err != nil {
+		return fmt.Errorf("moving file to trash: %w", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err = c.DB.Exec(`UPDATE traces SET trashed_at = ?, archived_at = NULL WHERE id = ?`, now, id)
+	return err
+}
+
+// Recover moves a trace out of the trash and back to the active traces directory.
+func (c *Cortex) Recover(id string) error {
+	r, err := c.Get(id)
+	if err != nil {
+		return err
+	}
+	if r.TrashedAt == "" {
+		return fmt.Errorf("trace %s is not in trash", id)
+	}
+	src := c.TrashFile(id)
+	dst := c.TraceFile(id, false)
+	if err := os.Rename(src, dst); err != nil {
+		return fmt.Errorf("recovering file from trash: %w", err)
+	}
+	_, err = c.DB.Exec(`UPDATE traces SET trashed_at = NULL WHERE id = ?`, id)
+	return err
+}
+
+// Purge permanently deletes traces that have been in the trash for more than
+// days days. A days value of 0 is treated as 30.
+func (c *Cortex) Purge(days int) error {
+	if days <= 0 {
+		days = 30
+	}
+	cutoff := time.Now().UTC().Add(-time.Duration(days) * 24 * time.Hour).Format(time.RFC3339)
+	rows, err := c.DB.Query(`SELECT id FROM traces WHERE trashed_at IS NOT NULL AND trashed_at < ?`, cutoff)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := os.Remove(c.TrashFile(id)); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("purging %s: %w", id, err)
+		}
+		if _, err := c.DB.Exec(`DELETE FROM traces WHERE id = ?`, id); err != nil {
+			return fmt.Errorf("purging %s from db: %w", id, err)
+		}
+	}
+	return nil
+}
+
 func (c *Cortex) Archive(id string) error {
 	r, err := c.Get(id)
 	if err != nil {
 		return err
+	}
+	if r.TrashedAt != "" {
+		return fmt.Errorf("trace %s is in trash — recover it first", id)
 	}
 	if r.ArchivedAt != "" {
 		return fmt.Errorf("trace %s is already archived", id)
@@ -300,7 +411,7 @@ func (c *Cortex) Update(id string) error {
 	if err != nil {
 		return err
 	}
-	t, err := trace.ParseFile(c.TraceFile(id, r.ArchivedAt != ""))
+	t, err := trace.ParseFile(c.filePath(r))
 	if err != nil {
 		return err
 	}
@@ -338,12 +449,15 @@ func (c *Cortex) scanRows(rows *sql.Rows) ([]Row, error) { //nolint:govet
 	var result []Row
 	for rows.Next() {
 		var r Row
-		var archivedAt *string
-		if err := rows.Scan(&r.ID, &r.Title, &r.Type, &r.Author, &archivedAt, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		var archivedAt, trashedAt *string
+		if err := rows.Scan(&r.ID, &r.Title, &r.Type, &r.Author, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if archivedAt != nil {
 			r.ArchivedAt = *archivedAt
+		}
+		if trashedAt != nil {
+			r.TrashedAt = *trashedAt
 		}
 		tags, err := c.tagsFor(r.ID)
 		if err != nil {

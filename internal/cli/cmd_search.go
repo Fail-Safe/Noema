@@ -11,6 +11,7 @@ import (
 func searchCmd() *cobra.Command {
 	var (
 		archived bool
+		trashed  bool
 		all      bool
 		typ      string
 	)
@@ -28,6 +29,7 @@ func searchCmd() *cobra.Command {
 
 			rows, err := cx.Search(args[0], cortex.ListOptions{
 				Archived: archived,
+				Trashed:  trashed,
 				All:      all,
 				Type:     typ,
 			})
@@ -44,6 +46,7 @@ func searchCmd() *cobra.Command {
 	}
 
 	cmd.Flags().BoolVar(&archived, "archived", false, "search only archived traces")
+	cmd.Flags().BoolVar(&trashed, "trashed", false, "search only trashed traces")
 	cmd.Flags().BoolVar(&all, "all", false, "search active and archived traces")
 	cmd.Flags().StringVar(&typ, "type", "", "filter results by type")
 	return cmd

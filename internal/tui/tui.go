@@ -92,6 +92,7 @@ type model struct {
 	search      textinput.Model
 	searchQuery string
 	showAll     bool
+	showTrashed bool
 	confirm     confirmAction
 	err         error
 	status      string
@@ -111,9 +112,9 @@ func initialModel(cx *cortex.Cortex) model {
 
 // ---- commands --------------------------------------------------------------
 
-func loadRows(cx *cortex.Cortex, query string, all bool) tea.Cmd {
+func loadRows(cx *cortex.Cortex, query string, all, trashed bool) tea.Cmd {
 	return func() tea.Msg {
-		opts := cortex.ListOptions{All: all}
+		opts := cortex.ListOptions{All: all, Trashed: trashed}
 		var (
 			rows []cortex.Row
 			err  error
@@ -147,7 +148,7 @@ func editorCmd(path, id string, isNew bool) tea.Cmd {
 // ---- lifecycle -------------------------------------------------------------
 
 func (m model) Init() tea.Cmd {
-	return loadRows(m.cx, "", false)
+	return loadRows(m.cx, "", false, false)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -216,6 +217,9 @@ func (m model) updateList(msg tea.KeyMsg) (model, tea.Cmd) {
 		}
 
 	case "n":
+		if m.showTrashed {
+			return m, nil // no new traces from trash view
+		}
 		path, err := newTraceTempFile()
 		if err != nil {
 			m.err = err
@@ -224,7 +228,7 @@ func (m model) updateList(msg tea.KeyMsg) (model, tea.Cmd) {
 		return m, editorCmd(path, "", true)
 
 	case "e":
-		if len(m.rows) == 0 {
+		if len(m.rows) == 0 || m.showTrashed {
 			return m, nil
 		}
 		row := m.rows[m.cursor]
@@ -232,7 +236,7 @@ func (m model) updateList(msg tea.KeyMsg) (model, tea.Cmd) {
 		return m, editorCmd(path, row.ID, false)
 
 	case "d":
-		if len(m.rows) == 0 {
+		if len(m.rows) == 0 || m.showTrashed {
 			return m, nil
 		}
 		m.confirm = confirmAction{action: "archive", id: m.rows[m.cursor].ID}
@@ -242,8 +246,26 @@ func (m model) updateList(msg tea.KeyMsg) (model, tea.Cmd) {
 		if len(m.rows) == 0 {
 			return m, nil
 		}
-		m.confirm = confirmAction{action: "delete", id: m.rows[m.cursor].ID}
+		if m.showTrashed {
+			// Hard-delete from trash view.
+			m.confirm = confirmAction{action: "purge", id: m.rows[m.cursor].ID}
+		} else {
+			// Soft-delete to trash.
+			m.confirm = confirmAction{action: "trash", id: m.rows[m.cursor].ID}
+		}
 		m.state = stateConfirm
+
+	case "r":
+		if len(m.rows) == 0 || !m.showTrashed {
+			return m, nil
+		}
+		row := m.rows[m.cursor]
+		if err := m.cx.Recover(row.ID); err != nil {
+			m.err = err
+			return m, nil
+		}
+		m.status = "Recovered " + row.ID
+		return m, loadRows(m.cx, m.searchQuery, m.showAll, m.showTrashed)
 
 	case "u":
 		if len(m.rows) == 0 {
@@ -258,12 +280,19 @@ func (m model) updateList(msg tea.KeyMsg) (model, tea.Cmd) {
 			return m, nil
 		}
 		m.status = "Unarchived " + row.ID
-		return m, loadRows(m.cx, m.searchQuery, m.showAll)
+		return m, loadRows(m.cx, m.searchQuery, m.showAll, m.showTrashed)
 
 	case "a":
 		m.showAll = !m.showAll
+		m.showTrashed = false
 		m.cursor = 0
-		return m, loadRows(m.cx, m.searchQuery, m.showAll)
+		return m, loadRows(m.cx, m.searchQuery, m.showAll, false)
+
+	case "t":
+		m.showTrashed = !m.showTrashed
+		m.showAll = false
+		m.cursor = 0
+		return m, loadRows(m.cx, m.searchQuery, false, m.showTrashed)
 
 	case "/":
 		m.state = stateSearch
@@ -277,7 +306,7 @@ func (m model) updateList(msg tea.KeyMsg) (model, tea.Cmd) {
 		if m.searchQuery != "" {
 			m.searchQuery = ""
 			m.cursor = 0
-			return m, loadRows(m.cx, "", m.showAll)
+			return m, loadRows(m.cx, "", m.showAll, m.showTrashed)
 		}
 	}
 	return m, nil
@@ -290,7 +319,7 @@ func (m model) updateSearch(msg tea.KeyMsg) (model, tea.Cmd) {
 		m.state = stateList
 		m.search.Blur()
 		m.cursor = 0
-		return m, loadRows(m.cx, m.searchQuery, m.showAll)
+		return m, loadRows(m.cx, m.searchQuery, m.showAll, m.showTrashed)
 
 	case "esc":
 		m.state = stateList
@@ -312,22 +341,28 @@ func (m model) updateConfirm(msg tea.KeyMsg) (model, tea.Cmd) {
 		m.confirm = confirmAction{}
 
 		var err error
-		if action == "archive" {
+		switch action {
+		case "archive":
 			err = m.cx.Archive(id)
 			if err == nil {
 				m.status = "Archived " + id
 			}
-		} else {
+		case "trash":
+			err = m.cx.Trash(id)
+			if err == nil {
+				m.status = "Moved to trash: " + id
+			}
+		case "purge":
 			err = m.cx.Remove(id)
 			if err == nil {
-				m.status = "Deleted " + id
+				m.status = "Permanently deleted " + id
 			}
 		}
 		if err != nil {
 			m.err = err
 			return m, nil
 		}
-		return m, loadRows(m.cx, m.searchQuery, m.showAll)
+		return m, loadRows(m.cx, m.searchQuery, m.showAll, m.showTrashed)
 
 	case "n", "N", "esc":
 		m.state = stateList
@@ -370,7 +405,7 @@ func (m model) handleEditorDone(msg editorDoneMsg) (model, tea.Cmd) {
 		m.status = "Updated " + msg.id
 	}
 
-	return m, loadRows(m.cx, m.searchQuery, m.showAll)
+	return m, loadRows(m.cx, m.searchQuery, m.showAll, m.showTrashed)
 }
 
 func (m model) loadCurrent() *trace.Trace {
@@ -378,7 +413,13 @@ func (m model) loadCurrent() *trace.Trace {
 		return nil
 	}
 	row := m.rows[m.cursor]
-	t, _ := trace.ParseFile(m.cx.TraceFile(row.ID, row.ArchivedAt != ""))
+	var path string
+	if row.TrashedAt != "" {
+		path = m.cx.TrashFile(row.ID)
+	} else {
+		path = m.cx.TraceFile(row.ID, row.ArchivedAt != "")
+	}
+	t, _ := trace.ParseFile(path)
 	return t
 }
 
@@ -430,7 +471,10 @@ func (m model) renderHeader() string {
 	if m.searchQuery != "" {
 		left += styleDim.Render(`  search:"` + m.searchQuery + `"`)
 	}
-	if m.showAll {
+	switch {
+	case m.showTrashed:
+		left += styleDim.Render("  [trash]")
+	case m.showAll:
 		left += styleDim.Render("  [all]")
 	}
 	right := styleDim.Render(fmt.Sprintf("%d traces", len(m.rows)))
@@ -473,7 +517,10 @@ func (m model) renderList(width, height int) string {
 		}
 
 		title := r.Title
-		if r.ArchivedAt != "" {
+		switch {
+		case r.TrashedAt != "":
+			title = "~" + title
+		case r.ArchivedAt != "":
 			title = "~" + title
 		}
 		title = truncRune(title, titleW)
@@ -582,7 +629,12 @@ func (m model) renderFooter() string {
 		if m.status != "" {
 			return styleStatus.Render("  " + m.status)
 		}
-		hint := "j/k:nav  n:new  e:edit  d:archive  D:delete  u:unarchive  /:search  a:all  q:quit"
+		var hint string
+		if m.showTrashed {
+			hint = "j/k:nav  r:recover  D:purge  t:back  /:search  q:quit"
+		} else {
+			hint = "j/k:nav  n:new  e:edit  d:archive  u:unarchive  D:trash  t:trash-view  a:all  /:search  q:quit"
+		}
 		if m.searchQuery != "" {
 			hint = "esc:clear  " + hint
 		}

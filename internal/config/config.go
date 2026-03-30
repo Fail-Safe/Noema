@@ -9,8 +9,9 @@ import (
 )
 
 type Config struct {
-	Default  string                 `yaml:"default"`
-	Cortexes map[string]CortexEntry `yaml:"cortexes"`
+	Default   string                 `yaml:"default"`
+	Cortexes  map[string]CortexEntry `yaml:"cortexes"`
+	TrashDays int                    `yaml:"trash_days,omitempty"` // 0 means use default (30)
 }
 
 type CortexEntry struct {

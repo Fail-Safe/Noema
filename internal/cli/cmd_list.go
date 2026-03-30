@@ -17,6 +17,7 @@ func listCmd() *cobra.Command {
 		filterAuthor string
 		filterTag    string
 		archived     bool
+		trashed      bool
 		all          bool
 	)
 
@@ -36,6 +37,7 @@ func listCmd() *cobra.Command {
 				Author:   filterAuthor,
 				Tag:      filterTag,
 				Archived: archived,
+				Trashed:  trashed,
 				All:      all,
 			})
 			if err != nil {
@@ -54,6 +56,7 @@ func listCmd() *cobra.Command {
 	cmd.Flags().StringVar(&filterAuthor, "author", "", "filter by author")
 	cmd.Flags().StringVar(&filterTag, "tag", "", "filter by tag")
 	cmd.Flags().BoolVar(&archived, "archived", false, "show only archived traces")
+	cmd.Flags().BoolVar(&trashed, "trashed", false, "show only trashed traces")
 	cmd.Flags().BoolVar(&all, "all", false, "show active and archived traces")
 	return cmd
 }
