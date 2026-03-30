@@ -3,6 +3,7 @@ package cortex_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Fail-Safe/Noema/internal/cortex"
@@ -33,7 +34,7 @@ func TestCreate_DirectoryLayout(t *testing.T) {
 	}
 	root := filepath.Join(dir, "mycortex")
 
-	for _, sub := range []string{"traces", "archive/traces", "db"} {
+	for _, sub := range []string{"traces", "archive/traces", "trash/traces", "db"} {
 		info, err := os.Stat(filepath.Join(root, sub))
 		if err != nil {
 			t.Errorf("directory %q missing: %v", sub, err)
@@ -43,11 +44,55 @@ func TestCreate_DirectoryLayout(t *testing.T) {
 			t.Errorf("%q is not a directory", sub)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(root, "cortex.md")); err != nil {
-		t.Errorf("cortex.md missing: %v", err)
+	for _, file := range []string{"cortex.md", "AGENT.md", filepath.Join("db", "noema.db")} {
+		if _, err := os.Stat(filepath.Join(root, file)); err != nil {
+			t.Errorf("%s missing: %v", file, err)
+		}
 	}
-	if _, err := os.Stat(filepath.Join(root, "db", "noema.db")); err != nil {
-		t.Errorf("noema.db missing: %v", err)
+}
+
+func TestCreate_AgentMDContent(t *testing.T) {
+	dir := t.TempDir()
+	if err := cortex.Create("myagent", dir); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "myagent", "AGENT.md"))
+	if err != nil {
+		t.Fatalf("AGENT.md missing: %v", err)
+	}
+	content := string(data)
+	for _, want := range []string{
+		"myagent",
+		"fact", "decision", "preference", "context", "skill", "intent", "observation", "note",
+		"noema sync",
+		"YYYYMMDD",
+		"traces/",
+		"archive/",
+		"trash/",
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("AGENT.md missing expected content %q", want)
+		}
+	}
+}
+
+func TestReadManifest(t *testing.T) {
+	dir := t.TempDir()
+	if err := cortex.Create("manifested", dir); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	m, err := cortex.ReadManifest(filepath.Join(dir, "manifested"))
+	if err != nil {
+		t.Fatalf("ReadManifest: %v", err)
+	}
+	if m.Name != "manifested" {
+		t.Errorf("Name: got %q, want %q", m.Name, "manifested")
+	}
+	if m.Version != 1 {
+		t.Errorf("Version: got %d, want 1", m.Version)
+	}
+	if m.Created == "" {
+		t.Error("Created must not be empty")
 	}
 }
 
@@ -427,6 +472,196 @@ func TestRemove_ArchivedTrace(t *testing.T) {
 }
 
 // ---- Update ----
+
+// ---- Sync ----
+
+func TestSync_AddsNewFiles(t *testing.T) {
+	cx := setup(t)
+
+	// Write two files directly to disk — no cx.Add.
+	tr1 := trace.New("Direct write 1", "fact", "agent", nil, "Body one.")
+	tr2 := trace.New("Direct write 2", "note", "", nil, "Body two.")
+	for _, tr := range []*trace.Trace{tr1, tr2} {
+		if err := tr.Write(cx.TraceFile(tr.ID, false)); err != nil {
+			t.Fatalf("Write %s: %v", tr.ID, err)
+		}
+	}
+
+	result, err := cx.Sync()
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if result.Added != 2 {
+		t.Errorf("Added: got %d, want 2", result.Added)
+	}
+	if result.Updated != 0 {
+		t.Errorf("Updated: got %d, want 0", result.Updated)
+	}
+	if result.Orphaned != 0 {
+		t.Errorf("Orphaned: got %d, want 0", result.Orphaned)
+	}
+	for _, tr := range []*trace.Trace{tr1, tr2} {
+		if _, err := cx.Get(tr.ID); err != nil {
+			t.Errorf("%s not in DB after Sync: %v", tr.ID, err)
+		}
+	}
+}
+
+func TestSync_UpdatesExistingFiles(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Original title", "fact", "", nil, "Original body.")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	// Simulate an agent editing the file directly.
+	path := cx.TraceFile(tr.ID, false)
+	parsed, err := trace.ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	parsed.Title = "Updated by agent"
+	parsed.Type = "decision"
+	if err := parsed.Write(path); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	result, err := cx.Sync()
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if result.Added != 0 {
+		t.Errorf("Added: got %d, want 0", result.Added)
+	}
+	if result.Updated != 1 {
+		t.Errorf("Updated: got %d, want 1", result.Updated)
+	}
+
+	row, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get after Sync: %v", err)
+	}
+	if row.Title != "Updated by agent" {
+		t.Errorf("Title: got %q, want %q", row.Title, "Updated by agent")
+	}
+	if row.Type != "decision" {
+		t.Errorf("Type: got %q, want %q", row.Type, "decision")
+	}
+}
+
+func TestSync_DetectsOrphans(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Will be orphaned", "note", "", nil, "Body.")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	// Delete the file directly — DB row remains.
+	if err := os.Remove(cx.TraceFile(tr.ID, false)); err != nil {
+		t.Fatalf("Remove file: %v", err)
+	}
+
+	result, err := cx.Sync()
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if result.Orphaned != 1 {
+		t.Errorf("Orphaned: got %d, want 1", result.Orphaned)
+	}
+	// Sync must not delete orphaned rows — that's the user's decision.
+	if _, err := cx.Get(tr.ID); err != nil {
+		t.Error("Sync must not delete orphaned DB rows")
+	}
+}
+
+func TestSync_ReconcilesArchivedByAgent(t *testing.T) {
+	cx := setup(t)
+
+	// Agent writes a file directly into archive/traces/ (e.g. after reading AGENT.md).
+	tr := trace.New("Agent archived", "note", "", nil, "Body.")
+	if err := tr.Write(cx.TraceFile(tr.ID, true)); err != nil {
+		t.Fatalf("Write to archive: %v", err)
+	}
+
+	result, err := cx.Sync()
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if result.Added != 1 {
+		t.Errorf("Added: got %d, want 1", result.Added)
+	}
+
+	row, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get after Sync: %v", err)
+	}
+	if row.ArchivedAt == "" {
+		t.Error("ArchivedAt must be set for file in archive/traces/")
+	}
+	if row.TrashedAt != "" {
+		t.Errorf("TrashedAt must be empty, got %q", row.TrashedAt)
+	}
+}
+
+func TestSync_ReconcilesTrashByAgent(t *testing.T) {
+	cx := setup(t)
+
+	// Agent writes a file directly into trash/traces/.
+	tr := trace.New("Agent trashed", "note", "", nil, "Body.")
+	if err := tr.Write(cx.TrashFile(tr.ID)); err != nil {
+		t.Fatalf("Write to trash: %v", err)
+	}
+
+	result, err := cx.Sync()
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if result.Added != 1 {
+		t.Errorf("Added: got %d, want 1", result.Added)
+	}
+
+	row, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get after Sync: %v", err)
+	}
+	if row.TrashedAt == "" {
+		t.Error("TrashedAt must be set for file in trash/traces/")
+	}
+	if row.ArchivedAt != "" {
+		t.Errorf("ArchivedAt must be empty, got %q", row.ArchivedAt)
+	}
+}
+
+func TestSync_PreservesExistingTimestamps(t *testing.T) {
+	cx := setup(t)
+
+	// Add and archive via API to get a real archived_at timestamp.
+	tr := trace.New("Preserve timestamps", "note", "", nil, "Body.")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := cx.Archive(tr.ID); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	row, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	originalArchivedAt := row.ArchivedAt
+
+	// Sync should not overwrite the existing timestamp.
+	if _, err := cx.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	row, err = cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get after Sync: %v", err)
+	}
+	if row.ArchivedAt != originalArchivedAt {
+		t.Errorf("ArchivedAt changed: got %q, want %q", row.ArchivedAt, originalArchivedAt)
+	}
+}
 
 func TestUpdate(t *testing.T) {
 	cx := setup(t)
