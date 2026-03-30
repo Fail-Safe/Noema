@@ -76,6 +76,28 @@ func TestCreate_AgentMDContent(t *testing.T) {
 	}
 }
 
+func TestOpen_GeneratesAgentMDIfMissing(t *testing.T) {
+	dir := t.TempDir()
+	if err := cortex.Create("legacy", dir); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Simulate a cortex created before AGENT.md was introduced.
+	agentMDPath := filepath.Join(dir, "legacy", "AGENT.md")
+	if err := os.Remove(agentMDPath); err != nil {
+		t.Fatalf("Remove AGENT.md: %v", err)
+	}
+
+	cx, err := cortex.Open("legacy", filepath.Join(dir, "legacy"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	cx.Close()
+
+	if _, err := os.Stat(agentMDPath); err != nil {
+		t.Error("Open must regenerate AGENT.md when it is missing")
+	}
+}
+
 func TestReadManifest(t *testing.T) {
 	dir := t.TempDir()
 	if err := cortex.Create("manifested", dir); err != nil {

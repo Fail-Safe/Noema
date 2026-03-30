@@ -120,7 +120,9 @@ noema completion [bash|zsh|fish|install]  Generate shell completions
 
 Noema can run as an [MCP](https://modelcontextprotocol.io) server, giving any MCP-compatible AI tool direct access to your Cortex.
 
-**Tools exposed:** `get_instructions`, `list_traces`, `get_trace`, `create_trace`, `update_trace`, `delete_trace`, `search_traces`, `archive_trace`, `unarchive_trace`
+**Tools exposed:** `get_instructions`, `list_traces`, `get_trace`, `create_trace`, `update_trace`, `delete_trace`, `recover_trace`, `search_traces`, `archive_trace`, `unarchive_trace`
+
+`delete_trace` moves a trace to trash (soft-delete, recoverable). Use `recover_trace` to restore it.
 
 Call `get_instructions` first in any new session — it returns a live reference guide covering Trace types, field definitions, filtering options, and tool usage, with the active Cortex's name and purpose already filled in.
 

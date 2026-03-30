@@ -80,7 +80,8 @@ Choose the type that best reflects the intent of the memory:
   search_traces query [all]      → FTS5 full-text search
   archive_trace id               → move to archive (reversible)
   unarchive_trace id             → restore from archive
-  delete_trace id                → permanently delete (irreversible)
+  delete_trace id                → move to trash (soft-delete, recoverable)
+  recover_trace id               → restore a trashed trace to active
 
 ## Filtering
   default              active traces only (not archived, not trashed)
@@ -200,17 +201,31 @@ Choose the type that best reflects the intent of the memory:
 	})
 
 	s.AddTool(mcp.NewTool("delete_trace",
-		mcp.WithDescription("Permanently delete a trace"),
+		mcp.WithDescription("Move a trace to trash (soft-delete, recoverable for 30 days). Use recover_trace to restore it."),
 		mcp.WithString("id", mcp.Description("Trace ID"), mcp.Required()),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id, err := req.RequireString("id")
 		if err != nil {
 			return nil, err
 		}
-		if err := cx.Remove(id); err != nil {
+		if err := cx.Trash(id); err != nil {
 			return nil, err
 		}
-		return mcp.NewToolResultText(fmt.Sprintf("Trace %s deleted.", id)), nil
+		return mcp.NewToolResultText(fmt.Sprintf("Trace %s moved to trash.", id)), nil
+	})
+
+	s.AddTool(mcp.NewTool("recover_trace",
+		mcp.WithDescription("Restore a trace from trash back to active"),
+		mcp.WithString("id", mcp.Description("Trace ID"), mcp.Required()),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id, err := req.RequireString("id")
+		if err != nil {
+			return nil, err
+		}
+		if err := cx.Recover(id); err != nil {
+			return nil, err
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("Trace %s recovered.", id)), nil
 	})
 
 	s.AddTool(mcp.NewTool("archive_trace",

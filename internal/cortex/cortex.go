@@ -210,7 +210,8 @@ they keep the database in sync automatically:
 | ` + "`search_traces`" + ` | Full-text search across titles and bodies |
 | ` + "`archive_trace`" + ` | Archive a trace |
 | ` + "`unarchive_trace`" + ` | Restore an archived trace |
-| ` + "`delete_trace`" + ` | Permanently delete a trace |
+| ` + "`delete_trace`" + ` | Move a trace to trash (soft-delete, recoverable) |
+| ` + "`recover_trace`" + ` | Restore a trashed trace to active |
 `
 }
 
@@ -235,6 +236,14 @@ func Open(name, dir string) (*Cortex, error) {
 		days = cfg.TrashDays
 	}
 	_ = cx.Purge(days)
+
+	// Write AGENT.md if it doesn't exist (e.g. cortex created before this feature).
+	agentMDPath := filepath.Join(dir, "AGENT.md")
+	if _, err := os.Stat(agentMDPath); os.IsNotExist(err) {
+		if m, err := ReadManifest(dir); err == nil {
+			_ = os.WriteFile(agentMDPath, []byte(agentMDContent(m)), 0o640)
+		}
+	}
 
 	return cx, nil
 }
