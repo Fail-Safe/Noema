@@ -81,14 +81,18 @@ noema add [flags]                         Add a Trace (interactive if flags omit
 noema list [flags]                        List Traces
 noema get <id>                            Show a Trace
 noema edit <id>                           Edit a Trace in $EDITOR
-noema remove <id>                         Permanently remove a Trace
+noema remove <id>                         Move a Trace to trash (--force to hard-delete)
+noema recover <id>                        Restore a Trace from trash
+noema purge [--days N]                    Permanently delete all trashed Traces older than N days
 noema search <query> [flags]              Full-text search (FTS5)
 
 noema archive <id>                        Archive a Trace
 noema unarchive <id>                      Restore an archived Trace
 
 noema serve [--transport stdio|sse]       Start the MCP server
+noema serve --print-config                Print a ready-to-use .mcp.json snippet and exit
 noema tui                                 Open the interactive TUI
+noema completion [bash|zsh|fish|install]  Generate shell completions
 ```
 
 **Common flags:**
@@ -99,6 +103,7 @@ noema tui                                 Open the interactive TUI
 --author <name>       Filter by author
 --tag <tag>           Filter by tag
 --archived            Show only archived Traces
+--trashed             Show only trashed Traces
 --all                 Show active and archived Traces
 ```
 
@@ -116,33 +121,25 @@ Noema can run as an [MCP](https://modelcontextprotocol.io) server, giving any MC
 
 **Tools exposed:** `list_traces`, `get_trace`, `create_trace`, `update_trace`, `delete_trace`, `search_traces`, `archive_trace`, `unarchive_trace`
 
-### stdio (Claude Desktop, Claude Code)
+### stdio (Claude Desktop, Claude Code, any MCP client)
 
-Add to your `claude_desktop_config.json`:
+Generate a ready-to-use config snippet for the current machine and cortex:
 
-```json
-{
-  "mcpServers": {
-    "noema": {
-      "command": "noema",
-      "args": ["serve", "--cortex", "my-cortex"]
-    }
-  }
-}
+```bash
+noema serve --print-config
 ```
 
-Or in a Claude Code project's `.claude/settings.json`:
+This prints a `.mcp.json` block with the correct binary path and cortex already filled in. Pipe it to a file to use it:
 
-```json
-{
-  "mcpServers": {
-    "noema": {
-      "command": "noema",
-      "args": ["serve"]
-    }
-  }
-}
+```bash
+# Claude Code (project-level)
+noema serve --print-config > .mcp.json
+
+# Claude Desktop — merge the "noema" block into ~/Library/Application Support/Claude/claude_desktop_config.json
+noema serve --print-config
 ```
+
+The `--cortex` flag, `NOEMA_CORTEX` env, and config default are all respected, so `--print-config` always reflects the cortex you would actually use.
 
 ### SSE (HTTP clients, GitHub Copilot)
 
@@ -180,6 +177,8 @@ my-cortex/
   traces/             ← active Traces
   archive/
     traces/           ← archived Traces (hidden by default, fully reversible)
+  trash/
+    traces/           ← soft-deleted Traces (auto-purged after 30 days by default)
   db/
     noema.db          ← SQLite index (metadata, tags, FTS5)
 ```

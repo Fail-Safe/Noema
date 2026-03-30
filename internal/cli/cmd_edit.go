@@ -6,13 +6,16 @@ import (
 	"os/exec"
 
 	"github.com/spf13/cobra"
+
+	"github.com/Fail-Safe/Noema/internal/cortex"
 )
 
 func editCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "edit <id>",
-		Short: "Edit a Trace in $EDITOR",
-		Args:  cobra.ExactArgs(1),
+		Use:               "edit <id>",
+		Short:             "Edit a Trace in $EDITOR",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completionsFor(cortex.ListOptions{}),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cx, err := resolveCortex()
 			if err != nil {

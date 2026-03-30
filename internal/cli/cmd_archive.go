@@ -4,13 +4,16 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+
+	"github.com/Fail-Safe/Noema/internal/cortex"
 )
 
 func archiveCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "archive <id>",
-		Short: "Archive a Trace",
-		Args:  cobra.ExactArgs(1),
+		Use:               "archive <id>",
+		Short:             "Archive a Trace",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completionsFor(cortex.ListOptions{}),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cx, err := resolveCortex()
 			if err != nil {
@@ -29,9 +32,10 @@ func archiveCmd() *cobra.Command {
 
 func unarchiveCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "unarchive <id>",
-		Short: "Restore an archived Trace",
-		Args:  cobra.ExactArgs(1),
+		Use:               "unarchive <id>",
+		Short:             "Restore an archived Trace",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completionsFor(cortex.ListOptions{Archived: true}),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cx, err := resolveCortex()
 			if err != nil {

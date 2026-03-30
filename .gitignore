@@ -9,6 +9,9 @@
 # macOS
 .DS_Store
 
+# Local MCP config (machine-specific paths)
+.mcp.json
+
 # Editor
 *.swp
 *.swo

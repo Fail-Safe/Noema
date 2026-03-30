@@ -6,14 +6,16 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/Fail-Safe/Noema/internal/cortex"
 	"github.com/Fail-Safe/Noema/internal/trace"
 )
 
 func getCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "get <id>",
-		Short: "Show a Trace",
-		Args:  cobra.ExactArgs(1),
+		Use:               "get <id>",
+		Short:             "Show a Trace",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completionsFor(cortex.ListOptions{All: true}),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cx, err := resolveCortex()
 			if err != nil {

@@ -10,9 +10,10 @@ import (
 
 func useCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "use <name>",
-		Short: "Set the default Cortex",
-		Args:  cobra.ExactArgs(1),
+		Use:               "use <name>",
+		Short:             "Set the default Cortex",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: cortexNameCompletions,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
 			cfg, err := config.Load()

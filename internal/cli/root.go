@@ -49,6 +49,7 @@ const (
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cortexFlag, "cortex", "", "cortex name to use (overrides NOEMA_CORTEX and config default)")
+	rootCmd.RegisterFlagCompletionFunc("cortex", cortexNameCompletions)
 
 	rootCmd.AddGroup(
 		&cobra.Group{ID: groupTrace, Title: "Trace commands:"},
@@ -72,6 +73,44 @@ func addGrouped(group string, cmds ...*cobra.Command) {
 	for _, cmd := range cmds {
 		cmd.GroupID = group
 		rootCmd.AddCommand(cmd)
+	}
+}
+
+// cortexNameCompletions is a ValidArgsFunction / RegisterFlagCompletionFunc
+// that returns the names of all known cortexes (with their paths as descriptions).
+func cortexNameCompletions(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	cfg, err := config.Load()
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveError
+	}
+	out := make([]string, 0, len(cfg.Cortexes))
+	for name, entry := range cfg.Cortexes {
+		out = append(out, name+"\t"+entry.Path)
+	}
+	return out, cobra.ShellCompDirectiveNoFileComp
+}
+
+// completionsFor returns a ValidArgsFunction that lists trace IDs (with titles
+// as descriptions) from the default Cortex, filtered by opts.
+func completionsFor(opts cortex.ListOptions) func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
+	return func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		if len(args) > 0 {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+		cx, err := resolveCortex()
+		if err != nil {
+			return nil, cobra.ShellCompDirectiveError
+		}
+		defer cx.Close()
+		rows, err := cx.List(opts)
+		if err != nil {
+			return nil, cobra.ShellCompDirectiveError
+		}
+		out := make([]string, len(rows))
+		for i, r := range rows {
+			out[i] = r.ID + "\t" + r.Title
+		}
+		return out, cobra.ShellCompDirectiveNoFileComp
 	}
 }
 

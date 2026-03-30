@@ -4,13 +4,16 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+
+	"github.com/Fail-Safe/Noema/internal/cortex"
 )
 
 func recoverCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "recover <id>",
-		Short: "Restore a Trace from trash",
-		Args:  cobra.ExactArgs(1),
+		Use:               "recover <id>",
+		Short:             "Restore a Trace from trash",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completionsFor(cortex.ListOptions{Trashed: true}),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cx, err := resolveCortex()
 			if err != nil {
