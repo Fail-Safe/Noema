@@ -59,7 +59,7 @@ func init() {
 
 	addGrouped(groupTrace,
 		addCmd(), listCmd(), getCmd(), editCmd(), removeCmd(),
-		searchCmd(), archiveCmd(), unarchiveCmd(), recoverCmd(), purgeCmd(),
+		searchCmd(), archiveCmd(), unarchiveCmd(), recoverCmd(), purgeCmd(), syncCmd(),
 	)
 	addGrouped(groupCortex,
 		initCmd(), useCmd(), cortexCmd(),

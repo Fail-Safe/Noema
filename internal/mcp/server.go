@@ -18,6 +18,86 @@ func NewServer(cx *cortex.Cortex) *server.MCPServer {
 		server.WithToolCapabilities(true),
 	)
 
+	s.AddTool(mcp.NewTool("get_instructions",
+		mcp.WithDescription("Returns a reference guide for working with this Cortex: terminology, trace types, field definitions, filtering options, and tool usage. Call this first if you are unfamiliar with Noema."),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		m, err := cortex.ReadManifest(cx.Dir)
+		if err != nil {
+			// Fallback to minimal identity if manifest is unreadable.
+			m = cortex.Manifest{Name: cx.Name}
+		}
+
+		purposeLine := ""
+		if m.Purpose != "" {
+			purposeLine = fmt.Sprintf("Purpose: %s\n", m.Purpose)
+		}
+		ownerLine := ""
+		if m.Owner != "" {
+			ownerLine = fmt.Sprintf("Owner:   %s\n", m.Owner)
+		}
+
+		out := fmt.Sprintf(`# Noema — Agent Reference
+
+## Active Cortex
+Name:    %s
+%s%s
+## Terminology
+- Cortex: a named collection of Traces (this instance: %q)
+- Trace:  a single memory unit — one markdown file with YAML frontmatter +
+          a corresponding row in the SQLite index
+
+## Trace Types
+Choose the type that best reflects the intent of the memory:
+
+  fact        — a discrete thing that is true
+  decision    — a choice made and why
+  preference  — a behavioral or stylistic lean
+  context     — situational background
+  skill       — a learned capability or procedure
+  intent      — something that needs to happen (autonomous pickup)
+  observation — something witnessed but not yet verified
+  note        — anything else
+
+## Trace Fields
+  id       required  YYYYMMDD-slugified-title  (e.g. 20260330-why-we-chose-go)
+  title    required  short, descriptive
+  type     required  one of the types above
+  created  required  RFC3339 UTC timestamp (set on creation, never changed)
+  updated  required  RFC3339 UTC timestamp (update on every edit)
+  author   optional  human username or agent name
+  tags     optional  list of keyword strings
+
+## Tools
+
+  get_instructions               → this document
+  list_traces [type] [author] [tag] [archived] [all]
+                                 → list traces; defaults to active only
+  get_trace id                   → full content including body
+  create_trace title type body [author] [tags]
+                                 → create a new trace; tags = comma-separated
+  update_trace id [title] [type] [author] [tags] [body]
+                                 → update any subset of fields
+  search_traces query [all]      → FTS5 full-text search
+  archive_trace id               → move to archive (reversible)
+  unarchive_trace id             → restore from archive
+  delete_trace id                → permanently delete (irreversible)
+
+## Filtering
+  default              active traces only (not archived, not trashed)
+  archived=true        archived traces only
+  all=true             active + archived (excludes trash)
+  (no trashed filter via MCP — use the CLI for trash operations)
+
+## Tips
+- Prefer specific types over "note" — it helps retrieval and reasoning later.
+- Use tags to group related traces across types.
+- author should be your agent name so traces are attributable in multi-agent systems.
+- search_traces supports FTS5 syntax: quoted phrases, AND/OR/NOT, prefix* matching.
+`, m.Name, purposeLine, ownerLine, m.Name)
+
+		return mcp.NewToolResultText(out), nil
+	})
+
 	s.AddTool(mcp.NewTool("list_traces",
 		mcp.WithDescription("List traces in the cortex"),
 		mcp.WithString("type", mcp.Description("Filter by trace type")),
