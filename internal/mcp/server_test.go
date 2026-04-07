@@ -97,6 +97,32 @@ func TestRenderInstructions_ManifestVersionReflectsInput(t *testing.T) {
 	}
 }
 
+// TestRenderInstructions_WarnsAgainstDateInTitle pins the warning text
+// added after a fleet of agents on the live federation ring was found
+// creating traces with IDs like 20260402-20260402-dadbot-foo. The agents
+// were dutifully putting dates in titles to mark when an event occurred,
+// and trace.NewID was prepending today's date on top — producing the
+// doubled prefix. NewID now strips leading YYYYMMDD- and YYYY-MM-DD-
+// prefixes defensively, but the get_instructions document is the
+// canonical place to teach agents the cleaner pattern up front so the
+// underlying habit shifts. Without this assertion, a future refactor of
+// the Tools section could quietly drop the warning and the doubled-
+// prefix bug would re-emerge from agent habit even though the code-
+// level defense would still catch it.
+func TestRenderInstructions_WarnsAgainstDateInTitle(t *testing.T) {
+	out := renderInstructions(cortex.Manifest{Name: "test", Version: 2}, "dev")
+
+	for _, want := range []string{
+		"Do NOT include a date in the title",
+		"YYYYMMDD-",
+		"YYYY-MM-DD-",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("instructions missing date-in-title warning fragment %q\nfull output:\n%s", want, out)
+		}
+	}
+}
+
 // itoa avoids pulling in strconv for a single call. Tests are the place
 // for tiny helpers like this — keeps the imports minimal and signals
 // "this isn't a hot path".

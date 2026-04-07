@@ -590,7 +590,14 @@ Choose the type that best reflects the intent of the memory:
                                  → list traces; defaults to active only
   get_trace id                   → full content including body, origin, lineage
   create_trace title type body [author] [tags] [derived_from] [origin]
-                                 → create a new trace; tags/derived_from = comma-separated
+                                 → create a new trace; tags/derived_from = comma-separated.
+                                   Do NOT include a date in the title — the ID
+                                   generator prepends today's date automatically,
+                                   and leading YYYYMMDD- or YYYY-MM-DD- prefixes
+                                   in the title are stripped to prevent doubled IDs
+                                   like 20260402-20260402-foo. If a trace is *about*
+                                   a specific date, put that information in the body
+                                   or in a tag (e.g. tags=event-2026-04-02) instead
   update_trace id [title] [type] [author] [tags] [derived_from] [body]
                                  → update any subset of fields
   search_traces query [all]      → FTS5 full-text search
