@@ -116,6 +116,8 @@ noema federation add-peer <name> <endpoint>
 noema serve [--transport stdio|sse] [--host <addr>] [--tls-cert <file> --tls-key <file>]
                                           Start the MCP server (SSE requires --host)
 noema serve --print-config                Print a ready-to-use .mcp.json snippet and exit
+noema serve ... --print-systemd-unit      Print a systemd service unit for the current serve flags
+noema serve ... --print-launchd-plist     Print a launchd LaunchAgent plist for the current serve flags
 noema tui                                 Open the interactive TUI
 noema completion [bash|zsh|fish|install]  Generate shell completions
 ```
@@ -202,6 +204,41 @@ noema serve --transport sse --host 10.0.0.5 --port 3000 \
 ```
 
 `--host` is **required** in SSE mode and must be an explicit address — `0.0.0.0`/`::` are rejected to avoid accidentally exposing a Cortex on every interface. Pair `--tls-cert` with `--tls-key` to serve over HTTPS.
+
+### Running as a persistent service
+
+For ad-hoc use, backgrounding with `nohup` works fine:
+
+```bash
+nohup noema serve --cortex agentbrain --transport sse --host 127.0.0.1 \
+  > ~/noema.log 2>&1 &
+disown
+```
+
+For a real federation host you probably want a process supervisor — restart on crash, start at boot, logs aggregated. Noema can print a ready-to-install unit/plist that mirrors the serve command you've already validated:
+
+**Linux (systemd)**
+
+```bash
+noema serve --cortex agentbrain --transport sse --host 192.168.1.10 --print-systemd-unit \
+  | sudo tee /etc/systemd/system/noema-agentbrain.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now noema-agentbrain
+sudo journalctl -u noema-agentbrain -f
+```
+
+**macOS (launchd)**
+
+```bash
+noema serve --cortex agentbrain --transport sse --host 127.0.0.1 --print-launchd-plist \
+  > ~/Library/LaunchAgents/com.fail-safe.noema.agentbrain.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fail-safe.noema.agentbrain.plist
+tail -f ~/Library/Logs/noema-agentbrain.log
+```
+
+Both flags require `--transport sse` (stdio has no endpoint to supervise) and an explicit `--cortex` (the unit/plist pins exactly one cortex — NOEMA_CORTEX and the config default aren't carried into the service environment). All the usual SSE flag invariants (`--host` not `0.0.0.0`, TLS pair symmetry) are validated at preview time, so you catch misconfigurations before installing.
+
+The emitted unit filename convention is `noema-<cortex>.service` / `com.fail-safe.noema.<cortex>.plist`, so running multiple cortexes on one host never collides.
 
 ---
 

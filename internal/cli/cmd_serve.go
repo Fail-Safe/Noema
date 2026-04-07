@@ -1,11 +1,16 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
+	"os/user"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -19,12 +24,14 @@ import (
 
 func serveCmd() *cobra.Command {
 	var (
-		transport   string
-		host        string
-		port        int
-		tlsCert     string
-		tlsKey      string
-		printConfig bool
+		transport         string
+		host              string
+		port              int
+		tlsCert           string
+		tlsKey            string
+		printConfig       bool
+		printSystemdUnit  bool
+		printLaunchdPlist bool
 	)
 
 	cmd := &cobra.Command{
@@ -34,6 +41,12 @@ func serveCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if printConfig {
 				return runPrintMCPConfig()
+			}
+			if printSystemdUnit {
+				return runPrintSystemdUnit(cmd.OutOrStdout(), transport, host, port, tlsCert, tlsKey)
+			}
+			if printLaunchdPlist {
+				return runPrintLaunchdPlist(cmd.OutOrStdout(), transport, host, port, tlsCert, tlsKey)
 			}
 
 			cx, err := resolveCortex()
@@ -111,6 +124,8 @@ func serveCmd() *cobra.Command {
 	cmd.Flags().StringVar(&tlsCert, "tls-cert", "", "path to TLS certificate file (enables HTTPS)")
 	cmd.Flags().StringVar(&tlsKey, "tls-key", "", "path to TLS private key file")
 	cmd.Flags().BoolVar(&printConfig, "print-config", false, "print MCP client config JSON and exit")
+	cmd.Flags().BoolVar(&printSystemdUnit, "print-systemd-unit", false, "print a systemd service unit for this serve command and exit")
+	cmd.Flags().BoolVar(&printLaunchdPlist, "print-launchd-plist", false, "print a launchd LaunchAgent plist for this serve command and exit")
 	return cmd
 }
 
@@ -179,6 +194,234 @@ func validateSSEServe(host, tlsCert, tlsKey, cortexName string, cortexExplicit b
 		)
 	}
 	return nil
+}
+
+// buildServeArgs returns the argv (starting with "serve") that reproduces the
+// current invocation's transport configuration. It's the shared source of
+// truth for --print-systemd-unit and --print-launchd-plist so both emit
+// identical arguments, and so the unit/plist reflects every flag the
+// operator actually passed on the command line that generated it.
+func buildServeArgs(cortexName, transport, host string, port int, tlsCert, tlsKey string) []string {
+	args := []string{"serve", "--cortex", cortexName, "--transport", transport}
+	if host != "" {
+		args = append(args, "--host", host)
+	}
+	if port != 0 {
+		args = append(args, "--port", fmt.Sprintf("%d", port))
+	}
+	if tlsCert != "" {
+		args = append(args, "--tls-cert", tlsCert)
+	}
+	if tlsKey != "" {
+		args = append(args, "--tls-key", tlsKey)
+	}
+	return args
+}
+
+// runPrintSystemdUnit writes a systemd service unit for the current serve
+// invocation to out. It requires --transport sse and an explicit --cortex
+// flag — the unit file pins exactly one cortex to supervise, and implicit
+// resolution (NOEMA_CORTEX or cfg.Default) wouldn't carry into the systemd
+// service environment anyway. All SSE flag invariants are validated via
+// validateSSEServe so a broken config is caught at preview time rather than
+// on first `systemctl start`.
+func runPrintSystemdUnit(out io.Writer, transport, host string, port int, tlsCert, tlsKey string) error {
+	if cortexFlag == "" {
+		return fmt.Errorf("--print-systemd-unit requires an explicit --cortex flag (the unit file pins one cortex to supervise)")
+	}
+	if transport != "sse" {
+		return fmt.Errorf("--print-systemd-unit requires --transport sse (stdio has no network endpoint to supervise)")
+	}
+	if err := validateSSEServe(host, tlsCert, tlsKey, cortexFlag, true); err != nil {
+		return err
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolving executable path: %w", err)
+	}
+	u, err := user.Current()
+	if err != nil {
+		return fmt.Errorf("looking up current user: %w", err)
+	}
+
+	unit := buildSystemdUnit(systemdUnitParams{
+		Cortex:    cortexFlag,
+		User:      u.Username,
+		Exe:       exe,
+		ServeArgs: buildServeArgs(cortexFlag, transport, host, port, tlsCert, tlsKey),
+	})
+	_, err = io.WriteString(out, unit)
+	return err
+}
+
+// runPrintLaunchdPlist is the macOS counterpart to runPrintSystemdUnit: it
+// emits a per-user LaunchAgent plist that reproduces the current serve
+// invocation. LaunchAgents run as the loading user, so there's no User
+// field — we do need the home directory for the log path, which is the
+// only side the two templates diverge on.
+//
+// Install instructions go to stderr rather than being embedded in the
+// plist as an XML comment: the XML 1.0 spec forbids "--" inside comments
+// (section 2.5), and the install commands contain flags like --cortex
+// that trip that rule. Writing instructions to stderr keeps the plist
+// well-formed while still showing operators the install steps when they
+// run the command interactively.
+func runPrintLaunchdPlist(out io.Writer, transport, host string, port int, tlsCert, tlsKey string) error {
+	if cortexFlag == "" {
+		return fmt.Errorf("--print-launchd-plist requires an explicit --cortex flag (the plist pins one cortex to supervise)")
+	}
+	if transport != "sse" {
+		return fmt.Errorf("--print-launchd-plist requires --transport sse (stdio has no network endpoint to supervise)")
+	}
+	if err := validateSSEServe(host, tlsCert, tlsKey, cortexFlag, true); err != nil {
+		return err
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolving executable path: %w", err)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("resolving user home dir: %w", err)
+	}
+
+	serveArgs := buildServeArgs(cortexFlag, transport, host, port, tlsCert, tlsKey)
+	label := "com.fail-safe.noema." + cortexFlag
+
+	// Install hint to stderr so `--print-launchd-plist > foo.plist`
+	// writes only the plist to the file while the operator still sees
+	// the install commands in their terminal.
+	fmt.Fprintf(os.Stderr, "# Generated LaunchAgent plist for Noema cortex %q.\n", cortexFlag)
+	fmt.Fprintln(os.Stderr, "# Install with:")
+	fmt.Fprintln(os.Stderr, "#")
+	fmt.Fprintf(os.Stderr, "#   noema serve %s --print-launchd-plist \\\n", strings.Join(serveArgs[1:], " "))
+	fmt.Fprintf(os.Stderr, "#     > ~/Library/LaunchAgents/%s.plist\n", label)
+	fmt.Fprintf(os.Stderr, "#   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/%s.plist\n", label)
+	fmt.Fprintln(os.Stderr, "#")
+	fmt.Fprintf(os.Stderr, "# Tail logs: tail -f ~/Library/Logs/noema-%s.log\n", cortexFlag)
+	fmt.Fprintf(os.Stderr, "# Stop:      launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/%s.plist\n", label)
+	fmt.Fprintln(os.Stderr)
+
+	plist := buildLaunchdPlist(launchdPlistParams{
+		Cortex:    cortexFlag,
+		Exe:       exe,
+		HomeDir:   home,
+		ServeArgs: serveArgs,
+	})
+	_, err = io.WriteString(out, plist)
+	return err
+}
+
+// systemdUnitParams carries the inputs for buildSystemdUnit. Keeping this
+// as a plain struct (vs. positional args) makes tests self-documenting
+// and leaves room for future fields without breaking the call sites.
+type systemdUnitParams struct {
+	Cortex    string   // e.g. "agentbrain" — pinned into Description and filename suggestion
+	User      string   // Linux username the service runs as (from os/user.Current)
+	Exe       string   // absolute path to the noema binary (from os.Executable)
+	ServeArgs []string // argv after the binary path, starting with "serve"
+}
+
+// buildSystemdUnit renders a ready-to-install systemd service unit. It is
+// intentionally minimal: no sandboxing directives (NoNewPrivileges,
+// ProtectHome, ReadWritePaths) because those require knowing the cortex
+// directory and can break legitimate setups where the cortex lives
+// outside ~/.noema. Operators who want hardening can add it manually;
+// the generated unit works out of the box, which is the goal.
+func buildSystemdUnit(p systemdUnitParams) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# Noema memory server (%s)\n", p.Cortex)
+	fmt.Fprintln(&b, "#")
+	fmt.Fprintln(&b, "# Generated by `noema serve --print-systemd-unit`. Install with:")
+	fmt.Fprintln(&b, "#")
+	fmt.Fprintf(&b, "#   noema serve %s --print-systemd-unit \\\n", strings.Join(p.ServeArgs[1:], " "))
+	fmt.Fprintf(&b, "#     | sudo tee /etc/systemd/system/noema-%s.service\n", p.Cortex)
+	fmt.Fprintln(&b, "#   sudo systemctl daemon-reload")
+	fmt.Fprintf(&b, "#   sudo systemctl enable --now noema-%s\n", p.Cortex)
+	fmt.Fprintln(&b, "#")
+	fmt.Fprintf(&b, "# Tail logs: sudo journalctl -u noema-%s -f\n", p.Cortex)
+	fmt.Fprintf(&b, "# Restart:   sudo systemctl restart noema-%s\n", p.Cortex)
+	fmt.Fprintf(&b, "# Stop:      sudo systemctl stop noema-%s\n", p.Cortex)
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "[Unit]")
+	fmt.Fprintf(&b, "Description=Noema memory server (%s)\n", p.Cortex)
+	fmt.Fprintln(&b, "Documentation=https://github.com/Fail-Safe/Noema")
+	fmt.Fprintln(&b, "After=network-online.target")
+	fmt.Fprintln(&b, "Wants=network-online.target")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "[Service]")
+	fmt.Fprintln(&b, "Type=simple")
+	fmt.Fprintf(&b, "User=%s\n", p.User)
+	fmt.Fprintf(&b, "ExecStart=%s %s\n", p.Exe, strings.Join(p.ServeArgs, " "))
+	fmt.Fprintln(&b, "Restart=on-failure")
+	fmt.Fprintln(&b, "RestartSec=5s")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "[Install]")
+	fmt.Fprintln(&b, "WantedBy=multi-user.target")
+	return b.String()
+}
+
+// launchdPlistParams carries the inputs for buildLaunchdPlist. HomeDir is
+// used only for the log path (~/Library/Logs/noema-<cortex>.log); the
+// agent itself runs as the user who loads the plist.
+type launchdPlistParams struct {
+	Cortex    string   // e.g. "agentbrain" — pinned into Label and filename
+	Exe       string   // absolute path to the noema binary
+	HomeDir   string   // user home dir (from os.UserHomeDir) for log path
+	ServeArgs []string // argv after the binary path, starting with "serve"
+}
+
+// buildLaunchdPlist renders a per-user LaunchAgent plist. Every text value
+// that could come from user input (cortex name, paths) is run through
+// xml.EscapeText so a weirdly-named cortex or a path with an ampersand
+// can't produce malformed XML that launchd would reject. The output
+// contains no XML comment block — install instructions are printed to
+// stderr by runPrintLaunchdPlist because the XML 1.0 spec forbids "--"
+// inside comments, and our install commands contain long-flag syntax.
+func buildLaunchdPlist(p launchdPlistParams) string {
+	label := "com.fail-safe.noema." + p.Cortex
+	logPath := p.HomeDir + "/Library/Logs/noema-" + p.Cortex + ".log"
+
+	var b strings.Builder
+	fmt.Fprintln(&b, `<?xml version="1.0" encoding="UTF-8"?>`)
+	fmt.Fprintln(&b, `<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">`)
+	fmt.Fprintln(&b, `<plist version="1.0">`)
+	fmt.Fprintln(&b, "<dict>")
+	fmt.Fprintln(&b, "    <key>Label</key>")
+	fmt.Fprintf(&b, "    <string>%s</string>\n", xmlEscape(label))
+	fmt.Fprintln(&b, "    <key>ProgramArguments</key>")
+	fmt.Fprintln(&b, "    <array>")
+	fmt.Fprintf(&b, "        <string>%s</string>\n", xmlEscape(p.Exe))
+	for _, arg := range p.ServeArgs {
+		fmt.Fprintf(&b, "        <string>%s</string>\n", xmlEscape(arg))
+	}
+	fmt.Fprintln(&b, "    </array>")
+	fmt.Fprintln(&b, "    <key>RunAtLoad</key>")
+	fmt.Fprintln(&b, "    <true/>")
+	fmt.Fprintln(&b, "    <key>KeepAlive</key>")
+	fmt.Fprintln(&b, "    <dict>")
+	fmt.Fprintln(&b, "        <key>SuccessfulExit</key>")
+	fmt.Fprintln(&b, "        <false/>")
+	fmt.Fprintln(&b, "    </dict>")
+	fmt.Fprintln(&b, "    <key>StandardOutPath</key>")
+	fmt.Fprintf(&b, "    <string>%s</string>\n", xmlEscape(logPath))
+	fmt.Fprintln(&b, "    <key>StandardErrorPath</key>")
+	fmt.Fprintf(&b, "    <string>%s</string>\n", xmlEscape(logPath))
+	fmt.Fprintln(&b, "</dict>")
+	fmt.Fprintln(&b, "</plist>")
+	return b.String()
+}
+
+// xmlEscape wraps xml.EscapeText for use inside element content. We never
+// emit untrusted data into attribute values or comments, so element-text
+// escaping is sufficient — it handles &, <, and > which are the only
+// characters that would break a well-formed plist.
+func xmlEscape(s string) string {
+	var buf bytes.Buffer
+	_ = xml.EscapeText(&buf, []byte(s))
+	return buf.String()
 }
 
 // runPrintMCPConfig writes a ready-to-use .mcp.json snippet to stdout.
