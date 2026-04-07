@@ -141,7 +141,7 @@ func friendlyPeerError(peer PeerConfig, category string, err error, backoff time
 	switch category {
 	case "refused":
 		reason = "the host is reachable but nothing is listening on that port"
-		hints = "    - is `noema serve --transport sse` running on the peer?\n" +
+		hints = "    - is `noema serve --transport http` running on the peer?\n" +
 			"    - does the peer's --host/--port match the endpoint above?\n" +
 			"    - is a firewall on the peer blocking the port?"
 	case "timeout":
@@ -190,24 +190,26 @@ func (s *Syncer) syncPeer(peer PeerConfig) error {
 		return fmt.Errorf("loading cursor: %w", err)
 	}
 
-	// Connect to remote MCP server.
-	sseURL := peer.Endpoint + "/sse"
-	var clientOpts []transport.ClientOption
+	// Connect to remote MCP server. Noema speaks Streamable HTTP (the
+	// MCP 2025-03-26 transport): a single endpoint at /mcp that handles
+	// JSON-RPC POSTs and optional SSE streaming on the same path.
+	mcpURL := peer.Endpoint + "/mcp"
+	var clientOpts []transport.StreamableHTTPCOption
 	if peer.CA != "" {
 		httpClient, err := tlsClientWithCA(peer.CA)
 		if err != nil {
 			return fmt.Errorf("loading CA for peer %s: %w", peer.Name, err)
 		}
-		clientOpts = append(clientOpts, transport.WithHTTPClient(httpClient))
+		clientOpts = append(clientOpts, transport.WithHTTPBasicClient(httpClient))
 	}
-	mcpClient, err := client.NewSSEMCPClient(sseURL, clientOpts...)
+	mcpClient, err := client.NewStreamableHttpClient(mcpURL, clientOpts...)
 	if err != nil {
-		return fmt.Errorf("creating SSE client: %w", err)
+		return fmt.Errorf("creating Streamable HTTP client: %w", err)
 	}
 	defer mcpClient.Close()
 
 	if err := mcpClient.Start(s.ctx); err != nil {
-		return fmt.Errorf("starting SSE connection: %w", err)
+		return fmt.Errorf("starting Streamable HTTP connection: %w", err)
 	}
 
 	_, err = mcpClient.Initialize(s.ctx, mcp.InitializeRequest{

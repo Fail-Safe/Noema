@@ -481,7 +481,7 @@ func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
 	s.AddTool(mcp.NewTool("announce_peer",
 		mcp.WithDescription("Accept a peer announcement from a remote cortex. Returns this cortex's identity for mutual discovery."),
 		mcp.WithString("name", mcp.Description("Name of the announcing cortex"), mcp.Required()),
-		mcp.WithString("endpoint", mcp.Description("SSE endpoint URL of the announcing cortex"), mcp.Required()),
+		mcp.WithString("endpoint", mcp.Description("Streamable HTTP base URL of the announcing cortex (the /mcp path is appended automatically)"), mcp.Required()),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		name, err := req.RequireString("name")
 		if err != nil {
