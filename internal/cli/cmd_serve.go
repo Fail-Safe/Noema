@@ -62,7 +62,7 @@ func serveCmd() *cobra.Command {
 			// not just the human-readable name.
 			fmt.Printf("[serve] cortex %q (id=%s) at %s\n", cx.Name, cx.ID, cx.Dir)
 
-			s := mcpserver.NewServer(cx)
+			s := mcpserver.NewServer(cx, version())
 
 			var syncer *federation.Syncer
 			switch transport {

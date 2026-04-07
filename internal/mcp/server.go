@@ -14,9 +14,18 @@ import (
 	"github.com/Fail-Safe/Noema/internal/trace"
 )
 
-// NewServer builds an MCP server exposing all Cortex operations.
-func NewServer(cx *cortex.Cortex) *server.MCPServer {
-	s := server.NewMCPServer("noema", "0.1.0",
+// NewServer builds an MCP server exposing all Cortex operations. The
+// version string is plumbed through to the MCP protocol's serverInfo
+// (visible to every client in the initialize handshake) and to the
+// get_instructions output, so any agent or operator can identify which
+// noema build they're talking to without grepping logs. Callers should
+// pass cli.version() so the value matches `noema --version`. An empty
+// string is normalized to "dev" so the protocol field is never blank.
+func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
+	if noemaVersion == "" {
+		noemaVersion = "dev"
+	}
+	s := server.NewMCPServer("noema", noemaVersion,
 		server.WithToolCapabilities(true),
 	)
 
@@ -28,116 +37,7 @@ func NewServer(cx *cortex.Cortex) *server.MCPServer {
 			// Fallback to minimal identity if manifest is unreadable.
 			m = cortex.Manifest{Name: cx.Name}
 		}
-
-		purposeLine := ""
-		if m.Purpose != "" {
-			purposeLine = fmt.Sprintf("Purpose: %s\n", m.Purpose)
-		}
-		ownerLine := ""
-		if m.Owner != "" {
-			ownerLine = fmt.Sprintf("Owner:   %s\n", m.Owner)
-		}
-
-		out := fmt.Sprintf(`# Noema — Agent Reference
-
-## Active Cortex
-Name:    %s
-%s%s
-## Terminology
-- Cortex: a named collection of Traces (this instance: %q)
-- Trace:  a single memory unit — one markdown file with YAML frontmatter +
-          a corresponding row in the SQLite index
-
-## Trace Types
-Choose the type that best reflects the intent of the memory:
-
-  fact        — a discrete thing that is true
-  decision    — a choice made and why
-  preference  — a behavioral or stylistic lean
-  context     — situational background
-  skill       — a learned capability or procedure
-  intent      — something that needs to happen (autonomous pickup)
-  observation — something witnessed but not yet verified
-  note        — anything else
-  divergence  — concurrent edit conflict (auto-created by federation sync)
-
-## Trace Fields
-  id            required  YYYYMMDD-slugified-title  (e.g. 20260330-why-we-chose-go)
-  title         required  short, descriptive
-  type          required  one of the types above
-  created       required  RFC3339 UTC timestamp (set on creation, never changed)
-  updated       required  RFC3339 UTC timestamp (update on every edit)
-  author        optional  human username or agent name
-  tags          optional  list of keyword strings
-  derived_from  optional  list of trace IDs this trace was derived from
-  origin        optional  cortex name that created this trace (auto-set)
-
-## Tools
-
-  get_instructions               → this document
-  list_traces [type] [author] [tag] [origin] [archived] [all]
-                                 → list traces; defaults to active only
-  get_trace id                   → full content including body, origin, lineage
-  create_trace title type body [author] [tags] [derived_from] [origin]
-                                 → create a new trace; tags/derived_from = comma-separated
-  update_trace id [title] [type] [author] [tags] [derived_from] [body]
-                                 → update any subset of fields
-  search_traces query [all]      → FTS5 full-text search
-  archive_trace id               → move to archive (reversible)
-  unarchive_trace id             → restore from archive
-  delete_trace id                → move to trash (soft-delete, recoverable)
-  recover_trace id               → restore a trashed trace to active
-  trace_history id               → event log (audit trail) for a trace
-  trace_lineage id               → derivation graph: derived_from + derived_by
-  resolve_divergence id [accept] [body]
-                                 → resolve a concurrent edit conflict by
-                                   accepting an origin's version, or by
-                                   supplying a custom merged body
-  cortex_identity                → return this cortex's stable ULID + name +
-                                   manifest version (used by federation peers
-                                   to verify identity on every sync)
-  sync_events [since] [limit]    → pull events for federation (JSON array)
-  federation_status              → federation config, peer states, vector clock
-  announce_peer name endpoint    → accept a peer announcement for discovery
-
-## Filtering
-  default              active traces only (not archived, not trashed)
-  archived=true        archived traces only
-  all=true             active + archived (excludes trash)
-  origin=<name>        traces from a specific cortex
-  (no trashed filter via MCP — use the CLI for trash operations)
-
-## Provenance
-- origin is auto-set to the current cortex name on creation. Override it when
-  replaying events from a remote peer.
-- derived_from records which traces informed this one — use it when synthesizing
-  conclusions from multiple sources. trace_lineage shows both directions.
-- trace_history shows every mutation (create, update, archive, etc.) as an
-  immutable event log with timestamps and origin attribution.
-
-## Conflict Resolution
-- When federated peers edit the same trace concurrently, a "divergence" trace is
-  auto-created containing every conflicting version. It has type=divergence,
-  tags=[divergence, needs-resolution], and derived_from=[original-trace-id].
-- The divergence body lists "**Conflicting origins:** <labels>" and one
-  "### Version from <name> (<id-prefix>)" section per version, where id-prefix
-  is the first 8 chars of the peer's cortex ULID. Sections are sorted by
-  cortex id (not name) so every replica produces byte-identical content.
-- Use resolve_divergence to resolve: pass accept=<peer-name> or accept=<id-prefix>
-  to apply that version cluster-wide, or pass body=<merged content> to apply a
-  custom merge.
-- Use list_traces with type filter or tag=needs-resolution to find unresolved divergences.
-- federation_status shows the count of unresolved divergences.
-
-## Tips
-- Prefer specific types over "note" — it helps retrieval and reasoning later.
-- Use tags to group related traces across types.
-- author should be your agent name so traces are attributable in multi-agent systems.
-- Use derived_from when creating traces based on other traces — it builds a knowledge graph.
-- search_traces supports FTS5 syntax: quoted phrases, AND/OR/NOT, prefix* matching.
-`, m.Name, purposeLine, ownerLine, m.Name)
-
-		return mcp.NewToolResultText(out), nil
+		return mcp.NewToolResultText(renderInstructions(m, noemaVersion)), nil
 	})
 
 	s.AddTool(mcp.NewTool("list_traces",
@@ -631,6 +531,122 @@ Choose the type that best reflects the intent of the memory:
 	})
 
 	return s
+}
+
+// renderInstructions builds the agent reference guide returned by the
+// get_instructions tool. It is split out from the tool closure so the
+// (large, easy-to-regress) template can be unit-tested directly without
+// standing up a full MCP server. The version parameter is the noema
+// binary version (set via -ldflags); the manifest version comes from
+// the cortex.md file and bumps when the cortex schema changes.
+func renderInstructions(m cortex.Manifest, noemaVersion string) string {
+	purposeLine := ""
+	if m.Purpose != "" {
+		purposeLine = fmt.Sprintf("Purpose:  %s\n", m.Purpose)
+	}
+	ownerLine := ""
+	if m.Owner != "" {
+		ownerLine = fmt.Sprintf("Owner:    %s\n", m.Owner)
+	}
+	return fmt.Sprintf(`# Noema — Agent Reference
+
+## Active Cortex
+Name:     %s
+Version:  noema %s (manifest v%d)
+%s%s
+## Terminology
+- Cortex: a named collection of Traces (this instance: %q)
+- Trace:  a single memory unit — one markdown file with YAML frontmatter +
+          a corresponding row in the SQLite index
+
+## Trace Types
+Choose the type that best reflects the intent of the memory:
+
+  fact        — a discrete thing that is true
+  decision    — a choice made and why
+  preference  — a behavioral or stylistic lean
+  context     — situational background
+  skill       — a learned capability or procedure
+  intent      — something that needs to happen (autonomous pickup)
+  observation — something witnessed but not yet verified
+  note        — anything else
+  divergence  — concurrent edit conflict (auto-created by federation sync)
+
+## Trace Fields
+  id            required  YYYYMMDD-slugified-title  (e.g. 20260330-why-we-chose-go)
+  title         required  short, descriptive
+  type          required  one of the types above
+  created       required  RFC3339 UTC timestamp (set on creation, never changed)
+  updated       required  RFC3339 UTC timestamp (update on every edit)
+  author        optional  human username or agent name
+  tags          optional  list of keyword strings
+  derived_from  optional  list of trace IDs this trace was derived from
+  origin        optional  cortex name that created this trace (auto-set)
+
+## Tools
+
+  get_instructions               → this document
+  list_traces [type] [author] [tag] [origin] [archived] [all]
+                                 → list traces; defaults to active only
+  get_trace id                   → full content including body, origin, lineage
+  create_trace title type body [author] [tags] [derived_from] [origin]
+                                 → create a new trace; tags/derived_from = comma-separated
+  update_trace id [title] [type] [author] [tags] [derived_from] [body]
+                                 → update any subset of fields
+  search_traces query [all]      → FTS5 full-text search
+  archive_trace id               → move to archive (reversible)
+  unarchive_trace id             → restore from archive
+  delete_trace id                → move to trash (soft-delete, recoverable)
+  recover_trace id               → restore a trashed trace to active
+  trace_history id               → event log (audit trail) for a trace
+  trace_lineage id               → derivation graph: derived_from + derived_by
+  resolve_divergence id [accept] [body]
+                                 → resolve a concurrent edit conflict by
+                                   accepting an origin's version, or by
+                                   supplying a custom merged body
+  cortex_identity                → return this cortex's stable ULID + name +
+                                   manifest version (used by federation peers
+                                   to verify identity on every sync)
+  sync_events [since] [limit]    → pull events for federation (JSON array)
+  federation_status              → federation config, peer states, vector clock
+  announce_peer name endpoint    → accept a peer announcement for discovery
+
+## Filtering
+  default              active traces only (not archived, not trashed)
+  archived=true        archived traces only
+  all=true             active + archived (excludes trash)
+  origin=<name>        traces from a specific cortex
+  (no trashed filter via MCP — use the CLI for trash operations)
+
+## Provenance
+- origin is auto-set to the current cortex name on creation. Override it when
+  replaying events from a remote peer.
+- derived_from records which traces informed this one — use it when synthesizing
+  conclusions from multiple sources. trace_lineage shows both directions.
+- trace_history shows every mutation (create, update, archive, etc.) as an
+  immutable event log with timestamps and origin attribution.
+
+## Conflict Resolution
+- When federated peers edit the same trace concurrently, a "divergence" trace is
+  auto-created containing every conflicting version. It has type=divergence,
+  tags=[divergence, needs-resolution], and derived_from=[original-trace-id].
+- The divergence body lists "**Conflicting origins:** <labels>" and one
+  "### Version from <name> (<id-prefix>)" section per version, where id-prefix
+  is the first 8 chars of the peer's cortex ULID. Sections are sorted by
+  cortex id (not name) so every replica produces byte-identical content.
+- Use resolve_divergence to resolve: pass accept=<peer-name> or accept=<id-prefix>
+  to apply that version cluster-wide, or pass body=<merged content> to apply a
+  custom merge.
+- Use list_traces with type filter or tag=needs-resolution to find unresolved divergences.
+- federation_status shows the count of unresolved divergences.
+
+## Tips
+- Prefer specific types over "note" — it helps retrieval and reasoning later.
+- Use tags to group related traces across types.
+- author should be your agent name so traces are attributable in multi-agent systems.
+- Use derived_from when creating traces based on other traces — it builds a knowledge graph.
+- search_traces supports FTS5 syntax: quoted phrases, AND/OR/NOT, prefix* matching.
+`, m.Name, noemaVersion, m.Version, purposeLine, ownerLine, m.Name)
 }
 
 func formatRows(rows []cortex.Row) string {
