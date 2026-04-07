@@ -118,8 +118,8 @@ noema federation reset-peer <name>...     Clear stored state for a peer (forces 
                                           ran `noema migrate cortex-id --reset` and the syncer is now reporting an
                                           identity mismatch)
 
-noema serve [--transport stdio|sse] [--host <addr>] [--tls-cert <file> --tls-key <file>]
-                                          Start the MCP server (SSE requires --host)
+noema serve [--transport stdio|http] [--host <addr>] [--tls-cert <file> --tls-key <file>]
+                                          Start the MCP server (http requires --host; endpoint is /mcp)
 noema serve --print-config                Print a ready-to-use .mcp.json snippet and exit
 noema serve ... --print-systemd-unit      Print a systemd service unit for the current serve flags
 noema serve ... --print-launchd-plist     Print a launchd LaunchAgent plist for the current serve flags
@@ -194,28 +194,46 @@ noema serve --print-config
 
 The `--cortex` flag, `NOEMA_CORTEX` env, and config default are all respected, so `--print-config` always reflects the cortex you would actually use.
 
-### SSE (HTTP clients, GitHub Copilot, federation peers)
+### Streamable HTTP (remote clients, GitHub Copilot, federation peers)
+
+Noema speaks the **Streamable HTTP** transport from the [MCP 2025-03-26 spec](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http) — a single endpoint at `/mcp` that handles JSON-RPC requests and optional SSE streaming on the same path. This is the transport native MCP clients (Zed, Claude Desktop's HTTP support, GitHub Copilot's MCP integration) speak today; the older two-endpoint legacy SSE transport has been removed.
 
 ```bash
 # Local-only listener
-noema serve --transport sse --host 127.0.0.1 --port 3000
+noema serve --cortex my-cortex --transport http --host 127.0.0.1 --port 3000
 
 # LAN-reachable listener (for federation peers)
-noema serve --transport sse --host 10.0.0.5 --port 3000
+noema serve --cortex my-cortex --transport http --host 10.0.0.5 --port 3000
 
 # HTTPS
-noema serve --transport sse --host 10.0.0.5 --port 3000 \
+noema serve --cortex my-cortex --transport http --host 10.0.0.5 --port 3000 \
             --tls-cert /path/server.crt --tls-key /path/server.key
 ```
 
-`--host` is **required** in SSE mode and must be an explicit address — `0.0.0.0`/`::` are rejected to avoid accidentally exposing a Cortex on every interface. Pair `--tls-cert` with `--tls-key` to serve over HTTPS.
+`--host` is **required** in HTTP mode and must be an explicit address — `0.0.0.0`/`::` are rejected to avoid accidentally exposing a Cortex on every interface. Pair `--tls-cert` with `--tls-key` to serve over HTTPS. The endpoint is `/mcp` (not configurable).
+
+#### Connecting from Zed
+
+Add the running endpoint to Zed's `settings.json`:
+
+```json
+{
+  "context_servers": {
+    "noema-my-cortex": {
+      "url": "https://10.0.0.5:3000/mcp"
+    }
+  }
+}
+```
+
+Any MCP client that supports Streamable HTTP works the same way — point its `url` field at `<scheme>://<host>:<port>/mcp`.
 
 ### Running as a persistent service
 
 For ad-hoc use, backgrounding with `nohup` works fine:
 
 ```bash
-nohup noema serve --cortex agentbrain --transport sse --host 127.0.0.1 \
+nohup noema serve --cortex agentbrain --transport http --host 127.0.0.1 \
   > ~/noema.log 2>&1 &
 disown
 ```
@@ -225,7 +243,7 @@ For a real federation host you probably want a process supervisor — restart on
 **Linux (systemd)**
 
 ```bash
-noema serve --cortex agentbrain --transport sse --host 192.168.1.10 --print-systemd-unit | sudo tee /etc/systemd/system/noema-agentbrain.service
+noema serve --cortex agentbrain --transport http --host 192.168.1.10 --print-systemd-unit | sudo tee /etc/systemd/system/noema-agentbrain.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now noema-agentbrain
 sudo journalctl -u noema-agentbrain -f
@@ -234,12 +252,12 @@ sudo journalctl -u noema-agentbrain -f
 **macOS (launchd)**
 
 ```bash
-noema serve --cortex agentbrain --transport sse --host 127.0.0.1 --print-launchd-plist > ~/Library/LaunchAgents/com.fail-safe.noema.agentbrain.plist
+noema serve --cortex agentbrain --transport http --host 127.0.0.1 --print-launchd-plist > ~/Library/LaunchAgents/com.fail-safe.noema.agentbrain.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fail-safe.noema.agentbrain.plist
 tail -f ~/Library/Logs/noema-agentbrain.log
 ```
 
-Both flags require `--transport sse` (stdio has no endpoint to supervise) and an explicit `--cortex` (the unit/plist pins exactly one cortex — NOEMA_CORTEX and the config default aren't carried into the service environment). All the usual SSE flag invariants (`--host` not `0.0.0.0`, TLS pair symmetry) are validated at preview time, so you catch misconfigurations before installing.
+Both flags require `--transport http` (stdio has no endpoint to supervise) and an explicit `--cortex` (the unit/plist pins exactly one cortex — NOEMA_CORTEX and the config default aren't carried into the service environment). All the usual HTTP flag invariants (`--host` not `0.0.0.0`, TLS pair symmetry) are validated at preview time, so you catch misconfigurations before installing.
 
 The emitted unit filename convention is `noema-<cortex>.service` / `com.fail-safe.noema.<cortex>.plist`, so running multiple cortexes on one host never collides.
 
@@ -247,7 +265,7 @@ The emitted unit filename convention is `noema-<cortex>.service` / `com.fail-saf
 
 ## Federation
 
-A Cortex can sync with peer Cortexes over SSE: every mutation is recorded in an immutable event log, peers pull each other's events, and concurrent edits surface as **divergence traces** instead of silently overwriting. Federation is fully opt-in — a Cortex with no `federation` block in `cortex.md` runs exactly as before.
+A Cortex can sync with peer Cortexes over Streamable HTTP: every mutation is recorded in an immutable event log, peers pull each other's events, and concurrent edits surface as **divergence traces** instead of silently overwriting. Federation is fully opt-in — a Cortex with no `federation` block in `cortex.md` runs exactly as before.
 
 ### Configure peers in `cortex.md`
 
@@ -275,7 +293,7 @@ noema federation add-peer beta http://192.168.1.10:3000
 
 ### How sync works
 
-When `noema serve --transport sse` starts and `cortex.md` has peers, a background syncer polls each peer's `sync_events` MCP tool on the configured `interval` (default 30s). New events are replayed locally — files are written, the DB is updated, and the event is stored in the local log with its original ID and origin (no event amplification).
+When `noema serve --transport http` starts and `cortex.md` has peers, a background syncer polls each peer's `sync_events` MCP tool (over the `/mcp` Streamable HTTP endpoint) on the configured `interval` (default 30s). New events are replayed locally — files are written, the DB is updated, and the event is stored in the local log with its original ID and origin (no event amplification).
 
 Every event carries a **vector clock** snapshot. Each Cortex tracks one counter per peer it has heard from; on every local mutation it bumps its own counter, and on every replayed remote event it merges the remote clock into its own.
 

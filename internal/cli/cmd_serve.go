@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"os"
 	"os/user"
 	"strings"
@@ -68,47 +67,49 @@ func serveCmd() *cobra.Command {
 			switch transport {
 			case "stdio", "":
 				err = mcpgo.ServeStdio(s)
-			case "sse":
-				if err := validateSSEServe(host, tlsCert, tlsKey, cx.Name, cortexFlag != ""); err != nil {
+			case "http":
+				if err := validateHTTPServe(host, tlsCert, tlsKey, cx.Name, cortexFlag != ""); err != nil {
 					return err
 				}
 				useTLS := tlsCert != "" && tlsKey != ""
 
-				// Federation only runs in SSE mode (peers need an HTTP
-				// endpoint to call sync_events on). Start the syncer only
-				// when the bound cortex actually has peers configured.
+				// Federation only runs over the HTTP transport (peers need
+				// an HTTP endpoint to call sync_events on). Start the
+				// syncer only when the bound cortex actually has peers
+				// configured.
 				m, manifestErr := cortex.ReadManifest(cx.Dir)
 				if manifestErr == nil && m.Federation != nil && len(m.Federation.Peers) > 0 {
 					syncer = startSyncer(cx)
 				}
 
-				// IPv6 addresses need brackets in URLs and listen addresses.
-				hostForURL := host
+				// IPv6 addresses need brackets in listen addresses.
+				hostForAddr := host
 				if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
-					hostForURL = "[" + host + "]"
+					hostForAddr = "[" + host + "]"
 				}
+				addr := fmt.Sprintf("%s:%d", hostForAddr, port)
+
+				httpOpts := []mcpgo.StreamableHTTPOption{
+					mcpgo.WithEndpointPath("/mcp"),
+				}
+				if useTLS {
+					httpOpts = append(httpOpts, mcpgo.WithTLSCert(tlsCert, tlsKey))
+				}
+				httpServer := mcpgo.NewStreamableHTTPServer(s, httpOpts...)
 
 				scheme := "http"
 				if useTLS {
 					scheme = "https"
 				}
-				addr := fmt.Sprintf("%s:%d", hostForURL, port)
-				baseURL := fmt.Sprintf("%s://%s:%d", scheme, hostForURL, port)
-				sseServer := mcpgo.NewSSEServer(s,
-					mcpgo.WithBaseURL(baseURL),
-					mcpgo.WithUseFullURLForMessageEndpoint(false),
-				)
-
-				if useTLS {
-					fmt.Printf("Starting SSE server on %s (TLS)\n", addr)
-					httpSrv := &http.Server{Addr: addr, Handler: sseServer}
-					err = httpSrv.ListenAndServeTLS(tlsCert, tlsKey)
-				} else {
-					fmt.Printf("Starting SSE server on %s\n", addr)
-					err = sseServer.Start(addr)
-				}
+				fmt.Printf("Starting Streamable HTTP server on %s://%s/mcp\n", scheme, addr)
+				err = httpServer.Start(addr)
+			case "sse":
+				err = fmt.Errorf(
+					"the legacy `sse` transport was removed in this release: noema now speaks Streamable HTTP (MCP 2025-03-26).\n" +
+						"  Re-run with --transport http (default endpoint /mcp) and regenerate any\n" +
+						"  systemd unit, launchd plist, or .mcp.json that pinned --transport sse.")
 			default:
-				err = fmt.Errorf("unknown transport %q: use stdio or sse", transport)
+				err = fmt.Errorf("unknown transport %q: use stdio or http", transport)
 			}
 
 			if syncer != nil {
@@ -118,9 +119,9 @@ func serveCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&transport, "transport", "stdio", "transport: stdio or sse")
-	cmd.Flags().StringVar(&host, "host", "", "listen address for SSE transport (required, e.g. 127.0.0.1 or LAN IP)")
-	cmd.Flags().IntVar(&port, "port", 3000, "port for SSE transport")
+	cmd.Flags().StringVar(&transport, "transport", "stdio", "transport: stdio or http (Streamable HTTP, MCP 2025-03-26)")
+	cmd.Flags().StringVar(&host, "host", "", "listen address for HTTP transport (required, e.g. 127.0.0.1 or LAN IP)")
+	cmd.Flags().IntVar(&port, "port", 3000, "port for HTTP transport")
 	cmd.Flags().StringVar(&tlsCert, "tls-cert", "", "path to TLS certificate file (enables HTTPS)")
 	cmd.Flags().StringVar(&tlsKey, "tls-key", "", "path to TLS private key file")
 	cmd.Flags().BoolVar(&printConfig, "print-config", false, "print MCP client config JSON and exit")
@@ -158,23 +159,23 @@ func startSyncer(cx *cortex.Cortex) *federation.Syncer {
 	return syncer
 }
 
-// validateSSEServe enforces the flag invariants for `noema serve --transport
-// sse`. It is split out from RunE so the explicit-cortex requirement (the
+// validateHTTPServe enforces the flag invariants for `noema serve --transport
+// http`. It is split out from RunE so the explicit-cortex requirement (the
 // most common federation footgun) can be unit-tested without standing up an
-// SSE server.
+// HTTP server.
 //
 // cortexExplicit captures whether `--cortex` was passed on the command line.
 // NOEMA_CORTEX and cfg.Default are intentionally treated as implicit
 // resolution paths that do NOT satisfy the requirement on a network
-// transport: SSE exposes the bound cortex to peers under its display name,
-// and silent default-resolution is exactly how a host ends up serving the
-// wrong cortex on an endpoint that peers have pinned to a specific identity.
-// The peer-side handshake catches the resulting mismatch but only logs the
-// failure on the OTHER host, which is the diagnostic asymmetry this guard
-// exists to prevent.
-func validateSSEServe(host, tlsCert, tlsKey, cortexName string, cortexExplicit bool) error {
+// transport: the HTTP transport exposes the bound cortex to peers under its
+// display name, and silent default-resolution is exactly how a host ends up
+// serving the wrong cortex on an endpoint that peers have pinned to a
+// specific identity. The peer-side handshake catches the resulting mismatch
+// but only logs the failure on the OTHER host, which is the diagnostic
+// asymmetry this guard exists to prevent.
+func validateHTTPServe(host, tlsCert, tlsKey, cortexName string, cortexExplicit bool) error {
 	if host == "" {
-		return fmt.Errorf("--host is required for SSE transport (e.g. --host 10.0.0.1 or --host 127.0.0.1)")
+		return fmt.Errorf("--host is required for HTTP transport (e.g. --host 10.0.0.1 or --host 127.0.0.1)")
 	}
 	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
 		return fmt.Errorf("binding to %s is not allowed — it may expose your cortex to the network.\n  Use an explicit address: --host 127.0.0.1 (local only) or --host <your-lan-ip> (federation)", host)
@@ -184,12 +185,12 @@ func validateSSEServe(host, tlsCert, tlsKey, cortexName string, cortexExplicit b
 	}
 	if !cortexExplicit {
 		return fmt.Errorf(
-			"refusing to start SSE server on cortex %q without an explicit --cortex flag.\n"+
-				"  SSE exposes this cortex's event stream to the network. Inheriting\n"+
-				"  the cortex from NOEMA_CORTEX or the config default makes it easy to\n"+
-				"  bind the wrong one — and on a host where peers are pinned to a\n"+
+			"refusing to start HTTP server on cortex %q without an explicit --cortex flag.\n"+
+				"  The HTTP transport exposes this cortex's event stream to the network.\n"+
+				"  Inheriting the cortex from NOEMA_CORTEX or the config default makes it\n"+
+				"  easy to bind the wrong one — and on a host where peers are pinned to a\n"+
 				"  specific identity, that produces silent failures on the peer side.\n"+
-				"  Re-run with: noema serve --cortex %s --transport sse --host %s",
+				"  Re-run with: noema serve --cortex %s --transport http --host %s",
 			cortexName, cortexName, host,
 		)
 	}
@@ -219,20 +220,20 @@ func buildServeArgs(cortexName, transport, host string, port int, tlsCert, tlsKe
 }
 
 // runPrintSystemdUnit writes a systemd service unit for the current serve
-// invocation to out. It requires --transport sse and an explicit --cortex
+// invocation to out. It requires --transport http and an explicit --cortex
 // flag — the unit file pins exactly one cortex to supervise, and implicit
 // resolution (NOEMA_CORTEX or cfg.Default) wouldn't carry into the systemd
-// service environment anyway. All SSE flag invariants are validated via
-// validateSSEServe so a broken config is caught at preview time rather than
-// on first `systemctl start`.
+// service environment anyway. All HTTP flag invariants are validated via
+// validateHTTPServe so a broken config is caught at preview time rather
+// than on first `systemctl start`.
 func runPrintSystemdUnit(out io.Writer, transport, host string, port int, tlsCert, tlsKey string) error {
 	if cortexFlag == "" {
 		return fmt.Errorf("--print-systemd-unit requires an explicit --cortex flag (the unit file pins one cortex to supervise)")
 	}
-	if transport != "sse" {
-		return fmt.Errorf("--print-systemd-unit requires --transport sse (stdio has no network endpoint to supervise)")
+	if transport != "http" {
+		return fmt.Errorf("--print-systemd-unit requires --transport http (stdio has no network endpoint to supervise)")
 	}
-	if err := validateSSEServe(host, tlsCert, tlsKey, cortexFlag, true); err != nil {
+	if err := validateHTTPServe(host, tlsCert, tlsKey, cortexFlag, true); err != nil {
 		return err
 	}
 
@@ -271,10 +272,10 @@ func runPrintLaunchdPlist(out io.Writer, transport, host string, port int, tlsCe
 	if cortexFlag == "" {
 		return fmt.Errorf("--print-launchd-plist requires an explicit --cortex flag (the plist pins one cortex to supervise)")
 	}
-	if transport != "sse" {
-		return fmt.Errorf("--print-launchd-plist requires --transport sse (stdio has no network endpoint to supervise)")
+	if transport != "http" {
+		return fmt.Errorf("--print-launchd-plist requires --transport http (stdio has no network endpoint to supervise)")
 	}
-	if err := validateSSEServe(host, tlsCert, tlsKey, cortexFlag, true); err != nil {
+	if err := validateHTTPServe(host, tlsCert, tlsKey, cortexFlag, true); err != nil {
 		return err
 	}
 

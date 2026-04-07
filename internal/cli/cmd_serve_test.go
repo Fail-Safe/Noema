@@ -7,12 +7,13 @@ import (
 	"testing"
 )
 
-// TestValidateSSEServe pins the flag invariants for `noema serve --transport
-// sse`. The most important case is the explicit-cortex requirement: SSE
-// silently inheriting the cortex from cfg.Default is the failure mode that
-// motivated this guard, and the test must keep firing if anyone weakens
-// the check (e.g. re-adding a "but only if peers are configured" condition).
-func TestValidateSSEServe(t *testing.T) {
+// TestValidateHTTPServe pins the flag invariants for `noema serve --transport
+// http`. The most important case is the explicit-cortex requirement: silently
+// inheriting the cortex from cfg.Default on a network transport is the failure
+// mode that motivated this guard, and the test must keep firing if anyone
+// weakens the check (e.g. re-adding a "but only if peers are configured"
+// condition).
+func TestValidateHTTPServe(t *testing.T) {
 	const cortexName = "ai-1"
 
 	cases := []struct {
@@ -39,7 +40,7 @@ func TestValidateSSEServe(t *testing.T) {
 			name:           "missing host",
 			host:           "",
 			cortexExplicit: true,
-			wantErrSubstr:  "--host is required",
+			wantErrSubstr:  "--host is required for HTTP transport",
 		},
 		{
 			name:           "0.0.0.0 unspecified IPv4",
@@ -72,7 +73,7 @@ func TestValidateSSEServe(t *testing.T) {
 			// --cortex was not on the command line. Even though host and
 			// TLS look fine, the implicit binding is a federation
 			// footgun and must be rejected.
-			name:           "implicit cortex on SSE",
+			name:           "implicit cortex on HTTP",
 			host:           "ai-1.example.com",
 			tlsCert:        "/etc/ssl/cert.pem",
 			tlsKey:         "/etc/ssl/key.pem",
@@ -85,7 +86,7 @@ func TestValidateSSEServe(t *testing.T) {
 			// served on a host where another cortex's peers expect to
 			// find a different identity. The guard must fire regardless
 			// of the bound cortex's federation config.
-			name:           "implicit cortex on SSE includes cortex name in error",
+			name:           "implicit cortex on HTTP includes cortex name in error",
 			host:           "ai-1-tb.home-dns.com",
 			cortexExplicit: false,
 			wantErrSubstr:  "\"ai-1\"",
@@ -94,7 +95,7 @@ func TestValidateSSEServe(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateSSEServe(tc.host, tc.tlsCert, tc.tlsKey, cortexName, tc.cortexExplicit)
+			err := validateHTTPServe(tc.host, tc.tlsCert, tc.tlsKey, cortexName, tc.cortexExplicit)
 			if tc.wantErrSubstr == "" {
 				if err != nil {
 					t.Fatalf("expected nil, got: %v", err)
@@ -123,16 +124,16 @@ func TestBuildServeArgs_OmitsEmptyOptionals(t *testing.T) {
 	// should NOT appear; callers using the real serve command always
 	// have port=3000 by default, but the print functions can be called
 	// with arbitrary values and must not emit --port 0.
-	got := buildServeArgs("agentbrain", "sse", "", 0, "", "")
-	want := []string{"serve", "--cortex", "agentbrain", "--transport", "sse"}
+	got := buildServeArgs("agentbrain", "http", "", 0, "", "")
+	want := []string{"serve", "--cortex", "agentbrain", "--transport", "http"}
 	if !equalSlices(got, want) {
 		t.Errorf("minimal args: got %v, want %v", got, want)
 	}
 
 	// Full: every optional flag set.
-	got = buildServeArgs("agentbrain", "sse", "10.0.0.5", 3000, "/etc/ssl/cert.pem", "/etc/ssl/key.pem")
+	got = buildServeArgs("agentbrain", "http", "10.0.0.5", 3000, "/etc/ssl/cert.pem", "/etc/ssl/key.pem")
 	want = []string{
-		"serve", "--cortex", "agentbrain", "--transport", "sse",
+		"serve", "--cortex", "agentbrain", "--transport", "http",
 		"--host", "10.0.0.5",
 		"--port", "3000",
 		"--tls-cert", "/etc/ssl/cert.pem",
@@ -169,7 +170,7 @@ func TestBuildSystemdUnit_RendersRequiredSections(t *testing.T) {
 		Exe:    "/home/mark/bin/noema",
 		ServeArgs: []string{
 			"serve", "--cortex", "agentbrain",
-			"--transport", "sse",
+			"--transport", "http",
 			"--host", "192.168.1.10",
 			"--port", "3000",
 		},
@@ -182,7 +183,7 @@ func TestBuildSystemdUnit_RendersRequiredSections(t *testing.T) {
 		"[Install]",
 		"Description=Noema memory server (agentbrain)",
 		"User=mark",
-		"ExecStart=/home/mark/bin/noema serve --cortex agentbrain --transport sse --host 192.168.1.10 --port 3000",
+		"ExecStart=/home/mark/bin/noema serve --cortex agentbrain --transport http --host 192.168.1.10 --port 3000",
 		"Restart=on-failure",
 		"WantedBy=multi-user.target",
 		"After=network-online.target",
@@ -203,7 +204,7 @@ func TestBuildSystemdUnit_CommentSuggestsCortexSpecificFilename(t *testing.T) {
 		Cortex:    "primary",
 		User:      "root",
 		Exe:       "/usr/local/bin/noema",
-		ServeArgs: []string{"serve", "--cortex", "primary", "--transport", "sse", "--host", "127.0.0.1"},
+		ServeArgs: []string{"serve", "--cortex", "primary", "--transport", "http", "--host", "127.0.0.1"},
 	})
 	if !strings.Contains(out, "noema-primary.service") {
 		t.Errorf("install comment does not suggest noema-primary.service:\n%s", out)
@@ -223,7 +224,7 @@ func TestBuildSystemdUnit_ReflectsTLSFlags(t *testing.T) {
 		Exe:    "/usr/bin/noema",
 		ServeArgs: []string{
 			"serve", "--cortex", "secure",
-			"--transport", "sse",
+			"--transport", "http",
 			"--host", "10.0.0.5",
 			"--port", "3443",
 			"--tls-cert", "/etc/noema/server.crt",
@@ -250,7 +251,7 @@ func TestBuildLaunchdPlist_IsValidXML(t *testing.T) {
 		HomeDir: "/Users/mark",
 		ServeArgs: []string{
 			"serve", "--cortex", "agentbrain",
-			"--transport", "sse", "--host", "127.0.0.1",
+			"--transport", "http", "--host", "127.0.0.1",
 		},
 	})
 
@@ -279,7 +280,7 @@ func TestBuildLaunchdPlist_RendersRequiredKeys(t *testing.T) {
 		HomeDir: "/Users/mark",
 		ServeArgs: []string{
 			"serve", "--cortex", "agentbrain",
-			"--transport", "sse", "--host", "127.0.0.1",
+			"--transport", "http", "--host", "127.0.0.1",
 			"--port", "3000",
 		},
 	})
@@ -314,7 +315,7 @@ func TestBuildLaunchdPlist_EscapesXMLSpecialChars(t *testing.T) {
 		HomeDir: "/home/a&b",
 		ServeArgs: []string{
 			"serve", "--cortex", "weird&name",
-			"--transport", "sse", "--host", "127.0.0.1",
+			"--transport", "http", "--host", "127.0.0.1",
 		},
 	})
 	// The literal "&" must not appear in element content outside
@@ -352,7 +353,7 @@ func TestRunPrintSystemdUnit_RejectsMissingCortex(t *testing.T) {
 	t.Cleanup(func() { cortexFlag = prev })
 
 	var out bytes.Buffer
-	err := runPrintSystemdUnit(&out, "sse", "127.0.0.1", 3000, "", "")
+	err := runPrintSystemdUnit(&out, "http", "127.0.0.1", 3000, "", "")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -364,7 +365,7 @@ func TestRunPrintSystemdUnit_RejectsMissingCortex(t *testing.T) {
 	}
 }
 
-// TestRunPrintSystemdUnit_RejectsStdioTransport pins the SSE-only
+// TestRunPrintSystemdUnit_RejectsStdioTransport pins the http-only
 // requirement. stdio has no endpoint for a supervisor to watch, so
 // wrapping it in systemd is meaningless and would just mask bugs.
 func TestRunPrintSystemdUnit_RejectsStdioTransport(t *testing.T) {
@@ -377,22 +378,22 @@ func TestRunPrintSystemdUnit_RejectsStdioTransport(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if !strings.Contains(err.Error(), "requires --transport sse") {
-		t.Errorf("error does not mention transport sse requirement: %v", err)
+	if !strings.Contains(err.Error(), "requires --transport http") {
+		t.Errorf("error does not mention transport http requirement: %v", err)
 	}
 }
 
-// TestRunPrintSystemdUnit_PropagatesSSEValidationErrors pins the
-// validateSSEServe reuse. The print path must reject the same
+// TestRunPrintSystemdUnit_PropagatesHTTPValidationErrors pins the
+// validateHTTPServe reuse. The print path must reject the same
 // configurations the real serve path rejects — otherwise operators
 // would install a unit file that fails only on first start.
-func TestRunPrintSystemdUnit_PropagatesSSEValidationErrors(t *testing.T) {
+func TestRunPrintSystemdUnit_PropagatesHTTPValidationErrors(t *testing.T) {
 	prev := cortexFlag
 	cortexFlag = "agentbrain"
 	t.Cleanup(func() { cortexFlag = prev })
 
 	var out bytes.Buffer
-	err := runPrintSystemdUnit(&out, "sse", "0.0.0.0", 3000, "", "")
+	err := runPrintSystemdUnit(&out, "http", "0.0.0.0", 3000, "", "")
 	if err == nil {
 		t.Fatal("expected error on 0.0.0.0 bind, got nil")
 	}
@@ -413,7 +414,7 @@ func TestRunPrintSystemdUnit_HappyPath(t *testing.T) {
 	t.Cleanup(func() { cortexFlag = prev })
 
 	var out bytes.Buffer
-	if err := runPrintSystemdUnit(&out, "sse", "127.0.0.1", 3000, "", ""); err != nil {
+	if err := runPrintSystemdUnit(&out, "http", "127.0.0.1", 3000, "", ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	s := out.String()
@@ -433,7 +434,7 @@ func TestRunPrintLaunchdPlist_RejectsMissingCortex(t *testing.T) {
 	t.Cleanup(func() { cortexFlag = prev })
 
 	var out bytes.Buffer
-	err := runPrintLaunchdPlist(&out, "sse", "127.0.0.1", 3000, "", "")
+	err := runPrintLaunchdPlist(&out, "http", "127.0.0.1", 3000, "", "")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -454,8 +455,8 @@ func TestRunPrintLaunchdPlist_RejectsStdioTransport(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if !strings.Contains(err.Error(), "requires --transport sse") {
-		t.Errorf("error does not mention transport sse requirement: %v", err)
+	if !strings.Contains(err.Error(), "requires --transport http") {
+		t.Errorf("error does not mention transport http requirement: %v", err)
 	}
 }
 
@@ -468,7 +469,7 @@ func TestRunPrintLaunchdPlist_HappyPath(t *testing.T) {
 	t.Cleanup(func() { cortexFlag = prev })
 
 	var out bytes.Buffer
-	if err := runPrintLaunchdPlist(&out, "sse", "127.0.0.1", 3000, "", ""); err != nil {
+	if err := runPrintLaunchdPlist(&out, "http", "127.0.0.1", 3000, "", ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	s := out.String()
@@ -480,25 +481,25 @@ func TestRunPrintLaunchdPlist_HappyPath(t *testing.T) {
 	}
 }
 
-// TestValidateSSEServe_ImplicitCortexErrorMessage pins the specific shape of
+// TestValidateHTTPServe_ImplicitCortexErrorMessage pins the specific shape of
 // the explicit-cortex error message. The error has to (a) name the bound
 // cortex so the operator can sanity-check it, (b) suggest the exact
 // command they should re-run, and (c) explain the *why* (network
 // exposure / silent failure mode) — not just say "no". A bare "missing
 // --cortex" error would be technically correct but would put the operator
 // right back in the same diagnostic loop the guard exists to short-circuit.
-func TestValidateSSEServe_ImplicitCortexErrorMessage(t *testing.T) {
-	err := validateSSEServe("ai-1.example.com", "", "", "ai-1", false)
+func TestValidateHTTPServe_ImplicitCortexErrorMessage(t *testing.T) {
+	err := validateHTTPServe("ai-1.example.com", "", "", "ai-1", false)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
 	msg := err.Error()
 	for _, want := range []string{
-		`"ai-1"`,                            // names the bound cortex
-		"--cortex ai-1",                     // suggests the exact fix
-		"--transport sse",                   // includes the transport flag
-		"--host ai-1.example.com",           // includes the host
-		"silent failures on the peer side",  // explains *why*
+		`"ai-1"`,                             // names the bound cortex
+		"--cortex ai-1",                      // suggests the exact fix
+		"--transport http",                   // includes the transport flag
+		"--host ai-1.example.com",            // includes the host
+		"silent failures on the peer side",   // explains *why*
 		"NOEMA_CORTEX or the config default", // names the implicit paths
 	} {
 		if !strings.Contains(msg, want) {
