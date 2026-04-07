@@ -77,6 +77,12 @@ noema get 20260329-we-chose-go
 noema init --name <name> [--path <dir>]   Create a new Cortex
 noema use <name>                          Set the default Cortex
 noema cortex list                         List all known Cortexes
+noema cortex remove <name> [--purge] [--force]
+                                          Unregister a Cortex (--purge also deletes its directory)
+noema cortex backup <name> [-o <path>] [--force]
+                                          Write a gzipped tarball of a Cortex
+noema cortex restore <tarball> [--name <n>] [--path <dir>] [--force]
+                                          Restore a Cortex from a backup tarball
 
 noema add [flags]                         Add a Trace (interactive if flags omitted)
 noema list [flags]                        List Traces

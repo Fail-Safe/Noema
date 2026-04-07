@@ -83,6 +83,36 @@ func (d *DB) migrate() error {
 	return nil
 }
 
+// CheckpointWAL runs PRAGMA wal_checkpoint(TRUNCATE) on the given cortex's
+// SQLite database, forcing all pending WAL pages into the main file and
+// truncating the WAL to zero bytes. Used by `noema cortex backup` so the
+// tarball captures a consistent snapshot without a separate -wal sidecar.
+//
+// This bypasses db.Open's migration runner on purpose: backup is a read-
+// mostly operation and must not upgrade the on-disk schema as a side
+// effect (a v1 cortex should stay at v1 after being backed up). If the
+// database file does not exist yet, the function is a no-op — there is
+// nothing to checkpoint on a cortex that has never been opened.
+func CheckpointWAL(cortexDir string) error {
+	dbPath := filepath.Join(cortexDir, "db", "noema.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	dsn := dbPath + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+	conn, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return fmt.Errorf("opening database for checkpoint: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		return fmt.Errorf("wal_checkpoint: %w", err)
+	}
+	return nil
+}
+
 // splitSQL splits a SQL script into individual statements on semicolons,
 // skipping comment and blank lines.
 func splitSQL(script string) []string {
