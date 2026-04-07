@@ -1,5 +1,6 @@
 # Build output
 /noema
+/dist/
 
 # SQLite databases
 *.db

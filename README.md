@@ -42,8 +42,15 @@ Or build from source:
 ```bash
 git clone https://github.com/Fail-Safe/Noema.git
 cd Noema
-go build -o noema ./cmd/noema
+make build                # dev build with debug info  -> ./noema
+make release              # stripped build for this host -> dist/noema-<os>-<arch>
+make release-linux        # stripped build for linux/amd64 -> dist/noema-linux-amd64
 ```
+
+Dev builds keep the symbol table and DWARF info for debugging (~19 MB).
+Release builds strip both and run with `-trimpath` for a ~13 MB static
+binary with the git version embedded via `-ldflags`. `make help` lists
+all targets.
 
 ---
 
