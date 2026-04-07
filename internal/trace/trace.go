@@ -112,13 +112,54 @@ func (t *Trace) Write(path string) error {
 }
 
 // NewID generates a trace ID from a title: YYYYMMDD-slugified-title.
+//
+// If the slugified title already begins with a date prefix (either
+// `YYYYMMDD-` or `YYYY-MM-DD-`), the leading date is stripped before
+// today's date is prepended. This is a defensive measure: agents
+// commonly include dates in titles to mark when an event occurred
+// (e.g., "20260402 dadbot heartbeat check"), and without the strip
+// the resulting ID would carry two date prefixes
+// (`20260402-20260402-dadbot-heartbeat-check`). The strip does not
+// validate that the digits form a real calendar date — its only job
+// is to prevent visual prefix duplication in the final ID.
 func NewID(title string) string {
 	date := time.Now().UTC().Format("20060102")
-	s := slug(title)
+	s := stripLeadingDatePrefix(slug(title))
 	if len(s) > 60 {
 		s = strings.TrimRight(s[:60], "-")
 	}
 	return date + "-" + s
+}
+
+// stripLeadingDatePrefix removes a leading date prefix from s if one is
+// present. It recognises two forms:
+//
+//	YYYYMMDD-     (8 digits + hyphen)         e.g. "20260402-foo" -> "foo"
+//	YYYY-MM-DD-   (4-2-2 digits with hyphens) e.g. "2026-04-02-foo" -> "foo"
+//
+// Anything else — including titles where digits appear later in the
+// string ("divergence-20260402-foo", "2026-was-a-year") — is returned
+// unchanged.
+func stripLeadingDatePrefix(s string) string {
+	// YYYYMMDD- form (9 chars).
+	if len(s) >= 9 && s[8] == '-' && allDigits(s[:8]) {
+		return s[9:]
+	}
+	// YYYY-MM-DD- form (11 chars).
+	if len(s) >= 11 && s[4] == '-' && s[7] == '-' && s[10] == '-' &&
+		allDigits(s[:4]) && allDigits(s[5:7]) && allDigits(s[8:10]) {
+		return s[11:]
+	}
+	return s
+}
+
+func allDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func slug(s string) string {

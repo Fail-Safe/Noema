@@ -168,6 +168,66 @@ func TestNewID_Unicode(t *testing.T) {
 	}
 }
 
+func TestNewID_StripsLeadingDatePrefix(t *testing.T) {
+	date := time.Now().UTC().Format("20060102")
+
+	cases := []struct {
+		name     string
+		title    string
+		wantSlug string
+	}{
+		{
+			name:     "YYYYMMDD prefix with space separator",
+			title:    "20260402 dadbot autonomous infrastructure access",
+			wantSlug: "dadbot-autonomous-infrastructure-access",
+		},
+		{
+			name:     "YYYYMMDD prefix already slug-shaped",
+			title:    "20260402-dadbot-autonomous-infrastructure-access",
+			wantSlug: "dadbot-autonomous-infrastructure-access",
+		},
+		{
+			name:     "YYYY-MM-DD prefix with space separator",
+			title:    "2026-04-02 ai news digest",
+			wantSlug: "ai-news-digest",
+		},
+		{
+			name:     "YYYY-MM-DD prefix already slug-shaped",
+			title:    "2026-04-02-ai-news-digest",
+			wantSlug: "ai-news-digest",
+		},
+		{
+			name:     "embedded date is not stripped",
+			title:    "divergence-20260402-original-trace",
+			wantSlug: "divergence-20260402-original-trace",
+		},
+		{
+			name:     "four-digit year alone is not stripped",
+			title:    "2026 was a year",
+			wantSlug: "2026-was-a-year",
+		},
+		{
+			name:     "eight digits without trailing hyphen are not stripped",
+			title:    "20260402dadbot",
+			wantSlug: "20260402dadbot",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id := trace.NewID(tc.title)
+			wantPrefix := date + "-"
+			if !strings.HasPrefix(id, wantPrefix) {
+				t.Fatalf("ID %q does not start with today's date %q", id, wantPrefix)
+			}
+			gotSlug := strings.TrimPrefix(id, wantPrefix)
+			if gotSlug != tc.wantSlug {
+				t.Errorf("slug = %q, want %q (full id: %q)", gotSlug, tc.wantSlug, id)
+			}
+		})
+	}
+}
+
 // ---- IsValidType ----
 
 func TestIsValidType(t *testing.T) {

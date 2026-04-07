@@ -237,6 +237,11 @@ Choose the type that best reflects the **intent** of the memory:
 
 1. Pick a type and write your content.
 2. Generate an ID: today's date + slugified title, e.g. ` + "`20260330-decision-to-use-sqlite`" + `.
+   **Do not include the date in the title** — the ID generator adds today's date
+   automatically. A leading ` + "`YYYYMMDD-`" + ` or ` + "`YYYY-MM-DD-`" + ` in the title
+   is stripped before the ID is built so you don't end up with two date prefixes.
+   If a trace is *about* a specific date, put that information in the body or in
+   a tag (e.g. ` + "`tags: [event-2026-04-02]`" + `) instead of the title.
 3. Write the file to ` + "`traces/<id>.md`" + ` with the frontmatter shown above.
 4. Run ` + "`noema sync`" + ` (if available) to update the database index.
 
