@@ -165,10 +165,28 @@ func runCortexRemove(out io.Writer, in io.Reader, cfg *config.Config, name strin
 		}
 	}
 
+	wasDefault := cfg.Default == name
 	delete(cfg.Cortexes, name)
-	if cfg.Default == name {
+
+	// If we just evicted the default, try to leave the user in a sane
+	// state rather than a config with no default and no hint about what
+	// to do next. When exactly one cortex remains it's the only possible
+	// answer, so promote it automatically. With more than one we'd be
+	// guessing, so leave the default empty and point at `noema use`
+	// below. The user already accepted destructive consequences by
+	// passing --force, so a silent promotion (with a clear notice) is
+	// less pestering than a second prompt.
+	var promoted string
+	if wasDefault {
 		cfg.Default = ""
+		if len(cfg.Cortexes) == 1 {
+			for onlyName := range cfg.Cortexes {
+				cfg.Default = onlyName
+				promoted = onlyName
+			}
+		}
 	}
+
 	if err := cfg.Save(); err != nil {
 		return fmt.Errorf("saving config: %w", err)
 	}
@@ -181,6 +199,26 @@ func runCortexRemove(out io.Writer, in io.Reader, cfg *config.Config, name strin
 	} else {
 		fmt.Fprintf(out, "Cortex %q unregistered from config (directory at %s was not touched)\n", name, entry.Path)
 	}
+
+	// Tell the operator what happened to the default, but only if they
+	// actually touched it. Removing a non-default cortex leaves the
+	// default alone and doesn't need a status line.
+	if promoted != "" {
+		fmt.Fprintf(out, "Promoted %q as the new default cortex.\n", promoted)
+	} else if wasDefault {
+		if len(cfg.Cortexes) == 0 {
+			fmt.Fprintln(out, "No cortexes remain. Run `noema init --name <name>` to create one.")
+		} else {
+			remaining := make([]string, 0, len(cfg.Cortexes))
+			for n := range cfg.Cortexes {
+				remaining = append(remaining, n)
+			}
+			sort.Strings(remaining)
+			fmt.Fprintln(out, "No default cortex set. Use `noema use <name>` to pick one.")
+			fmt.Fprintf(out, "Registered cortexes: %s\n", strings.Join(remaining, ", "))
+		}
+	}
+
 	if len(peerRefs) > 0 {
 		fmt.Fprintf(out, "warning: dangling peer references remain in: %s\n", strings.Join(peerRefs, ", "))
 	}

@@ -69,7 +69,9 @@ func TestCortexRemove_RefusesDefaultWithoutForce(t *testing.T) {
 
 // TestCortexRemove_DefaultWithForce pins the force-override behavior:
 // removing the default cortex must also clear cfg.Default, otherwise
-// the next command would resolve against a dangling name.
+// the next command would resolve against a dangling name. When zero
+// cortexes remain after removal the output also has to surface the
+// "run noema init" nudge so the user isn't staring at an empty list.
 func TestCortexRemove_DefaultWithForce(t *testing.T) {
 	dir, cfg := newSandboxedCortex(t, "solo")
 	var out bytes.Buffer
@@ -82,9 +84,68 @@ func TestCortexRemove_DefaultWithForce(t *testing.T) {
 	if cfg.Default != "" {
 		t.Errorf("cfg.Default = %q, want empty", cfg.Default)
 	}
+	if !strings.Contains(out.String(), "No cortexes remain") {
+		t.Errorf("expected empty-config hint, got: %s", out.String())
+	}
 	// Directory must survive without --purge even on force.
 	if _, err := os.Stat(dir); err != nil {
 		t.Errorf("directory unexpectedly removed: %v", err)
+	}
+}
+
+// TestCortexRemove_AutoPromotesSoleSurvivor pins the convenience path:
+// when removing the default leaves exactly one cortex behind, that
+// survivor is promoted to default in the same transaction so the user
+// isn't dropped into "no default cortex set" territory for a choice
+// with only one answer. The output must announce the promotion so the
+// change is auditable from a terminal scrollback alone.
+func TestCortexRemove_AutoPromotesSoleSurvivor(t *testing.T) {
+	_, cfg := newSandboxedCortex(t, "primary")
+	// Add a second cortex without giving it a directory on disk — the
+	// remove path only reads from cfg, and the peer-reference guard
+	// tolerates ReadManifest errors by skipping.
+	cfg.Cortexes["secondary"] = config.CortexEntry{Path: filepath.Join(t.TempDir(), "secondary")}
+
+	var out bytes.Buffer
+	if err := runCortexRemove(&out, strings.NewReader(""), cfg, "primary", false, true); err != nil {
+		t.Fatalf("runCortexRemove: %v", err)
+	}
+	if cfg.Default != "secondary" {
+		t.Errorf("cfg.Default = %q, want %q", cfg.Default, "secondary")
+	}
+	if !strings.Contains(out.String(), `Promoted "secondary" as the new default cortex.`) {
+		t.Errorf("expected promotion notice, got: %s", out.String())
+	}
+}
+
+// TestCortexRemove_HintsOnMultipleSurvivors pins the multi-survivor
+// path: with more than one cortex left, auto-promotion would be a
+// guess, so the default stays empty and the output has to name the
+// remaining cortexes and tell the user exactly which command picks a
+// new default. Silent "no default set" would leave operators hunting.
+func TestCortexRemove_HintsOnMultipleSurvivors(t *testing.T) {
+	_, cfg := newSandboxedCortex(t, "primary")
+	cfg.Cortexes["beta"] = config.CortexEntry{Path: filepath.Join(t.TempDir(), "beta")}
+	cfg.Cortexes["gamma"] = config.CortexEntry{Path: filepath.Join(t.TempDir(), "gamma")}
+
+	var out bytes.Buffer
+	if err := runCortexRemove(&out, strings.NewReader(""), cfg, "primary", false, true); err != nil {
+		t.Fatalf("runCortexRemove: %v", err)
+	}
+	if cfg.Default != "" {
+		t.Errorf("cfg.Default = %q, want empty (no auto-promotion with multiple survivors)", cfg.Default)
+	}
+	outStr := out.String()
+	if !strings.Contains(outStr, "No default cortex set") {
+		t.Errorf("expected no-default hint, got: %s", outStr)
+	}
+	if !strings.Contains(outStr, "noema use") {
+		t.Errorf("hint does not name the fix command: %s", outStr)
+	}
+	// Both survivors must be listed, and the order must be stable
+	// (alphabetical) so scripts and test assertions aren't flaky.
+	if !strings.Contains(outStr, "Registered cortexes: beta, gamma") {
+		t.Errorf("expected sorted survivor list, got: %s", outStr)
 	}
 }
 
