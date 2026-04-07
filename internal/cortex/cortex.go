@@ -3,6 +3,7 @@ package cortex
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,8 +20,14 @@ import (
 	"github.com/Fail-Safe/Noema/internal/trace"
 )
 
+// ManifestVersion is the current cortex.md schema version. Cortexes written
+// at this version carry an `id` field; cortexes at any earlier version must
+// be migrated via `noema migrate cortex-id` before federation will accept them.
+const ManifestVersion = 2
+
 // Manifest is the cortex.md file at the root of each Cortex.
 type Manifest struct {
+	ID         string            `yaml:"id,omitempty"`
 	Name       string            `yaml:"name"`
 	Purpose    string            `yaml:"purpose,omitempty"`
 	Owner      string            `yaml:"owner,omitempty"`
@@ -43,43 +50,47 @@ type PeerEntry struct {
 }
 
 type Cortex struct {
-	Name string
+	ID   string // ULID, stable across renames; the federation identity key
+	Name string // human-readable display label
 	Dir  string
 	DB   *db.DB
 }
 
 // Create initialises a new Cortex on disk and registers it.
-// dir is the parent directory; the cortex is created as dir/<name>/.
-func Create(name, dir string) error {
+// dir is the parent directory; the cortex is created as dir/<name>/. Returns
+// the freshly written manifest so callers can surface the new cortex's ULID
+// to the user (see `noema init`).
+func Create(name, dir string) (Manifest, error) {
 	root := filepath.Join(dir, name)
 	for _, sub := range []string{"traces", "archive/traces", "trash/traces", "db"} {
 		if err := os.MkdirAll(filepath.Join(root, sub), 0o750); err != nil {
-			return fmt.Errorf("creating %s: %w", sub, err)
+			return Manifest{}, fmt.Errorf("creating %s: %w", sub, err)
 		}
 	}
 
 	manifest := Manifest{
+		ID:      event.NewULID(),
 		Name:    name,
 		Created: time.Now().UTC().Format("2006-01-02"),
-		Version: 1,
+		Version: ManifestVersion,
 	}
 	data, err := yaml.Marshal(manifest)
 	if err != nil {
-		return err
+		return Manifest{}, err
 	}
 	if err := os.WriteFile(filepath.Join(root, "cortex.md"), data, 0o640); err != nil {
-		return fmt.Errorf("writing cortex.md: %w", err)
+		return Manifest{}, fmt.Errorf("writing cortex.md: %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "AGENT.md"), []byte(agentMDContent(manifest)), 0o640); err != nil {
-		return fmt.Errorf("writing AGENT.md: %w", err)
+		return Manifest{}, fmt.Errorf("writing AGENT.md: %w", err)
 	}
 
 	// Open (and migrate) the DB to initialise the schema.
 	conn, err := db.Open(root)
 	if err != nil {
-		return fmt.Errorf("initialising database: %w", err)
+		return Manifest{}, fmt.Errorf("initialising database: %w", err)
 	}
-	return conn.Close()
+	return manifest, conn.Close()
 }
 
 // ReadManifest parses the cortex.md manifest in the given cortex directory.
@@ -102,6 +113,31 @@ func WriteManifest(dir string, m Manifest) error {
 		return fmt.Errorf("marshaling cortex.md: %w", err)
 	}
 	return os.WriteFile(filepath.Join(dir, "cortex.md"), data, 0o640)
+}
+
+// PeerLabelCollidesWithSelf reports whether the proposed peer label is the
+// same as this cortex's own name. This is a federation safety guardrail:
+// even after the cortex-id migration (docs/design/cortex-uuid-plan.md), a
+// label collision is confusing in display surfaces and should be rejected
+// at config time.
+func (m Manifest) PeerLabelCollidesWithSelf(peerLabel string) bool {
+	return peerLabel != "" && peerLabel == m.Name
+}
+
+// lookupCortexIDForTrace returns the cortex_id of the most recent event
+// for a given trace, or "" if none exists. Used by Sync to attribute
+// remote-origin traces back to the cortex that created them when the
+// frontmatter only carries the display name.
+func (c *Cortex) lookupCortexIDForTrace(traceID string) string {
+	var id string
+	err := c.DB.QueryRow(
+		`SELECT cortex_id FROM events WHERE trace_id = ? AND cortex_id != '' ORDER BY id DESC LIMIT 1`,
+		traceID,
+	).Scan(&id)
+	if err != nil {
+		return ""
+	}
+	return id
 }
 
 // agentMDContent returns the generated AGENT.md content for the given manifest.
@@ -246,6 +282,7 @@ they keep the database in sync automatically:
 | ` + "`recover_trace`" + ` | Restore a trashed trace to active |
 | ` + "`trace_history`" + ` | Show the event log (audit trail) for a trace |
 | ` + "`trace_lineage`" + ` | Show what a trace was derived from and what derives from it |
+| ` + "`cortex_identity`" + ` | Return this cortex's stable ULID + name + manifest version (federation handshake) |
 | ` + "`sync_events`" + ` | Pull events for federation sync (used by remote peers) |
 | ` + "`federation_status`" + ` | Show federation config, peer states, and vector clock |
 | ` + "`announce_peer`" + ` | Accept a peer announcement for mutual discovery |
@@ -256,15 +293,15 @@ they keep the database in sync automatically:
 When two federated cortexes update the same trace concurrently, neither edit
 overwrites the other. Instead, a **divergence trace** is auto-created with
 ` + "`type=divergence`" + ` and ` + "`tags=[divergence, needs-resolution]`" + `. Its body lists every
-conflicting version under ` + "`### Version from <origin>`" + ` headers and a top-line
-` + "`**Conflicting origins:** <names>`" + ` summary. The body is rendered deterministically
-(origins sorted by name) so every replica sees identical content.
+conflicting version under ` + "`### Version from <name> (<id-prefix>)`" + ` headers and a
+top-line ` + "`**Conflicting origins:** <labels>`" + ` summary. The body is rendered
+deterministically (sorted by cortex id, not name) so every replica sees identical content.
 
 To resolve, run one of:
 
 ` + "```" + `
-noema resolve <divergence-id> --accept <origin-name>   # apply that origin's version
-noema resolve <divergence-id> --custom "<merged body>" # apply a custom merge
+noema resolve <divergence-id> --accept <name|id-prefix>   # apply that peer's version
+noema resolve <divergence-id> --custom "<merged body>"    # apply a custom merge
 ` + "```" + `
 
 Either choice updates the original trace, federates the resolution, and trashes
@@ -286,6 +323,33 @@ func Open(name, dir string) (*Cortex, error) {
 	}
 	cx := &Cortex{Name: name, Dir: dir, DB: conn}
 
+	// Load the manifest to pick up the cortex ID and enforce versioning.
+	m, mErr := ReadManifest(dir)
+	if mErr == nil {
+		if m.Version > 0 && m.Version < ManifestVersion {
+			conn.Close()
+			return nil, fmt.Errorf(
+				"cortex %q is at manifest version %d but this binary requires version %d.\n"+
+					"Run `noema migrate cortex-id --cortex %s` to upgrade.\n"+
+					"See docs/design/cortex-uuid-plan.md for what this changes.",
+				name, m.Version, ManifestVersion, name,
+			)
+		}
+		cx.ID = m.ID
+
+		// Copied-directory detection (Gotcha #3 in the design doc).
+		// If the manifest claims an ID but the events table has rows under
+		// a *different* cortex_id (and none under this one), the directory
+		// was copied from another machine and would silently corrupt vector
+		// clocks if allowed to run. Refuse with a clear escape hatch.
+		if cx.ID != "" {
+			if err := cx.detectCopiedDirectory(); err != nil {
+				conn.Close()
+				return nil, err
+			}
+		}
+	}
+
 	// Auto-purge expired trash. Best-effort: errors are silently ignored.
 	cfg, _ := config.Load()
 	days := 30
@@ -297,12 +361,50 @@ func Open(name, dir string) (*Cortex, error) {
 	// Write AGENT.md if it doesn't exist (e.g. cortex created before this feature).
 	agentMDPath := filepath.Join(dir, "AGENT.md")
 	if _, err := os.Stat(agentMDPath); os.IsNotExist(err) {
-		if m, err := ReadManifest(dir); err == nil {
+		if mErr == nil {
 			_ = os.WriteFile(agentMDPath, []byte(agentMDContent(m)), 0o640)
 		}
 	}
 
 	return cx, nil
+}
+
+// detectCopiedDirectory refuses to start if the events table contains rows
+// from a different cortex ID than the one declared in cortex.md, and zero
+// rows under the declared ID. That signature only happens when a Cortex
+// directory has been copied wholesale from another machine — the new
+// "instance" inherits the original's ULID but has none of its own writes.
+// Allowing this would create two physical Cortexes claiming the same
+// identity in any federation they joined.
+func (c *Cortex) detectCopiedDirectory() error {
+	var distinctIDs, ownRows int
+	if err := c.DB.QueryRow(
+		`SELECT COUNT(DISTINCT cortex_id) FROM events WHERE cortex_id != ''`,
+	).Scan(&distinctIDs); err != nil {
+		return nil // table missing or empty — fresh cortex, fine
+	}
+	if distinctIDs == 0 {
+		return nil // never written; fresh or pre-migration
+	}
+	if err := c.DB.QueryRow(
+		`SELECT COUNT(*) FROM events WHERE cortex_id = ?`, c.ID,
+	).Scan(&ownRows); err != nil {
+		return nil
+	}
+	if ownRows > 0 {
+		return nil // we have our own writes — legitimate
+	}
+	return fmt.Errorf(
+		"cortex %q at %s appears to be a copy of another Cortex.\n"+
+			"Its cortex.md declares id=%s but the event log contains no rows under that id\n"+
+			"(it has %d distinct other id(s)). Two Cortexes cannot share an identity in a\n"+
+			"federation — vector clocks would silently merge and concurrent edits would be\n"+
+			"clobbered. To make this directory a distinct Cortex, run:\n"+
+			"    noema migrate cortex-id --cortex %s --reset\n"+
+			"That will assign a fresh id and re-key the local event log. If this is not a\n"+
+			"copy and you expected the events to be present, restore from backup instead.",
+		c.Name, c.Dir, c.ID, distinctIDs, c.Name,
+	)
 }
 
 func (c *Cortex) Close() error {
@@ -366,8 +468,8 @@ func (c *Cortex) insertDB(t *trace.Trace) error {
 	defer tx.Rollback()
 
 	_, err = tx.Exec(
-		`INSERT INTO traces (id, title, type, author, origin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.Title, t.Type, t.Author, t.Origin, t.Created, t.Updated,
+		`INSERT INTO traces (id, title, type, author, origin, cortex_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.Title, t.Type, t.Author, t.Origin, c.ID, t.Created, t.Updated,
 	)
 	if err != nil {
 		return err
@@ -878,11 +980,22 @@ func (c *Cortex) SyncWithOptions(opts SyncOptions) (SyncResult, error) {
 			return result, err
 		}
 
+		// Resolve the cortex_id for this trace. Local-origin traces use the
+		// local ID; remote-origin traces look up the most recent event for
+		// the trace ID (which carries the writing cortex's ID). If neither
+		// applies, leave it empty — the next replay will fill it in.
+		cortexID := ""
+		if t.Origin == c.Name || t.Origin == "" {
+			cortexID = c.ID
+		} else {
+			cortexID = c.lookupCortexIDForTrace(t.ID)
+		}
+
 		if dbErr != nil {
 			// Not in DB — insert.
 			_, err = tx.Exec(
-				`INSERT INTO traces (id, title, type, author, origin, created_at, updated_at, archived_at, trashed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				t.ID, t.Title, t.Type, t.Author, t.Origin, t.Created, t.Updated, archivedAt, trashedAt,
+				`INSERT INTO traces (id, title, type, author, origin, cortex_id, created_at, updated_at, archived_at, trashed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				t.ID, t.Title, t.Type, t.Author, t.Origin, cortexID, t.Created, t.Updated, archivedAt, trashedAt,
 			)
 			if err != nil {
 				tx.Rollback()
@@ -892,8 +1005,8 @@ func (c *Cortex) SyncWithOptions(opts SyncOptions) (SyncResult, error) {
 		} else {
 			// Already in DB — update metadata and reconcile state.
 			_, err = tx.Exec(
-				`UPDATE traces SET title=?, type=?, author=?, origin=?, updated_at=?, archived_at=?, trashed_at=? WHERE id=?`,
-				t.Title, t.Type, t.Author, t.Origin, t.Updated, archivedAt, trashedAt, t.ID,
+				`UPDATE traces SET title=?, type=?, author=?, origin=?, cortex_id=?, updated_at=?, archived_at=?, trashed_at=? WHERE id=?`,
+				t.Title, t.Type, t.Author, t.Origin, cortexID, t.Updated, archivedAt, trashedAt, t.ID,
 			)
 			if err != nil {
 				tx.Rollback()
@@ -1144,32 +1257,28 @@ func (c *Cortex) ResolveDivergence(divergenceID, acceptOrigin, customBody string
 		return c.Trash(divergenceID)
 	}
 
-	origins, err := parseDivergenceOrigins(divergenceID, divPath)
+	t, err := trace.ParseFile(divPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("reading divergence trace: %w", err)
 	}
-	if !containsString(origins, acceptOrigin) {
-		return fmt.Errorf("origin %q not found in divergence %q (available: %s)",
-			acceptOrigin, divergenceID, strings.Join(origins, ", "))
-	}
-
-	chosenBody, err := extractVersionBody(divergenceID, divPath, acceptOrigin)
+	sections, err := splitDivergenceSections(t.Body)
 	if err != nil {
-		return err
+		return fmt.Errorf("parsing divergence trace %q: %w", divergenceID, err)
 	}
-	if err := c.applyResolutionBody(originalID, chosenBody); err != nil {
-		return err
-	}
-	return c.Trash(divergenceID)
-}
-
-func containsString(haystack []string, needle string) bool {
-	for _, s := range haystack {
-		if s == needle {
-			return true
+	for _, sec := range sections {
+		if matchVersionLabel(acceptOrigin, sec.name, sec.cortexID) {
+			if err := c.applyResolutionBody(originalID, strings.TrimSpace(sec.body)); err != nil {
+				return err
+			}
+			return c.Trash(divergenceID)
 		}
 	}
-	return false
+	available := make([]string, 0, len(sections))
+	for _, sec := range sections {
+		available = append(available, formatVersionLabel(sec.name, sec.cortexID))
+	}
+	return fmt.Errorf("origin %q not found in divergence %q (available: %s)",
+		acceptOrigin, divergenceID, strings.Join(available, ", "))
 }
 
 // applyResolutionBody overwrites the original trace's body and emits an update event.
@@ -1190,84 +1299,161 @@ func (c *Cortex) applyResolutionBody(originalID, newBody string) error {
 	return c.Update(originalID)
 }
 
-// extractVersionBody returns the body content of the `### Version from <origin>`
+// idPrefixLen is how many characters of a cortex ULID are shown in
+// divergence headers and conflict labels for human disambiguation. Eight
+// characters of Crockford base32 collide with vanishingly low probability
+// at any realistic federation size.
+const idPrefixLen = 8
+
+// formatVersionLabel renders a cortex display label for divergence headers
+// in the form "<name> (<id-prefix>)". The id prefix lets users tell apart
+// two peers that happen to share a display name (the same-name guardrail
+// blocks this at config time, but historic records may still contain it).
+func formatVersionLabel(name, cortexID string) string {
+	if cortexID == "" {
+		return name
+	}
+	prefix := cortexID
+	if len(prefix) > idPrefixLen {
+		prefix = prefix[:idPrefixLen]
+	}
+	return fmt.Sprintf("%s (%s)", name, prefix)
+}
+
+// matchVersionLabel reports whether `accept` selects the given (name, id)
+// version. Users can pass either the display name, the full ULID, or the
+// 8-char id prefix shown in the divergence header.
+func matchVersionLabel(accept, name, cortexID string) bool {
+	if accept == "" {
+		return false
+	}
+	if accept == name {
+		return true
+	}
+	if cortexID != "" && accept == cortexID {
+		return true
+	}
+	if cortexID != "" && len(cortexID) >= idPrefixLen && accept == cortexID[:idPrefixLen] {
+		return true
+	}
+	return false
+}
+
+// extractVersionBody returns the body content of the `### Version from <label>`
 // section in a divergence trace, stripping the `**Vector clock:**` metadata
-// line that follows the header.
-func extractVersionBody(divID, path, origin string) (string, error) {
+// line that follows the header. `accept` may be a display name, a full ULID,
+// or the 8-char id prefix shown in the header.
+func extractVersionBody(divID, path, accept string) (string, error) {
 	t, err := trace.ParseFile(path)
 	if err != nil {
 		return "", fmt.Errorf("reading divergence trace: %w", err)
 	}
-	header := "### Version from " + origin
-	idx := strings.Index(t.Body, header)
-	if idx < 0 {
-		return "", fmt.Errorf("divergence trace %q has no '%s' section", divID, header)
-	}
 
-	// Skip past the header line.
-	rest := t.Body[idx+len(header):]
-	if nl := strings.Index(rest, "\n"); nl >= 0 {
-		rest = rest[nl+1:]
+	sections, err := splitDivergenceSections(t.Body)
+	if err != nil {
+		return "", fmt.Errorf("parsing divergence trace %q: %w", divID, err)
 	}
-
-	// Skip the `**Vector clock:** ...` metadata line if present.
-	if strings.HasPrefix(rest, "**Vector clock:**") {
-		if nl := strings.Index(rest, "\n"); nl >= 0 {
-			rest = rest[nl+1:]
+	for _, sec := range sections {
+		if matchVersionLabel(accept, sec.name, sec.cortexID) {
+			return strings.TrimSpace(sec.body), nil
 		}
 	}
-
-	// Truncate at the next `### Version from ` header (if any).
-	if next := strings.Index(rest, "\n### Version from "); next >= 0 {
-		rest = rest[:next]
-	}
-
-	return strings.TrimSpace(rest), nil
+	return "", fmt.Errorf("divergence trace %q has no version matching %q", divID, accept)
 }
 
-// parseDivergenceOrigins reads the `**Conflicting origins:**` line from a
-// divergence trace body and returns the parsed list of origin names.
-func parseDivergenceOrigins(divID, path string) ([]string, error) {
-	t, err := trace.ParseFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("reading divergence trace: %w", err)
-	}
-	const marker = "**Conflicting origins:**"
-	idx := strings.Index(t.Body, marker)
-	if idx < 0 {
-		return nil, fmt.Errorf("divergence trace %q has no '%s' line", divID, marker)
-	}
-	rest := t.Body[idx+len(marker):]
-	if nl := strings.Index(rest, "\n"); nl >= 0 {
-		rest = rest[:nl]
-	}
-	var origins []string
-	for _, o := range strings.Split(rest, ",") {
-		if name := strings.TrimSpace(o); name != "" {
-			origins = append(origins, name)
+// divergenceSection is one parsed `### Version from <label>` block.
+type divergenceSection struct {
+	name     string // peer display name
+	cortexID string // peer cortex ULID, "" if header had no parenthetical
+	body     string // version body, with the **Vector clock:** line stripped
+}
+
+// splitDivergenceSections walks the body of a divergence trace and returns
+// every `### Version from <label>` block. The label is parsed back into its
+// (name, id-prefix) components — id-prefix is a *prefix*, so callers should
+// use matchVersionLabel for comparison rather than equality.
+func splitDivergenceSections(body string) ([]divergenceSection, error) {
+	const headerPrefix = "### Version from "
+	var out []divergenceSection
+	rest := body
+	for {
+		idx := strings.Index(rest, headerPrefix)
+		if idx < 0 {
+			break
+		}
+		rest = rest[idx+len(headerPrefix):]
+		// Header label runs to end of line.
+		nl := strings.Index(rest, "\n")
+		var label string
+		if nl < 0 {
+			label = rest
+			rest = ""
+		} else {
+			label = rest[:nl]
+			rest = rest[nl+1:]
+		}
+		// Strip optional `**Vector clock:** ...` metadata line.
+		if strings.HasPrefix(rest, "**Vector clock:**") {
+			if nl := strings.Index(rest, "\n"); nl >= 0 {
+				rest = rest[nl+1:]
+			} else {
+				rest = ""
+			}
+		}
+		// Section body runs until the next `### Version from ` header.
+		var sectionBody string
+		if next := strings.Index(rest, "\n"+headerPrefix); next >= 0 {
+			sectionBody = rest[:next]
+			rest = rest[next+1:]
+		} else {
+			sectionBody = rest
+			rest = ""
+		}
+		name, id := parseVersionLabel(label)
+		out = append(out, divergenceSection{name: name, cortexID: id, body: sectionBody})
+		if rest == "" {
+			break
 		}
 	}
-	if len(origins) == 0 {
-		return nil, fmt.Errorf("divergence trace %q has empty origins list", divID)
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no '### Version from ' headers found")
 	}
-	return origins, nil
+	return out, nil
+}
+
+// parseVersionLabel splits a header label "<name> (<id-prefix>)" back into
+// its components. Labels written by older binaries (no parenthetical) are
+// returned with cortexID == "".
+func parseVersionLabel(label string) (name, cortexID string) {
+	label = strings.TrimSpace(label)
+	if !strings.HasSuffix(label, ")") {
+		return label, ""
+	}
+	open := strings.LastIndex(label, " (")
+	if open < 0 {
+		return label, ""
+	}
+	id := label[open+2 : len(label)-1]
+	return label[:open], id
 }
 
 // emitEvent appends an event to the log inside the given transaction,
 // incrementing the local vector clock. All reads/writes go through the tx
-// to avoid SQLite lock contention.
+// to avoid SQLite lock contention. Vector clocks are keyed on the cortex
+// ID (a stable ULID), not the cortex name — see docs/design/cortex-uuid-plan.md.
 func (c *Cortex) emitEvent(tx *sql.Tx, action event.Action, traceID, timestamp string, data json.RawMessage) error {
 	// Read clock from federation_state within the transaction.
 	vc, err := getClockTx(tx)
 	if err != nil {
 		vc = make(federation.VClock)
 	}
-	vc.Increment(c.Name)
+	vc.Increment(c.ID)
 
 	e := &event.Event{
 		ID:        event.NewULID(),
 		Action:    action,
 		TraceID:   traceID,
+		CortexID:  c.ID,
 		Origin:    c.Name,
 		Timestamp: timestamp,
 		Data:      data,
@@ -1399,8 +1585,8 @@ func (c *Cortex) replayCreate(e event.Event) error {
 	defer tx.Rollback()
 
 	_, err = tx.Exec(
-		`INSERT INTO traces (id, title, type, author, origin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.Title, t.Type, t.Author, t.Origin, t.Created, t.Updated,
+		`INSERT INTO traces (id, title, type, author, origin, cortex_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.Title, t.Type, t.Author, t.Origin, e.CortexID, t.Created, t.Updated,
 	)
 	if err != nil {
 		cleanupFile(err)
@@ -1445,6 +1631,17 @@ func (c *Cortex) replayUpdate(e event.Event) error {
 
 	r, err := c.Get(e.TraceID)
 	if err != nil {
+		// Federation is eventually consistent: a peer's update event can
+		// arrive before its create event (e.g. our cursor pointed past the
+		// create after a partial sync, or the peer's create predates our
+		// pairing). Update events carry the full trace snapshot via
+		// marshalTraceData(), so we can materialize the trace from the
+		// update alone instead of getting stuck waiting for a create that
+		// may never come. This trades a missing "create" entry in the
+		// audit trail for not losing the trace entirely.
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.replayCreate(e)
+		}
 		return fmt.Errorf("trace %s not found for replay update: %w", e.TraceID, err)
 	}
 
@@ -1533,11 +1730,13 @@ func lastMutationEvent(events []event.Event) *event.Event {
 
 // createDivergence builds a divergence trace that preserves both versions of
 // a trace when concurrent edits are detected. The body is rendered
-// deterministically (origins sorted alphabetically, JSON map keys sorted by
+// deterministically (versions sorted by cortex_id, JSON map keys sorted by
 // encoding/json) so every replica produces byte-identical content. Combined
 // with the deterministic divergence ID, this means concurrent createDivergence
 // calls across the cluster collapse into a single row via the UNIQUE
-// constraint instead of fighting over the file.
+// constraint instead of fighting over the file. Version headers carry the
+// peer's display name plus an 8-char id prefix so users can disambiguate
+// peers that share a name without losing the human-readable label.
 func (c *Cortex) createDivergence(
 	localRow *Row,
 	remoteEvent event.Event,
@@ -1554,22 +1753,24 @@ func (c *Cortex) createDivergence(
 	now := time.Now().UTC().Format(time.RFC3339)
 	divID := trace.NewID("divergence-" + localRow.ID)
 
-	// Collect both versions and sort alphabetically by origin so the rendered
-	// body is identical regardless of which side observed the conflict first.
+	// Collect both versions and sort by cortex_id so the rendered body is
+	// identical regardless of which side observed the conflict first. Sorting
+	// by ID (not name) keeps the order stable even if a peer is renamed.
 	type version struct {
-		origin string
-		clock  federation.VClock
-		body   string
+		origin   string
+		cortexID string
+		clock    federation.VClock
+		body     string
 	}
 	versions := []version{
-		{origin: c.Name, clock: localClock, body: localTrace.Body},
-		{origin: remoteEvent.Origin, clock: remoteClock, body: remoteBody},
+		{origin: c.Name, cortexID: c.ID, clock: localClock, body: localTrace.Body},
+		{origin: remoteEvent.Origin, cortexID: remoteEvent.CortexID, clock: remoteClock, body: remoteBody},
 	}
-	sort.Slice(versions, func(i, j int) bool { return versions[i].origin < versions[j].origin })
+	sort.Slice(versions, func(i, j int) bool { return versions[i].cortexID < versions[j].cortexID })
 
 	origins := make([]string, len(versions))
 	for i, v := range versions {
-		origins[i] = v.origin
+		origins[i] = formatVersionLabel(v.origin, v.cortexID)
 	}
 
 	var sb strings.Builder
@@ -1578,7 +1779,7 @@ func (c *Cortex) createDivergence(
 	fmt.Fprintf(&sb, "**Conflicting origins:** %s\n", strings.Join(origins, ", "))
 	for _, v := range versions {
 		clockJSON, _ := json.Marshal(v.clock)
-		fmt.Fprintf(&sb, "\n### Version from %s\n", v.origin)
+		fmt.Fprintf(&sb, "\n### Version from %s\n", formatVersionLabel(v.origin, v.cortexID))
 		fmt.Fprintf(&sb, "**Vector clock:** %s\n\n", string(clockJSON))
 		sb.WriteString(v.body)
 		if !strings.HasSuffix(v.body, "\n") {
@@ -1617,8 +1818,8 @@ func (c *Cortex) createDivergence(
 	defer tx.Rollback()
 
 	_, err = tx.Exec(
-		`INSERT INTO traces (id, title, type, author, origin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		divTrace.ID, divTrace.Title, divTrace.Type, divTrace.Author, divTrace.Origin, divTrace.Created, divTrace.Updated,
+		`INSERT INTO traces (id, title, type, author, origin, cortex_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		divTrace.ID, divTrace.Title, divTrace.Type, divTrace.Author, divTrace.Origin, c.ID, divTrace.Created, divTrace.Updated,
 	)
 	if err != nil {
 		os.Remove(divPath)
@@ -1660,6 +1861,13 @@ func (c *Cortex) createDivergence(
 func (c *Cortex) replayArchive(e event.Event) error {
 	r, err := c.Get(e.TraceID)
 	if err != nil {
+		// Trace doesn't exist locally (we missed the create, or it was
+		// already hard-deleted by Remove()). Archive is a no-op against
+		// nothing — record the event for the audit trail and move on
+		// instead of pinning the cursor on a permanent failure.
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.storeRemoteEvent(e)
+		}
 		return err
 	}
 	if r.ArchivedAt != "" {
@@ -1688,6 +1896,9 @@ func (c *Cortex) replayArchive(e event.Event) error {
 func (c *Cortex) replayUnarchive(e event.Event) error {
 	r, err := c.Get(e.TraceID)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.storeRemoteEvent(e)
+		}
 		return err
 	}
 	if r.ArchivedAt == "" {
@@ -1715,6 +1926,9 @@ func (c *Cortex) replayUnarchive(e event.Event) error {
 func (c *Cortex) replayTrash(e event.Event) error {
 	r, err := c.Get(e.TraceID)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.storeRemoteEvent(e)
+		}
 		return err
 	}
 	if r.TrashedAt != "" {
@@ -1742,6 +1956,9 @@ func (c *Cortex) replayTrash(e event.Event) error {
 func (c *Cortex) replayRecover(e event.Event) error {
 	r, err := c.Get(e.TraceID)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.storeRemoteEvent(e)
+		}
 		return err
 	}
 	if r.TrashedAt == "" {

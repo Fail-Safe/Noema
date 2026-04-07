@@ -42,25 +42,32 @@ func serveCmd() *cobra.Command {
 			}
 			// Don't defer cx.Close() — server runs until interrupted.
 
+			// Surface the bound cortex identity on every serve, so an
+			// operator who started the wrong cortex sees it in the very
+			// first log line instead of finding out via peer drift hours
+			// later. The ULID is the federation key — print it explicitly,
+			// not just the human-readable name.
+			fmt.Printf("[serve] cortex %q (id=%s) at %s\n", cx.Name, cx.ID, cx.Dir)
+
 			s := mcpserver.NewServer(cx)
 
-			// Start federation syncer if peers are configured.
-			syncer := startSyncer(cx)
-
+			var syncer *federation.Syncer
 			switch transport {
 			case "stdio", "":
 				err = mcpgo.ServeStdio(s)
 			case "sse":
-				if host == "" {
-					return fmt.Errorf("--host is required for SSE transport (e.g. --host 10.0.0.1 or --host 127.0.0.1)")
-				}
-				if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
-					return fmt.Errorf("binding to %s is not allowed — it may expose your cortex to the network.\n  Use an explicit address: --host 127.0.0.1 (local only) or --host <your-lan-ip> (federation)", host)
-				}
-				if (tlsCert == "") != (tlsKey == "") {
-					return fmt.Errorf("--tls-cert and --tls-key must be provided together")
+				if err := validateSSEServe(host, tlsCert, tlsKey, cx.Name, cortexFlag != ""); err != nil {
+					return err
 				}
 				useTLS := tlsCert != "" && tlsKey != ""
+
+				// Federation only runs in SSE mode (peers need an HTTP
+				// endpoint to call sync_events on). Start the syncer only
+				// when the bound cortex actually has peers configured.
+				m, manifestErr := cortex.ReadManifest(cx.Dir)
+				if manifestErr == nil && m.Federation != nil && len(m.Federation.Peers) > 0 {
+					syncer = startSyncer(cx)
+				}
 
 				// IPv6 addresses need brackets in URLs and listen addresses.
 				hostForURL := host
@@ -134,6 +141,44 @@ func startSyncer(cx *cortex.Cortex) *federation.Syncer {
 
 	fmt.Printf("Federation syncer started (%d peers, interval %s)\n", len(peers), cfg.EffectiveInterval())
 	return syncer
+}
+
+// validateSSEServe enforces the flag invariants for `noema serve --transport
+// sse`. It is split out from RunE so the explicit-cortex requirement (the
+// most common federation footgun) can be unit-tested without standing up an
+// SSE server.
+//
+// cortexExplicit captures whether `--cortex` was passed on the command line.
+// NOEMA_CORTEX and cfg.Default are intentionally treated as implicit
+// resolution paths that do NOT satisfy the requirement on a network
+// transport: SSE exposes the bound cortex to peers under its display name,
+// and silent default-resolution is exactly how a host ends up serving the
+// wrong cortex on an endpoint that peers have pinned to a specific identity.
+// The peer-side handshake catches the resulting mismatch but only logs the
+// failure on the OTHER host, which is the diagnostic asymmetry this guard
+// exists to prevent.
+func validateSSEServe(host, tlsCert, tlsKey, cortexName string, cortexExplicit bool) error {
+	if host == "" {
+		return fmt.Errorf("--host is required for SSE transport (e.g. --host 10.0.0.1 or --host 127.0.0.1)")
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		return fmt.Errorf("binding to %s is not allowed — it may expose your cortex to the network.\n  Use an explicit address: --host 127.0.0.1 (local only) or --host <your-lan-ip> (federation)", host)
+	}
+	if (tlsCert == "") != (tlsKey == "") {
+		return fmt.Errorf("--tls-cert and --tls-key must be provided together")
+	}
+	if !cortexExplicit {
+		return fmt.Errorf(
+			"refusing to start SSE server on cortex %q without an explicit --cortex flag.\n"+
+				"  SSE exposes this cortex's event stream to the network. Inheriting\n"+
+				"  the cortex from NOEMA_CORTEX or the config default makes it easy to\n"+
+				"  bind the wrong one — and on a host where peers are pinned to a\n"+
+				"  specific identity, that produces silent failures on the peer side.\n"+
+				"  Re-run with: noema serve --cortex %s --transport sse --host %s",
+			cortexName, cortexName, host,
+		)
+	}
+	return nil
 }
 
 // runPrintMCPConfig writes a ready-to-use .mcp.json snippet to stdout.

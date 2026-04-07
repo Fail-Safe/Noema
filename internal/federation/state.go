@@ -67,6 +67,14 @@ func PeerSeenKey(peerName string) string {
 	return "peer:" + peerName + ":last_seen"
 }
 
+// PeerCortexIDKey returns the federation_state key under which a peer's verified
+// cortex ULID is pinned after the first successful identity handshake. The
+// syncer refuses to talk to a peer whose advertised ID has changed from what
+// is stored here — see docs/design/cortex-uuid-plan.md.
+func PeerCortexIDKey(peerName string) string {
+	return "peer:" + peerName + ":cortex_id"
+}
+
 // GetPeerState loads the runtime state for a peer.
 func (s *State) GetPeerState(name, endpoint string) (PeerState, error) {
 	ps := PeerState{Name: name, Endpoint: endpoint}
@@ -76,6 +84,10 @@ func (s *State) GetPeerState(name, endpoint string) (PeerState, error) {
 		return ps, err
 	}
 	ps.LastSeen, err = s.Get(PeerSeenKey(name))
+	if err != nil {
+		return ps, err
+	}
+	ps.CortexID, err = s.Get(PeerCortexIDKey(name))
 	return ps, err
 }
 
@@ -87,4 +99,10 @@ func (s *State) SetPeerCursor(name, eventID string) error {
 // SetPeerSeen updates the last seen time for a peer.
 func (s *State) SetPeerSeen(name, timestamp string) error {
 	return s.Set(PeerSeenKey(name), timestamp)
+}
+
+// SetPeerCortexID pins a peer's verified cortex ULID. Should only be called
+// after the cortex_identity handshake has succeeded once.
+func (s *State) SetPeerCortexID(name, cortexID string) error {
+	return s.Set(PeerCortexIDKey(name), cortexID)
 }

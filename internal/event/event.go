@@ -16,12 +16,19 @@ const (
 )
 
 // Event is an immutable record of a mutation to a Trace.
+//
+// CortexID is the stable ULID identity of the cortex that produced the event.
+// Origin is the human-readable display name at the time of writing — it can
+// drift if the cortex is renamed and is never trusted for identity decisions
+// on replay. Federation, vector clocks, and divergence detection all key on
+// CortexID; Origin is purely for audit-trail rendering.
 type Event struct {
-	ID        string            `json:"id"`                // ULID
+	ID        string            `json:"id"`                  // ULID
 	Action    Action            `json:"action"`
 	TraceID   string            `json:"trace_id"`
-	Origin    string            `json:"origin"`            // cortex name that produced this event
-	Timestamp string            `json:"timestamp"`         // RFC3339 UTC
-	Data      json.RawMessage   `json:"data,omitempty"`    // action-specific payload
-	VClock    map[string]uint64 `json:"vclock,omitempty"`  // vector clock (Phase 2)
+	CortexID  string            `json:"cortex_id"`           // stable ULID identity (federation key)
+	Origin    string            `json:"origin"`              // display name at write time
+	Timestamp string            `json:"timestamp"`           // RFC3339 UTC
+	Data      json.RawMessage   `json:"data,omitempty"`      // action-specific payload
+	VClock    map[string]uint64 `json:"vclock,omitempty"`    // vector clock keyed on cortex IDs
 }

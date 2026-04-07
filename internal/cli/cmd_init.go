@@ -41,7 +41,8 @@ func initCmd() *cobra.Command {
 				return fmt.Errorf("cortex already exists at %s", cortexPath)
 			}
 
-			if err := cortex.Create(name, dir); err != nil {
+			manifest, err := cortex.Create(name, dir)
+			if err != nil {
 				return fmt.Errorf("creating cortex: %w", err)
 			}
 
@@ -49,7 +50,7 @@ func initCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			cfg.Cortexes[name] = config.CortexEntry{Path: cortexPath}
+			cfg.Cortexes[name] = config.CortexEntry{Path: cortexPath, ID: manifest.ID}
 			if cfg.Default == "" {
 				cfg.Default = name
 			}
@@ -58,6 +59,7 @@ func initCmd() *cobra.Command {
 			}
 
 			fmt.Printf("Cortex %q created at %s\n", name, cortexPath)
+			fmt.Printf("Cortex ID: %s\n", manifest.ID)
 			if cfg.Default == name {
 				fmt.Printf("Set as default cortex.\n")
 			}

@@ -33,6 +33,11 @@ var rootCmd = &cobra.Command{
 	CompletionOptions: cobra.CompletionOptions{
 		DisableDefaultCmd: true,
 	},
+	// Errors from RunE are operational failures (upgrade required, network
+	// issues, missing cortex), not flag-usage mistakes. Cobra walks up to the
+	// root to find SilenceUsage, so setting it once here suppresses the flag
+	// wall across every subcommand.
+	SilenceUsage: true,
 }
 
 func Execute() {
@@ -63,7 +68,7 @@ func init() {
 		eventsCmd(), resolveCmd(),
 	)
 	addGrouped(groupCortex,
-		initCmd(), useCmd(), cortexCmd(), federationCmd(),
+		initCmd(), useCmd(), cortexCmd(), federationCmd(), migrateCmd(),
 	)
 	addGrouped(groupIface,
 		serveCmd(), tuiCmd(), completionCmd(),
@@ -139,5 +144,26 @@ func resolveCortex() (*cortex.Cortex, error) {
 	if !ok {
 		return nil, fmt.Errorf("unknown cortex %q — run `noema init --name %s` first", name, name)
 	}
-	return cortex.Open(name, entry.Path)
+	cx, err := cortex.Open(name, entry.Path)
+	if err != nil {
+		return nil, err
+	}
+
+	// If the config remembers a ULID for this entry but the manifest now
+	// reports a different one, the on-disk cortex is not the one we
+	// registered. This typically means someone copied or replaced the
+	// directory out of band, or ran `noema migrate cortex-id` against a
+	// directory that the config still believes is something else. Warn
+	// loudly but don't fail — the operator may know what they're doing.
+	if entry.ID != "" && cx.ID != "" && entry.ID != cx.ID {
+		fmt.Fprintf(os.Stderr,
+			"warning: cortex %q config id (%s) does not match the manifest id on disk (%s).\n"+
+				"  This usually means the directory at %s was replaced, copied, or migrated\n"+
+				"  out of band. Federation peers that pinned the old id will refuse to talk to\n"+
+				"  this cortex until they re-pair. To accept the on-disk identity as canonical,\n"+
+				"  edit ~/.config/noema/config.yaml and update the id for entry %q.\n",
+			name, entry.ID, cx.ID, entry.Path, name,
+		)
+	}
+	return cx, nil
 }

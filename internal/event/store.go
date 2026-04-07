@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 )
 
+const eventColumns = `id, action, trace_id, cortex_id, origin, timestamp, data, vclock`
+
 // Append inserts an event into the event log within an existing transaction.
 func Append(tx *sql.Tx, e *Event) error {
 	vclock, err := json.Marshal(e.VClock)
@@ -16,8 +18,8 @@ func Append(tx *sql.Tx, e *Event) error {
 		data = json.RawMessage("{}")
 	}
 	_, err = tx.Exec(
-		`INSERT INTO events (id, action, trace_id, origin, timestamp, data, vclock) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		e.ID, string(e.Action), e.TraceID, e.Origin, e.Timestamp, string(data), string(vclock),
+		`INSERT INTO events (`+eventColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.ID, string(e.Action), e.TraceID, e.CortexID, e.Origin, e.Timestamp, string(data), string(vclock),
 	)
 	return err
 }
@@ -28,10 +30,10 @@ func Since(db *sql.DB, afterID string, limit int) ([]Event, error) {
 	var q string
 	var args []any
 	if afterID == "" {
-		q = `SELECT id, action, trace_id, origin, timestamp, data, vclock FROM events ORDER BY id LIMIT ?`
+		q = `SELECT ` + eventColumns + ` FROM events ORDER BY id LIMIT ?`
 		args = []any{limit}
 	} else {
-		q = `SELECT id, action, trace_id, origin, timestamp, data, vclock FROM events WHERE id > ? ORDER BY id LIMIT ?`
+		q = `SELECT ` + eventColumns + ` FROM events WHERE id > ? ORDER BY id LIMIT ?`
 		args = []any{afterID, limit}
 	}
 	rows, err := db.Query(q, args...)
@@ -45,7 +47,7 @@ func Since(db *sql.DB, afterID string, limit int) ([]Event, error) {
 // ForTrace returns all events for a given trace ID, ordered chronologically.
 func ForTrace(db *sql.DB, traceID string) ([]Event, error) {
 	rows, err := db.Query(
-		`SELECT id, action, trace_id, origin, timestamp, data, vclock FROM events WHERE trace_id = ? ORDER BY id`,
+		`SELECT `+eventColumns+` FROM events WHERE trace_id = ? ORDER BY id`,
 		traceID,
 	)
 	if err != nil {
@@ -60,7 +62,7 @@ func scanEvents(rows *sql.Rows) ([]Event, error) {
 	for rows.Next() {
 		var e Event
 		var data, vclock string
-		if err := rows.Scan(&e.ID, &e.Action, &e.TraceID, &e.Origin, &e.Timestamp, &data, &vclock); err != nil {
+		if err := rows.Scan(&e.ID, &e.Action, &e.TraceID, &e.CortexID, &e.Origin, &e.Timestamp, &data, &vclock); err != nil {
 			return nil, err
 		}
 		e.Data = json.RawMessage(data)

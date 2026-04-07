@@ -1,6 +1,8 @@
 package config_test
 
 import (
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -35,6 +37,62 @@ func TestConfigMarshalRoundTrip(t *testing.T) {
 	}
 	if restored.Cortexes["work"].Path != "/home/user/.noema/work" {
 		t.Errorf("work path = %q", restored.Cortexes["work"].Path)
+	}
+}
+
+// TestSave_RejectsDuplicatePaths pins the guardrail in validatePaths: two
+// cortex entries cannot share the same on-disk directory. The motivating
+// failure mode was a stray `noema serve --cortex agentbrain` process
+// federating agentbrain's events under the "ai-1" alias because both
+// entries had been pointed (via copy/paste) at the same directory.
+//
+// HOME is redirected so a passing run can't accidentally stomp on the
+// developer's real ~/.config/noema/config.yaml. The error path doesn't
+// touch disk at all (validatePaths runs before MkdirAll), but the
+// redirection is cheap insurance.
+func TestSave_RejectsDuplicatePaths(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "xdg"))
+
+	shared := filepath.Join(t.TempDir(), "shared-cortex")
+	cfg := &config.Config{
+		Default: "alpha",
+		Cortexes: map[string]config.CortexEntry{
+			"alpha": {Path: shared},
+			"beta":  {Path: shared},
+		},
+	}
+
+	err := cfg.Save()
+	if err == nil {
+		t.Fatal("Save accepted two cortex entries pointing at the same path")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "alpha") || !strings.Contains(msg, "beta") {
+		t.Errorf("error message should name both colliding entries, got: %s", msg)
+	}
+	if !strings.Contains(msg, shared) {
+		t.Errorf("error message should include the shared path %q, got: %s", shared, msg)
+	}
+}
+
+// TestSave_NormalizesPathBeforeComparing covers the trailing-slash and
+// "./" disguise vectors. validatePaths uses filepath.Abs+Clean so two
+// syntactically different strings that resolve to the same directory
+// still collide.
+func TestSave_NormalizesPathBeforeComparing(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "xdg"))
+
+	shared := filepath.Join(t.TempDir(), "shared")
+	cfg := &config.Config{
+		Cortexes: map[string]config.CortexEntry{
+			"clean": {Path: shared},
+			"dirty": {Path: shared + "/"},
+		},
+	}
+	if err := cfg.Save(); err == nil {
+		t.Error("Save accepted shared path with trailing slash variant")
 	}
 }
 

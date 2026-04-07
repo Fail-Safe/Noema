@@ -19,7 +19,7 @@ import (
 func setup(t *testing.T) *cortex.Cortex {
 	t.Helper()
 	dir := t.TempDir()
-	if err := cortex.Create("test", dir); err != nil {
+	if _, err := cortex.Create("test", dir); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	cx, err := cortex.Open("test", filepath.Join(dir, "test"))
@@ -34,7 +34,7 @@ func setup(t *testing.T) *cortex.Cortex {
 
 func TestCreate_DirectoryLayout(t *testing.T) {
 	dir := t.TempDir()
-	if err := cortex.Create("mycortex", dir); err != nil {
+	if _, err := cortex.Create("mycortex", dir); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	root := filepath.Join(dir, "mycortex")
@@ -58,7 +58,7 @@ func TestCreate_DirectoryLayout(t *testing.T) {
 
 func TestCreate_AgentMDContent(t *testing.T) {
 	dir := t.TempDir()
-	if err := cortex.Create("myagent", dir); err != nil {
+	if _, err := cortex.Create("myagent", dir); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "myagent", "AGENT.md"))
@@ -87,7 +87,7 @@ func TestCreate_AgentMDContent(t *testing.T) {
 
 func TestOpen_GeneratesAgentMDIfMissing(t *testing.T) {
 	dir := t.TempDir()
-	if err := cortex.Create("legacy", dir); err != nil {
+	if _, err := cortex.Create("legacy", dir); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	// Simulate a cortex created before AGENT.md was introduced.
@@ -109,7 +109,7 @@ func TestOpen_GeneratesAgentMDIfMissing(t *testing.T) {
 
 func TestReadManifest(t *testing.T) {
 	dir := t.TempDir()
-	if err := cortex.Create("manifested", dir); err != nil {
+	if _, err := cortex.Create("manifested", dir); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	m, err := cortex.ReadManifest(filepath.Join(dir, "manifested"))
@@ -119,11 +119,37 @@ func TestReadManifest(t *testing.T) {
 	if m.Name != "manifested" {
 		t.Errorf("Name: got %q, want %q", m.Name, "manifested")
 	}
-	if m.Version != 1 {
-		t.Errorf("Version: got %d, want 1", m.Version)
+	if m.Version != cortex.ManifestVersion {
+		t.Errorf("Version: got %d, want %d", m.Version, cortex.ManifestVersion)
+	}
+	if m.ID == "" {
+		t.Error("ID must be populated by Create")
+	}
+	if len(m.ID) != 26 {
+		t.Errorf("ID must be a 26-char ULID; got %d chars", len(m.ID))
 	}
 	if m.Created == "" {
 		t.Error("Created must not be empty")
+	}
+}
+
+func TestPeerLabelCollidesWithSelf(t *testing.T) {
+	m := cortex.Manifest{Name: "alpha"}
+
+	cases := []struct {
+		label string
+		want  bool
+	}{
+		{"alpha", true},      // exact collision
+		{"beta", false},      // distinct
+		{"", false},          // empty is not a collision (other validation handles empty)
+		{"Alpha", false},     // case-sensitive: cortex names are exact strings
+		{"alpha-1", false},   // distinct
+	}
+	for _, tc := range cases {
+		if got := m.PeerLabelCollidesWithSelf(tc.label); got != tc.want {
+			t.Errorf("PeerLabelCollidesWithSelf(%q): got %v, want %v", tc.label, got, tc.want)
+		}
 	}
 }
 
@@ -1032,8 +1058,10 @@ func TestVectorClockIncrements(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetClock: %v", err)
 	}
-	if vc["test"] != 3 {
-		t.Errorf("clock[test] = %d, want 3", vc["test"])
+	// Vector clocks are keyed on the cortex's stable ID (a ULID), not the
+	// display name. See docs/design/cortex-uuid-plan.md.
+	if vc[cx.ID] != 3 {
+		t.Errorf("clock[%s] = %d, want 3", cx.ID, vc[cx.ID])
 	}
 }
 
@@ -1118,6 +1146,11 @@ func TestReplayEvent_Idempotent(t *testing.T) {
 
 // ---- Divergence / Conflict Detection ----
 
+// remotePeerID is a fixed ULID used by federation tests as the stand-in for
+// a remote peer's cortex identity. It only needs to be a 26-char Crockford
+// base32 string distinct from any local cortex's generated ID.
+const remotePeerID = "01JR0000000000000000000000"
+
 // setupWithLocalTrace creates a cortex with a local trace and a local update event
 // that has a known vector clock. Returns the cortex and the trace ID.
 func setupWithLocalTrace(t *testing.T) (*cortex.Cortex, string) {
@@ -1164,10 +1197,11 @@ func TestReplayUpdate_ConcurrentCreates_Divergence(t *testing.T) {
 		ID:        event.NewULID(),
 		Action:    event.ActionUpdate,
 		TraceID:   traceID,
+		CortexID:  remotePeerID,
 		Origin:    "remote-peer",
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Data:      remoteData,
-		VClock:    map[string]uint64{"remote-peer": 1},
+		VClock:    map[string]uint64{remotePeerID: 1},
 	}
 
 	if err := cx.ReplayEvent(remoteEvent); err != nil {
@@ -1205,8 +1239,10 @@ func TestReplayUpdate_ConcurrentCreates_Divergence(t *testing.T) {
 		t.Errorf("divergence derived_from = %v, want [%s]", div.DerivedFrom, traceID)
 	}
 
-	// Divergence body should contain both versions, labeled by origin name,
-	// in alphabetical order with the deterministic header format.
+	// Divergence body should contain both versions, labeled by origin name
+	// plus an 8-char cortex-id prefix, with sections sorted by cortex_id
+	// (not name). The remote peer ID is fixed; the local cortex's ID is
+	// generated at setup time.
 	divTrace, err := trace.ParseFile(cx.TraceFile(div.ID, false))
 	if err != nil {
 		t.Fatalf("ParseFile divergence: %v", err)
@@ -1217,20 +1253,23 @@ func TestReplayUpdate_ConcurrentCreates_Divergence(t *testing.T) {
 	if !strings.Contains(divTrace.Body, "Updated remote body.") {
 		t.Error("divergence body missing remote version")
 	}
-	// Origins are sorted alphabetically: "remote-peer" < "test".
-	if !strings.Contains(divTrace.Body, "**Conflicting origins:** remote-peer, test") {
+	remoteLabel := "remote-peer (" + remotePeerID[:8] + ")"
+	localLabel := "test (" + cx.ID[:8] + ")"
+	// remotePeerID starts with "01JR0000" which sorts before any freshly
+	// generated ULID, so remote should appear first in both the origins
+	// summary and the section ordering.
+	if !strings.Contains(divTrace.Body, "**Conflicting origins:** "+remoteLabel+", "+localLabel) {
 		t.Errorf("divergence body missing/wrong origins line:\n%s", divTrace.Body)
 	}
-	if !strings.Contains(divTrace.Body, "### Version from remote-peer") {
-		t.Error("divergence body missing 'Version from remote-peer' section")
+	if !strings.Contains(divTrace.Body, "### Version from "+remoteLabel) {
+		t.Errorf("divergence body missing 'Version from %s' section", remoteLabel)
 	}
-	if !strings.Contains(divTrace.Body, "### Version from test") {
-		t.Error("divergence body missing 'Version from test' section")
+	if !strings.Contains(divTrace.Body, "### Version from "+localLabel) {
+		t.Errorf("divergence body missing 'Version from %s' section", localLabel)
 	}
-	// Sections must appear in alphabetical order: remote-peer before test.
-	if strings.Index(divTrace.Body, "### Version from remote-peer") >
-		strings.Index(divTrace.Body, "### Version from test") {
-		t.Error("divergence body sections are not sorted alphabetically by origin")
+	if strings.Index(divTrace.Body, "### Version from "+remoteLabel) >
+		strings.Index(divTrace.Body, "### Version from "+localLabel) {
+		t.Error("divergence body sections are not sorted by cortex_id (remote should come first)")
 	}
 
 	// DivergenceCount should be 1.
@@ -1262,10 +1301,11 @@ func TestReplayUpdate_CausallyOrdered_NoConflict(t *testing.T) {
 		ID:        event.NewULID(),
 		Action:    event.ActionUpdate,
 		TraceID:   traceID,
+		CortexID:  remotePeerID,
 		Origin:    "remote-peer",
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Data:      remoteData,
-		VClock:    map[string]uint64{"test": 3, "remote-peer": 1},
+		VClock:    map[string]uint64{cx.ID: 3, remotePeerID: 1},
 	}
 
 	if err := cx.ReplayEvent(remoteEvent); err != nil {
@@ -1436,13 +1476,160 @@ func triggerDivergence(t *testing.T, cx *cortex.Cortex, traceID string) {
 		ID:        event.NewULID(),
 		Action:    event.ActionUpdate,
 		TraceID:   traceID,
+		CortexID:  remotePeerID,
 		Origin:    "remote-peer",
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Data:      remoteData,
-		VClock:    map[string]uint64{"remote-peer": 1},
+		VClock:    map[string]uint64{remotePeerID: 1},
 	}
 	if err := cx.ReplayEvent(remoteEvent); err != nil {
 		t.Fatalf("triggerDivergence: %v", err)
+	}
+}
+
+// ---- Replay graceful no-op (missing local trace) ----
+//
+// These tests pin the behavior described in cortex.go's replay handlers:
+// when an event arrives for a trace that doesn't exist locally, replay must
+// not pin the federation cursor on a permanent failure. Update events
+// promote into a create (the snapshot in the event is enough to materialize
+// the trace); the four soft-state mutations (archive/unarchive/trash/recover)
+// store the event idempotently and move on. The original failure mode that
+// motivated this — orphan agentbrain events spamming ai-2/ai-3 with
+// "trace not found" replay errors — must stay fixed.
+
+// missingTraceUpdateEvent builds an update event for a trace ID that does
+// not exist in the cortex. The event carries a complete snapshot in Data so
+// it can be promoted into a create on replay.
+func missingTraceUpdateEvent(t *testing.T) event.Event {
+	t.Helper()
+	data, _ := json.Marshal(map[string]any{
+		"title":  "Promoted from update",
+		"type":   "fact",
+		"author": "remote-agent",
+		"tags":   []string{"orphan", "promoted"},
+		"origin": "peer-orphan",
+		"body":   "Body materialized from an update event with no prior create.",
+	})
+	return event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionUpdate,
+		TraceID:   "20260407-orphan-update",
+		CortexID:  remotePeerID,
+		Origin:    "peer-orphan",
+		Timestamp: "2026-04-07T12:00:00Z",
+		Data:      data,
+	}
+}
+
+func TestReplayEvent_UpdateOnMissingTrace_PromotesToCreate(t *testing.T) {
+	cx := setup(t)
+	e := missingTraceUpdateEvent(t)
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent: %v", err)
+	}
+
+	// The trace should now exist with the snapshot from the update event.
+	row, err := cx.Get(e.TraceID)
+	if err != nil {
+		t.Fatalf("Get after promoted update: %v", err)
+	}
+	if row.Title != "Promoted from update" {
+		t.Errorf("Title = %q, want %q", row.Title, "Promoted from update")
+	}
+	if row.Origin != "peer-orphan" {
+		t.Errorf("Origin = %q, want %q", row.Origin, "peer-orphan")
+	}
+	if len(row.Tags) != 2 {
+		t.Errorf("Tags = %v, want 2 entries", row.Tags)
+	}
+
+	// File should exist on disk.
+	if _, err := os.Stat(cx.TraceFile(e.TraceID, false)); err != nil {
+		t.Errorf("trace file missing after promoted update: %v", err)
+	}
+
+	// Body must come from the update snapshot, not be empty.
+	parsed, err := trace.ParseFile(cx.TraceFile(e.TraceID, false))
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if !strings.Contains(parsed.Body, "Body materialized from an update event") {
+		t.Errorf("body lost during promotion: %q", parsed.Body)
+	}
+
+	// The original update event must be in the log so a replay of the
+	// same batch is a no-op (the federation cursor depends on this).
+	events, err := cx.Events(e.TraceID)
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	var found bool
+	for _, ev := range events {
+		if ev.ID == e.ID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("promoted update event %s not found in local log: %+v", e.ID, events)
+	}
+}
+
+// missingSoftStateEvent builds a soft-state event (archive/unarchive/trash/
+// recover) targeting a trace ID that doesn't exist locally.
+func missingSoftStateEvent(action event.Action) event.Event {
+	return event.Event{
+		ID:        event.NewULID(),
+		Action:    action,
+		TraceID:   "20260407-orphan-" + string(action),
+		CortexID:  remotePeerID,
+		Origin:    "peer-orphan",
+		Timestamp: "2026-04-07T12:00:00Z",
+	}
+}
+
+func TestReplayEvent_SoftStateOnMissingTrace_NoOpAndStored(t *testing.T) {
+	// Each row covers one of the four soft-state replay handlers that
+	// previously returned bare sql.ErrNoRows from c.Get. The fix is in
+	// cortex.go: replayArchive/Unarchive/Trash/Recover should fall through
+	// to storeRemoteEvent on a missing trace instead of pinning the cursor.
+	cases := []struct {
+		name   string
+		action event.Action
+	}{
+		{"archive", event.ActionArchive},
+		{"unarchive", event.ActionUnarchive},
+		{"trash", event.ActionTrash},
+		{"recover", event.ActionRecover},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cx := setup(t)
+			e := missingSoftStateEvent(tc.action)
+
+			if err := cx.ReplayEvent(e); err != nil {
+				t.Fatalf("ReplayEvent(%s) on missing trace returned error: %v", tc.action, err)
+			}
+
+			// No local trace should have been created — soft-state events
+			// must not materialize traces from thin air, only store the
+			// event for the audit trail.
+			if _, err := cx.Get(e.TraceID); err == nil {
+				t.Errorf("trace %s exists after %s replay; soft-state replay must not create traces", e.TraceID, tc.action)
+			}
+
+			// The event must be in the local log keyed by the original ID
+			// so a re-poll of the same batch idempotently skips it.
+			events, err := cx.Events(e.TraceID)
+			if err != nil {
+				t.Fatalf("Events: %v", err)
+			}
+			if len(events) != 1 || events[0].ID != e.ID {
+				t.Errorf("expected exactly the replayed event in log, got %+v", events)
+			}
+		})
 	}
 }
 

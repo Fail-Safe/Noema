@@ -135,6 +135,14 @@ func federationAddPeerCmd() *cobra.Command {
 				return err
 			}
 
+			// Reject if the proposed label collides with this cortex's own name.
+			// Two participants in a federation must have distinct names or their
+			// vector clocks merge into one bucket and concurrent edits stop being
+			// detected. See docs/design/cortex-uuid-plan.md for the permanent fix.
+			if m.PeerLabelCollidesWithSelf(name) {
+				return fmt.Errorf("peer name %q matches this cortex's own name; pick a different label to avoid federation identity collisions", name)
+			}
+
 			// Check for duplicate.
 			if m.Federation != nil {
 				for _, p := range m.Federation.Peers {

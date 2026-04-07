@@ -93,6 +93,9 @@ Choose the type that best reflects the intent of the memory:
                                  → resolve a concurrent edit conflict by
                                    accepting an origin's version, or by
                                    supplying a custom merged body
+  cortex_identity                → return this cortex's stable ULID + name +
+                                   manifest version (used by federation peers
+                                   to verify identity on every sync)
   sync_events [since] [limit]    → pull events for federation (JSON array)
   federation_status              → federation config, peer states, vector clock
   announce_peer name endpoint    → accept a peer announcement for discovery
@@ -116,11 +119,13 @@ Choose the type that best reflects the intent of the memory:
 - When federated peers edit the same trace concurrently, a "divergence" trace is
   auto-created containing every conflicting version. It has type=divergence,
   tags=[divergence, needs-resolution], and derived_from=[original-trace-id].
-- The divergence body lists "**Conflicting origins:** <names>" and one
-  "### Version from <origin>" section per version. The body is rendered
-  deterministically (sorted by origin name) so every replica sees identical content.
-- Use resolve_divergence to resolve: pass accept=<origin-name> to apply that
-  version cluster-wide, or pass body=<merged content> to apply a custom merge.
+- The divergence body lists "**Conflicting origins:** <labels>" and one
+  "### Version from <name> (<id-prefix>)" section per version, where id-prefix
+  is the first 8 chars of the peer's cortex ULID. Sections are sorted by
+  cortex id (not name) so every replica produces byte-identical content.
+- Use resolve_divergence to resolve: pass accept=<peer-name> or accept=<id-prefix>
+  to apply that version cluster-wide, or pass body=<merged content> to apply a
+  custom merge.
 - Use list_traces with type filter or tag=needs-resolution to find unresolved divergences.
 - federation_status shows the count of unresolved divergences.
 
@@ -455,6 +460,25 @@ Choose the type that best reflects the intent of the memory:
 
 	// ---- Federation tools ----
 
+	s.AddTool(mcp.NewTool("cortex_identity",
+		mcp.WithDescription("Returns this cortex's stable identity (ULID, name, manifest version). Federation peers call this on every sync to verify the remote endpoint still belongs to the cortex they originally paired with."),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		m, err := cortex.ReadManifest(cx.Dir)
+		if err != nil {
+			return nil, fmt.Errorf("reading manifest: %w", err)
+		}
+		payload := map[string]any{
+			"id":      cx.ID,
+			"name":    m.Name,
+			"version": m.Version,
+		}
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return nil, fmt.Errorf("marshaling identity: %w", err)
+		}
+		return mcp.NewToolResultText(string(data)), nil
+	})
+
 	s.AddTool(mcp.NewTool("sync_events",
 		mcp.WithDescription("Returns events from this cortex for federation sync. Remote peers call this to pull new events. Returns a JSON array of event objects."),
 		mcp.WithString("since", mcp.Description("ULID cursor — return only events after this ID")),
@@ -511,17 +535,37 @@ Choose the type that best reflects the intent of the memory:
 				if ps.LastEvent != "" {
 					lastEvent = ps.LastEvent
 				}
-				sb.WriteString(fmt.Sprintf("  %s\n    endpoint:   %s\n    last_seen:  %s\n    last_event: %s\n",
-					p.Name, p.Endpoint, lastSeen, lastEvent))
+				cortexID := "(unverified)"
+				if ps.CortexID != "" {
+					cortexID = ps.CortexID
+				}
+				sb.WriteString(fmt.Sprintf("  %s\n    endpoint:   %s\n    cortex_id:  %s\n    last_seen:  %s\n    last_event: %s\n",
+					p.Name, p.Endpoint, cortexID, lastSeen, lastEvent))
 			}
 		}
 
-		// Show local vector clock.
+		// Show local vector clock. Vector clocks are keyed on cortex IDs
+		// (ULIDs); annotate the local cortex's own bucket with its name and
+		// each peer's bucket with its display name when we know it.
 		vc, err := cx.GetClock()
 		if err == nil && len(vc) > 0 {
 			sb.WriteString("\nVector Clock:\n")
-			for peer, tick := range vc {
-				sb.WriteString(fmt.Sprintf("  %s: %d\n", peer, tick))
+			peerNames := make(map[string]string)
+			peerNames[cx.ID] = m.Name + " (local)"
+			if m.Federation != nil {
+				state := federation.NewState(cx.DB.DB)
+				for _, p := range m.Federation.Peers {
+					if id, _ := state.Get(federation.PeerCortexIDKey(p.Name)); id != "" {
+						peerNames[id] = p.Name
+					}
+				}
+			}
+			for cortexID, tick := range vc {
+				label := peerNames[cortexID]
+				if label == "" {
+					label = "(unknown peer)"
+				}
+				sb.WriteString(fmt.Sprintf("  %s [%s]: %d\n", cortexID, label, tick))
 			}
 		}
 
@@ -551,6 +595,17 @@ Choose the type that best reflects the intent of the memory:
 		m, err := cortex.ReadManifest(cx.Dir)
 		if err != nil {
 			m = cortex.Manifest{Name: cx.Name}
+		}
+
+		// Reject any announcement that uses our own cortex name. Two
+		// participants in a federation cannot share an identity — vector
+		// clocks would merge into one bucket and concurrent-edit detection
+		// would silently break. See docs/design/cortex-uuid-plan.md.
+		if m.PeerLabelCollidesWithSelf(name) {
+			return mcp.NewToolResultError(fmt.Sprintf(
+				"refusing announcement: name %q matches this cortex's own name. The announcing peer must rename its cortex (in its cortex.md) to a unique value before federation can proceed.",
+				name,
+			)), nil
 		}
 
 		// Check if this peer is already known.

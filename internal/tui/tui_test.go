@@ -17,7 +17,7 @@ import (
 func setupCortex(t *testing.T) *cortex.Cortex {
 	t.Helper()
 	dir := t.TempDir()
-	if err := cortex.Create("test", dir); err != nil {
+	if _, err := cortex.Create("test", dir); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	cx, err := cortex.Open("test", filepath.Join(dir, "test"))
