@@ -385,8 +385,8 @@ func (s *Syncer) verifyPeerIdentity(mcpClient *client.Client, peer PeerConfig) e
 		return fmt.Errorf(
 			"peer %q identity mismatch: pinned id is %s but the endpoint now reports %s. "+
 				"This can happen if the peer was reset, replaced, or restored from a different cortex's backup. "+
-				"If this change is intentional, manually clear the pinned id and reset the cursor for this peer in federation_state",
-			peer.Name, pinned, identity.ID,
+				"If this change is intentional, run `noema federation reset-peer %s` to clear the pin and cursor — the next sync will re-pin the peer's new identity",
+			peer.Name, pinned, identity.ID, peer.Name,
 		)
 	}
 	return nil

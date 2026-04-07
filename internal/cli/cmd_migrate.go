@@ -59,7 +59,12 @@ What it does:
 
 Use --reset (with caution) when this directory is a copy of another cortex —
 it assigns a fresh ULID and re-keys local rows under the new ID, accepting
-that the original peer's federation history is no longer ours to claim.
+that the original peer's federation history is no longer ours to claim. As
+part of that clean break, --reset also clears every peer sync cursor and
+last_seen timestamp so the post-migration syncer re-pulls each peer's log
+from the beginning; without that, a cursor carried over from the old
+identity could silently skip events that were written during the period
+of broken federation that motivated the reset.
 
 This migration is intentionally interactive — pass --yes to skip the prompt.
 See docs/design/cortex-uuid-plan.md for the full design rationale.`,
@@ -245,6 +250,25 @@ func runCortexIDMigration(out io.Writer, in io.Reader, cfg *config.Config, name 
 		return fmt.Errorf("clearing peer cortex id pins: %w", err)
 	}
 
+	// Under --reset (and only under --reset), also drop peer sync cursors
+	// and last_seen rows. A reset declares the local cortex's causal
+	// history disconnected from everything it had previously pulled, so
+	// the cursors — which tell us "we already saw events up to X from
+	// peer P" — are noise. Keeping them would cause the post-migration
+	// syncer to ask each peer for "events since <stale cursor>" and
+	// quietly skip everything written to the peer's log before that
+	// point, which is exactly the incident that motivated this flag.
+	// The normal (non-reset) migration leaves cursors alone because
+	// ULIDs are stable across re-keying, so an existing cursor still
+	// points at a causally meaningful event in the peer's log.
+	var cursorsCleared int
+	if reset {
+		cursorsCleared, err = clearPeerSyncCursors(tx)
+		if err != nil {
+			return fmt.Errorf("clearing peer sync cursors: %w", err)
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing migration: %w", err)
 	}
@@ -274,6 +298,9 @@ func runCortexIDMigration(out io.Writer, in io.Reader, cfg *config.Config, name 
 	if pinsCleared > 0 {
 		fmt.Fprintf(out, "  peer cortex_id pins cleared: %d (peers will re-pin on next handshake)\n", pinsCleared)
 	}
+	if cursorsCleared > 0 {
+		fmt.Fprintf(out, "  peer sync cursors cleared: %d (peers will re-pull from the start of each log)\n", cursorsCleared)
+	}
 	fmt.Fprintf(out, "  backups: cortex.md.%s.bak, db/noema.db.%s.bak\n", stamp, stamp)
 	return nil
 }
@@ -286,6 +313,28 @@ func runCortexIDMigration(out io.Writer, in io.Reader, cfg *config.Config, name 
 func clearPeerCortexIDPins(tx *sql.Tx) (int, error) {
 	res, err := tx.Exec(
 		`DELETE FROM federation_state WHERE key LIKE 'peer:%:cortex_id'`,
+	)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+// clearPeerSyncCursors removes every federation_state row keyed on a peer
+// cursor or last_seen timestamp. Called only under --reset, because a
+// reset is the operator's declaration that the local cortex's causal
+// history is disconnected from everything it had pulled before — cursors
+// that were causally meaningful under the old identity become noise under
+// the new one. The normal migration path leaves these rows alone since
+// ULIDs are stable across re-keying, so existing cursors still point at
+// causally meaningful events. Returns the number of rows removed (cursor
+// + last_seen combined) so the migration summary can report it.
+func clearPeerSyncCursors(tx *sql.Tx) (int, error) {
+	res, err := tx.Exec(
+		`DELETE FROM federation_state
+		 WHERE key LIKE 'peer:%:last_event'
+		    OR key LIKE 'peer:%:last_seen'`,
 	)
 	if err != nil {
 		return 0, err

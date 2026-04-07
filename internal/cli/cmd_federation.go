@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -21,6 +22,7 @@ func federationCmd() *cobra.Command {
 		federationStatusCmd(),
 		federationPeersCmd(),
 		federationAddPeerCmd(),
+		federationResetPeerCmd(),
 	)
 	return cmd
 }
@@ -113,6 +115,172 @@ func federationPeersCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func federationResetPeerCmd() *cobra.Command {
+	var assumeYes bool
+
+	cmd := &cobra.Command{
+		Use:   "reset-peer <name>...",
+		Short: "Clear stored state for one or more peers (forces a fresh handshake)",
+		Long: `Clears the pinned cortex_id, last-event cursor, last-seen timestamp, and
+local vector-clock bucket for one or more configured peers. The peer entry
+in cortex.md is left untouched — only the runtime state in federation_state
+and the dead vclock bucket are removed.
+
+Use this when a peer's identity legitimately changed (e.g. it ran
+` + "`noema migrate cortex-id --reset`" + `, was restored from a backup, or was
+re-paired) and the local syncer is now refusing to talk to it with a
+"peer identity mismatch" error. After the reset, the next sync re-pins
+the peer's new cortex_id and the cursor restarts from the beginning of
+the peer's event log so no events are silently skipped.
+
+This is the supported way to clear stale federation state — never edit
+the federation_state SQLite table by hand.`,
+		Example: "  noema federation reset-peer ai-2\n  noema federation reset-peer ai-2 ai-3 --yes",
+		Args:    cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cx, err := resolveCortex()
+			if err != nil {
+				return err
+			}
+			defer cx.Close()
+
+			m, err := cortex.ReadManifest(cx.Dir)
+			if err != nil {
+				return fmt.Errorf("reading cortex.md: %w", err)
+			}
+
+			// Build the set of configured peers so unknown names are rejected
+			// up front. Reset-peer is destructive enough that a typo silently
+			// becoming a no-op (or, worse, eating an unrelated key) would be
+			// a foot-gun.
+			configured := map[string]string{} // name -> endpoint
+			if m.Federation != nil {
+				for _, p := range m.Federation.Peers {
+					configured[p.Name] = p.Endpoint
+				}
+			}
+			for _, name := range args {
+				if _, ok := configured[name]; !ok {
+					known := make([]string, 0, len(configured))
+					for k := range configured {
+						known = append(known, k)
+					}
+					return fmt.Errorf(
+						"peer %q is not configured in cortex.md (known: %s)",
+						name, strings.Join(known, ", "),
+					)
+				}
+			}
+
+			return runFederationResetPeer(cmd.OutOrStdout(), cmd.InOrStdin(), cx, args, configured, assumeYes)
+		},
+	}
+	cmd.Flags().BoolVarP(&assumeYes, "yes", "y", false, "skip the confirmation prompt")
+	return cmd
+}
+
+// runFederationResetPeer is split out so tests can drive it without going
+// through cobra. It assumes args have already been validated against
+// cortex.md so it never sees an unknown peer name.
+func runFederationResetPeer(out io.Writer, in io.Reader, cx *cortex.Cortex, names []string, endpoints map[string]string, assumeYes bool) error {
+	state := federation.NewState(cx.DB.DB)
+
+	// Snapshot what we're about to delete so the prompt actually shows the
+	// operator what will be lost. We also remember each peer's pinned ID so
+	// we can drop the matching vector-clock bucket — once the pin is gone,
+	// the bucket is unreachable and would otherwise linger forever.
+	type snapshot struct {
+		name      string
+		endpoint  string
+		pinnedID  string
+		cursor    string
+		lastSeen  string
+		hadAnyRow bool
+	}
+	snaps := make([]snapshot, 0, len(names))
+	for _, name := range names {
+		ps, err := state.GetPeerState(name, endpoints[name])
+		if err != nil {
+			return fmt.Errorf("loading state for peer %q: %w", name, err)
+		}
+		snaps = append(snaps, snapshot{
+			name:      name,
+			endpoint:  endpoints[name],
+			pinnedID:  ps.CortexID,
+			cursor:    ps.LastEvent,
+			lastSeen:  ps.LastSeen,
+			hadAnyRow: ps.CortexID != "" || ps.LastEvent != "" || ps.LastSeen != "",
+		})
+	}
+
+	fmt.Fprintf(out, "About to reset federation state for %d peer(s) in cortex %q:\n", len(snaps), cx.Name)
+	for _, s := range snaps {
+		fmt.Fprintf(out, "  %s (%s)\n", s.name, s.endpoint)
+		fmt.Fprintf(out, "    pinned cortex_id: %s\n", emptyDash(s.pinnedID))
+		fmt.Fprintf(out, "    last_event:       %s\n", emptyDash(s.cursor))
+		fmt.Fprintf(out, "    last_seen:        %s\n", emptyDash(s.lastSeen))
+	}
+	fmt.Fprintln(out, "After reset, the next sync will re-pin the peer's current cortex_id")
+	fmt.Fprintln(out, "and replay events from the beginning of its log.")
+
+	if !assumeYes {
+		fmt.Fprint(out, "Proceed? [y/N]: ")
+		var resp string
+		_, _ = fmt.Fscanln(in, &resp)
+		if resp != "y" && resp != "Y" && resp != "yes" {
+			return fmt.Errorf("aborted by user")
+		}
+	}
+
+	// Load the vclock once, mutate it for every peer whose pinned id we're
+	// dropping, and write it back at the end. We do not drop buckets for
+	// peers that have never pinned — there's nothing to drop, and we have
+	// no way to know which bucket would be theirs without the pin.
+	vc, err := state.GetClock()
+	if err != nil {
+		return fmt.Errorf("loading vector clock: %w", err)
+	}
+	bucketsDropped := 0
+
+	for _, s := range snaps {
+		if err := state.Delete(federation.PeerCortexIDKey(s.name)); err != nil {
+			return fmt.Errorf("clearing pin for peer %q: %w", s.name, err)
+		}
+		if err := state.Delete(federation.PeerCursorKey(s.name)); err != nil {
+			return fmt.Errorf("clearing cursor for peer %q: %w", s.name, err)
+		}
+		if err := state.Delete(federation.PeerSeenKey(s.name)); err != nil {
+			return fmt.Errorf("clearing last_seen for peer %q: %w", s.name, err)
+		}
+		if s.pinnedID != "" {
+			if _, ok := vc[s.pinnedID]; ok {
+				delete(vc, s.pinnedID)
+				bucketsDropped++
+			}
+		}
+	}
+
+	if bucketsDropped > 0 {
+		if err := state.SetClock(vc); err != nil {
+			return fmt.Errorf("saving vector clock: %w", err)
+		}
+	}
+
+	fmt.Fprintf(out, "\nReset complete.\n")
+	for _, s := range snaps {
+		if s.hadAnyRow {
+			fmt.Fprintf(out, "  %s: state cleared\n", s.name)
+		} else {
+			fmt.Fprintf(out, "  %s: nothing to clear (peer had no stored state)\n", s.name)
+		}
+	}
+	if bucketsDropped > 0 {
+		fmt.Fprintf(out, "  vector-clock buckets dropped: %d\n", bucketsDropped)
+	}
+	fmt.Fprintln(out, "Restart `noema serve` (or wait for the next syncer poll) to re-pin the peers.")
+	return nil
 }
 
 func federationAddPeerCmd() *cobra.Command {

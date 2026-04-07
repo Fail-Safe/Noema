@@ -32,6 +32,15 @@ func (s *State) Set(key, value string) error {
 	return err
 }
 
+// Delete removes a single key from federation_state. Missing keys are not
+// an error — Delete is used by `noema federation reset-peer` to clear pin /
+// cursor / last_seen rows that may or may not exist depending on whether
+// the peer has ever been contacted, so the operation has to be idempotent.
+func (s *State) Delete(key string) error {
+	_, err := s.db.Exec(`DELETE FROM federation_state WHERE key = ?`, key)
+	return err
+}
+
 // GetClock loads the vector clock from federation_state.
 func (s *State) GetClock() (VClock, error) {
 	val, err := s.Get("vclock")

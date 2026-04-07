@@ -260,6 +260,27 @@ func TestMigrateCortexID_ClearsStalePeerState(t *testing.T) {
 			t.Fatalf("inject peer pin %s: %v", peer.name, err)
 		}
 	}
+
+	// Seed cursor + last_seen rows for both peers so we can prove the
+	// non-reset path leaves them alone. Under the normal migration,
+	// ULIDs are stable across re-keying, so these cursors still point
+	// at causally meaningful events in the peer's log and must survive
+	// untouched. (The --reset path clears them — see TestMigrateCortexID_ResetClearsCursors.)
+	for _, row := range []struct {
+		key, value string
+	}{
+		{"peer:ai-2:last_event", "01EVENT00000000000000AI201"},
+		{"peer:ai-2:last_seen", "2026-04-07T12:00:00Z"},
+		{"peer:ai-3:last_event", "01EVENT00000000000000AI301"},
+		{"peer:ai-3:last_seen", "2026-04-07T12:00:00Z"},
+	} {
+		if _, err := conn.Exec(
+			`INSERT INTO federation_state (key, value) VALUES (?, ?)`,
+			row.key, row.value,
+		); err != nil {
+			t.Fatalf("inject %s: %v", row.key, err)
+		}
+	}
 	conn.Close()
 
 	cfg := &config.Config{
@@ -320,6 +341,114 @@ func TestMigrateCortexID_ClearsStalePeerState(t *testing.T) {
 	}
 	if pinCount != 0 {
 		t.Errorf("expected 0 peer cortex_id pins after migration, got %d", pinCount)
+	}
+
+	// Cursor + last_seen rows MUST survive a non-reset migration. ULIDs
+	// are stable across re-keying, so these rows still point at real
+	// events in the peers' logs and clearing them would force a wasteful
+	// full re-pull for no causal benefit. The --reset path is the only
+	// place we wipe them — that contract is load-bearing for the whole
+	// "non-reset migration is free" promise in the design doc.
+	var cursorCount int
+	if err := conn2.QueryRow(
+		`SELECT COUNT(*) FROM federation_state
+		 WHERE key LIKE 'peer:%:last_event' OR key LIKE 'peer:%:last_seen'`,
+	).Scan(&cursorCount); err != nil {
+		t.Fatalf("count peer cursors: %v", err)
+	}
+	if cursorCount != 4 {
+		t.Errorf("expected 4 cursor/last_seen rows preserved by non-reset migration, got %d", cursorCount)
+	}
+	if strings.Contains(output, "peer sync cursors cleared") {
+		t.Errorf("non-reset migration should not print cursor-clearing line, got:\n%s", output)
+	}
+}
+
+// TestMigrateCortexID_ResetClearsCursors pins the new --reset side effect:
+// cursors and last_seen rows are wiped so the post-migration syncer
+// re-pulls each peer's event log from the start. This is the fix for the
+// incident where ai-2/ai-3 migrated with --reset, kept their pre-incident
+// cursors for ai-1, and then only saw the handful of events ai-1 emitted
+// after the chaos — silently skipping everything written during the
+// period of broken federation that motivated the reset in the first place.
+//
+// The test contract is exact: 4 cursor/last_seen rows in, 0 out. If this
+// test ever drops to "0 rows survive" without the reset flag being set, or
+// "4 rows survive" with reset=true, the incident recurs.
+func TestMigrateCortexID_ResetClearsCursors(t *testing.T) {
+	const name = "reset-cursor-target"
+	dir, _ := setupV1Cortex(t, name)
+
+	// Add peers so the migration has something to recognize in cortex.md
+	// (not strictly required for cursor clearing — the SQL is name-agnostic —
+	// but it makes the test mirror the real incident shape).
+	m, err := cortex.ReadManifest(dir)
+	if err != nil {
+		t.Fatalf("ReadManifest: %v", err)
+	}
+	m.Federation = &cortex.FederationConfig{
+		Peers: []cortex.PeerEntry{
+			{Name: "ai-1", Endpoint: "https://ai-1.example:3000"},
+			{Name: "ai-3", Endpoint: "https://ai-3.example:3000"},
+		},
+	}
+	if err := cortex.WriteManifest(dir, m); err != nil {
+		t.Fatalf("WriteManifest: %v", err)
+	}
+
+	// Seed cursor + last_seen for both peers. These are the rows the
+	// --reset path must delete.
+	dbPath := filepath.Join(dir, "db", "noema.db")
+	conn, err := sql.Open("sqlite", dbPath+"?_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	for _, row := range []struct {
+		key, value string
+	}{
+		{"peer:ai-1:last_event", "01EVENT0000000000000000AI1"},
+		{"peer:ai-1:last_seen", "2026-04-07T12:00:00Z"},
+		{"peer:ai-3:last_event", "01EVENT0000000000000000AI3"},
+		{"peer:ai-3:last_seen", "2026-04-07T12:00:00Z"},
+	} {
+		if _, err := conn.Exec(
+			`INSERT INTO federation_state (key, value) VALUES (?, ?)`,
+			row.key, row.value,
+		); err != nil {
+			t.Fatalf("seed %s: %v", row.key, err)
+		}
+	}
+	conn.Close()
+
+	cfg := &config.Config{
+		Default:  name,
+		Cortexes: map[string]config.CortexEntry{name: {Path: dir}},
+	}
+	var out bytes.Buffer
+	// reset=true is the specific thing under test.
+	if err := runCortexIDMigration(&out, strings.NewReader("y\n"), cfg, name, cfg.Cortexes[name], true, false); err != nil {
+		t.Fatalf("runCortexIDMigration: %v\noutput:\n%s", err, out.String())
+	}
+	output := out.String()
+	if !strings.Contains(output, "peer sync cursors cleared: 4") {
+		t.Errorf("expected 'peer sync cursors cleared: 4' in output, got:\n%s", output)
+	}
+
+	conn2, err := db.Open(dir)
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer conn2.Close()
+
+	var cursorCount int
+	if err := conn2.QueryRow(
+		`SELECT COUNT(*) FROM federation_state
+		 WHERE key LIKE 'peer:%:last_event' OR key LIKE 'peer:%:last_seen'`,
+	).Scan(&cursorCount); err != nil {
+		t.Fatalf("count peer cursors: %v", err)
+	}
+	if cursorCount != 0 {
+		t.Errorf("expected 0 cursor/last_seen rows after --reset, got %d", cursorCount)
 	}
 }
 

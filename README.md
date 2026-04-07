@@ -105,6 +105,8 @@ noema unarchive <id>                      Restore an archived Trace
 noema sync [--recover]                    Re-index trace files; --recover rebuilds missing files from the event log
 noema events [trace-id] [--since] [--limit]
                                           Show the event log (audit trail) for a trace, or recent events across all traces
+noema events backfill [--dry-run] [--yes]
+                                          Synthesize create events for active traces missing one (e.g. traces added via `noema sync`)
 noema resolve <divergence-id> --accept <origin> | --custom <body>
                                           Resolve a divergence (concurrent edit conflict)
 
@@ -112,6 +114,9 @@ noema federation status                   Show federation config, peer sync stat
 noema federation peers                    List configured federation peers
 noema federation add-peer <name> <endpoint>
                                           Add a federation peer to cortex.md
+noema federation reset-peer <name>...     Clear stored state for a peer (forces a fresh handshake; use after a peer
+                                          ran `noema migrate cortex-id --reset` and the syncer is now reporting an
+                                          identity mismatch)
 
 noema serve [--transport stdio|sse] [--host <addr>] [--tls-cert <file> --tls-key <file>]
                                           Start the MCP server (SSE requires --host)
@@ -220,8 +225,7 @@ For a real federation host you probably want a process supervisor — restart on
 **Linux (systemd)**
 
 ```bash
-noema serve --cortex agentbrain --transport sse --host 192.168.1.10 --print-systemd-unit \
-  | sudo tee /etc/systemd/system/noema-agentbrain.service
+noema serve --cortex agentbrain --transport sse --host 192.168.1.10 --print-systemd-unit | sudo tee /etc/systemd/system/noema-agentbrain.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now noema-agentbrain
 sudo journalctl -u noema-agentbrain -f
@@ -230,8 +234,7 @@ sudo journalctl -u noema-agentbrain -f
 **macOS (launchd)**
 
 ```bash
-noema serve --cortex agentbrain --transport sse --host 127.0.0.1 --print-launchd-plist \
-  > ~/Library/LaunchAgents/com.fail-safe.noema.agentbrain.plist
+noema serve --cortex agentbrain --transport sse --host 127.0.0.1 --print-launchd-plist > ~/Library/LaunchAgents/com.fail-safe.noema.agentbrain.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fail-safe.noema.agentbrain.plist
 tail -f ~/Library/Logs/noema-agentbrain.log
 ```

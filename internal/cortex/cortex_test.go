@@ -1065,6 +1065,304 @@ func TestVectorClockIncrements(t *testing.T) {
 	}
 }
 
+// ---- Backfill ----
+
+// TestBackfillCreateEvents_SyncedTraceGetsCreate is the headline scenario:
+// a trace landed via Sync (no event emitted), Backfill must materialise a
+// `create` event for it that mirrors the trace's current state. Without
+// this test the next refactor could quietly skip the snapshot payload and
+// peers would replay an empty trace.
+func TestBackfillCreateEvents_SyncedTraceGetsCreate(t *testing.T) {
+	cx := setup(t)
+
+	// Drop a markdown file directly to disk and Sync it — this is the path
+	// that creates a DB row without an event, exactly like the production
+	// case the user is hitting on ai-1.
+	tr := trace.New("Synced trace", "fact", "agent-x", []string{"alpha", "beta"}, "Body content.")
+	if err := tr.Write(cx.TraceFile(tr.ID, false)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if _, err := cx.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	// Sanity: no events at all yet — Sync is reconciliation, not mutation.
+	pre, err := cx.Events(tr.ID)
+	if err != nil {
+		t.Fatalf("Events pre-backfill: %v", err)
+	}
+	if len(pre) != 0 {
+		t.Fatalf("expected 0 events before backfill, got %d", len(pre))
+	}
+
+	result, err := cx.BackfillCreateEvents(false)
+	if err != nil {
+		t.Fatalf("BackfillCreateEvents: %v", err)
+	}
+	if len(result.BackfilledIDs) != 1 || result.BackfilledIDs[0] != tr.ID {
+		t.Errorf("BackfilledIDs = %v, want [%s]", result.BackfilledIDs, tr.ID)
+	}
+	if len(result.SkippedIDs) != 0 {
+		t.Errorf("SkippedIDs = %v, want []", result.SkippedIDs)
+	}
+
+	// Exactly one create event must now exist for the trace, with the
+	// snapshot payload reflecting the current trace state.
+	post, err := cx.Events(tr.ID)
+	if err != nil {
+		t.Fatalf("Events post-backfill: %v", err)
+	}
+	if len(post) != 1 {
+		t.Fatalf("expected 1 event after backfill, got %d", len(post))
+	}
+	if post[0].Action != event.ActionCreate {
+		t.Errorf("Action = %q, want %q", post[0].Action, event.ActionCreate)
+	}
+	if post[0].CortexID != cx.ID {
+		t.Errorf("CortexID = %q, want %q", post[0].CortexID, cx.ID)
+	}
+	if post[0].Origin != cx.Name {
+		t.Errorf("Origin = %q, want %q", post[0].Origin, cx.Name)
+	}
+
+	var snap struct {
+		Title  string   `json:"title"`
+		Type   string   `json:"type"`
+		Author string   `json:"author"`
+		Tags   []string `json:"tags"`
+		Body   string   `json:"body"`
+	}
+	if err := json.Unmarshal(post[0].Data, &snap); err != nil {
+		t.Fatalf("unmarshal snapshot: %v", err)
+	}
+	if snap.Title != "Synced trace" {
+		t.Errorf("snapshot title = %q, want %q", snap.Title, "Synced trace")
+	}
+	if snap.Type != "fact" {
+		t.Errorf("snapshot type = %q, want %q", snap.Type, "fact")
+	}
+	if snap.Author != "agent-x" {
+		t.Errorf("snapshot author = %q, want %q", snap.Author, "agent-x")
+	}
+	if len(snap.Tags) != 2 || snap.Tags[0] != "alpha" || snap.Tags[1] != "beta" {
+		t.Errorf("snapshot tags = %v, want [alpha beta]", snap.Tags)
+	}
+	if snap.Body != "Body content." {
+		t.Errorf("snapshot body = %q, want %q", snap.Body, "Body content.")
+	}
+}
+
+// TestBackfillCreateEvents_BumpsVectorClock pins the federation contract:
+// each backfill event has to bump the local clock the same way a normal
+// Add does, otherwise peers replay the events but never advance their
+// causal view of this cortex.
+func TestBackfillCreateEvents_BumpsVectorClock(t *testing.T) {
+	cx := setup(t)
+
+	// Two synced traces with no events.
+	for _, title := range []string{"first", "second"} {
+		tr := trace.New(title, "note", "", nil, "body")
+		if err := tr.Write(cx.TraceFile(tr.ID, false)); err != nil {
+			t.Fatalf("Write %s: %v", title, err)
+		}
+	}
+	if _, err := cx.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	preClock, _ := cx.GetClock()
+	preTick := preClock[cx.ID] // 0 — no mutations have happened
+
+	if _, err := cx.BackfillCreateEvents(false); err != nil {
+		t.Fatalf("BackfillCreateEvents: %v", err)
+	}
+
+	postClock, err := cx.GetClock()
+	if err != nil {
+		t.Fatalf("GetClock: %v", err)
+	}
+	if postClock[cx.ID] != preTick+2 {
+		t.Errorf("clock[%s] = %d, want %d (bumped once per backfilled event)", cx.ID, postClock[cx.ID], preTick+2)
+	}
+}
+
+// TestBackfillCreateEvents_Idempotent pins that running backfill twice in
+// a row is a no-op the second time. The candidate query filters traces
+// that already have a create event, so the second pass must report zero
+// new IDs and the event log must still hold exactly one event per trace.
+func TestBackfillCreateEvents_Idempotent(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Synced once", "fact", "", nil, "body")
+	tr.Write(cx.TraceFile(tr.ID, false))
+	if _, err := cx.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	first, err := cx.BackfillCreateEvents(false)
+	if err != nil {
+		t.Fatalf("first BackfillCreateEvents: %v", err)
+	}
+	if len(first.BackfilledIDs) != 1 {
+		t.Fatalf("first pass BackfilledIDs = %v, want 1", first.BackfilledIDs)
+	}
+
+	second, err := cx.BackfillCreateEvents(false)
+	if err != nil {
+		t.Fatalf("second BackfillCreateEvents: %v", err)
+	}
+	if len(second.BackfilledIDs) != 0 {
+		t.Errorf("second pass BackfilledIDs = %v, want empty (idempotent)", second.BackfilledIDs)
+	}
+	if len(second.SkippedIDs) != 0 {
+		t.Errorf("second pass SkippedIDs = %v, want empty", second.SkippedIDs)
+	}
+
+	// Exactly one create event in the log — the second pass did not
+	// duplicate it.
+	events, _ := cx.Events(tr.ID)
+	if len(events) != 1 {
+		t.Errorf("event count = %d, want 1 (no duplicate from second pass)", len(events))
+	}
+}
+
+// TestBackfillCreateEvents_DryRun pins that --dry-run reports what would
+// happen without writing anything. The vclock must not move and the
+// candidate must still appear on a follow-up real run.
+func TestBackfillCreateEvents_DryRun(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Dry run trace", "note", "", nil, "body")
+	tr.Write(cx.TraceFile(tr.ID, false))
+	if _, err := cx.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	preClock, _ := cx.GetClock()
+
+	preview, err := cx.BackfillCreateEvents(true)
+	if err != nil {
+		t.Fatalf("BackfillCreateEvents dry-run: %v", err)
+	}
+	if len(preview.BackfilledIDs) != 1 || preview.BackfilledIDs[0] != tr.ID {
+		t.Errorf("preview BackfilledIDs = %v, want [%s]", preview.BackfilledIDs, tr.ID)
+	}
+
+	// Vclock must be untouched.
+	postClock, _ := cx.GetClock()
+	if postClock[cx.ID] != preClock[cx.ID] {
+		t.Errorf("dry-run mutated clock: pre=%d post=%d", preClock[cx.ID], postClock[cx.ID])
+	}
+	// And no events were written.
+	events, _ := cx.Events(tr.ID)
+	if len(events) != 0 {
+		t.Errorf("dry-run wrote %d events, want 0", len(events))
+	}
+
+	// A real run after the dry-run still picks up the trace — proves the
+	// preview pass left no side effects.
+	real, _ := cx.BackfillCreateEvents(false)
+	if len(real.BackfilledIDs) != 1 {
+		t.Errorf("real run after dry-run BackfilledIDs = %v, want 1", real.BackfilledIDs)
+	}
+}
+
+// TestBackfillCreateEvents_SkipsArchivedAndTrashed pins the federation
+// safety guardrail: a trace currently archived or trashed must NOT be
+// backfilled with a create-only event, because peers would materialise
+// it as active and the federation state would diverge. Instead it has
+// to surface in SkippedIDs so the operator can act on it.
+func TestBackfillCreateEvents_SkipsArchivedAndTrashed(t *testing.T) {
+	cx := setup(t)
+
+	// Build three sync-introduced traces (no events), then archive one
+	// and trash another. The third remains active and is the only one
+	// the backfill should touch.
+	active := trace.New("Active trace", "note", "", nil, "active body")
+	archived := trace.New("Archived trace", "note", "", nil, "archived body")
+	trashed := trace.New("Trashed trace", "note", "", nil, "trashed body")
+	for _, tr := range []*trace.Trace{active, archived, trashed} {
+		if err := tr.Write(cx.TraceFile(tr.ID, false)); err != nil {
+			t.Fatalf("Write %s: %v", tr.ID, err)
+		}
+	}
+	if _, err := cx.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	// Move the second trace to archive on disk and re-sync so the DB
+	// reflects archived_at without emitting events.
+	if err := os.Rename(cx.TraceFile(archived.ID, false), cx.TraceFile(archived.ID, true)); err != nil {
+		t.Fatalf("rename to archive: %v", err)
+	}
+	// Move the third trace to trash on disk so the DB picks up trashed_at.
+	if err := os.Rename(cx.TraceFile(trashed.ID, false), cx.TrashFile(trashed.ID)); err != nil {
+		t.Fatalf("rename to trash: %v", err)
+	}
+	if _, err := cx.Sync(); err != nil {
+		t.Fatalf("Sync after moves: %v", err)
+	}
+
+	result, err := cx.BackfillCreateEvents(false)
+	if err != nil {
+		t.Fatalf("BackfillCreateEvents: %v", err)
+	}
+	if len(result.BackfilledIDs) != 1 || result.BackfilledIDs[0] != active.ID {
+		t.Errorf("BackfilledIDs = %v, want [%s]", result.BackfilledIDs, active.ID)
+	}
+	if len(result.SkippedIDs) != 2 {
+		t.Errorf("SkippedIDs = %v, want 2 entries (archived + trashed)", result.SkippedIDs)
+	}
+	skippedSet := map[string]bool{}
+	for _, id := range result.SkippedIDs {
+		skippedSet[id] = true
+	}
+	if !skippedSet[archived.ID] {
+		t.Errorf("archived trace %s missing from SkippedIDs", archived.ID)
+	}
+	if !skippedSet[trashed.ID] {
+		t.Errorf("trashed trace %s missing from SkippedIDs", trashed.ID)
+	}
+
+	// And no event was written for the skipped traces.
+	for _, skipped := range []string{archived.ID, trashed.ID} {
+		events, _ := cx.Events(skipped)
+		if len(events) != 0 {
+			t.Errorf("skipped trace %s got %d events, want 0", skipped, len(events))
+		}
+	}
+}
+
+// TestBackfillCreateEvents_NormalTracesUntouched pins that traces created
+// the normal way (via cx.Add, which already emitted a create event) are
+// not double-counted. This is the common case — backfill should be
+// invisible on a healthy cortex.
+func TestBackfillCreateEvents_NormalTracesUntouched(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Normal trace", "note", "", nil, "body")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	result, err := cx.BackfillCreateEvents(false)
+	if err != nil {
+		t.Fatalf("BackfillCreateEvents: %v", err)
+	}
+	if len(result.BackfilledIDs) != 0 {
+		t.Errorf("BackfilledIDs = %v, want empty (Add already emitted a create)", result.BackfilledIDs)
+	}
+	if len(result.SkippedIDs) != 0 {
+		t.Errorf("SkippedIDs = %v, want empty", result.SkippedIDs)
+	}
+
+	// Still exactly one create event — not duplicated.
+	events, _ := cx.Events(tr.ID)
+	if len(events) != 1 {
+		t.Errorf("event count = %d, want 1", len(events))
+	}
+}
+
 // ---- Replay ----
 
 func TestReplayEvent_Create(t *testing.T) {

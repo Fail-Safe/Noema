@@ -2028,6 +2028,129 @@ func (c *Cortex) GetClock() (federation.VClock, error) {
 	return federation.NewState(c.DB.DB).GetClock()
 }
 
+// BackfillResult summarises a `noema events backfill` operation. The slices
+// hold trace IDs (not row counts) so the caller can render them line-by-line
+// for the operator's audit trail.
+type BackfillResult struct {
+	BackfilledIDs []string // active traces that received a synthetic create event
+	SkippedIDs    []string // traces with no create event but currently archived/trashed
+}
+
+// BackfillCreateEvents emits synthetic `create` events for any active trace
+// that lacks one in the event log. This folds traces that pre-date the event
+// log — or that landed via `noema sync`, which intentionally emits no events
+// because it is reconciliation, not a semantic mutation — back into the
+// federated history so peers can replay them.
+//
+// Each backfilled event uses a fresh ULID, the local cortex_id and origin,
+// the current wall-clock time as the event timestamp, and a JSON snapshot of
+// the trace's current frontmatter + body. The trace's own `created` field
+// (in the markdown frontmatter and the DB row) is left untouched, so the
+// audit trail still surfaces "this happened on <real date>" — the event
+// timestamp only records when the backfill ran. Using wall-clock time keeps
+// per-cortex ULID monotonicity and avoids the event log lying about when
+// the event was actually appended.
+//
+// Archived and trashed traces are skipped: emitting only a `create` event
+// for them would leave federation diverged (peers would materialise the
+// trace as active and never see the archive/trash). Recover or unarchive
+// the trace first if it needs to federate.
+//
+// If dryRun is true, no events are written and the vector clock is not
+// touched, but the returned result still lists every trace that would have
+// been backfilled or skipped — so operators can preview before committing.
+//
+// The iteration is idempotent: traces that already have a create event in
+// the log (whether locally emitted or replayed from a peer) are not in the
+// candidate set, so running this twice is a no-op on the second pass.
+func (c *Cortex) BackfillCreateEvents(dryRun bool) (BackfillResult, error) {
+	var result BackfillResult
+
+	// Candidate set: every trace whose ID is missing from the create-event
+	// table. We deliberately do *not* filter on archived_at / trashed_at in
+	// SQL — we want to surface those skipped IDs to the operator instead of
+	// silently dropping them, so the filter happens in Go below.
+	rows, err := c.DB.Query(`
+		SELECT id, archived_at, trashed_at FROM traces
+		WHERE id NOT IN (SELECT trace_id FROM events WHERE action = 'create')
+		ORDER BY created_at, id
+	`)
+	if err != nil {
+		return result, fmt.Errorf("scanning candidate traces: %w", err)
+	}
+	type candidate struct {
+		id       string
+		archived bool
+		trashed  bool
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var id string
+		var archivedAt, trashedAt *string
+		if err := rows.Scan(&id, &archivedAt, &trashedAt); err != nil {
+			rows.Close()
+			return result, err
+		}
+		candidates = append(candidates, candidate{
+			id:       id,
+			archived: archivedAt != nil,
+			trashed:  trashedAt != nil,
+		})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return result, err
+	}
+
+	for _, cand := range candidates {
+		if cand.archived || cand.trashed {
+			result.SkippedIDs = append(result.SkippedIDs, cand.id)
+			continue
+		}
+		if dryRun {
+			result.BackfilledIDs = append(result.BackfilledIDs, cand.id)
+			continue
+		}
+		if err := c.backfillCreateEvent(cand.id); err != nil {
+			return result, fmt.Errorf("backfilling %s: %w", cand.id, err)
+		}
+		result.BackfilledIDs = append(result.BackfilledIDs, cand.id)
+	}
+
+	return result, nil
+}
+
+// backfillCreateEvent loads the active trace's markdown file and emits a
+// single `create` event in its own transaction. We open one transaction per
+// trace rather than batching the entire backfill: a multi-hundred-trace
+// backfill in one tx would hold a write lock long enough to stall any
+// concurrent serve process, and a partial failure mid-batch is fine here
+// because the iteration query is idempotent — re-running picks up exactly
+// what wasn't yet committed.
+func (c *Cortex) backfillCreateEvent(traceID string) error {
+	path := c.TraceFile(traceID, false)
+	t, err := trace.ParseFile(path)
+	if err != nil {
+		return fmt.Errorf("loading trace file %s: %w", path, err)
+	}
+
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Use wall-clock time as the event timestamp so per-cortex ULID
+	// monotonicity holds and the event log doesn't claim a backfilled
+	// row was appended years ago. The trace's own `created` field
+	// preserves the original chronology.
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := c.emitEvent(tx, event.ActionCreate, traceID, now, marshalTraceData(t)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // marshalTraceData builds a JSON snapshot of a trace for event payloads.
 func marshalTraceData(t *trace.Trace) json.RawMessage {
 	payload := struct {
