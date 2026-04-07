@@ -41,6 +41,8 @@ func completionPrintCmd(shell string) *cobra.Command {
 	}
 }
 
+var quietInstall bool
+
 func completionInstallCmd() *cobra.Command {
 	var shellFlag string
 	cmd := &cobra.Command{
@@ -58,6 +60,7 @@ func completionInstallCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&shellFlag, "shell", "", "shell to install for (bash, zsh, fish); detected from $SHELL if omitted")
+	cmd.Flags().BoolVarP(&quietInstall, "quiet", "q", false, "suppress output (useful in .bashrc/.zshrc)")
 	return cmd
 }
 
@@ -101,9 +104,11 @@ func installBash() error {
 	if err := rootCmd.GenBashCompletionV2(f, true); err != nil {
 		return err
 	}
-	fmt.Printf("Installed to %s\n\n", path)
-	fmt.Println("Add to ~/.bashrc if not already sourced:")
-	fmt.Printf("  [[ -f %s ]] && source %s\n", path, path)
+	if !quietInstall {
+		fmt.Printf("Installed to %s\n\n", path)
+		fmt.Println("Add to ~/.bashrc if not already sourced:")
+		fmt.Printf("  [[ -f %s ]] && source %s\n", path, path)
+	}
 	return nil
 }
 
@@ -125,10 +130,12 @@ func installZsh() error {
 	if err := rootCmd.GenZshCompletion(f); err != nil {
 		return err
 	}
-	fmt.Printf("Installed to %s\n\n", path)
-	fmt.Println("Add to ~/.zshrc if not already present:")
-	fmt.Println("  fpath+=(~/.zfunc)")
-	fmt.Println("  autoload -Uz compinit && compinit")
+	if !quietInstall {
+		fmt.Printf("Installed to %s\n\n", path)
+		fmt.Println("Add to ~/.zshrc if not already present:")
+		fmt.Println("  fpath+=(~/.zfunc)")
+		fmt.Println("  autoload -Uz compinit && compinit")
+	}
 	return nil
 }
 
@@ -150,7 +157,9 @@ func installFish() error {
 	if err := rootCmd.GenFishCompletion(f, true); err != nil {
 		return err
 	}
-	fmt.Printf("Installed to %s\n", path)
-	fmt.Println("Completions will be active in new fish sessions.")
+	if !quietInstall {
+		fmt.Printf("Installed to %s\n", path)
+		fmt.Println("Completions will be active in new fish sessions.")
+	}
 	return nil
 }

@@ -25,6 +25,7 @@ A Trace has a **type** that describes its intent:
 | `intent` | Something that needs to happen |
 | `observation` | Something witnessed but not yet verified |
 | `note` | Anything else |
+| `divergence` | A concurrent edit conflict, auto-created by federation sync |
 
 ---
 
@@ -88,9 +89,19 @@ noema search <query> [flags]              Full-text search (FTS5)
 
 noema archive <id>                        Archive a Trace
 noema unarchive <id>                      Restore an archived Trace
-noema sync                                Re-index trace files into the database
+noema sync [--recover]                    Re-index trace files; --recover rebuilds missing files from the event log
+noema events [trace-id] [--since] [--limit]
+                                          Show the event log (audit trail) for a trace, or recent events across all traces
+noema resolve <divergence-id> --accept <origin> | --custom <body>
+                                          Resolve a divergence (concurrent edit conflict)
 
-noema serve [--transport stdio|sse]       Start the MCP server
+noema federation status                   Show federation config, peer sync state, and vector clock
+noema federation peers                    List configured federation peers
+noema federation add-peer <name> <endpoint>
+                                          Add a federation peer to cortex.md
+
+noema serve [--transport stdio|sse] [--host <addr>] [--tls-cert <file> --tls-key <file>]
+                                          Start the MCP server (SSE requires --host)
 noema serve --print-config                Print a ready-to-use .mcp.json snippet and exit
 noema tui                                 Open the interactive TUI
 noema completion [bash|zsh|fish|install]  Generate shell completions
@@ -120,7 +131,24 @@ noema completion [bash|zsh|fish|install]  Generate shell completions
 
 Noema can run as an [MCP](https://modelcontextprotocol.io) server, giving any MCP-compatible AI tool direct access to your Cortex.
 
-**Tools exposed:** `get_instructions`, `list_traces`, `get_trace`, `create_trace`, `update_trace`, `delete_trace`, `recover_trace`, `search_traces`, `archive_trace`, `unarchive_trace`
+**Tools exposed:**
+
+| Tool | Purpose |
+|---|---|
+| `get_instructions` | Live reference guide for this Cortex (call first in any new session) |
+| `list_traces` | List traces, filterable by `type`, `author`, `tag`, `origin`, `archived`, `all` |
+| `get_trace` | Fetch a trace's full body, origin, and lineage |
+| `create_trace` | Create a new trace (supports `derived_from`, `origin`) |
+| `update_trace` | Update any subset of fields on an existing trace |
+| `search_traces` | FTS5 full-text search |
+| `archive_trace` / `unarchive_trace` | Archive a trace or restore it |
+| `delete_trace` / `recover_trace` | Soft-delete (move to trash) or restore from trash |
+| `trace_history` | Event log (audit trail) for a trace |
+| `trace_lineage` | Derivation graph: `derived_from` + `derived_by` |
+| `resolve_divergence` | Resolve a concurrent edit conflict by accepting an origin or supplying a merged body |
+| `sync_events` | Pull events for federation sync (called by remote peers) |
+| `federation_status` | Federation config, peer sync state, vector clock, unresolved divergences |
+| `announce_peer` | Accept a peer announcement for mutual discovery |
 
 `delete_trace` moves a trace to trash (soft-delete, recoverable). Use `recover_trace` to restore it.
 
@@ -146,12 +174,89 @@ noema serve --print-config
 
 The `--cortex` flag, `NOEMA_CORTEX` env, and config default are all respected, so `--print-config` always reflects the cortex you would actually use.
 
-### SSE (HTTP clients, GitHub Copilot)
+### SSE (HTTP clients, GitHub Copilot, federation peers)
 
 ```bash
-noema serve --transport sse --port 3000
-# Endpoint: http://localhost:3000/sse
+# Local-only listener
+noema serve --transport sse --host 127.0.0.1 --port 3000
+
+# LAN-reachable listener (for federation peers)
+noema serve --transport sse --host 10.0.0.5 --port 3000
+
+# HTTPS
+noema serve --transport sse --host 10.0.0.5 --port 3000 \
+            --tls-cert /path/server.crt --tls-key /path/server.key
 ```
+
+`--host` is **required** in SSE mode and must be an explicit address — `0.0.0.0`/`::` are rejected to avoid accidentally exposing a Cortex on every interface. Pair `--tls-cert` with `--tls-key` to serve over HTTPS.
+
+---
+
+## Federation
+
+A Cortex can sync with peer Cortexes over SSE: every mutation is recorded in an immutable event log, peers pull each other's events, and concurrent edits surface as **divergence traces** instead of silently overwriting. Federation is fully opt-in — a Cortex with no `federation` block in `cortex.md` runs exactly as before.
+
+### Configure peers in `cortex.md`
+
+```yaml
+name: alpha
+purpose: Primary research cortex
+owner: mark
+created: 2026-03-29
+version: 1
+federation:
+  interval: 30s
+  peers:
+    - name: beta
+      endpoint: http://192.168.1.10:3000
+    - name: gamma
+      endpoint: https://192.168.1.11:3000
+      ca: /etc/noema/beta-ca.pem    # optional, for self-signed TLS
+```
+
+Or add a peer from the CLI:
+
+```bash
+noema federation add-peer beta http://192.168.1.10:3000
+```
+
+### How sync works
+
+When `noema serve --transport sse` starts and `cortex.md` has peers, a background syncer polls each peer's `sync_events` MCP tool on the configured `interval` (default 30s). New events are replayed locally — files are written, the DB is updated, and the event is stored in the local log with its original ID and origin (no event amplification).
+
+Every event carries a **vector clock** snapshot. Each Cortex tracks one counter per peer it has heard from; on every local mutation it bumps its own counter, and on every replayed remote event it merges the remote clock into its own.
+
+### Divergence traces
+
+When two peers update the same trace concurrently (their vector clocks neither dominate nor are dominated), neither edit overwrites the other. Instead, Noema creates a **divergence trace** with `type: divergence`, tags `[divergence, needs-resolution]`, and `derived_from: [<original-id>]`. Its body lists every conflicting version under `### Version from <origin>` headers, deterministically rendered (origins sorted by name) so every replica produces identical content.
+
+Find unresolved divergences:
+
+```bash
+noema list --type divergence
+noema federation status     # also shows the count
+```
+
+Resolve a divergence by picking a side or supplying a custom merge:
+
+```bash
+noema resolve <divergence-id> --accept beta
+noema resolve <divergence-id> --custom "merged body content"
+```
+
+Either form updates the original trace, federates the resolution, and trashes the divergence trace. The MCP equivalent is the `resolve_divergence` tool.
+
+### Audit trail and recovery
+
+Every create / update / archive / unarchive / trash / recover / purge is recorded as an event with a ULID, timestamp, origin, and JSON snapshot. Inspect from the CLI:
+
+```bash
+noema events 20260329-why-we-chose-go     # full history for one trace
+noema events --limit 50                   # recent events across all traces
+noema events --since 01JQXYZ...           # cursor-based pagination
+```
+
+If a trace file is lost from disk but its event log survives, `noema sync --recover` rebuilds the file from the most recent `create`/`update` event snapshot.
 
 ---
 
@@ -166,6 +271,8 @@ title: Why we chose Go
 type: decision
 author: research-agent-1
 tags: [go, architecture]
+derived_from: [20260328-language-candidates]
+origin: research-cortex
 created: 2026-03-29T14:23:00Z
 updated: 2026-03-29T14:23:00Z
 ---
@@ -173,6 +280,8 @@ updated: 2026-03-29T14:23:00Z
 Go gives us pure-Go SQLite (no CGo), best-in-class TUI tooling, and fast
 iteration. We can revisit Rust if the MCP server demands higher concurrency.
 ```
+
+`derived_from` records which traces informed this one (used by `trace_lineage` to build a knowledge graph). `origin` is the name of the Cortex that created the trace — set automatically and used by federation to attribute remote traces. Both fields are optional; existing traces without them parse unchanged.
 
 **Cortex layout on disk:**
 

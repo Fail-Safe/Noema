@@ -21,11 +21,13 @@ const (
 	TypeIntent      Type = "intent"
 	TypeObservation Type = "observation"
 	TypeNote        Type = "note"
+	TypeDivergence  Type = "divergence"
 )
 
 var ValidTypes = []Type{
 	TypeFact, TypeDecision, TypePreference, TypeContext,
 	TypeSkill, TypeIntent, TypeObservation, TypeNote,
+	TypeDivergence,
 }
 
 func IsValidType(t string) bool {
@@ -38,13 +40,15 @@ func IsValidType(t string) bool {
 }
 
 type Frontmatter struct {
-	ID      string   `yaml:"id"`
-	Title   string   `yaml:"title"`
-	Type    string   `yaml:"type"`
-	Author  string   `yaml:"author,omitempty"`
-	Tags    []string `yaml:"tags,omitempty"`
-	Created string   `yaml:"created"`
-	Updated string   `yaml:"updated"`
+	ID          string   `yaml:"id"`
+	Title       string   `yaml:"title"`
+	Type        string   `yaml:"type"`
+	Author      string   `yaml:"author,omitempty"`
+	Tags        []string `yaml:"tags,omitempty"`
+	DerivedFrom []string `yaml:"derived_from,omitempty"`
+	Origin      string   `yaml:"origin,omitempty"`
+	Created     string   `yaml:"created"`
+	Updated     string   `yaml:"updated"`
 }
 
 type Trace struct {

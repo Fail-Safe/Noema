@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/Fail-Safe/Noema/internal/cortex"
+	"github.com/Fail-Safe/Noema/internal/federation"
 	"github.com/Fail-Safe/Noema/internal/trace"
 )
 
@@ -57,42 +59,76 @@ Choose the type that best reflects the intent of the memory:
   intent      — something that needs to happen (autonomous pickup)
   observation — something witnessed but not yet verified
   note        — anything else
+  divergence  — concurrent edit conflict (auto-created by federation sync)
 
 ## Trace Fields
-  id       required  YYYYMMDD-slugified-title  (e.g. 20260330-why-we-chose-go)
-  title    required  short, descriptive
-  type     required  one of the types above
-  created  required  RFC3339 UTC timestamp (set on creation, never changed)
-  updated  required  RFC3339 UTC timestamp (update on every edit)
-  author   optional  human username or agent name
-  tags     optional  list of keyword strings
+  id            required  YYYYMMDD-slugified-title  (e.g. 20260330-why-we-chose-go)
+  title         required  short, descriptive
+  type          required  one of the types above
+  created       required  RFC3339 UTC timestamp (set on creation, never changed)
+  updated       required  RFC3339 UTC timestamp (update on every edit)
+  author        optional  human username or agent name
+  tags          optional  list of keyword strings
+  derived_from  optional  list of trace IDs this trace was derived from
+  origin        optional  cortex name that created this trace (auto-set)
 
 ## Tools
 
   get_instructions               → this document
-  list_traces [type] [author] [tag] [archived] [all]
+  list_traces [type] [author] [tag] [origin] [archived] [all]
                                  → list traces; defaults to active only
-  get_trace id                   → full content including body
-  create_trace title type body [author] [tags]
-                                 → create a new trace; tags = comma-separated
-  update_trace id [title] [type] [author] [tags] [body]
+  get_trace id                   → full content including body, origin, lineage
+  create_trace title type body [author] [tags] [derived_from] [origin]
+                                 → create a new trace; tags/derived_from = comma-separated
+  update_trace id [title] [type] [author] [tags] [derived_from] [body]
                                  → update any subset of fields
   search_traces query [all]      → FTS5 full-text search
   archive_trace id               → move to archive (reversible)
   unarchive_trace id             → restore from archive
   delete_trace id                → move to trash (soft-delete, recoverable)
   recover_trace id               → restore a trashed trace to active
+  trace_history id               → event log (audit trail) for a trace
+  trace_lineage id               → derivation graph: derived_from + derived_by
+  resolve_divergence id [accept] [body]
+                                 → resolve a concurrent edit conflict by
+                                   accepting an origin's version, or by
+                                   supplying a custom merged body
+  sync_events [since] [limit]    → pull events for federation (JSON array)
+  federation_status              → federation config, peer states, vector clock
+  announce_peer name endpoint    → accept a peer announcement for discovery
 
 ## Filtering
   default              active traces only (not archived, not trashed)
   archived=true        archived traces only
   all=true             active + archived (excludes trash)
+  origin=<name>        traces from a specific cortex
   (no trashed filter via MCP — use the CLI for trash operations)
+
+## Provenance
+- origin is auto-set to the current cortex name on creation. Override it when
+  replaying events from a remote peer.
+- derived_from records which traces informed this one — use it when synthesizing
+  conclusions from multiple sources. trace_lineage shows both directions.
+- trace_history shows every mutation (create, update, archive, etc.) as an
+  immutable event log with timestamps and origin attribution.
+
+## Conflict Resolution
+- When federated peers edit the same trace concurrently, a "divergence" trace is
+  auto-created containing every conflicting version. It has type=divergence,
+  tags=[divergence, needs-resolution], and derived_from=[original-trace-id].
+- The divergence body lists "**Conflicting origins:** <names>" and one
+  "### Version from <origin>" section per version. The body is rendered
+  deterministically (sorted by origin name) so every replica sees identical content.
+- Use resolve_divergence to resolve: pass accept=<origin-name> to apply that
+  version cluster-wide, or pass body=<merged content> to apply a custom merge.
+- Use list_traces with type filter or tag=needs-resolution to find unresolved divergences.
+- federation_status shows the count of unresolved divergences.
 
 ## Tips
 - Prefer specific types over "note" — it helps retrieval and reasoning later.
 - Use tags to group related traces across types.
 - author should be your agent name so traces are attributable in multi-agent systems.
+- Use derived_from when creating traces based on other traces — it builds a knowledge graph.
 - search_traces supports FTS5 syntax: quoted phrases, AND/OR/NOT, prefix* matching.
 `, m.Name, purposeLine, ownerLine, m.Name)
 
@@ -104,6 +140,7 @@ Choose the type that best reflects the intent of the memory:
 		mcp.WithString("type", mcp.Description("Filter by trace type")),
 		mcp.WithString("author", mcp.Description("Filter by author")),
 		mcp.WithString("tag", mcp.Description("Filter by tag")),
+		mcp.WithString("origin", mcp.Description("Filter by origin cortex name")),
 		mcp.WithBoolean("archived", mcp.Description("Show only archived traces")),
 		mcp.WithBoolean("all", mcp.Description("Show active and archived traces")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -111,6 +148,7 @@ Choose the type that best reflects the intent of the memory:
 			Type:     req.GetString("type", ""),
 			Author:   req.GetString("author", ""),
 			Tag:      req.GetString("tag", ""),
+			Origin:   req.GetString("origin", ""),
 			Archived: req.GetBool("archived", false),
 			All:      req.GetBool("all", false),
 		})
@@ -136,12 +174,18 @@ Choose the type that best reflects the intent of the memory:
 		if err != nil {
 			return nil, err
 		}
-		out := fmt.Sprintf("ID: %s\nTitle: %s\nType: %s\nAuthor: %s\nTags: %s\nCreated: %s\nUpdated: %s\n\n%s",
+		out := fmt.Sprintf("ID: %s\nTitle: %s\nType: %s\nAuthor: %s\nTags: %s\nCreated: %s\nUpdated: %s",
 			row.ID, row.Title, row.Type, row.Author,
 			strings.Join(row.Tags, ", "),
 			row.CreatedAt, row.UpdatedAt,
-			t.Body,
 		)
+		if row.Origin != "" {
+			out += fmt.Sprintf("\nOrigin: %s", row.Origin)
+		}
+		if len(row.DerivedFrom) > 0 {
+			out += fmt.Sprintf("\nDerived From: %s", strings.Join(row.DerivedFrom, ", "))
+		}
+		out += fmt.Sprintf("\n\n%s", t.Body)
 		return mcp.NewToolResultText(out), nil
 	})
 
@@ -149,10 +193,12 @@ Choose the type that best reflects the intent of the memory:
 		mcp.WithDescription("Create a new trace"),
 		mcp.WithString("title", mcp.Description("Trace title"), mcp.Required()),
 		mcp.WithString("type", mcp.Description("Trace type"), mcp.Required(),
-			mcp.Enum("fact", "decision", "preference", "context", "skill", "intent", "observation", "note")),
+			mcp.Enum("fact", "decision", "preference", "context", "skill", "intent", "observation", "note", "divergence")),
 		mcp.WithString("body", mcp.Description("Trace body content"), mcp.Required()),
 		mcp.WithString("author", mcp.Description("Author name or agent identifier")),
 		mcp.WithString("tags", mcp.Description("Comma-separated tags")),
+		mcp.WithString("derived_from", mcp.Description("Comma-separated trace IDs this trace was derived from")),
+		mcp.WithString("origin", mcp.Description("Origin cortex name (defaults to current cortex)")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		title, err := req.RequireString("title")
 		if err != nil {
@@ -176,6 +222,16 @@ Choose the type that best reflects the intent of the memory:
 			}
 		}
 		t := trace.New(title, traceType, author, tags, body)
+		if raw := req.GetString("derived_from", ""); raw != "" {
+			for _, id := range strings.Split(raw, ",") {
+				if id := strings.TrimSpace(id); id != "" {
+					t.DerivedFrom = append(t.DerivedFrom, id)
+				}
+			}
+		}
+		if origin := req.GetString("origin", ""); origin != "" {
+			t.Origin = origin
+		}
 		if err := cx.Add(t); err != nil {
 			return nil, err
 		}
@@ -261,9 +317,10 @@ Choose the type that best reflects the intent of the memory:
 		mcp.WithString("id", mcp.Description("Trace ID"), mcp.Required()),
 		mcp.WithString("title", mcp.Description("New title")),
 		mcp.WithString("type", mcp.Description("New type"),
-			mcp.Enum("fact", "decision", "preference", "context", "skill", "intent", "observation", "note")),
+			mcp.Enum("fact", "decision", "preference", "context", "skill", "intent", "observation", "note", "divergence")),
 		mcp.WithString("author", mcp.Description("New author")),
 		mcp.WithString("tags", mcp.Description("New tags, comma-separated (replaces existing tags)")),
+		mcp.WithString("derived_from", mcp.Description("New derived_from, comma-separated trace IDs (replaces existing lineage)")),
 		mcp.WithString("body", mcp.Description("New body content")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id, err := req.RequireString("id")
@@ -300,6 +357,15 @@ Choose the type that best reflects the intent of the memory:
 		if v := req.GetString("body", ""); v != "" {
 			t.Body = v
 		}
+		if v := req.GetString("derived_from", ""); v != "" {
+			var sources []string
+			for _, id := range strings.Split(v, ",") {
+				if id := strings.TrimSpace(id); id != "" {
+					sources = append(sources, id)
+				}
+			}
+			t.DerivedFrom = sources
+		}
 		if err := t.Write(path); err != nil {
 			return nil, err
 		}
@@ -307,6 +373,206 @@ Choose the type that best reflects the intent of the memory:
 			return nil, err
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("Trace %s updated.", id)), nil
+	})
+
+	// ---- Event Log & Lineage tools ----
+
+	s.AddTool(mcp.NewTool("trace_history",
+		mcp.WithDescription("Show the event log (audit trail) for a trace: all mutations in chronological order."),
+		mcp.WithString("id", mcp.Description("Trace ID"), mcp.Required()),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id, err := req.RequireString("id")
+		if err != nil {
+			return nil, err
+		}
+		events, err := cx.Events(id)
+		if err != nil {
+			return nil, err
+		}
+		if len(events) == 0 {
+			return mcp.NewToolResultText("No events found for trace " + id), nil
+		}
+		var sb strings.Builder
+		for _, e := range events {
+			sb.WriteString(fmt.Sprintf("%s  %-10s  %s  origin=%s\n", e.ID, e.Action, e.Timestamp, e.Origin))
+		}
+		return mcp.NewToolResultText(sb.String()), nil
+	})
+
+	s.AddTool(mcp.NewTool("trace_lineage",
+		mcp.WithDescription("Show the derivation graph for a trace: what it was derived from and what was derived from it."),
+		mcp.WithString("id", mcp.Description("Trace ID"), mcp.Required()),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id, err := req.RequireString("id")
+		if err != nil {
+			return nil, err
+		}
+		row, err := cx.Get(id)
+		if err != nil {
+			return nil, fmt.Errorf("trace %q not found", id)
+		}
+		derivedBy, err := cx.DerivedBy(id)
+		if err != nil {
+			return nil, err
+		}
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("Trace: %s\n", id))
+		if len(row.DerivedFrom) > 0 {
+			sb.WriteString(fmt.Sprintf("Derived from: %s\n", strings.Join(row.DerivedFrom, ", ")))
+		} else {
+			sb.WriteString("Derived from: (none)\n")
+		}
+		if len(derivedBy) > 0 {
+			sb.WriteString(fmt.Sprintf("Derived by:   %s\n", strings.Join(derivedBy, ", ")))
+		} else {
+			sb.WriteString("Derived by:   (none)\n")
+		}
+		return mcp.NewToolResultText(sb.String()), nil
+	})
+
+	// ---- Conflict Resolution ----
+
+	s.AddTool(mcp.NewTool("resolve_divergence",
+		mcp.WithDescription("Resolve a divergence (concurrent edit conflict). Either accept one of the versions by origin name, or supply a custom merged body."),
+		mcp.WithString("id", mcp.Description("Divergence trace ID"), mcp.Required()),
+		mcp.WithString("accept", mcp.Description("Origin name whose version to accept. See the '**Conflicting origins:**' line in the divergence body for valid values.")),
+		mcp.WithString("body", mcp.Description("Custom merged body content. Mutually exclusive with 'accept'.")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id, err := req.RequireString("id")
+		if err != nil {
+			return nil, err
+		}
+		accept := req.GetString("accept", "")
+		body := req.GetString("body", "")
+		if err := cx.ResolveDivergence(id, accept, body); err != nil {
+			return nil, err
+		}
+		if accept != "" {
+			return mcp.NewToolResultText(fmt.Sprintf("Divergence %s resolved (accepted %s).", id, accept)), nil
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("Divergence %s resolved (custom merge).", id)), nil
+	})
+
+	// ---- Federation tools ----
+
+	s.AddTool(mcp.NewTool("sync_events",
+		mcp.WithDescription("Returns events from this cortex for federation sync. Remote peers call this to pull new events. Returns a JSON array of event objects."),
+		mcp.WithString("since", mcp.Description("ULID cursor — return only events after this ID")),
+		mcp.WithNumber("limit", mcp.Description("Max events to return (default 100, max 1000)")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		since := req.GetString("since", "")
+		limit := req.GetInt("limit", 100)
+		if limit <= 0 || limit > 1000 {
+			limit = 100
+		}
+		events, err := cx.EventsSince(since, limit)
+		if err != nil {
+			return nil, err
+		}
+		data, err := json.Marshal(events)
+		if err != nil {
+			return nil, fmt.Errorf("marshaling events: %w", err)
+		}
+		return mcp.NewToolResultText(string(data)), nil
+	})
+
+	s.AddTool(mcp.NewTool("federation_status",
+		mcp.WithDescription("Show federation configuration, peer sync state, and local vector clock."),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		m, err := cortex.ReadManifest(cx.Dir)
+		if err != nil {
+			m = cortex.Manifest{Name: cx.Name}
+		}
+
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("Cortex: %s\n\n", m.Name))
+
+		if m.Federation == nil || len(m.Federation.Peers) == 0 {
+			sb.WriteString("Federation: not configured (no peers in cortex.md)\n")
+		} else {
+			sb.WriteString(fmt.Sprintf("Peers: %d\n", len(m.Federation.Peers)))
+			if m.Federation.Interval != "" {
+				sb.WriteString(fmt.Sprintf("Interval: %s\n", m.Federation.Interval))
+			}
+			sb.WriteByte('\n')
+
+			state := federation.NewState(cx.DB.DB)
+			for _, p := range m.Federation.Peers {
+				ps, err := state.GetPeerState(p.Name, p.Endpoint)
+				if err != nil {
+					sb.WriteString(fmt.Sprintf("  %s (%s): error loading state\n", p.Name, p.Endpoint))
+					continue
+				}
+				lastSeen := "(never)"
+				if ps.LastSeen != "" {
+					lastSeen = ps.LastSeen
+				}
+				lastEvent := "(none)"
+				if ps.LastEvent != "" {
+					lastEvent = ps.LastEvent
+				}
+				sb.WriteString(fmt.Sprintf("  %s\n    endpoint:   %s\n    last_seen:  %s\n    last_event: %s\n",
+					p.Name, p.Endpoint, lastSeen, lastEvent))
+			}
+		}
+
+		// Show local vector clock.
+		vc, err := cx.GetClock()
+		if err == nil && len(vc) > 0 {
+			sb.WriteString("\nVector Clock:\n")
+			for peer, tick := range vc {
+				sb.WriteString(fmt.Sprintf("  %s: %d\n", peer, tick))
+			}
+		}
+
+		// Show unresolved divergences.
+		if n, err := cx.DivergenceCount(); err == nil && n > 0 {
+			sb.WriteString(fmt.Sprintf("\nUnresolved Divergences: %d\n", n))
+			sb.WriteString("  Use resolve_divergence or `noema resolve` to resolve them.\n")
+		}
+
+		return mcp.NewToolResultText(sb.String()), nil
+	})
+
+	s.AddTool(mcp.NewTool("announce_peer",
+		mcp.WithDescription("Accept a peer announcement from a remote cortex. Returns this cortex's identity for mutual discovery."),
+		mcp.WithString("name", mcp.Description("Name of the announcing cortex"), mcp.Required()),
+		mcp.WithString("endpoint", mcp.Description("SSE endpoint URL of the announcing cortex"), mcp.Required()),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		name, err := req.RequireString("name")
+		if err != nil {
+			return nil, err
+		}
+		endpoint, err := req.RequireString("endpoint")
+		if err != nil {
+			return nil, err
+		}
+
+		m, err := cortex.ReadManifest(cx.Dir)
+		if err != nil {
+			m = cortex.Manifest{Name: cx.Name}
+		}
+
+		// Check if this peer is already known.
+		known := false
+		if m.Federation != nil {
+			for _, p := range m.Federation.Peers {
+				if p.Name == name {
+					known = true
+					break
+				}
+			}
+		}
+
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("Acknowledged. This cortex is %q.\n", m.Name))
+		if known {
+			sb.WriteString(fmt.Sprintf("Peer %q is already configured.\n", name))
+		} else {
+			sb.WriteString(fmt.Sprintf("Peer %q (%s) is not yet configured. Add it to cortex.md to enable sync.\n", name, endpoint))
+		}
+
+		return mcp.NewToolResultText(sb.String()), nil
 	})
 
 	return s
@@ -318,7 +584,11 @@ func formatRows(rows []cortex.Row) string {
 	}
 	var sb strings.Builder
 	for _, r := range rows {
-		sb.WriteString(fmt.Sprintf("[%s] %s (%s)", r.Type, r.ID, r.CreatedAt[:10]))
+		typeLabel := r.Type
+		if r.Type == string(trace.TypeDivergence) {
+			typeLabel = "DIVERGENCE"
+		}
+		sb.WriteString(fmt.Sprintf("[%s] %s (%s)", typeLabel, r.ID, r.CreatedAt[:10]))
 		if r.Author != "" {
 			sb.WriteString(fmt.Sprintf(" — %s", r.Author))
 		}

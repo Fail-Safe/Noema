@@ -24,7 +24,7 @@ func TestOpen_CreatesSchema(t *testing.T) {
 	}
 
 	// Core tables must exist.
-	for _, table := range []string{"traces", "trace_tags"} {
+	for _, table := range []string{"traces", "trace_tags", "events", "trace_lineage", "federation_state"} {
 		var name string
 		if err := conn.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&name); err != nil {
 			t.Errorf("table %q not found: %v", table, err)

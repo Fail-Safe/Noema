@@ -2,25 +2,44 @@ package cortex
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 
 	"github.com/Fail-Safe/Noema/internal/config"
 	"github.com/Fail-Safe/Noema/internal/db"
+	"github.com/Fail-Safe/Noema/internal/event"
+	"github.com/Fail-Safe/Noema/internal/federation"
 	"github.com/Fail-Safe/Noema/internal/trace"
 )
 
 // Manifest is the cortex.md file at the root of each Cortex.
 type Manifest struct {
-	Name    string `yaml:"name"`
-	Purpose string `yaml:"purpose,omitempty"`
-	Owner   string `yaml:"owner,omitempty"`
-	Created string `yaml:"created"`
-	Version int    `yaml:"version"`
+	Name       string            `yaml:"name"`
+	Purpose    string            `yaml:"purpose,omitempty"`
+	Owner      string            `yaml:"owner,omitempty"`
+	Created    string            `yaml:"created"`
+	Version    int               `yaml:"version"`
+	Federation *FederationConfig `yaml:"federation,omitempty"`
+}
+
+// FederationConfig holds peer declarations for cortex.md.
+type FederationConfig struct {
+	Peers    []PeerEntry `yaml:"peers,omitempty"`
+	Interval string      `yaml:"interval,omitempty"` // e.g. "30s", "1m"
+}
+
+// PeerEntry is a peer declared in cortex.md.
+type PeerEntry struct {
+	Name     string `yaml:"name"`
+	Endpoint string `yaml:"endpoint"`
+	CA       string `yaml:"ca,omitempty"` // path to CA cert for TLS verification
 }
 
 type Cortex struct {
@@ -74,6 +93,15 @@ func ReadManifest(dir string) (Manifest, error) {
 		return Manifest{}, fmt.Errorf("parsing cortex.md: %w", err)
 	}
 	return m, nil
+}
+
+// WriteManifest writes the manifest back to cortex.md in the given directory.
+func WriteManifest(dir string, m Manifest) error {
+	data, err := yaml.Marshal(m)
+	if err != nil {
+		return fmt.Errorf("marshaling cortex.md: %w", err)
+	}
+	return os.WriteFile(filepath.Join(dir, "cortex.md"), data, 0o640)
 }
 
 // agentMDContent returns the generated AGENT.md content for the given manifest.
@@ -131,6 +159,8 @@ title: Why we chose Go
 type: decision
 author: research-agent-1
 tags: [go, language, architecture]
+derived_from: [20260328-language-candidates]
+origin: research-cortex
 created: 2026-03-29T14:23:00Z
 updated: 2026-03-29T14:23:00Z
 ---
@@ -149,6 +179,8 @@ Body content here. Plain markdown, any length.
 | ` + "`updated`" + ` | yes | RFC3339 UTC timestamp — update on every edit |
 | ` + "`author`" + ` | no | Human username or agent name |
 | ` + "`tags`" + ` | no | YAML list of strings |
+| ` + "`derived_from`" + ` | no | YAML list of trace IDs this was derived from |
+| ` + "`origin`" + ` | no | Cortex name that created this trace |
 
 ## Trace Types
 
@@ -203,15 +235,40 @@ they keep the database in sync automatically:
 
 | Tool | Purpose |
 |---|---|
-| ` + "`list_traces`" + ` | List traces with optional type/author/tag filters |
+| ` + "`list_traces`" + ` | List traces with optional type/author/tag/origin filters |
 | ` + "`get_trace`" + ` | Fetch full content of a trace by ID |
-| ` + "`create_trace`" + ` | Create a new trace |
+| ` + "`create_trace`" + ` | Create a new trace (supports derived_from, origin) |
 | ` + "`update_trace`" + ` | Update fields of an existing trace |
 | ` + "`search_traces`" + ` | Full-text search across titles and bodies |
 | ` + "`archive_trace`" + ` | Archive a trace |
 | ` + "`unarchive_trace`" + ` | Restore an archived trace |
 | ` + "`delete_trace`" + ` | Move a trace to trash (soft-delete, recoverable) |
 | ` + "`recover_trace`" + ` | Restore a trashed trace to active |
+| ` + "`trace_history`" + ` | Show the event log (audit trail) for a trace |
+| ` + "`trace_lineage`" + ` | Show what a trace was derived from and what derives from it |
+| ` + "`sync_events`" + ` | Pull events for federation sync (used by remote peers) |
+| ` + "`federation_status`" + ` | Show federation config, peer states, and vector clock |
+| ` + "`announce_peer`" + ` | Accept a peer announcement for mutual discovery |
+| ` + "`resolve_divergence`" + ` | Resolve a concurrent edit conflict (divergence) |
+
+## Conflict Resolution
+
+When two federated cortexes update the same trace concurrently, neither edit
+overwrites the other. Instead, a **divergence trace** is auto-created with
+` + "`type=divergence`" + ` and ` + "`tags=[divergence, needs-resolution]`" + `. Its body lists every
+conflicting version under ` + "`### Version from <origin>`" + ` headers and a top-line
+` + "`**Conflicting origins:** <names>`" + ` summary. The body is rendered deterministically
+(origins sorted by name) so every replica sees identical content.
+
+To resolve, run one of:
+
+` + "```" + `
+noema resolve <divergence-id> --accept <origin-name>   # apply that origin's version
+noema resolve <divergence-id> --custom "<merged body>" # apply a custom merge
+` + "```" + `
+
+Either choice updates the original trace, federates the resolution, and trashes
+the divergence trace. The MCP equivalent is the ` + "`resolve_divergence`" + ` tool.
 `
 }
 
@@ -287,6 +344,9 @@ func (c *Cortex) filePath(r *Row) string {
 
 // Add writes a new Trace to disk and inserts it into the DB.
 func (c *Cortex) Add(t *trace.Trace) error {
+	if t.Origin == "" {
+		t.Origin = c.Name
+	}
 	path := c.TraceFile(t.ID, false)
 	if err := t.Write(path); err != nil {
 		return fmt.Errorf("writing trace file: %w", err)
@@ -306,8 +366,8 @@ func (c *Cortex) insertDB(t *trace.Trace) error {
 	defer tx.Rollback()
 
 	_, err = tx.Exec(
-		`INSERT INTO traces (id, title, type, author, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		t.ID, t.Title, t.Type, t.Author, t.Created, t.Updated,
+		`INSERT INTO traces (id, title, type, author, origin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.Title, t.Type, t.Author, t.Origin, t.Created, t.Updated,
 	)
 	if err != nil {
 		return err
@@ -317,8 +377,16 @@ func (c *Cortex) insertDB(t *trace.Trace) error {
 			return err
 		}
 	}
+	for _, src := range t.DerivedFrom {
+		if _, err := tx.Exec(`INSERT INTO trace_lineage (trace_id, derived_from) VALUES (?, ?)`, t.ID, src); err != nil {
+			return err
+		}
+	}
 	_, err = tx.Exec(`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`, t.ID, t.Title, t.Body)
 	if err != nil {
+		return err
+	}
+	if err := c.emitEvent(tx, event.ActionCreate, t.ID, t.Created, marshalTraceData(t)); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -326,28 +394,31 @@ func (c *Cortex) insertDB(t *trace.Trace) error {
 
 // Row is a DB row joined with tags, returned by list/search operations.
 type Row struct {
-	ID         string
-	Title      string
-	Type       string
-	Author     string
-	Tags       []string
-	ArchivedAt string
-	TrashedAt  string
-	CreatedAt  string
-	UpdatedAt  string
+	ID          string
+	Title       string
+	Type        string
+	Author      string
+	Origin      string
+	Tags        []string
+	DerivedFrom []string
+	ArchivedAt  string
+	TrashedAt   string
+	CreatedAt   string
+	UpdatedAt   string
 }
 
 type ListOptions struct {
 	Type     string
 	Author   string
 	Tag      string
+	Origin   string
 	Archived bool // only archived (excludes trashed)
 	Trashed  bool // only trashed
 	All      bool // active + archived (excludes trashed)
 }
 
 func (c *Cortex) List(opts ListOptions) ([]Row, error) {
-	q := `SELECT id, title, type, author, archived_at, trashed_at, created_at, updated_at FROM traces WHERE 1=1`
+	q := `SELECT id, title, type, author, origin, archived_at, trashed_at, created_at, updated_at FROM traces WHERE 1=1`
 	var args []any
 
 	switch {
@@ -372,6 +443,10 @@ func (c *Cortex) List(opts ListOptions) ([]Row, error) {
 		q += ` AND id IN (SELECT trace_id FROM trace_tags WHERE tag = ?)`
 		args = append(args, opts.Tag)
 	}
+	if opts.Origin != "" {
+		q += ` AND origin = ?`
+		args = append(args, opts.Origin)
+	}
 	q += ` ORDER BY created_at DESC, rowid DESC`
 
 	rows, err := c.DB.Query(q, args...)
@@ -384,7 +459,7 @@ func (c *Cortex) List(opts ListOptions) ([]Row, error) {
 
 func (c *Cortex) Search(query string, opts ListOptions) ([]Row, error) {
 	q := `
-		SELECT t.id, t.title, t.type, t.author, t.archived_at, t.trashed_at, t.created_at, t.updated_at
+		SELECT t.id, t.title, t.type, t.author, t.origin, t.archived_at, t.trashed_at, t.created_at, t.updated_at
 		FROM traces t
 		WHERE t.id IN (SELECT id FROM traces_fts WHERE traces_fts MATCH ?)`
 	args := []any{query}
@@ -425,8 +500,8 @@ func (c *Cortex) Get(id string) (*Row, error) {
 	var r Row
 	var archivedAt, trashedAt *string
 	err := c.DB.QueryRow(
-		`SELECT id, title, type, author, archived_at, trashed_at, created_at, updated_at FROM traces WHERE id = ?`, id,
-	).Scan(&r.ID, &r.Title, &r.Type, &r.Author, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt)
+		`SELECT id, title, type, author, origin, archived_at, trashed_at, created_at, updated_at FROM traces WHERE id = ?`, id,
+	).Scan(&r.ID, &r.Title, &r.Type, &r.Author, &r.Origin, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -437,6 +512,10 @@ func (c *Cortex) Get(id string) (*Row, error) {
 		r.TrashedAt = *trashedAt
 	}
 	r.Tags, err = c.tagsFor(id)
+	if err != nil {
+		return nil, err
+	}
+	r.DerivedFrom, err = c.lineageFor(id)
 	if err != nil {
 		return nil, err
 	}
@@ -472,8 +551,18 @@ func (c *Cortex) Trash(id string) error {
 		return fmt.Errorf("moving file to trash: %w", err)
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
-	_, err = c.DB.Exec(`UPDATE traces SET trashed_at = ?, archived_at = NULL WHERE id = ?`, now, id)
-	return err
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE traces SET trashed_at = ?, archived_at = NULL WHERE id = ?`, now, id); err != nil {
+		return err
+	}
+	if err := c.emitEvent(tx, event.ActionTrash, id, now, nil); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Recover moves a trace out of the trash and back to the active traces directory.
@@ -490,8 +579,19 @@ func (c *Cortex) Recover(id string) error {
 	if err := os.Rename(src, dst); err != nil {
 		return fmt.Errorf("recovering file from trash: %w", err)
 	}
-	_, err = c.DB.Exec(`UPDATE traces SET trashed_at = NULL WHERE id = ?`, id)
-	return err
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE traces SET trashed_at = NULL WHERE id = ?`, id); err != nil {
+		return err
+	}
+	if err := c.emitEvent(tx, event.ActionRecover, id, now, nil); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Purge permanently deletes traces that have been in the trash for more than
@@ -518,12 +618,25 @@ func (c *Cortex) Purge(days int) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	now := time.Now().UTC().Format(time.RFC3339)
 	for _, id := range ids {
 		if err := os.Remove(c.TrashFile(id)); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("purging %s: %w", id, err)
 		}
-		if _, err := c.DB.Exec(`DELETE FROM traces WHERE id = ?`, id); err != nil {
+		tx, err := c.DB.Begin()
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM traces WHERE id = ?`, id); err != nil {
+			tx.Rollback()
 			return fmt.Errorf("purging %s from db: %w", id, err)
+		}
+		if err := c.emitEvent(tx, event.ActionPurge, id, now, nil); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -546,8 +659,18 @@ func (c *Cortex) Archive(id string) error {
 		return fmt.Errorf("moving file: %w", err)
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
-	_, err = c.DB.Exec(`UPDATE traces SET archived_at = ? WHERE id = ?`, now, id)
-	return err
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE traces SET archived_at = ? WHERE id = ?`, now, id); err != nil {
+		return err
+	}
+	if err := c.emitEvent(tx, event.ActionArchive, id, now, nil); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (c *Cortex) Unarchive(id string) error {
@@ -563,8 +686,19 @@ func (c *Cortex) Unarchive(id string) error {
 	if err := os.Rename(src, dst); err != nil {
 		return fmt.Errorf("moving file: %w", err)
 	}
-	_, err = c.DB.Exec(`UPDATE traces SET archived_at = NULL WHERE id = ?`, id)
-	return err
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE traces SET archived_at = NULL WHERE id = ?`, id); err != nil {
+		return err
+	}
+	if err := c.emitEvent(tx, event.ActionUnarchive, id, now, nil); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Update rewrites an existing trace's DB row and FTS entry from its (potentially
@@ -574,10 +708,20 @@ func (c *Cortex) Update(id string) error {
 	if err != nil {
 		return err
 	}
-	t, err := trace.ParseFile(c.filePath(r))
+	path := c.filePath(r)
+	t, err := trace.ParseFile(path)
 	if err != nil {
 		return err
 	}
+
+	// Stamp the update time authoritatively rather than trusting whatever the
+	// editor left in the frontmatter — and write it back to the file so disk,
+	// DB, and emitted event all agree.
+	t.Updated = time.Now().UTC().Format(time.RFC3339)
+	if err := t.Write(path); err != nil {
+		return fmt.Errorf("rewriting trace file with updated timestamp: %w", err)
+	}
+
 	tx, err := c.DB.Begin()
 	if err != nil {
 		return err
@@ -585,8 +729,8 @@ func (c *Cortex) Update(id string) error {
 	defer tx.Rollback()
 
 	_, err = tx.Exec(
-		`UPDATE traces SET title=?, type=?, author=?, updated_at=? WHERE id=?`,
-		t.Title, t.Type, t.Author, t.Updated, id,
+		`UPDATE traces SET title=?, type=?, author=?, origin=?, updated_at=? WHERE id=?`,
+		t.Title, t.Type, t.Author, t.Origin, t.Updated, id,
 	)
 	if err != nil {
 		return err
@@ -599,10 +743,21 @@ func (c *Cortex) Update(id string) error {
 			return err
 		}
 	}
+	if _, err := tx.Exec(`DELETE FROM trace_lineage WHERE trace_id = ?`, id); err != nil {
+		return err
+	}
+	for _, src := range t.DerivedFrom {
+		if _, err := tx.Exec(`INSERT INTO trace_lineage (trace_id, derived_from) VALUES (?, ?)`, id, src); err != nil {
+			return err
+		}
+	}
 	if _, err := tx.Exec(`DELETE FROM traces_fts WHERE id = ?`, id); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`, id, t.Title, t.Body); err != nil {
+		return err
+	}
+	if err := c.emitEvent(tx, event.ActionUpdate, id, t.Updated, marshalTraceData(t)); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -613,7 +768,7 @@ func (c *Cortex) scanRows(rows *sql.Rows) ([]Row, error) { //nolint:govet
 	for rows.Next() {
 		var r Row
 		var archivedAt, trashedAt *string
-		if err := rows.Scan(&r.ID, &r.Title, &r.Type, &r.Author, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.Title, &r.Type, &r.Author, &r.Origin, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if archivedAt != nil {
@@ -634,15 +789,29 @@ func (c *Cortex) scanRows(rows *sql.Rows) ([]Row, error) { //nolint:govet
 
 // SyncResult summarises what Sync found.
 type SyncResult struct {
-	Added    int // files found on disk but not in DB
-	Updated  int // files found on disk and already in DB (re-synced)
-	Orphaned int // IDs in DB with no corresponding file on disk
+	Added     int // files found on disk but not in DB
+	Updated   int // files found on disk and already in DB (re-synced)
+	Recovered int // orphaned DB rows whose files were rebuilt from the event log
+	Orphaned  int // IDs in DB with no corresponding file on disk (after recovery)
+}
+
+// SyncOptions controls optional Sync behaviors.
+type SyncOptions struct {
+	// Recover, when true, attempts to rebuild missing files for orphaned DB
+	// rows from the local event log. Off by default so manual `rm` of a trace
+	// file remains a valid way to mark it for cleanup.
+	Recover bool
 }
 
 // Sync reconciles the database with the current state of the markdown files on
 // disk. It walks traces/, archive/traces/, and trash/traces/, upserts every
 // file it finds, and reports orphaned DB rows (not deleted — just reported).
 func (c *Cortex) Sync() (SyncResult, error) {
+	return c.SyncWithOptions(SyncOptions{})
+}
+
+// SyncWithOptions is Sync with explicit options. See SyncOptions.
+func (c *Cortex) SyncWithOptions(opts SyncOptions) (SyncResult, error) {
 	type entry struct {
 		path  string
 		state string // "active" | "archived" | "trashed"
@@ -712,8 +881,8 @@ func (c *Cortex) Sync() (SyncResult, error) {
 		if dbErr != nil {
 			// Not in DB — insert.
 			_, err = tx.Exec(
-				`INSERT INTO traces (id, title, type, author, created_at, updated_at, archived_at, trashed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-				t.ID, t.Title, t.Type, t.Author, t.Created, t.Updated, archivedAt, trashedAt,
+				`INSERT INTO traces (id, title, type, author, origin, created_at, updated_at, archived_at, trashed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				t.ID, t.Title, t.Type, t.Author, t.Origin, t.Created, t.Updated, archivedAt, trashedAt,
 			)
 			if err != nil {
 				tx.Rollback()
@@ -723,8 +892,8 @@ func (c *Cortex) Sync() (SyncResult, error) {
 		} else {
 			// Already in DB — update metadata and reconcile state.
 			_, err = tx.Exec(
-				`UPDATE traces SET title=?, type=?, author=?, updated_at=?, archived_at=?, trashed_at=? WHERE id=?`,
-				t.Title, t.Type, t.Author, t.Updated, archivedAt, trashedAt, t.ID,
+				`UPDATE traces SET title=?, type=?, author=?, origin=?, updated_at=?, archived_at=?, trashed_at=? WHERE id=?`,
+				t.Title, t.Type, t.Author, t.Origin, t.Updated, archivedAt, trashedAt, t.ID,
 			)
 			if err != nil {
 				tx.Rollback()
@@ -743,6 +912,16 @@ func (c *Cortex) Sync() (SyncResult, error) {
 				return result, err
 			}
 		}
+		if _, err := tx.Exec(`DELETE FROM trace_lineage WHERE trace_id = ?`, t.ID); err != nil {
+			tx.Rollback()
+			return result, err
+		}
+		for _, src := range t.DerivedFrom {
+			if _, err := tx.Exec(`INSERT INTO trace_lineage (trace_id, derived_from) VALUES (?, ?)`, t.ID, src); err != nil {
+				tx.Rollback()
+				return result, err
+			}
+		}
 		if _, err := tx.Exec(`DELETE FROM traces_fts WHERE id = ?`, t.ID); err != nil {
 			tx.Rollback()
 			return result, err
@@ -756,22 +935,109 @@ func (c *Cortex) Sync() (SyncResult, error) {
 		}
 	}
 
-	// Count orphaned DB rows.
+	// Find orphaned DB rows and attempt to recover their files from the local
+	// event log. If a create/update event exists with a body snapshot, rewrite
+	// the file from that snapshot. Anything that can't be recovered is counted
+	// as still orphaned.
 	rows, err := c.DB.Query(`SELECT id FROM traces`)
 	if err != nil {
 		return result, err
 	}
-	defer rows.Close()
+	var orphanIDs []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
+			rows.Close()
 			return result, err
 		}
 		if !seenIDs[id] {
+			orphanIDs = append(orphanIDs, id)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return result, err
+	}
+
+	for _, id := range orphanIDs {
+		if !opts.Recover {
+			result.Orphaned++
+			continue
+		}
+		recovered, err := c.recoverOrphanFromEventLog(id)
+		if err != nil {
+			return result, fmt.Errorf("recovering %s: %w", id, err)
+		}
+		if recovered {
+			result.Recovered++
+		} else {
 			result.Orphaned++
 		}
 	}
-	return result, rows.Err()
+	return result, nil
+}
+
+// recoverOrphanFromEventLog rebuilds a missing trace file from the most recent
+// create or update event in the local event log. Returns true if the file was
+// rebuilt, false if no usable snapshot exists.
+func (c *Cortex) recoverOrphanFromEventLog(id string) (bool, error) {
+	events, err := event.ForTrace(c.DB.DB, id)
+	if err != nil {
+		return false, err
+	}
+	last := lastMutationEvent(events)
+	if last == nil {
+		return false, nil
+	}
+
+	var data struct {
+		Title       string   `json:"title"`
+		Type        string   `json:"type"`
+		Author      string   `json:"author"`
+		Tags        []string `json:"tags"`
+		DerivedFrom []string `json:"derived_from"`
+		Origin      string   `json:"origin"`
+		Body        string   `json:"body"`
+	}
+	if err := json.Unmarshal(last.Data, &data); err != nil {
+		return false, fmt.Errorf("parsing event data: %w", err)
+	}
+
+	// Look up created_at + state from the DB so the recovered file matches
+	// what the index believes about it.
+	r, err := c.Get(id)
+	if err != nil {
+		return false, err
+	}
+
+	t := &trace.Trace{
+		Frontmatter: trace.Frontmatter{
+			ID:          id,
+			Title:       data.Title,
+			Type:        data.Type,
+			Author:      data.Author,
+			Tags:        data.Tags,
+			DerivedFrom: data.DerivedFrom,
+			Origin:      data.Origin,
+			Created:     r.CreatedAt,
+			Updated:     last.Timestamp,
+		},
+		Body: data.Body,
+	}
+
+	var path string
+	switch {
+	case r.TrashedAt != "":
+		path = c.TrashFile(id)
+	case r.ArchivedAt != "":
+		path = c.TraceFile(id, true)
+	default:
+		path = c.TraceFile(id, false)
+	}
+	if err := t.Write(path); err != nil {
+		return false, fmt.Errorf("writing recovered file: %w", err)
+	}
+	return true, nil
 }
 
 func (c *Cortex) tagsFor(id string) ([]string, error) {
@@ -789,5 +1055,782 @@ func (c *Cortex) tagsFor(id string) ([]string, error) {
 		tags = append(tags, tag)
 	}
 	return tags, rows.Err()
+}
+
+func (c *Cortex) lineageFor(id string) ([]string, error) {
+	rows, err := c.DB.Query(`SELECT derived_from FROM trace_lineage WHERE trace_id = ? ORDER BY derived_from`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var sources []string
+	for rows.Next() {
+		var src string
+		if err := rows.Scan(&src); err != nil {
+			return nil, err
+		}
+		sources = append(sources, src)
+	}
+	return sources, rows.Err()
+}
+
+// DerivedBy returns all trace IDs that list the given trace as a source.
+func (c *Cortex) DerivedBy(id string) ([]string, error) {
+	rows, err := c.DB.Query(`SELECT trace_id FROM trace_lineage WHERE derived_from = ? ORDER BY trace_id`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var tid string
+		if err := rows.Scan(&tid); err != nil {
+			return nil, err
+		}
+		ids = append(ids, tid)
+	}
+	return ids, rows.Err()
+}
+
+// Events returns the event log for a specific trace, ordered chronologically.
+func (c *Cortex) Events(traceID string) ([]event.Event, error) {
+	return event.ForTrace(c.DB.DB, traceID)
+}
+
+// EventsSince returns events after the given ULID cursor, up to limit.
+func (c *Cortex) EventsSince(afterID string, limit int) ([]event.Event, error) {
+	return event.Since(c.DB.DB, afterID, limit)
+}
+
+// DivergenceCount returns the number of unresolved divergence traces.
+func (c *Cortex) DivergenceCount() (int, error) {
+	var n int
+	err := c.DB.QueryRow(
+		`SELECT COUNT(*) FROM traces WHERE type = 'divergence' AND archived_at IS NULL AND trashed_at IS NULL`,
+	).Scan(&n)
+	return n, err
+}
+
+// ResolveDivergence resolves a divergence trace by either picking one of the
+// versions stored in the divergence body (by origin name) or applying a
+// caller-supplied custom merge. Exactly one of acceptOrigin or customBody must
+// be non-empty. The divergence trace is trashed once the original is updated.
+func (c *Cortex) ResolveDivergence(divergenceID, acceptOrigin, customBody string) error {
+	if acceptOrigin == "" && customBody == "" {
+		return fmt.Errorf("resolution requires either an accept origin or a custom body")
+	}
+	if acceptOrigin != "" && customBody != "" {
+		return fmt.Errorf("specify only one of accept origin or custom body")
+	}
+
+	divRow, err := c.Get(divergenceID)
+	if err != nil {
+		return fmt.Errorf("divergence trace %q not found", divergenceID)
+	}
+	if divRow.Type != string(trace.TypeDivergence) {
+		return fmt.Errorf("trace %q is not a divergence (type=%s)", divergenceID, divRow.Type)
+	}
+	if len(divRow.DerivedFrom) == 0 {
+		return fmt.Errorf("divergence trace %q has no derived_from link to original trace", divergenceID)
+	}
+
+	originalID := divRow.DerivedFrom[0]
+	divPath := c.filePath(divRow)
+
+	if customBody != "" {
+		if err := c.applyResolutionBody(originalID, customBody); err != nil {
+			return err
+		}
+		return c.Trash(divergenceID)
+	}
+
+	origins, err := parseDivergenceOrigins(divergenceID, divPath)
+	if err != nil {
+		return err
+	}
+	if !containsString(origins, acceptOrigin) {
+		return fmt.Errorf("origin %q not found in divergence %q (available: %s)",
+			acceptOrigin, divergenceID, strings.Join(origins, ", "))
+	}
+
+	chosenBody, err := extractVersionBody(divergenceID, divPath, acceptOrigin)
+	if err != nil {
+		return err
+	}
+	if err := c.applyResolutionBody(originalID, chosenBody); err != nil {
+		return err
+	}
+	return c.Trash(divergenceID)
+}
+
+func containsString(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
+}
+
+// applyResolutionBody overwrites the original trace's body and emits an update event.
+func (c *Cortex) applyResolutionBody(originalID, newBody string) error {
+	r, err := c.Get(originalID)
+	if err != nil {
+		return fmt.Errorf("original trace %q not found", originalID)
+	}
+	path := c.filePath(r)
+	t, err := trace.ParseFile(path)
+	if err != nil {
+		return fmt.Errorf("reading original trace: %w", err)
+	}
+	t.Body = newBody
+	if err := t.Write(path); err != nil {
+		return err
+	}
+	return c.Update(originalID)
+}
+
+// extractVersionBody returns the body content of the `### Version from <origin>`
+// section in a divergence trace, stripping the `**Vector clock:**` metadata
+// line that follows the header.
+func extractVersionBody(divID, path, origin string) (string, error) {
+	t, err := trace.ParseFile(path)
+	if err != nil {
+		return "", fmt.Errorf("reading divergence trace: %w", err)
+	}
+	header := "### Version from " + origin
+	idx := strings.Index(t.Body, header)
+	if idx < 0 {
+		return "", fmt.Errorf("divergence trace %q has no '%s' section", divID, header)
+	}
+
+	// Skip past the header line.
+	rest := t.Body[idx+len(header):]
+	if nl := strings.Index(rest, "\n"); nl >= 0 {
+		rest = rest[nl+1:]
+	}
+
+	// Skip the `**Vector clock:** ...` metadata line if present.
+	if strings.HasPrefix(rest, "**Vector clock:**") {
+		if nl := strings.Index(rest, "\n"); nl >= 0 {
+			rest = rest[nl+1:]
+		}
+	}
+
+	// Truncate at the next `### Version from ` header (if any).
+	if next := strings.Index(rest, "\n### Version from "); next >= 0 {
+		rest = rest[:next]
+	}
+
+	return strings.TrimSpace(rest), nil
+}
+
+// parseDivergenceOrigins reads the `**Conflicting origins:**` line from a
+// divergence trace body and returns the parsed list of origin names.
+func parseDivergenceOrigins(divID, path string) ([]string, error) {
+	t, err := trace.ParseFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading divergence trace: %w", err)
+	}
+	const marker = "**Conflicting origins:**"
+	idx := strings.Index(t.Body, marker)
+	if idx < 0 {
+		return nil, fmt.Errorf("divergence trace %q has no '%s' line", divID, marker)
+	}
+	rest := t.Body[idx+len(marker):]
+	if nl := strings.Index(rest, "\n"); nl >= 0 {
+		rest = rest[:nl]
+	}
+	var origins []string
+	for _, o := range strings.Split(rest, ",") {
+		if name := strings.TrimSpace(o); name != "" {
+			origins = append(origins, name)
+		}
+	}
+	if len(origins) == 0 {
+		return nil, fmt.Errorf("divergence trace %q has empty origins list", divID)
+	}
+	return origins, nil
+}
+
+// emitEvent appends an event to the log inside the given transaction,
+// incrementing the local vector clock. All reads/writes go through the tx
+// to avoid SQLite lock contention.
+func (c *Cortex) emitEvent(tx *sql.Tx, action event.Action, traceID, timestamp string, data json.RawMessage) error {
+	// Read clock from federation_state within the transaction.
+	vc, err := getClockTx(tx)
+	if err != nil {
+		vc = make(federation.VClock)
+	}
+	vc.Increment(c.Name)
+
+	e := &event.Event{
+		ID:        event.NewULID(),
+		Action:    action,
+		TraceID:   traceID,
+		Origin:    c.Name,
+		Timestamp: timestamp,
+		Data:      data,
+		VClock:    vc,
+	}
+	if err := event.Append(tx, e); err != nil {
+		return err
+	}
+	// Persist updated clock within the same transaction.
+	return setClockTx(tx, vc)
+}
+
+func getClockTx(tx *sql.Tx) (federation.VClock, error) {
+	var val string
+	err := tx.QueryRow(`SELECT value FROM federation_state WHERE key = 'vclock'`).Scan(&val)
+	if err != nil {
+		return make(federation.VClock), nil // not found or error — start fresh
+	}
+	var vc federation.VClock
+	if err := json.Unmarshal([]byte(val), &vc); err != nil {
+		return make(federation.VClock), nil
+	}
+	return vc, nil
+}
+
+func setClockTx(tx *sql.Tx, vc federation.VClock) error {
+	data, err := json.Marshal(vc)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(
+		`INSERT INTO federation_state (key, value) VALUES ('vclock', ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		string(data),
+	)
+	return err
+}
+
+// ReplayEvent materializes a remote event locally without emitting a new event.
+// The remote event is stored in the local log with its original ID and origin.
+func (c *Cortex) ReplayEvent(e event.Event) error {
+	// Idempotency: skip if already in local log.
+	existing, err := event.ForTrace(c.DB.DB, e.TraceID)
+	if err != nil {
+		return err
+	}
+	for _, ex := range existing {
+		if ex.ID == e.ID {
+			return nil // already replayed
+		}
+	}
+
+	var replayErr error
+	switch e.Action {
+	case event.ActionCreate:
+		replayErr = c.replayCreate(e)
+	case event.ActionUpdate:
+		replayErr = c.replayUpdate(e)
+	case event.ActionArchive:
+		replayErr = c.replayArchive(e)
+	case event.ActionUnarchive:
+		replayErr = c.replayUnarchive(e)
+	case event.ActionTrash:
+		replayErr = c.replayTrash(e)
+	case event.ActionRecover:
+		replayErr = c.replayRecover(e)
+	case event.ActionPurge:
+		replayErr = c.replayPurge(e)
+	default:
+		return fmt.Errorf("unknown event action: %s", e.Action)
+	}
+	// In a full-mesh federation, multiple peers may serve the same event.
+	// Two sync goroutines can race past the idempotency check above and
+	// both attempt the insert. Treat UNIQUE violations as success.
+	if replayErr != nil && strings.Contains(replayErr.Error(), "UNIQUE constraint failed") {
+		return nil
+	}
+	return replayErr
+}
+
+func (c *Cortex) replayCreate(e event.Event) error {
+	var data struct {
+		Title       string   `json:"title"`
+		Type        string   `json:"type"`
+		Author      string   `json:"author"`
+		Tags        []string `json:"tags"`
+		DerivedFrom []string `json:"derived_from"`
+		Origin      string   `json:"origin"`
+		Body        string   `json:"body"`
+	}
+	if err := json.Unmarshal(e.Data, &data); err != nil {
+		return fmt.Errorf("parsing create event data: %w", err)
+	}
+
+	t := &trace.Trace{
+		Frontmatter: trace.Frontmatter{
+			ID:          e.TraceID,
+			Title:       data.Title,
+			Type:        data.Type,
+			Author:      data.Author,
+			Tags:        data.Tags,
+			DerivedFrom: data.DerivedFrom,
+			Origin:      data.Origin,
+			Created:     e.Timestamp,
+			Updated:     e.Timestamp,
+		},
+		Body: data.Body,
+	}
+
+	path := c.TraceFile(t.ID, false)
+	if err := t.Write(path); err != nil {
+		return fmt.Errorf("writing replayed trace file: %w", err)
+	}
+
+	// cleanupFile removes the trace file on error — but NOT when the error is
+	// a UNIQUE constraint violation, because in a full-mesh race the winning
+	// goroutine already owns that file.
+	cleanupFile := func(err error) {
+		if !strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			os.Remove(path)
+		}
+	}
+
+	tx, err := c.DB.Begin()
+	if err != nil {
+		os.Remove(path)
+		return err
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(
+		`INSERT INTO traces (id, title, type, author, origin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.Title, t.Type, t.Author, t.Origin, t.Created, t.Updated,
+	)
+	if err != nil {
+		cleanupFile(err)
+		return err
+	}
+	for _, tag := range t.Tags {
+		if _, err := tx.Exec(`INSERT INTO trace_tags (trace_id, tag) VALUES (?, ?)`, t.ID, tag); err != nil {
+			cleanupFile(err)
+			return err
+		}
+	}
+	for _, src := range t.DerivedFrom {
+		if _, err := tx.Exec(`INSERT INTO trace_lineage (trace_id, derived_from) VALUES (?, ?)`, t.ID, src); err != nil {
+			cleanupFile(err)
+			return err
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`, t.ID, t.Title, t.Body); err != nil {
+		cleanupFile(err)
+		return err
+	}
+	if err := event.Append(tx, &e); err != nil {
+		cleanupFile(err)
+		return err
+	}
+	return tx.Commit()
+}
+
+func (c *Cortex) replayUpdate(e event.Event) error {
+	var data struct {
+		Title       string   `json:"title"`
+		Type        string   `json:"type"`
+		Author      string   `json:"author"`
+		Tags        []string `json:"tags"`
+		DerivedFrom []string `json:"derived_from"`
+		Origin      string   `json:"origin"`
+		Body        string   `json:"body"`
+	}
+	if err := json.Unmarshal(e.Data, &data); err != nil {
+		return fmt.Errorf("parsing update event data: %w", err)
+	}
+
+	r, err := c.Get(e.TraceID)
+	if err != nil {
+		return fmt.Errorf("trace %s not found for replay update: %w", e.TraceID, err)
+	}
+
+	// Conflict detection: compare vector clocks with last local mutation.
+	if len(e.VClock) > 0 {
+		localEvents, _ := event.ForTrace(c.DB.DB, e.TraceID)
+		if lastLocal := lastMutationEvent(localEvents); lastLocal != nil && len(lastLocal.VClock) > 0 {
+			rel := federation.Compare(lastLocal.VClock, e.VClock)
+			if rel == 0 {
+				// Concurrent — neither clock dominates. Create a divergence trace.
+				return c.createDivergence(r, e, data.Body, lastLocal.VClock, e.VClock)
+			}
+		}
+	}
+
+	t := &trace.Trace{
+		Frontmatter: trace.Frontmatter{
+			ID:          e.TraceID,
+			Title:       data.Title,
+			Type:        data.Type,
+			Author:      data.Author,
+			Tags:        data.Tags,
+			DerivedFrom: data.DerivedFrom,
+			Origin:      data.Origin,
+			Created:     r.CreatedAt,
+			Updated:     e.Timestamp,
+		},
+		Body: data.Body,
+	}
+
+	path := c.filePath(r)
+	if err := t.Write(path); err != nil {
+		return err
+	}
+
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(
+		`UPDATE traces SET title=?, type=?, author=?, origin=?, updated_at=? WHERE id=?`,
+		t.Title, t.Type, t.Author, t.Origin, t.Updated, e.TraceID,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM trace_tags WHERE trace_id = ?`, e.TraceID); err != nil {
+		return err
+	}
+	for _, tag := range t.Tags {
+		if _, err := tx.Exec(`INSERT INTO trace_tags (trace_id, tag) VALUES (?, ?)`, e.TraceID, tag); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM trace_lineage WHERE trace_id = ?`, e.TraceID); err != nil {
+		return err
+	}
+	for _, src := range t.DerivedFrom {
+		if _, err := tx.Exec(`INSERT INTO trace_lineage (trace_id, derived_from) VALUES (?, ?)`, e.TraceID, src); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM traces_fts WHERE id = ?`, e.TraceID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`, e.TraceID, t.Title, t.Body); err != nil {
+		return err
+	}
+	if err := event.Append(tx, &e); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// lastMutationEvent returns the most recent create or update event from the
+// given list, which is assumed to be in chronological order.
+func lastMutationEvent(events []event.Event) *event.Event {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Action == event.ActionCreate || events[i].Action == event.ActionUpdate {
+			return &events[i]
+		}
+	}
+	return nil
+}
+
+// createDivergence builds a divergence trace that preserves both versions of
+// a trace when concurrent edits are detected. The body is rendered
+// deterministically (origins sorted alphabetically, JSON map keys sorted by
+// encoding/json) so every replica produces byte-identical content. Combined
+// with the deterministic divergence ID, this means concurrent createDivergence
+// calls across the cluster collapse into a single row via the UNIQUE
+// constraint instead of fighting over the file.
+func (c *Cortex) createDivergence(
+	localRow *Row,
+	remoteEvent event.Event,
+	remoteBody string,
+	localClock, remoteClock federation.VClock,
+) error {
+	// Read the current local body.
+	localPath := c.filePath(localRow)
+	localTrace, err := trace.ParseFile(localPath)
+	if err != nil {
+		return fmt.Errorf("reading local trace for divergence: %w", err)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	divID := trace.NewID("divergence-" + localRow.ID)
+
+	// Collect both versions and sort alphabetically by origin so the rendered
+	// body is identical regardless of which side observed the conflict first.
+	type version struct {
+		origin string
+		clock  federation.VClock
+		body   string
+	}
+	versions := []version{
+		{origin: c.Name, clock: localClock, body: localTrace.Body},
+		{origin: remoteEvent.Origin, clock: remoteClock, body: remoteBody},
+	}
+	sort.Slice(versions, func(i, j int) bool { return versions[i].origin < versions[j].origin })
+
+	origins := make([]string, len(versions))
+	for i, v := range versions {
+		origins[i] = v.origin
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "## Concurrent edits detected\n\n")
+	fmt.Fprintf(&sb, "**Trace:** %s\n", localRow.ID)
+	fmt.Fprintf(&sb, "**Conflicting origins:** %s\n", strings.Join(origins, ", "))
+	for _, v := range versions {
+		clockJSON, _ := json.Marshal(v.clock)
+		fmt.Fprintf(&sb, "\n### Version from %s\n", v.origin)
+		fmt.Fprintf(&sb, "**Vector clock:** %s\n\n", string(clockJSON))
+		sb.WriteString(v.body)
+		if !strings.HasSuffix(v.body, "\n") {
+			sb.WriteByte('\n')
+		}
+	}
+	body := strings.TrimRight(sb.String(), "\n")
+
+	divTrace := &trace.Trace{
+		Frontmatter: trace.Frontmatter{
+			ID:          divID,
+			Title:       "Divergence: " + localRow.Title,
+			Type:        string(trace.TypeDivergence),
+			Author:      "system",
+			Tags:        []string{"divergence", "needs-resolution"},
+			DerivedFrom: []string{localRow.ID},
+			Origin:      c.Name,
+			Created:     now,
+			Updated:     now,
+		},
+		Body: body,
+	}
+
+	// Write the divergence trace file.
+	divPath := c.TraceFile(divID, false)
+	if err := divTrace.Write(divPath); err != nil {
+		return fmt.Errorf("writing divergence trace: %w", err)
+	}
+
+	// Insert into DB within a transaction.
+	tx, err := c.DB.Begin()
+	if err != nil {
+		os.Remove(divPath)
+		return err
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(
+		`INSERT INTO traces (id, title, type, author, origin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		divTrace.ID, divTrace.Title, divTrace.Type, divTrace.Author, divTrace.Origin, divTrace.Created, divTrace.Updated,
+	)
+	if err != nil {
+		os.Remove(divPath)
+		return err
+	}
+	for _, tag := range divTrace.Tags {
+		if _, err := tx.Exec(`INSERT INTO trace_tags (trace_id, tag) VALUES (?, ?)`, divID, tag); err != nil {
+			os.Remove(divPath)
+			return err
+		}
+	}
+	for _, src := range divTrace.DerivedFrom {
+		if _, err := tx.Exec(`INSERT INTO trace_lineage (trace_id, derived_from) VALUES (?, ?)`, divID, src); err != nil {
+			os.Remove(divPath)
+			return err
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`, divID, divTrace.Title, body); err != nil {
+		os.Remove(divPath)
+		return err
+	}
+
+	// Emit a create event for the divergence trace.
+	if err := c.emitEvent(tx, event.ActionCreate, divID, now, marshalTraceData(divTrace)); err != nil {
+		os.Remove(divPath)
+		return err
+	}
+
+	// Also store the remote event that triggered the divergence, so we don't
+	// replay it again (idempotency).
+	if err := event.Append(tx, &remoteEvent); err != nil {
+		os.Remove(divPath)
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func (c *Cortex) replayArchive(e event.Event) error {
+	r, err := c.Get(e.TraceID)
+	if err != nil {
+		return err
+	}
+	if r.ArchivedAt != "" {
+		// Already archived — just store the event.
+		return c.storeRemoteEvent(e)
+	}
+	src := c.TraceFile(e.TraceID, false)
+	dst := c.TraceFile(e.TraceID, true)
+	if err := os.Rename(src, dst); err != nil {
+		return err
+	}
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE traces SET archived_at = ? WHERE id = ?`, e.Timestamp, e.TraceID); err != nil {
+		return err
+	}
+	if err := event.Append(tx, &e); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (c *Cortex) replayUnarchive(e event.Event) error {
+	r, err := c.Get(e.TraceID)
+	if err != nil {
+		return err
+	}
+	if r.ArchivedAt == "" {
+		return c.storeRemoteEvent(e)
+	}
+	src := c.TraceFile(e.TraceID, true)
+	dst := c.TraceFile(e.TraceID, false)
+	if err := os.Rename(src, dst); err != nil {
+		return err
+	}
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE traces SET archived_at = NULL WHERE id = ?`, e.TraceID); err != nil {
+		return err
+	}
+	if err := event.Append(tx, &e); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (c *Cortex) replayTrash(e event.Event) error {
+	r, err := c.Get(e.TraceID)
+	if err != nil {
+		return err
+	}
+	if r.TrashedAt != "" {
+		return c.storeRemoteEvent(e)
+	}
+	src := c.filePath(r)
+	dst := c.TrashFile(e.TraceID)
+	if err := os.Rename(src, dst); err != nil {
+		return err
+	}
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE traces SET trashed_at = ?, archived_at = NULL WHERE id = ?`, e.Timestamp, e.TraceID); err != nil {
+		return err
+	}
+	if err := event.Append(tx, &e); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (c *Cortex) replayRecover(e event.Event) error {
+	r, err := c.Get(e.TraceID)
+	if err != nil {
+		return err
+	}
+	if r.TrashedAt == "" {
+		return c.storeRemoteEvent(e)
+	}
+	src := c.TrashFile(e.TraceID)
+	dst := c.TraceFile(e.TraceID, false)
+	if err := os.Rename(src, dst); err != nil {
+		return err
+	}
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE traces SET trashed_at = NULL WHERE id = ?`, e.TraceID); err != nil {
+		return err
+	}
+	if err := event.Append(tx, &e); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (c *Cortex) replayPurge(e event.Event) error {
+	// Just store the event — the trace may already be gone locally.
+	_ = os.Remove(c.TrashFile(e.TraceID))
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// Best-effort delete; trace may not exist locally.
+	tx.Exec(`DELETE FROM traces WHERE id = ?`, e.TraceID)
+	if err := event.Append(tx, &e); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// storeRemoteEvent stores a remote event without any state change (trace already in expected state).
+func (c *Cortex) storeRemoteEvent(e event.Event) error {
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := event.Append(tx, &e); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// MergeClock merges a remote vector clock into the local clock.
+func (c *Cortex) MergeClock(remote federation.VClock) error {
+	state := federation.NewState(c.DB.DB)
+	local, err := state.GetClock()
+	if err != nil {
+		return err
+	}
+	merged := federation.Merge(local, remote)
+	return state.SetClock(merged)
+}
+
+// GetClock returns the current vector clock.
+func (c *Cortex) GetClock() (federation.VClock, error) {
+	return federation.NewState(c.DB.DB).GetClock()
+}
+
+// marshalTraceData builds a JSON snapshot of a trace for event payloads.
+func marshalTraceData(t *trace.Trace) json.RawMessage {
+	payload := struct {
+		Title       string   `json:"title"`
+		Type        string   `json:"type"`
+		Author      string   `json:"author,omitempty"`
+		Tags        []string `json:"tags,omitempty"`
+		DerivedFrom []string `json:"derived_from,omitempty"`
+		Origin      string   `json:"origin,omitempty"`
+		Body        string   `json:"body"`
+	}{
+		Title:       t.Title,
+		Type:        t.Type,
+		Author:      t.Author,
+		Tags:        t.Tags,
+		DerivedFrom: t.DerivedFrom,
+		Origin:      t.Origin,
+		Body:        t.Body,
+	}
+	data, _ := json.Marshal(payload)
+	return data
 }
 

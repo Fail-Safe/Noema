@@ -5,8 +5,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"encoding/json"
 
 	"github.com/Fail-Safe/Noema/internal/cortex"
+	"github.com/Fail-Safe/Noema/internal/event"
+	"github.com/Fail-Safe/Noema/internal/federation"
 	"github.com/Fail-Safe/Noema/internal/trace"
 )
 
@@ -69,6 +74,10 @@ func TestCreate_AgentMDContent(t *testing.T) {
 		"traces/",
 		"archive/",
 		"trash/",
+		"derived_from",
+		"origin",
+		"trace_history",
+		"trace_lineage",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("AGENT.md missing expected content %q", want)
@@ -591,9 +600,51 @@ func TestSync_DetectsOrphans(t *testing.T) {
 	if result.Orphaned != 1 {
 		t.Errorf("Orphaned: got %d, want 1", result.Orphaned)
 	}
+	if result.Recovered != 0 {
+		t.Errorf("Recovered: got %d, want 0 (recovery is opt-in)", result.Recovered)
+	}
 	// Sync must not delete orphaned rows — that's the user's decision.
 	if _, err := cx.Get(tr.ID); err != nil {
 		t.Error("Sync must not delete orphaned DB rows")
+	}
+}
+
+func TestSync_RecoverRebuildsFromEventLog(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Will be recovered", "note", "agent-1", []string{"x"}, "Original body.")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	path := cx.TraceFile(tr.ID, false)
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("Remove file: %v", err)
+	}
+
+	result, err := cx.SyncWithOptions(cortex.SyncOptions{Recover: true})
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if result.Recovered != 1 {
+		t.Errorf("Recovered: got %d, want 1", result.Recovered)
+	}
+	if result.Orphaned != 0 {
+		t.Errorf("Orphaned: got %d, want 0", result.Orphaned)
+	}
+
+	// File must exist and round-trip the create event's snapshot.
+	rebuilt, err := trace.ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile after recover: %v", err)
+	}
+	if rebuilt.Title != "Will be recovered" {
+		t.Errorf("Title: got %q, want %q", rebuilt.Title, "Will be recovered")
+	}
+	if rebuilt.Body != "Original body." {
+		t.Errorf("Body: got %q, want %q", rebuilt.Body, "Original body.")
+	}
+	if rebuilt.Author != "agent-1" {
+		t.Errorf("Author: got %q, want %q", rebuilt.Author, "agent-1")
 	}
 }
 
@@ -734,3 +785,667 @@ func TestUpdate(t *testing.T) {
 		t.Errorf("FTS not updated: search returned %v", results)
 	}
 }
+
+// ---- Origin ----
+
+func TestOrigin_DefaultsToCortexName(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Test origin", "fact", "", nil, "Body.")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if tr.Origin != "test" {
+		t.Errorf("Trace.Origin = %q, want %q", tr.Origin, "test")
+	}
+	row, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if row.Origin != "test" {
+		t.Errorf("Row.Origin = %q, want %q", row.Origin, "test")
+	}
+}
+
+func TestOrigin_ExplicitPreserved(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("From peer", "fact", "", nil, "Body.")
+	tr.Origin = "remote-alpha"
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	row, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if row.Origin != "remote-alpha" {
+		t.Errorf("Origin = %q, want %q", row.Origin, "remote-alpha")
+	}
+}
+
+func TestList_FilterByOrigin(t *testing.T) {
+	cx := setup(t)
+
+	t1 := trace.New("Local trace", "fact", "", nil, "Body.")
+	t2 := trace.New("Remote trace", "fact", "", nil, "Body.")
+	t2.Origin = "remote-beta"
+
+	for _, tr := range []*trace.Trace{t1, t2} {
+		if err := cx.Add(tr); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+	}
+
+	rows, err := cx.List(cortex.ListOptions{Origin: "remote-beta"})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Origin != "remote-beta" {
+		t.Errorf("origin filter: got %d rows", len(rows))
+	}
+}
+
+// ---- Lineage ----
+
+func TestDerivedFrom(t *testing.T) {
+	cx := setup(t)
+
+	t1 := trace.New("Source A", "fact", "", nil, "Source content.")
+	t2 := trace.New("Source B", "fact", "", nil, "Source content.")
+	for _, tr := range []*trace.Trace{t1, t2} {
+		if err := cx.Add(tr); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+	}
+
+	t3 := trace.New("Derived trace", "decision", "", nil, "Based on A and B.")
+	t3.DerivedFrom = []string{t1.ID, t2.ID}
+	if err := cx.Add(t3); err != nil {
+		t.Fatalf("Add derived: %v", err)
+	}
+
+	row, err := cx.Get(t3.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if len(row.DerivedFrom) != 2 {
+		t.Fatalf("DerivedFrom: got %v, want 2 entries", row.DerivedFrom)
+	}
+}
+
+func TestDerivedBy(t *testing.T) {
+	cx := setup(t)
+
+	src := trace.New("Source", "fact", "", nil, "Source.")
+	if err := cx.Add(src); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	d1 := trace.New("Derived one", "note", "", nil, "Based on source.")
+	d1.DerivedFrom = []string{src.ID}
+	d2 := trace.New("Derived two", "note", "", nil, "Also based on source.")
+	d2.DerivedFrom = []string{src.ID}
+	for _, tr := range []*trace.Trace{d1, d2} {
+		if err := cx.Add(tr); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+	}
+
+	ids, err := cx.DerivedBy(src.ID)
+	if err != nil {
+		t.Fatalf("DerivedBy: %v", err)
+	}
+	if len(ids) != 2 {
+		t.Errorf("DerivedBy: got %d, want 2", len(ids))
+	}
+}
+
+// ---- Event Log ----
+
+func TestAddEmitsCreateEvent(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Event test", "fact", "agent-1", []string{"tag1"}, "Body.")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	events, err := cx.Events(tr.ID)
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	if events[0].Action != event.ActionCreate {
+		t.Errorf("Action = %q, want %q", events[0].Action, event.ActionCreate)
+	}
+	if events[0].Origin != "test" {
+		t.Errorf("Origin = %q, want %q", events[0].Origin, "test")
+	}
+	if events[0].TraceID != tr.ID {
+		t.Errorf("TraceID = %q, want %q", events[0].TraceID, tr.ID)
+	}
+}
+
+func TestArchiveEmitsEvent(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Archive event", "note", "", nil, "Body.")
+	cx.Add(tr)
+	cx.Archive(tr.ID)
+
+	events, err := cx.Events(tr.ID)
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("got %d events, want 2 (create + archive)", len(events))
+	}
+	if events[1].Action != event.ActionArchive {
+		t.Errorf("events[1].Action = %q, want %q", events[1].Action, event.ActionArchive)
+	}
+}
+
+func TestTrashRecoverEmitsEvents(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Trash event", "note", "", nil, "Body.")
+	cx.Add(tr)
+	cx.Trash(tr.ID)
+	cx.Recover(tr.ID)
+
+	events, err := cx.Events(tr.ID)
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("got %d events, want 3 (create + trash + recover)", len(events))
+	}
+	if events[1].Action != event.ActionTrash {
+		t.Errorf("events[1].Action = %q, want %q", events[1].Action, event.ActionTrash)
+	}
+	if events[2].Action != event.ActionRecover {
+		t.Errorf("events[2].Action = %q, want %q", events[2].Action, event.ActionRecover)
+	}
+}
+
+func TestUpdateEmitsEvent(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Will update", "fact", "", nil, "Original body.")
+	cx.Add(tr)
+
+	path := cx.TraceFile(tr.ID, false)
+	parsed, _ := trace.ParseFile(path)
+	parsed.Title = "Updated"
+	parsed.Write(path)
+	cx.Update(tr.ID)
+
+	events, err := cx.Events(tr.ID)
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("got %d events, want 2 (create + update)", len(events))
+	}
+	if events[1].Action != event.ActionUpdate {
+		t.Errorf("events[1].Action = %q, want %q", events[1].Action, event.ActionUpdate)
+	}
+}
+
+func TestEventsSince(t *testing.T) {
+	cx := setup(t)
+
+	for i := 0; i < 5; i++ {
+		tr := trace.New("trace "+string(rune('A'+i)), "note", "", nil, "body")
+		cx.Add(tr)
+	}
+
+	page1, err := cx.EventsSince("", 3)
+	if err != nil {
+		t.Fatalf("EventsSince: %v", err)
+	}
+	if len(page1) != 3 {
+		t.Fatalf("page 1: got %d, want 3", len(page1))
+	}
+
+	page2, err := cx.EventsSince(page1[2].ID, 10)
+	if err != nil {
+		t.Fatalf("EventsSince page 2: %v", err)
+	}
+	if len(page2) != 2 {
+		t.Fatalf("page 2: got %d, want 2", len(page2))
+	}
+}
+
+func TestVectorClockIncrements(t *testing.T) {
+	cx := setup(t)
+
+	for i := 0; i < 3; i++ {
+		tr := trace.New("trace "+string(rune('A'+i)), "note", "", nil, "body")
+		cx.Add(tr)
+	}
+
+	vc, err := cx.GetClock()
+	if err != nil {
+		t.Fatalf("GetClock: %v", err)
+	}
+	if vc["test"] != 3 {
+		t.Errorf("clock[test] = %d, want 3", vc["test"])
+	}
+}
+
+// ---- Replay ----
+
+func TestReplayEvent_Create(t *testing.T) {
+	cx := setup(t)
+
+	data, _ := json.Marshal(map[string]any{
+		"title":  "Remote trace",
+		"type":   "fact",
+		"author": "remote-agent",
+		"tags":   []string{"remote"},
+		"origin": "peer-alpha",
+		"body":   "Created on a remote cortex.",
+	})
+
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionCreate,
+		TraceID:   "20260405-remote-trace",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-04-05T12:00:00Z",
+		Data:      data,
+	}
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent: %v", err)
+	}
+
+	// Trace should exist.
+	row, err := cx.Get("20260405-remote-trace")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if row.Title != "Remote trace" {
+		t.Errorf("Title = %q, want %q", row.Title, "Remote trace")
+	}
+	if row.Origin != "peer-alpha" {
+		t.Errorf("Origin = %q, want %q", row.Origin, "peer-alpha")
+	}
+
+	// Event should be in the log with the original ID.
+	events, err := cx.Events("20260405-remote-trace")
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if len(events) != 1 || events[0].ID != e.ID {
+		t.Errorf("expected remote event in log, got %v", events)
+	}
+
+	// File should exist on disk.
+	if _, err := os.Stat(cx.TraceFile("20260405-remote-trace", false)); err != nil {
+		t.Errorf("trace file missing: %v", err)
+	}
+}
+
+func TestReplayEvent_Idempotent(t *testing.T) {
+	cx := setup(t)
+
+	data, _ := json.Marshal(map[string]any{
+		"title": "Idempotent", "type": "note", "body": "Body.",
+	})
+	e := event.Event{
+		ID: event.NewULID(), Action: event.ActionCreate,
+		TraceID: "20260405-idempotent", Origin: "peer",
+		Timestamp: "2026-04-05T12:00:00Z", Data: data,
+	}
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("first replay: %v", err)
+	}
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("second replay should be a no-op: %v", err)
+	}
+
+	events, _ := cx.Events("20260405-idempotent")
+	if len(events) != 1 {
+		t.Errorf("expected 1 event after idempotent replay, got %d", len(events))
+	}
+}
+
+// ---- Divergence / Conflict Detection ----
+
+// setupWithLocalTrace creates a cortex with a local trace and a local update event
+// that has a known vector clock. Returns the cortex and the trace ID.
+func setupWithLocalTrace(t *testing.T) (*cortex.Cortex, string) {
+	t.Helper()
+	cx := setup(t)
+
+	tr := trace.New("Shared Knowledge", "fact", "local-agent", []string{"shared"}, "Original local body.")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	// Update locally to get a local update event with a vector clock.
+	localTrace, err := trace.ParseFile(cx.TraceFile(tr.ID, false))
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	localTrace.Body = "Updated local body."
+	if err := localTrace.Write(cx.TraceFile(tr.ID, false)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := cx.Update(tr.ID); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	return cx, tr.ID
+}
+
+func TestReplayUpdate_ConcurrentCreates_Divergence(t *testing.T) {
+	cx, traceID := setupWithLocalTrace(t)
+
+	// Build a remote update event with a concurrent vector clock.
+	// Local clock after update: {test: 2} (create + update)
+	// Remote clock: {remote-peer: 1} — neither dominates, so concurrent.
+	remoteData, _ := json.Marshal(map[string]any{
+		"title":  "Shared Knowledge",
+		"type":   "fact",
+		"author": "remote-agent",
+		"tags":   []string{"shared"},
+		"origin": "remote-peer",
+		"body":   "Updated remote body.",
+	})
+
+	remoteEvent := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionUpdate,
+		TraceID:   traceID,
+		Origin:    "remote-peer",
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Data:      remoteData,
+		VClock:    map[string]uint64{"remote-peer": 1},
+	}
+
+	if err := cx.ReplayEvent(remoteEvent); err != nil {
+		t.Fatalf("ReplayEvent: %v", err)
+	}
+
+	// Original trace body should be UNCHANGED (not overwritten).
+	origTrace, err := trace.ParseFile(cx.TraceFile(traceID, false))
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if origTrace.Body != "Updated local body." {
+		t.Errorf("original trace body was overwritten: got %q", origTrace.Body)
+	}
+
+	// A divergence trace should exist.
+	rows, err := cx.List(cortex.ListOptions{Type: "divergence"})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 divergence trace, got %d", len(rows))
+	}
+	divListRow := rows[0]
+	if !strings.Contains(divListRow.Title, "Divergence") {
+		t.Errorf("divergence title = %q, want it to contain 'Divergence'", divListRow.Title)
+	}
+
+	// Use Get() to load lineage (List doesn't populate DerivedFrom).
+	div, err := cx.Get(divListRow.ID)
+	if err != nil {
+		t.Fatalf("Get divergence: %v", err)
+	}
+	if len(div.DerivedFrom) == 0 || div.DerivedFrom[0] != traceID {
+		t.Errorf("divergence derived_from = %v, want [%s]", div.DerivedFrom, traceID)
+	}
+
+	// Divergence body should contain both versions, labeled by origin name,
+	// in alphabetical order with the deterministic header format.
+	divTrace, err := trace.ParseFile(cx.TraceFile(div.ID, false))
+	if err != nil {
+		t.Fatalf("ParseFile divergence: %v", err)
+	}
+	if !strings.Contains(divTrace.Body, "Updated local body.") {
+		t.Error("divergence body missing local version")
+	}
+	if !strings.Contains(divTrace.Body, "Updated remote body.") {
+		t.Error("divergence body missing remote version")
+	}
+	// Origins are sorted alphabetically: "remote-peer" < "test".
+	if !strings.Contains(divTrace.Body, "**Conflicting origins:** remote-peer, test") {
+		t.Errorf("divergence body missing/wrong origins line:\n%s", divTrace.Body)
+	}
+	if !strings.Contains(divTrace.Body, "### Version from remote-peer") {
+		t.Error("divergence body missing 'Version from remote-peer' section")
+	}
+	if !strings.Contains(divTrace.Body, "### Version from test") {
+		t.Error("divergence body missing 'Version from test' section")
+	}
+	// Sections must appear in alphabetical order: remote-peer before test.
+	if strings.Index(divTrace.Body, "### Version from remote-peer") >
+		strings.Index(divTrace.Body, "### Version from test") {
+		t.Error("divergence body sections are not sorted alphabetically by origin")
+	}
+
+	// DivergenceCount should be 1.
+	n, err := cx.DivergenceCount()
+	if err != nil {
+		t.Fatalf("DivergenceCount: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("DivergenceCount = %d, want 1", n)
+	}
+}
+
+func TestReplayUpdate_CausallyOrdered_NoConflict(t *testing.T) {
+	cx, traceID := setupWithLocalTrace(t)
+
+	// Build a remote update event where the remote clock dominates the local.
+	// Local clock after update: {test: 2}
+	// Remote clock: {test: 3, remote-peer: 1} — remote happened AFTER local.
+	remoteData, _ := json.Marshal(map[string]any{
+		"title":  "Shared Knowledge",
+		"type":   "fact",
+		"author": "remote-agent",
+		"tags":   []string{"shared"},
+		"origin": "remote-peer",
+		"body":   "Causally ordered remote update.",
+	})
+
+	remoteEvent := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionUpdate,
+		TraceID:   traceID,
+		Origin:    "remote-peer",
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Data:      remoteData,
+		VClock:    map[string]uint64{"test": 3, "remote-peer": 1},
+	}
+
+	if err := cx.ReplayEvent(remoteEvent); err != nil {
+		t.Fatalf("ReplayEvent: %v", err)
+	}
+
+	// No divergence should be created — causally ordered update applies normally.
+	rows, err := cx.List(cortex.ListOptions{Type: "divergence"})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("expected 0 divergence traces, got %d", len(rows))
+	}
+
+	// The trace body should be the remote version.
+	updated, err := trace.ParseFile(cx.TraceFile(traceID, false))
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if updated.Body != "Causally ordered remote update." {
+		t.Errorf("body = %q, want remote version", updated.Body)
+	}
+}
+
+func TestResolveDivergence_AcceptLocalOrigin(t *testing.T) {
+	cx, traceID := setupWithLocalTrace(t)
+
+	// Create a divergence by replaying a concurrent update.
+	triggerDivergence(t, cx, traceID)
+
+	divs, _ := cx.List(cortex.ListOptions{Type: "divergence"})
+	if len(divs) != 1 {
+		t.Fatalf("expected 1 divergence, got %d", len(divs))
+	}
+
+	// Accept this cortex's own version by name (test cortex is named "test").
+	if err := cx.ResolveDivergence(divs[0].ID, "test", ""); err != nil {
+		t.Fatalf("ResolveDivergence: %v", err)
+	}
+
+	// Original trace should still have the local body.
+	orig, err := trace.ParseFile(cx.TraceFile(traceID, false))
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if orig.Body != "Updated local body." {
+		t.Errorf("body = %q, want local version", orig.Body)
+	}
+
+	// Divergence count should be 0.
+	n, _ := cx.DivergenceCount()
+	if n != 0 {
+		t.Errorf("DivergenceCount = %d, want 0 after resolution", n)
+	}
+}
+
+func TestResolveDivergence_AcceptRemoteOrigin(t *testing.T) {
+	cx, traceID := setupWithLocalTrace(t)
+
+	triggerDivergence(t, cx, traceID)
+
+	divs, _ := cx.List(cortex.ListOptions{Type: "divergence"})
+	if len(divs) != 1 {
+		t.Fatalf("expected 1 divergence, got %d", len(divs))
+	}
+
+	if err := cx.ResolveDivergence(divs[0].ID, "remote-peer", ""); err != nil {
+		t.Fatalf("ResolveDivergence: %v", err)
+	}
+
+	// Original trace should now have the remote body.
+	orig, err := trace.ParseFile(cx.TraceFile(traceID, false))
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if orig.Body != "Concurrent remote body." {
+		t.Errorf("body = %q, want remote version", orig.Body)
+	}
+}
+
+func TestResolveDivergence_Custom(t *testing.T) {
+	cx, traceID := setupWithLocalTrace(t)
+
+	triggerDivergence(t, cx, traceID)
+
+	divs, _ := cx.List(cortex.ListOptions{Type: "divergence"})
+	if len(divs) != 1 {
+		t.Fatalf("expected 1 divergence, got %d", len(divs))
+	}
+
+	merged := "This is the manually merged content."
+	if err := cx.ResolveDivergence(divs[0].ID, "", merged); err != nil {
+		t.Fatalf("ResolveDivergence: %v", err)
+	}
+
+	orig, err := trace.ParseFile(cx.TraceFile(traceID, false))
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if orig.Body != merged {
+		t.Errorf("body = %q, want custom merged content", orig.Body)
+	}
+}
+
+func TestResolveDivergence_RejectsUnknownOrigin(t *testing.T) {
+	cx, traceID := setupWithLocalTrace(t)
+	triggerDivergence(t, cx, traceID)
+
+	divs, _ := cx.List(cortex.ListOptions{Type: "divergence"})
+	if len(divs) != 1 {
+		t.Fatalf("expected 1 divergence, got %d", len(divs))
+	}
+
+	err := cx.ResolveDivergence(divs[0].ID, "nonexistent-origin", "")
+	if err == nil {
+		t.Fatal("expected error for unknown origin")
+	}
+	if !strings.Contains(err.Error(), "not found in divergence") {
+		t.Errorf("error = %q, want 'not found in divergence'", err.Error())
+	}
+}
+
+func TestResolveDivergence_RejectsEmptyArgs(t *testing.T) {
+	cx, traceID := setupWithLocalTrace(t)
+	triggerDivergence(t, cx, traceID)
+
+	divs, _ := cx.List(cortex.ListOptions{Type: "divergence"})
+	if len(divs) != 1 {
+		t.Fatalf("expected 1 divergence, got %d", len(divs))
+	}
+
+	err := cx.ResolveDivergence(divs[0].ID, "", "")
+	if err == nil {
+		t.Fatal("expected error when neither accept origin nor custom body is provided")
+	}
+}
+
+func TestResolveDivergence_RejectsNonDivergence(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Not a divergence", "note", "", nil, "Just a note.")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	err := cx.ResolveDivergence(tr.ID, "test", "")
+	if err == nil {
+		t.Fatal("expected error for non-divergence trace")
+	}
+	if !strings.Contains(err.Error(), "not a divergence") {
+		t.Errorf("error = %q, want 'not a divergence'", err.Error())
+	}
+}
+
+// triggerDivergence replays a concurrent remote update to create a divergence trace.
+func triggerDivergence(t *testing.T, cx *cortex.Cortex, traceID string) {
+	t.Helper()
+	remoteData, _ := json.Marshal(map[string]any{
+		"title":  "Shared Knowledge",
+		"type":   "fact",
+		"author": "remote-agent",
+		"tags":   []string{"shared"},
+		"origin": "remote-peer",
+		"body":   "Concurrent remote body.",
+	})
+	remoteEvent := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionUpdate,
+		TraceID:   traceID,
+		Origin:    "remote-peer",
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Data:      remoteData,
+		VClock:    map[string]uint64{"remote-peer": 1},
+	}
+	if err := cx.ReplayEvent(remoteEvent); err != nil {
+		t.Fatalf("triggerDivergence: %v", err)
+	}
+}
+
+// Verify the _ imports are used
+var _ = federation.VClock{}
+var _ = trace.TypeDivergence

@@ -17,3 +17,4 @@
 *.swo
 .idea/
 .vscode/
+push-binary.sh

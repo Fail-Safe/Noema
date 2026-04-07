@@ -26,16 +26,13 @@ func Open(cortexDir string) (*DB, error) {
 		return nil, fmt.Errorf("creating db dir: %w", err)
 	}
 	dbPath := filepath.Join(dbDir, "noema.db")
-	conn, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL")
+	// All pragmas go in the DSN so they apply to every connection in the pool.
+	dsn := dbPath + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening database: %w", err)
 	}
 	d := &DB{conn}
-	// DSN pragma params are unreliable across drivers; set explicitly after open.
-	if _, err := conn.Exec(`PRAGMA foreign_keys = ON`); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("enabling foreign keys: %w", err)
-	}
 	if err := d.migrate(); err != nil {
 		conn.Close()
 		return nil, err

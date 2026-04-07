@@ -59,6 +59,8 @@ title: Why we chose Go
 type: decision
 author: research-agent-1
 tags: [go, language, architecture]
+derived_from: [20260328-language-candidates]
+origin: research-cortex
 created: 2026-03-29T14:23:00Z
 updated: 2026-03-29T14:23:00Z
 ---
@@ -67,6 +69,8 @@ Body content here.
 ```
 
 All frontmatter fields are indexed in the DB. `author` is a free-form string — it can be a human username, an agent name, or omitted. Multi-agent systems use it to identify which peer wrote a given Trace.
+
+`derived_from` is an optional list of trace IDs this Trace was derived from — it builds a lineage graph queryable via `trace_lineage`. `origin` is the name of the Cortex that produced the Trace; it is set automatically on creation and used by federation to attribute remote Traces. Both fields use `omitempty`, so older Traces without them parse unchanged.
 
 ### Trace Types
 
@@ -82,6 +86,7 @@ Every Trace has exactly one type:
 | `intent` | Something that needs to happen (pickup is autonomous) |
 | `observation` | Something witnessed but not yet verified |
 | `note` | Anything else |
+| `divergence` | A concurrent edit conflict, auto-created by federation sync |
 
 ### Cortex Storage Layout
 
@@ -97,6 +102,8 @@ Each Cortex is a named directory the user manages. Layout:
   traces/
     20260329-why-we-chose-go.md
     20260329-another-trace.md
+  trash/
+    traces/         ← Removed traces, kept for 30 days [user-configurable]
 ```
 
 Trace filenames follow the pattern `YYYYMMDD-slugified-title.md` (ISO 8601). The markdown files are the source of truth for content; the DB is the index.
@@ -121,17 +128,31 @@ Archiving is non-destructive and fully reversible:
 - Surface them with `--archived` (archived only) or `--all` (active + archived)
 - DB query pattern: active = `WHERE archived_at IS NULL`; archived = `WHERE archived_at IS NOT NULL`
 
+### Event Log, Lineage, and Federation
+
+Every mutation (create / update / archive / unarchive / trash / recover / purge) is recorded as an immutable event in the `events` table inside the same SQLite transaction as the mutation itself. Events carry a ULID, an action, the trace ID, the originating Cortex name, an RFC3339 timestamp, a JSON snapshot of the trace state (for create/update), and a vector clock snapshot. `Remove()` (hard delete) and `Sync()` (filesystem reconciliation) intentionally emit no events — hard deletes are local-only escape hatches and Sync is reconciliation, not a semantic mutation.
+
+Lineage is a separate `trace_lineage` join table populated from the `derived_from` frontmatter field. `trace_lineage` supports both directions: `cortex.Get()` reads `derived_from`, and `cortex.DerivedBy()` reads the reverse edge.
+
+Federation is opt-in via a `federation:` block in `cortex.md` (peers + interval). When `noema serve --transport sse` starts on a Cortex with peers configured, a background syncer polls each peer's `sync_events` MCP tool, replays new events into the local Cortex, and merges the remote vector clock into the local one. Replayed events are stored with their original ID and origin so the event log becomes the union of all peers' events (no event amplification). When two peers update the same trace concurrently — vector clocks neither dominate nor are dominated — Noema creates a `type: divergence` Trace preserving every conflicting version under deterministically-sorted `### Version from <origin>` headers, rather than overwriting. Resolve via `noema resolve <divergence-id> --accept <origin>` or `--custom <body>` (or the `resolve_divergence` MCP tool).
+
+The full design rationale, edge cases, and phase breakdown live in `docs/design/federation-plan.md`.
+
+### MCP Tools
+
+The MCP server (`internal/mcp/server.go`) exposes the full Cortex surface: `get_instructions`, `list_traces`, `get_trace`, `create_trace`, `update_trace`, `delete_trace`, `recover_trace`, `archive_trace`, `unarchive_trace`, `search_traces`, `trace_history`, `trace_lineage`, `resolve_divergence`, `sync_events`, `federation_status`, and `announce_peer`. The `get_instructions` tool returns a live reference guide for the active Cortex; agents should call it first in any new session.
+
 ### DB Schema Migrations
 
 Schema changes must always be transparent and non-destructive. Rules:
 
 - Migrations are versioned SQL files embedded in the binary (`embed.FS`), run in order on startup if the DB is behind the current version
-- The DB tracks the applied version in a `schema_migrations` table (single-row: `version INTEGER`)
+- The DB tracks the applied version in a `schema_migrations` table (one row per applied version)
 - Migrations only use `ALTER TABLE ... ADD COLUMN`, new table creation, or new index creation — never `DROP`, never destructive `ALTER`
 - If a migration would require removing or restructuring data, provide a separate explicit `noema migrate` command with a clear description of what it does, requiring user confirmation
 - Migration failures abort startup with a clear error; they never partially apply
 
-Use `pressly/goose` or a thin hand-rolled runner over embedded `*.sql` files — whichever stays closer to the "no magic" principle.
+The runner is a thin hand-rolled loop over embedded `*.sql` files in `internal/db/migrations/`, sorted by leading version number. Currently applied: `001_initial.sql`, `002_trash.sql`, `003_events_and_lineage.sql` (event log + `trace_lineage` + `traces.origin` column), and `004_federation_state.sql` (key-value store for vector clocks and per-peer cursors).
 
 ### Cortex Creation
 
@@ -174,6 +195,6 @@ This should provide an intuitive one-stop-shop approach to insertion, modificati
 
 ### MCP
 
-A lightweight MCP server is spawned with `noema serve` (or `noema server`). It exposes Cortex operations — list, create, update, delete, search — to any MCP consumer.
+A lightweight MCP server is spawned with `noema serve` (or `noema server`). It exposes Cortex operations — list, create, update, delete, search, audit, lineage, federation — to any MCP consumer.
 
-**Transports:** both `stdio` and SSE must be supported, so the server works with Claude Code agents, GitHub Copilot extensions, and any other MCP-compatible tooling. The transport is selected by how the server is invoked (flag or auto-detected).
+**Transports:** both `stdio` and SSE must be supported, so the server works with Claude Code agents, GitHub Copilot extensions, and any other MCP-compatible tooling. The transport is selected by `--transport`. SSE requires an explicit `--host` (binding to `0.0.0.0`/`::` is rejected to prevent accidental network exposure) and supports `--tls-cert`/`--tls-key` for HTTPS. Federation only runs in SSE mode because peers need an HTTP endpoint to call `sync_events` on; a single Cortex can serve stdio (for a local agent) and SSE (for federation) from separate processes thanks to SQLite WAL mode.
