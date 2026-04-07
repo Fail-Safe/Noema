@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"runtime/debug"
+	"sort"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -122,6 +124,13 @@ func completionsFor(opts cortex.ListOptions) func(*cobra.Command, []string, stri
 
 // resolveCortex returns an open Cortex using the priority chain:
 // --cortex flag → NOEMA_CORTEX env → config default.
+//
+// If none of those produce a name AND exactly one cortex is registered,
+// that cortex is auto-promoted to default and persisted. This repairs
+// configs that lost their default field via a manual edit, a legacy
+// binary, or a cross-machine sync — rather than erroring out on a
+// one-answer question. Zero or many registered cortexes still produce
+// a hard error, but one that actually names the fix.
 func resolveCortex() (*cortex.Cortex, error) {
 	name := cortexFlag
 	if name == "" {
@@ -137,7 +146,28 @@ func resolveCortex() (*cortex.Cortex, error) {
 		name = cfg.Default
 	}
 	if name == "" {
-		return nil, fmt.Errorf("no cortex specified: use --cortex, set NOEMA_CORTEX, or run `noema use <name>`")
+		resolved, promoted, rerr := resolveDefaultCortex(cfg)
+		if rerr != nil {
+			return nil, rerr
+		}
+		name = resolved
+		if promoted {
+			cfg.Default = name
+			if saveErr := cfg.Save(); saveErr != nil {
+				// Promotion is already correct in memory, so the
+				// command can still run. We just couldn't persist
+				// the repair — warn loudly and keep going.
+				fmt.Fprintf(os.Stderr,
+					"warning: auto-promoted %q as default, but could not persist config (%v)\n",
+					name, saveErr,
+				)
+			} else {
+				fmt.Fprintf(os.Stderr,
+					"notice: Promoted %q as the default cortex (was unset).\n",
+					name,
+				)
+			}
+		}
 	}
 
 	entry, ok := cfg.Cortexes[name]
@@ -166,4 +196,38 @@ func resolveCortex() (*cortex.Cortex, error) {
 		)
 	}
 	return cx, nil
+}
+
+// resolveDefaultCortex decides what to do when the caller supplied no
+// --cortex flag, no NOEMA_CORTEX env, and no cfg.Default. It is the
+// three-branch policy that mirrors the rule in `cortex remove`:
+//
+//   - 0 cortexes: nothing to do — error and point at `noema init`
+//   - 1 cortex:   the answer is unambiguous — return it with promoted=true
+//     so the caller persists cfg.Default and prints a notice
+//   - 2+ cortexes: guessing would be wrong — error with the full list
+//     and the exact fix command
+//
+// Side-effect free by design so it can be tested without touching the
+// filesystem or HOME — the caller owns the persistence decision.
+func resolveDefaultCortex(cfg *config.Config) (name string, promoted bool, err error) {
+	switch len(cfg.Cortexes) {
+	case 0:
+		return "", false, fmt.Errorf("no cortexes configured — run `noema init --name <name>` to create one")
+	case 1:
+		for onlyName := range cfg.Cortexes {
+			return onlyName, true, nil
+		}
+	}
+	names := make([]string, 0, len(cfg.Cortexes))
+	for n := range cfg.Cortexes {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return "", false, fmt.Errorf(
+		"no default cortex set. Pick one with:\n"+
+			"  noema use <name>\n"+
+			"Registered cortexes: %s",
+		strings.Join(names, ", "),
+	)
 }

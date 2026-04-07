@@ -43,31 +43,49 @@ func cortexListCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if len(cfg.Cortexes) == 0 {
-				fmt.Println("No cortexes configured. Run `noema init --name <name>` to create one.")
-				return nil
-			}
-
-			// Sort names for stable output.
-			names := make([]string, 0, len(cfg.Cortexes))
-			for name := range cfg.Cortexes {
-				names = append(names, name)
-			}
-			sort.Strings(names)
-
-			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "NAME\tPATH\t")
-			for _, name := range names {
-				marker := " "
-				if name == cfg.Default {
-					marker = "*"
-				}
-				fmt.Fprintf(w, "%s\t%s\t%s\n", name, cfg.Cortexes[name].Path, marker)
-			}
-			w.Flush()
-			return nil
+			return runCortexList(cmd.OutOrStdout(), cfg)
 		},
 	}
+}
+
+func runCortexList(out io.Writer, cfg *config.Config) error {
+	if len(cfg.Cortexes) == 0 {
+		fmt.Fprintln(out, "No cortexes configured. Run `noema init --name <name>` to create one.")
+		return nil
+	}
+
+	// Sort names for stable output.
+	names := make([]string, 0, len(cfg.Cortexes))
+	for name := range cfg.Cortexes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "NAME\tPATH\t")
+	for _, name := range names {
+		marker := " "
+		if name == cfg.Default {
+			marker = "*"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\n", name, cfg.Cortexes[name].Path, marker)
+	}
+	w.Flush()
+
+	// When there's no default set, the table above shows no `*`
+	// marker and leaves the user guessing what to do. Print a hint
+	// that names the exact `noema use` command and — in the single-
+	// cortex case — notes that the next runtime command will auto-
+	// promote it anyway, so the user knows both paths are valid.
+	if cfg.Default == "" {
+		fmt.Fprintln(out)
+		if len(cfg.Cortexes) == 1 {
+			fmt.Fprintf(out, "(No default cortex set. Run `noema use %s`, or it will be auto-promoted on next use.)\n", names[0])
+		} else {
+			fmt.Fprintln(out, "(No default cortex set. Run `noema use <name>` to pick one.)")
+		}
+	}
+	return nil
 }
 
 // cortexRemoveCmd unregisters a cortex from the config, optionally deleting

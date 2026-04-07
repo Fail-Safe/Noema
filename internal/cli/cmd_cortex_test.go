@@ -40,6 +40,102 @@ func newSandboxedCortex(t *testing.T, name string) (string, *config.Config) {
 	return dir, cfg
 }
 
+// --------- cortex list ---------
+
+// TestCortexList_EmptyConfig pins the zero-cortex message. The list
+// output has to tell the user what command will unblock them, not
+// just print a blank table.
+func TestCortexList_EmptyConfig(t *testing.T) {
+	cfg := &config.Config{Cortexes: map[string]config.CortexEntry{}}
+	var out bytes.Buffer
+	if err := runCortexList(&out, cfg); err != nil {
+		t.Fatalf("runCortexList: %v", err)
+	}
+	if !strings.Contains(out.String(), "noema init") {
+		t.Errorf("empty-config message does not mention `noema init`: %s", out.String())
+	}
+}
+
+// TestCortexList_WithDefault pins the happy path: the default cortex
+// is marked with a `*`, and there's no hint line because the default
+// is set.
+func TestCortexList_WithDefault(t *testing.T) {
+	cfg := &config.Config{
+		Default: "alpha",
+		Cortexes: map[string]config.CortexEntry{
+			"alpha": {Path: "/tmp/alpha"},
+			"beta":  {Path: "/tmp/beta"},
+		},
+	}
+	var out bytes.Buffer
+	if err := runCortexList(&out, cfg); err != nil {
+		t.Fatalf("runCortexList: %v", err)
+	}
+	s := out.String()
+	// The `*` must appear on the alpha row. We check for the literal
+	// "alpha" + some amount of whitespace + path + whitespace + "*"
+	// by just asserting both alpha and "*" are present and the hint
+	// is NOT.
+	if !strings.Contains(s, "alpha") || !strings.Contains(s, "*") {
+		t.Errorf("expected alpha row with `*`, got: %s", s)
+	}
+	if strings.Contains(s, "No default cortex set") {
+		t.Errorf("unexpected no-default hint with a default present: %s", s)
+	}
+}
+
+// TestCortexList_NoDefaultSingleCortex pins the single-cortex hint.
+// The hint has to name the specific `noema use <name>` command AND
+// mention that the next runtime call will auto-promote, so the user
+// understands both paths are valid.
+func TestCortexList_NoDefaultSingleCortex(t *testing.T) {
+	cfg := &config.Config{
+		Default: "",
+		Cortexes: map[string]config.CortexEntry{
+			"agentbrain": {Path: "/home/mark/.noema/agentbrain"},
+		},
+	}
+	var out bytes.Buffer
+	if err := runCortexList(&out, cfg); err != nil {
+		t.Fatalf("runCortexList: %v", err)
+	}
+	s := out.String()
+	if !strings.Contains(s, "noema use agentbrain") {
+		t.Errorf("hint does not name the specific use command: %s", s)
+	}
+	if !strings.Contains(s, "auto-promoted on next use") {
+		t.Errorf("hint does not mention auto-promotion: %s", s)
+	}
+}
+
+// TestCortexList_NoDefaultMultipleCortexes pins the multi-cortex hint.
+// Unlike the single-cortex case, the hint here uses the generic
+// `<name>` placeholder because auto-promotion won't happen — the
+// operator has to pick.
+func TestCortexList_NoDefaultMultipleCortexes(t *testing.T) {
+	cfg := &config.Config{
+		Default: "",
+		Cortexes: map[string]config.CortexEntry{
+			"alpha": {Path: "/tmp/alpha"},
+			"beta":  {Path: "/tmp/beta"},
+			"gamma": {Path: "/tmp/gamma"},
+		},
+	}
+	var out bytes.Buffer
+	if err := runCortexList(&out, cfg); err != nil {
+		t.Fatalf("runCortexList: %v", err)
+	}
+	s := out.String()
+	if !strings.Contains(s, "noema use <name>") {
+		t.Errorf("hint does not use the generic placeholder: %s", s)
+	}
+	// Must NOT claim auto-promotion will happen — with 2+ cortexes
+	// the runtime resolution will error out instead.
+	if strings.Contains(s, "auto-promoted") {
+		t.Errorf("multi-cortex hint wrongly claims auto-promotion: %s", s)
+	}
+}
+
 // --------- cortex remove ---------
 
 func TestCortexRemove_UnknownName(t *testing.T) {
