@@ -661,6 +661,21 @@ Choose the type that best reflects the intent of the memory:
 - Use list_traces with type filter or tag=needs-resolution to find unresolved divergences.
 - federation_status shows the count of unresolved divergences.
 
+## Access Posture
+- The HTTP MCP endpoint runs either "open" (no auth) or "keyed" (bearer key required).
+  federation_status reports the active posture as "Access: open" or
+  "Access: keyed (source=env|file, fingerprint=SHA256:...)".
+- Keyed mode is mandatory for any non-loopback deployment and for federation rings.
+  In keyed mode the server also requires TLS — it refuses to start over plaintext HTTP.
+- The fingerprint is a non-secret SHA-256 of the key; every host in a federation ring
+  must report the same fingerprint or peers will 401 each other on sync.
+- Key configuration is operator-side: NOEMA_MCP_KEY environment variable, or an
+  access.shared_key_file sidecar path in cortex.md pointing at a 0600 file. Env wins
+  if both are set. As an agent you do not read, write, or rotate the key yourself —
+  your client either has it configured and every tool call works, or it doesn't and
+  you'll see a 401 from the transport layer.
+- Stdio is unaffected by this posture: stdio implies local-process trust.
+
 ## Tips
 - Prefer specific types over "note" — it helps retrieval and reasoning later.
 - Use tags to group related traces across types.
