@@ -409,7 +409,20 @@ func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
 		}
 
 		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("Cortex: %s\n\n", m.Name))
+		sb.WriteString(fmt.Sprintf("Cortex: %s\n", m.Name))
+
+		// Surface the MCP access posture alongside federation state so a
+		// peer calling this tool sees exactly what the middleware is
+		// enforcing locally. Resolution errors are non-fatal: print them
+		// and keep going rather than blanking the rest of the status.
+		if key, kerr := cortex.LoadAccessKey(cx.Dir, m.Access); kerr != nil {
+			sb.WriteString(fmt.Sprintf("Access: error loading key: %v\n", kerr))
+		} else if key.Keyed() {
+			sb.WriteString(fmt.Sprintf("Access: keyed (source=%s, fingerprint=%s)\n", key.Source, key.Fingerprint))
+		} else {
+			sb.WriteString("Access: open\n")
+		}
+		sb.WriteByte('\n')
 
 		if m.Federation == nil || len(m.Federation.Peers) == 0 {
 			sb.WriteString("Federation: not configured (no peers in cortex.md)\n")
@@ -615,7 +628,8 @@ Choose the type that best reflects the intent of the memory:
                                    manifest version (used by federation peers
                                    to verify identity on every sync)
   sync_events [since] [limit]    → pull events for federation (JSON array)
-  federation_status              → federation config, peer states, vector clock
+  federation_status              → MCP access posture, federation config,
+                                   peer states, vector clock
   announce_peer name endpoint    → accept a peer announcement for discovery
 
 ## Filtering

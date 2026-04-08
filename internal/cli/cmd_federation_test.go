@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -317,5 +318,258 @@ func withConfigForCortex(t *testing.T, cx *cortex.Cortex) {
 	}
 	if err := cfg.Save(); err != nil {
 		t.Fatalf("cfg.Save: %v", err)
+	}
+}
+
+// writeSidecarKeyFile drops a sidecar key file at <cortexDir>/<rel> with
+// mode 0o600 and rewrites cortex.md so access.shared_key_file points at
+// it. Tests use this to exercise the file-source branch of the
+// fingerprint command without plumbing a whole file-loader fake.
+func writeSidecarKeyFile(t *testing.T, cx *cortex.Cortex, rel, key string) {
+	t.Helper()
+	path := filepath.Join(cx.Dir, rel)
+	if err := os.WriteFile(path, []byte(key+"\n"), 0o600); err != nil {
+		t.Fatalf("write sidecar %s: %v", path, err)
+	}
+	m, err := cortex.ReadManifest(cx.Dir)
+	if err != nil {
+		t.Fatalf("ReadManifest: %v", err)
+	}
+	m.Access = &cortex.AccessConfig{SharedKeyFile: rel}
+	if err := cortex.WriteManifest(cx.Dir, m); err != nil {
+		t.Fatalf("WriteManifest: %v", err)
+	}
+}
+
+// ---- federation status (access line) ----
+
+// TestFederationStatus_ShowsAccessLineOpenMode pins that `noema
+// federation status` surfaces the active MCP access posture on every
+// run, even on a cortex with no peers. The access line has to come
+// before the "Federation: not configured" message so an operator
+// inspecting a fresh cortex can tell keyed vs open at a glance.
+func TestFederationStatus_ShowsAccessLineOpenMode(t *testing.T) {
+	cx := newCortexWithPeers(t, "solo") // no peers variadic arg
+	withConfigForCortex(t, cx)
+	t.Setenv(cortex.AccessKeyEnvVar, "")
+
+	// Capture os.Stdout. federationStatusCmd prints through fmt.Printf
+	// directly rather than cmd.OutOrStdout, so we have to redirect
+	// os.Stdout. The alternative (plumbing an io.Writer through the
+	// RunE) is out of scope for PR (c).
+	out := captureStdout(t, func() {
+		cmd := federationStatusCmd()
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "Access: open") {
+		t.Errorf("output missing 'Access: open' line:\n%s", out)
+	}
+	// Ordering matters: Access line must come before the federation
+	// block so the top-of-output summary is always consistent.
+	accessIdx := strings.Index(out, "Access:")
+	fedIdx := strings.Index(out, "Federation:")
+	if accessIdx < 0 || fedIdx < 0 || accessIdx > fedIdx {
+		t.Errorf("Access line must appear before Federation line:\n%s", out)
+	}
+}
+
+// TestFederationStatus_ShowsAccessLineKeyedMode pins that env-sourced
+// keyed mode is surfaced with source + fingerprint and, critically,
+// that the raw key does not leak into status output. `noema
+// federation status` is the thing operators are likely to paste into
+// a bug report or support channel, so the "no raw key" invariant
+// matters more here than anywhere else in the codebase.
+func TestFederationStatus_ShowsAccessLineKeyedMode(t *testing.T) {
+	cx := newCortexWithPeers(t, "solo")
+	withConfigForCortex(t, cx)
+	const key = "not-a-real-key-for-tests"
+	t.Setenv(cortex.AccessKeyEnvVar, key)
+
+	out := captureStdout(t, func() {
+		cmd := federationStatusCmd()
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "Access: keyed") {
+		t.Errorf("output missing 'Access: keyed' line:\n%s", out)
+	}
+	if !strings.Contains(out, "source=env") {
+		t.Errorf("output missing source=env:\n%s", out)
+	}
+	if !strings.Contains(out, cortex.KeyFingerprint(key)) {
+		t.Errorf("output missing fingerprint:\n%s", out)
+	}
+	if strings.Contains(out, key) {
+		t.Errorf("SECURITY: raw key leaked in status output:\n%s", out)
+	}
+}
+
+// captureStdout redirects os.Stdout for the duration of f and returns
+// everything written to it. federationStatusCmd bypasses cmd.OutOrStdout
+// in favor of fmt.Printf, so this indirection is the only way to
+// assert on its output without rewriting the command.
+func captureStdout(t *testing.T, f func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	orig := os.Stdout
+	os.Stdout = w
+	done := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(r)
+		done <- buf.String()
+	}()
+	f()
+	_ = w.Close()
+	os.Stdout = orig
+	return <-done
+}
+
+// ---- federation key fingerprint ----
+
+// TestFederationKeyFingerprint_OpenMode pins that a cortex with no access
+// config and no NOEMA_MCP_KEY reports open mode rather than erroring.
+// This is the "query whether I'm keyed" use case — the command must be
+// callable on any cortex and must answer truthfully without tripping on
+// the absence of a key.
+func TestFederationKeyFingerprint_OpenMode(t *testing.T) {
+	cx := newCortexWithPeers(t, "alpha")
+	withConfigForCortex(t, cx)
+	t.Setenv(cortex.AccessKeyEnvVar, "")
+
+	var out bytes.Buffer
+	cmd := federationKeyFingerprintCmd()
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v\noutput:\n%s", err, out.String())
+	}
+	s := out.String()
+	if !strings.Contains(s, "open mode") {
+		t.Errorf("output does not report open mode:\n%s", s)
+	}
+	if strings.Contains(s, "Fingerprint:") {
+		t.Errorf("open mode output must not print a Fingerprint line:\n%s", s)
+	}
+}
+
+// TestFederationKeyFingerprint_EnvKey pins the env-sourced path: when
+// NOEMA_MCP_KEY is set, the command reports Source: env and the
+// fingerprint. The exact fingerprint is derived from cortex.KeyFingerprint
+// so we can assert on it byte-for-byte without duplicating the SHA-256
+// logic in the test.
+func TestFederationKeyFingerprint_EnvKey(t *testing.T) {
+	cx := newCortexWithPeers(t, "alpha")
+	withConfigForCortex(t, cx)
+	const key = "test-shared-key-123"
+	t.Setenv(cortex.AccessKeyEnvVar, key)
+
+	var out bytes.Buffer
+	cmd := federationKeyFingerprintCmd()
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v\noutput:\n%s", err, out.String())
+	}
+	s := out.String()
+
+	for _, want := range []string{
+		"Source:      env",
+		"Fingerprint: " + cortex.KeyFingerprint(key),
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("output missing %q:\n%s", want, s)
+		}
+	}
+	// Critical: the raw key must never appear in output. This is the
+	// whole point of the fingerprint — it's the thing you can say over
+	// Signal without compromising the secret.
+	if strings.Contains(s, key) {
+		t.Errorf("SECURITY: raw key leaked in fingerprint output:\n%s", s)
+	}
+}
+
+// TestFederationKeyFingerprint_FileKey pins the sidecar-file path: a
+// cortex with access.shared_key_file pointing at a valid sidecar resolves
+// to Source: file and the correct fingerprint, and also surfaces the
+// absolute Path so an operator can see which file is in play.
+func TestFederationKeyFingerprint_FileKey(t *testing.T) {
+	cx := newCortexWithPeers(t, "alpha")
+	withConfigForCortex(t, cx)
+	t.Setenv(cortex.AccessKeyEnvVar, "")
+
+	const key = "file-sourced-key-abc"
+	writeSidecarKeyFile(t, cx, ".access.secret", key)
+
+	var out bytes.Buffer
+	cmd := federationKeyFingerprintCmd()
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v\noutput:\n%s", err, out.String())
+	}
+	s := out.String()
+
+	for _, want := range []string{
+		"Source:      file",
+		"Fingerprint: " + cortex.KeyFingerprint(key),
+		".access.secret", // Path line includes the filename
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("output missing %q:\n%s", want, s)
+		}
+	}
+	if strings.Contains(s, key) {
+		t.Errorf("SECURITY: raw key leaked in fingerprint output:\n%s", s)
+	}
+}
+
+// TestFederationKeyFingerprint_EnvOverridesFile pins the override-warning
+// branch: when both a sidecar file AND NOEMA_MCP_KEY are present, the
+// env wins (that's the design) but the command must surface the
+// override so the operator knows why the sidecar file they thought
+// was active isn't. Without this the override is silent and the next
+// operator inherits a confusing "why is my fingerprint wrong" puzzle.
+func TestFederationKeyFingerprint_EnvOverridesFile(t *testing.T) {
+	cx := newCortexWithPeers(t, "alpha")
+	withConfigForCortex(t, cx)
+
+	const fileKey = "from-file"
+	const envKey = "from-env-wins"
+	writeSidecarKeyFile(t, cx, ".access.secret", fileKey)
+	t.Setenv(cortex.AccessKeyEnvVar, envKey)
+
+	var out bytes.Buffer
+	cmd := federationKeyFingerprintCmd()
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v\noutput:\n%s", err, out.String())
+	}
+	s := out.String()
+
+	if !strings.Contains(s, "Source:      env") {
+		t.Errorf("expected env source:\n%s", s)
+	}
+	// The reported fingerprint must match the env key, not the file
+	// key — the whole point of this test is that env wins.
+	if !strings.Contains(s, cortex.KeyFingerprint(envKey)) {
+		t.Errorf("fingerprint does not match env key:\n%s", s)
+	}
+	if strings.Contains(s, cortex.KeyFingerprint(fileKey)) {
+		t.Errorf("fingerprint unexpectedly matches overridden file key:\n%s", s)
+	}
+	// The override note is the "loud failure" — without it the
+	// operator can't tell why their sidecar file isn't being used.
+	if !strings.Contains(s, "NOEMA_MCP_KEY is overriding") {
+		t.Errorf("output missing env-override warning:\n%s", s)
 	}
 }

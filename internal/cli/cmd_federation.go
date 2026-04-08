@@ -23,8 +23,77 @@ func federationCmd() *cobra.Command {
 		federationPeersCmd(),
 		federationAddPeerCmd(),
 		federationResetPeerCmd(),
+		federationKeyCmd(),
 	)
 	return cmd
+}
+
+// federationKeyCmd groups subcommands that inspect or manage the MCP shared
+// access key. `fingerprint` is the only subcommand for now; rotate / path /
+// show-source are natural follow-ons that live under the same umbrella.
+func federationKeyCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "key",
+		Short: "Inspect or manage the MCP shared access key",
+	}
+	cmd.AddCommand(federationKeyFingerprintCmd())
+	return cmd
+}
+
+// federationKeyFingerprintCmd prints the SHA-256 fingerprint of the
+// currently-active shared key, resolved via the same env > file > open
+// priority chain `noema serve` uses. It exists so two operators can
+// confirm they're holding the same key over an out-of-band channel
+// (Signal, phone) without speaking the secret itself — the fingerprint
+// is safe to say aloud.
+func federationKeyFingerprintCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "fingerprint",
+		Short: "Print the SHA-256 fingerprint of the active MCP shared key",
+		Long: `Resolves the active MCP shared key using the same priority chain as ` + "`noema serve`" + `:
+NOEMA_MCP_KEY > access.shared_key_file > open mode. Prints the SHA-256
+fingerprint of the key (SSH-style format, safe to say aloud) so two
+operators can confirm over an out-of-band channel that they're holding
+the same secret.
+
+In open mode (no key configured), prints a message and exits successfully.`,
+		Example: "  noema federation key fingerprint\n  NOEMA_MCP_KEY=... noema federation key fingerprint",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cx, err := resolveCortex()
+			if err != nil {
+				return err
+			}
+			defer cx.Close()
+
+			m, err := cortex.ReadManifest(cx.Dir)
+			if err != nil {
+				return fmt.Errorf("reading cortex.md: %w", err)
+			}
+
+			key, err := cortex.LoadAccessKey(cx.Dir, m.Access)
+			if err != nil {
+				return fmt.Errorf("loading access key: %w", err)
+			}
+
+			out := cmd.OutOrStdout()
+			if !key.Keyed() {
+				fmt.Fprintf(out, "Cortex:      %s\n", cx.Name)
+				fmt.Fprintln(out, "Access:      open mode (no key configured)")
+				return nil
+			}
+
+			fmt.Fprintf(out, "Cortex:      %s\n", cx.Name)
+			fmt.Fprintf(out, "Source:      %s\n", key.Source)
+			if key.Path != "" {
+				fmt.Fprintf(out, "Path:        %s\n", key.Path)
+			}
+			fmt.Fprintf(out, "Fingerprint: %s\n", key.Fingerprint)
+			if key.EnvOverride() {
+				fmt.Fprintf(out, "Note:        %s is overriding access.shared_key_file\n", cortex.AccessKeyEnvVar)
+			}
+			return nil
+		},
+	}
 }
 
 func federationStatusCmd() *cobra.Command {
@@ -43,7 +112,22 @@ func federationStatusCmd() *cobra.Command {
 				m = cortex.Manifest{Name: cx.Name}
 			}
 
-			fmt.Printf("Cortex: %s\n\n", m.Name)
+			fmt.Printf("Cortex: %s\n", m.Name)
+
+			// Surface the active MCP access posture regardless of whether
+			// federation is configured. An operator inspecting status on a
+			// stdio-only cortex still wants to know whether the same cortex
+			// would come up keyed or open if they flipped it to http.
+			// Resolution errors here are non-fatal: print a warning line
+			// and keep going so the rest of the status output still lands.
+			if key, err := cortex.LoadAccessKey(cx.Dir, m.Access); err != nil {
+				fmt.Printf("Access: error loading key: %v\n", err)
+			} else if key.Keyed() {
+				fmt.Printf("Access: keyed (source=%s, fingerprint=%s)\n", key.Source, key.Fingerprint)
+			} else {
+				fmt.Println("Access: open")
+			}
+			fmt.Println()
 
 			if m.Federation == nil || len(m.Federation.Peers) == 0 {
 				fmt.Println("Federation: not configured (no peers in cortex.md)")
