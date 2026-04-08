@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/user"
 	"strings"
@@ -68,18 +69,56 @@ func serveCmd() *cobra.Command {
 			case "stdio", "":
 				err = mcpgo.ServeStdio(s)
 			case "http":
+				// Read the manifest BEFORE validateHTTPServe so the
+				// access-key resolution and the keyed-TLS check below
+				// share the same view of cortex.md with everything
+				// downstream (syncer, middleware).
+				m, manifestErr := cortex.ReadManifest(cx.Dir)
+				if manifestErr != nil {
+					return fmt.Errorf("reading cortex.md: %w", manifestErr)
+				}
+
+				// Resolve the shared MCP access key: NOEMA_MCP_KEY env
+				// var > sidecar file > open mode. Errors here are hard
+				// stops — misconfigured auth must not silently downgrade
+				// to open mode.
+				accessKey, accessErr := cortex.LoadAccessKey(cx.Dir, m.Access)
+				if accessErr != nil {
+					return fmt.Errorf("loading MCP access key: %w", accessErr)
+				}
+				if accessKey.EnvOverride() {
+					fmt.Printf("[serve] %s overrides access.shared_key_file at %s\n",
+						cortex.AccessKeyEnvVar, accessKey.Path)
+				}
+
 				if err := validateHTTPServe(host, tlsCert, tlsKey, cx.Name, cortexFlag != ""); err != nil {
 					return err
 				}
 				useTLS := tlsCert != "" && tlsKey != ""
 
-				// Federation only runs over the HTTP transport (peers need
-				// an HTTP endpoint to call sync_events on). Start the
-				// syncer only when the bound cortex actually has peers
-				// configured.
-				m, manifestErr := cortex.ReadManifest(cx.Dir)
-				if manifestErr == nil && m.Federation != nil && len(m.Federation.Peers) > 0 {
-					syncer = startSyncer(cx)
+				if err := requireTLSForKeyedMode(accessKey, useTLS); err != nil {
+					return err
+				}
+
+				// Federation only runs over the HTTP transport (peers
+				// need an HTTP endpoint to call sync_events on). Start
+				// the syncer only when the bound cortex actually has
+				// peers configured. Pass the shared key so outbound
+				// sync calls carry the same Authorization header the
+				// middleware enforces on inbound calls (ring model).
+				if m.Federation != nil && len(m.Federation.Peers) > 0 {
+					syncer = startSyncer(cx, accessKey.Value)
+				}
+
+				// Surface the access posture on startup. The
+				// fingerprint lets two operators confirm they're
+				// running the same key without speaking the secret
+				// itself.
+				if accessKey.Keyed() {
+					fmt.Printf("[serve] access=keyed source=%s fingerprint=%s\n",
+						accessKey.Source, accessKey.Fingerprint)
+				} else {
+					fmt.Printf("[serve] access=open\n")
 				}
 
 				// IPv6 addresses need brackets in listen addresses.
@@ -89,20 +128,42 @@ func serveCmd() *cobra.Command {
 				}
 				addr := fmt.Sprintf("%s:%d", hostForAddr, port)
 
-				httpOpts := []mcpgo.StreamableHTTPOption{
-					mcpgo.WithEndpointPath("/mcp"),
+				// Build the MCP handler. No WithEndpointPath — our
+				// own mux routes /mcp. No WithTLSCert — we drive
+				// ListenAndServeTLS ourselves so the middleware chain
+				// wraps the handler cleanly. NewStreamableHTTPServer
+				// still starts mcp-go's session sweeper, which is the
+				// only side effect of that call we care about.
+				mcpHandler := mcpgo.NewStreamableHTTPServer(s)
+
+				// Middleware chain: CORS (outermost) → Auth → mcpHandler.
+				// CORS is outermost because preflight (OPTIONS) cannot
+				// carry credentials by spec and must not be 401'd.
+				// AuthMiddleware("") is a pass-through in open mode.
+				wrapped := mcpserver.CORSMiddleware(
+					mcpserver.AuthMiddleware(accessKey.Value)(mcpHandler),
+				)
+
+				// Our own mux so non-/mcp paths return 404 cleanly
+				// instead of being dispatched through the MCP handler.
+				mux := http.NewServeMux()
+				mux.Handle("/mcp", wrapped)
+
+				httpSrv := &http.Server{
+					Addr:    addr,
+					Handler: mux,
 				}
-				if useTLS {
-					httpOpts = append(httpOpts, mcpgo.WithTLSCert(tlsCert, tlsKey))
-				}
-				httpServer := mcpgo.NewStreamableHTTPServer(s, httpOpts...)
 
 				scheme := "http"
 				if useTLS {
 					scheme = "https"
 				}
 				fmt.Printf("Starting Streamable HTTP server on %s://%s/mcp\n", scheme, addr)
-				err = httpServer.Start(addr)
+				if useTLS {
+					err = httpSrv.ListenAndServeTLS(tlsCert, tlsKey)
+				} else {
+					err = httpSrv.ListenAndServe()
+				}
 			case "sse":
 				err = fmt.Errorf(
 					"the legacy `sse` transport was removed in this release: noema now speaks Streamable HTTP (MCP 2025-03-26).\n" +
@@ -132,8 +193,10 @@ func serveCmd() *cobra.Command {
 
 // startSyncer reads the cortex manifest and, if federation peers are configured,
 // starts a background syncer that polls remote peers for new events.
-// Returns nil if federation is not configured.
-func startSyncer(cx *cortex.Cortex) *federation.Syncer {
+// Returns nil if federation is not configured. sharedKey is attached as an
+// Authorization: Bearer header on every outbound sync when non-empty; pass ""
+// for open-mode peers.
+func startSyncer(cx *cortex.Cortex, sharedKey string) *federation.Syncer {
 	m, err := cortex.ReadManifest(cx.Dir)
 	if err != nil || m.Federation == nil || len(m.Federation.Peers) == 0 {
 		return nil
@@ -150,13 +213,32 @@ func startSyncer(cx *cortex.Cortex) *federation.Syncer {
 	}
 
 	state := federation.NewState(cx.DB.DB)
-	cfg := federation.Config{Peers: peers, Interval: interval}
+	cfg := federation.Config{Peers: peers, Interval: interval, SharedKey: sharedKey}
 
 	syncer := federation.NewSyncer(cx, state, cfg)
 	syncer.Start()
 
 	fmt.Printf("Federation syncer started (%d peers, interval %s)\n", len(peers), cfg.EffectiveInterval())
 	return syncer
+}
+
+// requireTLSForKeyedMode returns a startup error when shared-key auth is
+// active but TLS is not configured. A bearer token sent over plaintext HTTP
+// is stolen by the first adversary on the network path, so the combination
+// is worse than open mode: it creates the appearance of security while
+// leaking the key on every request. Making this a hard error — not a
+// warning — is consistent with the --host guardrail's fail-fast posture.
+// See docs/design/mcp-auth-plan.md §4.
+func requireTLSForKeyedMode(access cortex.AccessKey, useTLS bool) error {
+	if !access.Keyed() || useTLS {
+		return nil
+	}
+	return fmt.Errorf(
+		"refusing to serve MCP auth over plaintext HTTP: access.shared_key_file is set (source=%s) but --tls-cert/--tls-key are not configured.\n"+
+			"  A bearer token sent without TLS is stolen by the first adversary on the network path.\n"+
+			"  Provide --tls-cert and --tls-key, or remove access.shared_key_file from cortex.md to run in open mode.",
+		access.Source,
+	)
 }
 
 // validateHTTPServe enforces the flag invariants for `noema serve --transport
