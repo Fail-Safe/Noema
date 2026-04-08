@@ -202,6 +202,15 @@ func (s *Syncer) syncPeer(peer PeerConfig) error {
 		}
 		clientOpts = append(clientOpts, transport.WithHTTPBasicClient(httpClient))
 	}
+	if s.config.SharedKey != "" {
+		// Ring-model auth: the same key the middleware enforces on
+		// incoming requests is attached to every outbound sync. Peers
+		// in mismatched modes (one keyed, one open) will 401 each
+		// other — by design; see docs/design/mcp-auth-plan.md.
+		clientOpts = append(clientOpts, transport.WithHTTPHeaders(map[string]string{
+			"Authorization": "Bearer " + s.config.SharedKey,
+		}))
+	}
 	mcpClient, err := client.NewStreamableHttpClient(mcpURL, clientOpts...)
 	if err != nil {
 		return fmt.Errorf("creating Streamable HTTP client: %w", err)

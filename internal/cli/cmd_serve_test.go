@@ -5,6 +5,8 @@ import (
 	"encoding/xml"
 	"strings"
 	"testing"
+
+	"github.com/Fail-Safe/Noema/internal/cortex"
 )
 
 // TestValidateHTTPServe pins the flag invariants for `noema serve --transport
@@ -478,6 +480,78 @@ func TestRunPrintLaunchdPlist_HappyPath(t *testing.T) {
 	}
 	if !strings.Contains(s, "com.fail-safe.noema.agentbrain") {
 		t.Errorf("plist label does not include cortex name:\n%s", s)
+	}
+}
+
+// TestRequireTLSForKeyedMode pins the auth-requires-TLS guard: shared-key
+// mode over plaintext HTTP is a worse security posture than open mode (it
+// leaks the key on every request while creating the appearance of security),
+// so the combination is a hard startup error. The guard must fire for both
+// "file" and "env" sources, must be a no-op in open mode, and must be a
+// no-op when TLS is configured.
+func TestRequireTLSForKeyedMode(t *testing.T) {
+	cases := []struct {
+		name          string
+		access        cortex.AccessKey
+		useTLS        bool
+		wantErrSubstr string // empty = expect nil
+	}{
+		{
+			name:   "open mode no TLS — fine",
+			access: cortex.AccessKey{}, // Keyed() == false
+			useTLS: false,
+		},
+		{
+			name:   "open mode with TLS — fine",
+			access: cortex.AccessKey{},
+			useTLS: true,
+		},
+		{
+			name:   "keyed mode with TLS — fine",
+			access: cortex.AccessKey{Value: "k", Source: "file", Fingerprint: "SHA256:aa"},
+			useTLS: true,
+		},
+		{
+			name:          "keyed mode from file, no TLS — reject",
+			access:        cortex.AccessKey{Value: "k", Source: "file", Path: ".access.secret"},
+			useTLS:        false,
+			wantErrSubstr: "source=file",
+		},
+		{
+			name:          "keyed mode from env, no TLS — reject",
+			access:        cortex.AccessKey{Value: "k", Source: "env"},
+			useTLS:        false,
+			wantErrSubstr: "source=env",
+		},
+		{
+			name:          "keyed mode error mentions plaintext",
+			access:        cortex.AccessKey{Value: "k", Source: "file"},
+			useTLS:        false,
+			wantErrSubstr: "plaintext HTTP",
+		},
+		{
+			name:          "keyed mode error suggests remediation",
+			access:        cortex.AccessKey{Value: "k", Source: "file"},
+			useTLS:        false,
+			wantErrSubstr: "--tls-cert and --tls-key",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := requireTLSForKeyedMode(tc.access, tc.useTLS)
+			if tc.wantErrSubstr == "" {
+				if err != nil {
+					t.Fatalf("expected nil, got: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.wantErrSubstr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Errorf("error %q does not contain %q", err.Error(), tc.wantErrSubstr)
+			}
+		})
 	}
 }
 

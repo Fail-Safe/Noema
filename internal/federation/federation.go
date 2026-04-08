@@ -15,6 +15,12 @@ type PeerConfig struct {
 type Config struct {
 	Peers    []PeerConfig  `yaml:"peers,omitempty"`
 	Interval time.Duration // parsed from string
+
+	// SharedKey is the MCP bearer token this syncer attaches to every
+	// outbound request as "Authorization: Bearer <SharedKey>". Empty
+	// means open mode (no header sent). Populated at startup from
+	// cortex.LoadAccessKey; never surfaced in YAML, logs, or events.
+	SharedKey string `yaml:"-"`
 }
 
 // EffectiveInterval returns the configured interval or the default.
