@@ -1,4 +1,9 @@
-# Noema
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/noema-dark.svg">
+    <img alt="Noema." src="assets/brand/noema-light.svg" width="600">
+  </picture>
+</p>
 
 **The intentional memory layer for your AI agents.**
 
