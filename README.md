@@ -110,13 +110,15 @@ noema events backfill [--dry-run] [--yes]
 noema resolve <divergence-id> --accept <origin> | --custom <body>
                                           Resolve a divergence (concurrent edit conflict)
 
-noema federation status                   Show federation config, peer sync state, and vector clock
+noema federation status                   Show federation config, MCP access posture, peer sync state, and vector clock
 noema federation peers                    List configured federation peers
 noema federation add-peer <name> <endpoint>
                                           Add a federation peer to cortex.md
 noema federation reset-peer <name>...     Clear stored state for a peer (forces a fresh handshake; use after a peer
                                           ran `noema migrate cortex-id --reset` and the syncer is now reporting an
                                           identity mismatch)
+noema federation key fingerprint          Print the SHA-256 fingerprint of the active MCP shared key (safe to
+                                          say aloud over an out-of-band channel to confirm a pairing)
 
 noema serve [--transport stdio|http] [--host <addr>] [--tls-cert <file> --tls-key <file>]
                                           Start the MCP server (http requires --host; endpoint is /mcp)

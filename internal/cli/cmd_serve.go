@@ -40,7 +40,7 @@ func serveCmd() *cobra.Command {
 		Aliases: []string{"server"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if printConfig {
-				return runPrintMCPConfig()
+				return runPrintMCPConfig(cmd.OutOrStdout(), transport, host, port, tlsCert, tlsKey)
 			}
 			if printSystemdUnit {
 				return runPrintSystemdUnit(cmd.OutOrStdout(), transport, host, port, tlsCert, tlsKey)
@@ -376,15 +376,28 @@ func runPrintLaunchdPlist(out io.Writer, transport, host string, port int, tlsCe
 	// Install hint to stderr so `--print-launchd-plist > foo.plist`
 	// writes only the plist to the file while the operator still sees
 	// the install commands in their terminal.
+	plistPath := fmt.Sprintf("~/Library/LaunchAgents/%s.plist", label)
 	fmt.Fprintf(os.Stderr, "# Generated LaunchAgent plist for Noema cortex %q.\n", cortexFlag)
 	fmt.Fprintln(os.Stderr, "# Install with:")
 	fmt.Fprintln(os.Stderr, "#")
 	fmt.Fprintf(os.Stderr, "#   noema serve %s --print-launchd-plist \\\n", strings.Join(serveArgs[1:], " "))
-	fmt.Fprintf(os.Stderr, "#     > ~/Library/LaunchAgents/%s.plist\n", label)
-	fmt.Fprintf(os.Stderr, "#   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/%s.plist\n", label)
+	fmt.Fprintf(os.Stderr, "#     > %s\n", plistPath)
+	fmt.Fprintf(os.Stderr, "#   launchctl bootstrap gui/$(id -u) %s\n", plistPath)
+	fmt.Fprintln(os.Stderr, "#")
+	fmt.Fprintln(os.Stderr, "# KEYED MODE (MCP shared-key auth):")
+	fmt.Fprintf(os.Stderr, "#   The plist contains an EnvironmentVariables block with NOEMA_MCP_KEY=%s\n", launchdKeyPlaceholder)
+	fmt.Fprintln(os.Stderr, "#   launchd has no EnvironmentFile= equivalent, so the key must live inside")
+	fmt.Fprintln(os.Stderr, "#   the plist itself. Before loading, edit the plist and replace the")
+	fmt.Fprintln(os.Stderr, "#   placeholder with your real bearer token, then tighten permissions:")
+	fmt.Fprintln(os.Stderr, "#")
+	fmt.Fprintf(os.Stderr, "#     chmod 600 %s\n", plistPath)
+	fmt.Fprintln(os.Stderr, "#")
+	fmt.Fprintln(os.Stderr, "# OPEN MODE (no auth):")
+	fmt.Fprintln(os.Stderr, "#   Delete the entire <key>EnvironmentVariables</key>...</dict> block")
+	fmt.Fprintln(os.Stderr, "#   before loading. The server will come up in open mode.")
 	fmt.Fprintln(os.Stderr, "#")
 	fmt.Fprintf(os.Stderr, "# Tail logs: tail -f ~/Library/Logs/noema-%s.log\n", cortexFlag)
-	fmt.Fprintf(os.Stderr, "# Stop:      launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/%s.plist\n", label)
+	fmt.Fprintf(os.Stderr, "# Stop:      launchctl bootout gui/$(id -u) %s\n", plistPath)
 	fmt.Fprintln(os.Stderr)
 
 	plist := buildLaunchdPlist(launchdPlistParams{
@@ -413,7 +426,18 @@ type systemdUnitParams struct {
 // directory and can break legitimate setups where the cortex lives
 // outside ~/.noema. Operators who want hardening can add it manually;
 // the generated unit works out of the box, which is the goal.
+//
+// The generator is pure-flag and emits the same unit whether the target
+// cortex is keyed or open: the EnvironmentFile= line uses a leading "-"
+// so systemd treats it as optional, which means open-mode cortexes
+// simply ignore the missing file, and keyed-mode cortexes get their
+// NOEMA_MCP_KEY injected when the operator drops the env file in place.
+// That keeps the print path testable without loading a live cortex and
+// lets operators flip between open and keyed mode without regenerating
+// the unit.
 func buildSystemdUnit(p systemdUnitParams) string {
+	envFile := "%h/.config/noema/" + p.Cortex + ".env"
+
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Noema memory server (%s)\n", p.Cortex)
 	fmt.Fprintln(&b, "#")
@@ -423,6 +447,15 @@ func buildSystemdUnit(p systemdUnitParams) string {
 	fmt.Fprintf(&b, "#     | sudo tee /etc/systemd/system/noema-%s.service\n", p.Cortex)
 	fmt.Fprintln(&b, "#   sudo systemctl daemon-reload")
 	fmt.Fprintf(&b, "#   sudo systemctl enable --now noema-%s\n", p.Cortex)
+	fmt.Fprintln(&b, "#")
+	fmt.Fprintln(&b, "# For keyed-mode MCP auth, create the env file before first start:")
+	fmt.Fprintln(&b, "#")
+	fmt.Fprintf(&b, "#   install -d -m 700 ~/.config/noema\n")
+	fmt.Fprintf(&b, "#   umask 077 && printf 'NOEMA_MCP_KEY=<paste-key>\\n' > %s\n", envFile)
+	fmt.Fprintf(&b, "#   chmod 600 %s\n", envFile)
+	fmt.Fprintln(&b, "#")
+	fmt.Fprintln(&b, "# The EnvironmentFile= line below is prefixed with `-` so the unit")
+	fmt.Fprintln(&b, "# still starts in open mode when the env file is absent.")
 	fmt.Fprintln(&b, "#")
 	fmt.Fprintf(&b, "# Tail logs: sudo journalctl -u noema-%s -f\n", p.Cortex)
 	fmt.Fprintf(&b, "# Restart:   sudo systemctl restart noema-%s\n", p.Cortex)
@@ -437,6 +470,7 @@ func buildSystemdUnit(p systemdUnitParams) string {
 	fmt.Fprintln(&b, "[Service]")
 	fmt.Fprintln(&b, "Type=simple")
 	fmt.Fprintf(&b, "User=%s\n", p.User)
+	fmt.Fprintf(&b, "EnvironmentFile=-%s\n", envFile)
 	fmt.Fprintf(&b, "ExecStart=%s %s\n", p.Exe, strings.Join(p.ServeArgs, " "))
 	fmt.Fprintln(&b, "Restart=on-failure")
 	fmt.Fprintln(&b, "RestartSec=5s")
@@ -455,6 +489,19 @@ type launchdPlistParams struct {
 	HomeDir   string   // user home dir (from os.UserHomeDir) for log path
 	ServeArgs []string // argv after the binary path, starting with "serve"
 }
+
+// launchdKeyPlaceholder is the literal value emitted in the plist's
+// EnvironmentVariables dict for NOEMA_MCP_KEY. Operators must replace
+// it with the real key before loading the plist, OR delete the whole
+// EnvironmentVariables block for open mode. The stderr install hints
+// printed by runPrintLaunchdPlist call this out explicitly.
+//
+// launchd has no equivalent of systemd's EnvironmentFile= directive, so
+// unlike the systemd unit we cannot reference an external secret file:
+// the plist itself becomes secret-bearing in keyed mode. The placeholder
+// makes that requirement visible in the generated file rather than
+// leaving it buried in documentation.
+const launchdKeyPlaceholder = "REPLACE_WITH_BEARER_KEY_OR_DELETE_THIS_DICT"
 
 // buildLaunchdPlist renders a per-user LaunchAgent plist. Every text value
 // that could come from user input (cortex name, paths) is run through
@@ -481,6 +528,11 @@ func buildLaunchdPlist(p launchdPlistParams) string {
 		fmt.Fprintf(&b, "        <string>%s</string>\n", xmlEscape(arg))
 	}
 	fmt.Fprintln(&b, "    </array>")
+	fmt.Fprintln(&b, "    <key>EnvironmentVariables</key>")
+	fmt.Fprintln(&b, "    <dict>")
+	fmt.Fprintln(&b, "        <key>NOEMA_MCP_KEY</key>")
+	fmt.Fprintf(&b, "        <string>%s</string>\n", xmlEscape(launchdKeyPlaceholder))
+	fmt.Fprintln(&b, "    </dict>")
 	fmt.Fprintln(&b, "    <key>RunAtLoad</key>")
 	fmt.Fprintln(&b, "    <true/>")
 	fmt.Fprintln(&b, "    <key>KeepAlive</key>")
@@ -508,9 +560,27 @@ func xmlEscape(s string) string {
 }
 
 // runPrintMCPConfig writes a ready-to-use .mcp.json snippet to stdout.
-// It resolves the binary path via os.Executable and the cortex name via the
-// same priority chain used by resolveCortex (flag > env > config default).
-func runPrintMCPConfig() error {
+// For stdio transport (the default), it emits a `command` + `args` entry
+// that Claude Code and other stdio-based MCP clients expect. For http
+// transport, it emits a `url` + `headers` entry pointing at the
+// /mcp Streamable HTTP endpoint with an Authorization header literal
+// of "Bearer ${NOEMA_MCP_KEY}". That placeholder is emitted verbatim
+// rather than pulling the live key for two reasons:
+//
+//  1. the file is typically committed to source control alongside the
+//     rest of the repo's .mcp.json, and
+//  2. MCP clients that support env interpolation in headers (Claude
+//     Code does) will resolve it at runtime, while clients that do not
+//     will produce an obvious 401 with a bearer string they can search
+//     for and edit, rather than a silent "wrong key" failure.
+//
+// The cortex name is resolved via the same priority chain as resolveCortex
+// (flag > env > config default). Transport-specific flags are plumbed
+// through from RunE so a single `noema serve --print-config --transport
+// http --host 10.0.0.1 ...` invocation produces the exact config a
+// remote client would need, including the URL scheme that matches the
+// --tls-cert/--tls-key pair.
+func runPrintMCPConfig(out io.Writer, transport, host string, port int, tlsCert, tlsKey string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("resolving executable path: %w", err)
@@ -528,20 +598,60 @@ func runPrintMCPConfig() error {
 		name = cfg.Default
 	}
 
-	serveArgs := []string{"serve"}
-	if name != "" {
-		serveArgs = append(serveArgs, "--cortex", name)
+	var entry map[string]any
+	switch transport {
+	case "http":
+		// For the http entry we must be able to form a URL, so --host
+		// and --port are required. --tls-cert/--tls-key are optional;
+		// their presence determines https vs. http. We reuse
+		// validateHTTPServe's sub-checks (host required, not 0.0.0.0,
+		// tls pair coherent) but don't gate on cortexExplicit here —
+		// the .mcp.json snippet is emitted for a client that's talking
+		// TO a server, not launching one, so there's no network-
+		// exposure risk in printing an http config without --cortex.
+		if host == "" {
+			return fmt.Errorf("--print-config --transport http requires --host (the address a client will dial, e.g. 10.0.0.1 or my.lan)")
+		}
+		if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+			return fmt.Errorf("--host %s is a wildcard bind address; pass the address clients should dial instead", host)
+		}
+		if (tlsCert == "") != (tlsKey == "") {
+			return fmt.Errorf("--tls-cert and --tls-key must be provided together")
+		}
+		scheme := "http"
+		if tlsCert != "" && tlsKey != "" {
+			scheme = "https"
+		}
+		// IPv6 addresses need brackets in URLs.
+		hostForURL := host
+		if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+			hostForURL = "[" + host + "]"
+		}
+		entry = map[string]any{
+			"url": fmt.Sprintf("%s://%s:%d/mcp", scheme, hostForURL, port),
+			"headers": map[string]any{
+				"Authorization": "Bearer ${NOEMA_MCP_KEY}",
+			},
+		}
+	case "stdio", "":
+		serveArgs := []string{"serve"}
+		if name != "" {
+			serveArgs = append(serveArgs, "--cortex", name)
+		}
+		entry = map[string]any{
+			"command": exe,
+			"args":    serveArgs,
+		}
+	default:
+		return fmt.Errorf("--print-config does not support --transport %q (use stdio or http)", transport)
 	}
 
-	out := map[string]any{
+	payload := map[string]any{
 		"mcpServers": map[string]any{
-			"noema": map[string]any{
-				"command": exe,
-				"args":    serveArgs,
-			},
+			"noema": entry,
 		},
 	}
-	enc := json.NewEncoder(os.Stdout)
+	enc := json.NewEncoder(out)
 	enc.SetIndent("", "  ")
-	return enc.Encode(out)
+	return enc.Encode(payload)
 }
