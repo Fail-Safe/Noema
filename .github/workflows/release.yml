@@ -68,6 +68,8 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          # ^ uncomment once the homebrew-noema tap repo exists and the
-          # `brews:` block in .goreleaser.yaml is enabled.
+          # Homebrew tap push target: Fail-Safe/homebrew-noema. Both the
+          # brews: (Formula) and homebrew_casks: (Cask) blocks in
+          # .goreleaser.yaml share this token — it's a fine-grained PAT
+          # scoped to the single tap repo with Contents write permission.
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
