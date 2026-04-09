@@ -36,6 +36,36 @@ A Trace has a **type** that describes its intent:
 
 ## Installation
 
+### With Homebrew (macOS + Linux)
+
+The fastest path. One command taps `Fail-Safe/homebrew-noema` and
+installs the cross-platform formula covering `darwin/{amd64,arm64}`
+and `linux/{amd64,arm64}`:
+
+```bash
+brew install Fail-Safe/noema/noema
+```
+
+On macOS a cask is also published for users who prefer the cask
+ecosystem:
+
+```bash
+brew install --cask Fail-Safe/noema/noema
+```
+
+> The formula path is the default on macOS — when a tap contains both a
+> formula and a cask of the same name, `brew install` (without `--cask`)
+> resolves the formula first. Pass `--cask` to opt into the cask. Linux
+> users get the formula automatically.
+
+Prefer the two-step form? It works the same:
+
+```bash
+brew tap Fail-Safe/noema
+brew install noema          # formula (macOS + Linux)
+brew install --cask noema   # cask (macOS only)
+```
+
 ### Download a pre-built binary
 
 Grab the archive for your OS/arch from the
