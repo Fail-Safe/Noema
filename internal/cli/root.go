@@ -13,8 +13,20 @@ import (
 	"github.com/Fail-Safe/Noema/internal/cortex"
 )
 
-// Version is set via -ldflags at build time; falls back to module info.
-var Version = ""
+// Version, Commit, and Date are set via -ldflags at build time.
+//
+// Version falls back to Go module build info when the binary was produced
+// without ldflags (e.g. `go install`, `go run`), and finally to "dev" for
+// a working-copy build. Commit and Date have no useful runtime fallback —
+// an empty string means "unknown" and callers render it as such.
+//
+// The Makefile injects Version only; GoReleaser injects all three on
+// tagged releases.
+var (
+	Version = ""
+	Commit  = ""
+	Date    = ""
+)
 
 func version() string {
 	if Version != "" {
@@ -75,6 +87,11 @@ func init() {
 	addGrouped(groupIface,
 		serveCmd(), tuiCmd(), completionCmd(),
 	)
+
+	// versionCmd is intentionally ungrouped — it's meta (about the
+	// binary itself, not Traces or Cortexes), so it lands under
+	// cobra's "Additional Commands:" section at the bottom of help.
+	rootCmd.AddCommand(versionCmd())
 }
 
 func addGrouped(group string, cmds ...*cobra.Command) {

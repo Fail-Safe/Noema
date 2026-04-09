@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # sync-brand-assets.sh — copy the published brand SVGs from the
-# private Noema-design repo into this repo's assets/brand/ so the
+# private Noema-design repo into this repo's .github/assets/brand/ so the
 # README can reference them from a committed path.
 #
 # Noema-design is a separate git checkout. By default this script
@@ -25,7 +25,7 @@ fi
 
 DESIGN_REPO="$(cd -- "$DESIGN_REPO_RAW" && pwd)"
 SRC="$DESIGN_REPO/graphics/name"
-DST="$REPO_ROOT/assets/brand"
+DST="$REPO_ROOT/.github/assets/brand"
 
 if [[ ! -d "$SRC" ]]; then
   echo "error: source dir $SRC not found — regenerate via scripts/compose_brand_text.py first" >&2
@@ -49,4 +49,4 @@ for f in "${FILES[@]}"; do
   echo "synced $f"
 done
 
-echo "done. assets/brand/ now matches $SRC"
+echo "done. .github/assets/brand/ now matches $SRC"

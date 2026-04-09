@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/noema-dark.svg">
-    <img alt="Noema." src="assets/brand/noema-light.svg" width="600">
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/brand/noema-dark.svg">
+    <img alt="Noema." src=".github/assets/brand/noema-light.svg" width="600">
   </picture>
 </p>
 
@@ -36,13 +36,40 @@ A Trace has a **type** that describes its intent:
 
 ## Installation
 
-Requires Go 1.21+.
+### Download a pre-built binary
+
+Grab the archive for your OS/arch from the
+[Releases page](https://github.com/Fail-Safe/Noema/releases), verify it
+against `checksums.txt`, and put `noema` somewhere on your `$PATH`:
+
+```bash
+# macOS (Apple Silicon) — adjust VERSION and Arch as needed.
+# Pre-built binaries start at v0.3.0; earlier tags (v0.1.x, v0.2.x)
+# exist in git history but were never published as downloadable
+# releases.
+VERSION=0.3.0
+curl -LO https://github.com/Fail-Safe/Noema/releases/download/v${VERSION}/noema_${VERSION}_darwin_arm64.tar.gz
+curl -LO https://github.com/Fail-Safe/Noema/releases/download/v${VERSION}/checksums.txt
+shasum -a 256 -c checksums.txt --ignore-missing
+tar -xzf noema_${VERSION}_darwin_arm64.tar.gz
+sudo mv noema /usr/local/bin/
+noema version
+```
+
+Release archives are fully static (pure-Go SQLite, `CGO_ENABLED=0`) so
+there's nothing to install alongside the binary. Supported targets:
+`darwin/amd64`, `darwin/arm64`, `linux/amd64`, `linux/arm64`,
+`windows/amd64`, `windows/arm64`.
+
+### With the Go toolchain
+
+If you already have Go 1.25+ installed:
 
 ```bash
 go install github.com/Fail-Safe/Noema/cmd/noema@latest
 ```
 
-Or build from source:
+### Build from source
 
 ```bash
 git clone https://github.com/Fail-Safe/Noema.git
@@ -56,6 +83,12 @@ Dev builds keep the symbol table and DWARF info for debugging (~19 MB).
 Release builds strip both and run with `-trimpath` for a ~13 MB static
 binary with the git version embedded via `-ldflags`. `make help` lists
 all targets.
+
+> **Pre-1.0 notice.** Noema is currently on the `v0.x` line. Expect
+> breaking changes between minor releases until v1.0. Cortex data on
+> disk is forward-compatible via non-destructive migrations; any
+> `cortex.md` version bump that requires a manual step ships with an
+> explicit `noema migrate` command.
 
 ---
 
@@ -132,6 +165,7 @@ noema serve ... --print-systemd-unit      Print a systemd service unit for the c
 noema serve ... --print-launchd-plist     Print a launchd LaunchAgent plist for the current serve flags
 noema tui                                 Open the interactive TUI
 noema completion [bash|zsh|fish|install]  Generate shell completions
+noema version                             Print version, commit, and build date
 ```
 
 **Common flags:**

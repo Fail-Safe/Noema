@@ -1,0 +1,73 @@
+# Release workflow for Noema.
+#
+# Triggered only by a pushed `v*` tag — regular commits to `main` or
+# `next` do nothing here. GoReleaser reads `.goreleaser.yaml`, cross-
+# compiles every OS/arch target, produces tar.gz/zip archives + a
+# checksums.txt file, and publishes a GitHub Release with auto-
+# generated notes.
+#
+# How to cut a release:
+#
+#   # From a clean `main` checkout pointing at the commit you want to ship:
+#   git tag v0.3.0
+#   git push origin v0.3.0
+#
+# (v0.1.x and v0.2.x tags exist in git history from early development
+# but were never published as downloadable releases — v0.3.0 is the
+# first tag with pre-built binaries attached.)
+#
+# This workflow takes it from there. A failed build fails cleanly before
+# any artifacts are published, so a broken tag never leaves a half-
+# published release on the repo.
+#
+# Local dry-run (no publish, no tag required):
+#
+#   goreleaser release --snapshot --clean --skip=publish
+#
+# Security note: this workflow intentionally avoids interpolating any
+# `github.event.*` values into shell commands. The only dynamic input is
+# `secrets.GITHUB_TOKEN`, passed through `env:` — no `run:` steps ever
+# see untrusted data, so there's no surface for workflow injection.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Default token permissions are read-only on modern GitHub; GoReleaser
+# needs write access to create the release and upload assets.
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    name: goreleaser
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # GoReleaser needs the full history to generate the changelog
+          # (and to see the previous tag for the `use: github` diff).
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Track go.mod so the CI Go version never drifts from the
+          # version the project actually builds against locally.
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # ^ uncomment once the homebrew-noema tap repo exists and the
+          # `brews:` block in .goreleaser.yaml is enabled.
