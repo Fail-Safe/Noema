@@ -324,6 +324,29 @@ noema resolve <divergence-id> --custom "<merged body>"    # apply a custom merge
 
 Either choice updates the original trace, federates the resolution, and trashes
 the divergence trace. The MCP equivalent is the ` + "`resolve_divergence`" + ` tool.
+
+## Access Posture
+
+The HTTP MCP endpoint runs in one of two postures, logged on every ` + "`noema serve`" + ` startup:
+
+- **Open** — no bearer key required. Fine for ` + "`127.0.0.1`" + ` stdio-adjacent use; not safe for anything else.
+- **Keyed** — every request must carry ` + "`Authorization: Bearer <key>`" + `. Required for federation rings, remote IDEs, and any non-loopback host. Keyed mode also refuses to start without ` + "`--tls-cert`" + `/` + "`--tls-key`" + ` — a bearer token over plaintext HTTP is stolen by the first adversary on the network path.
+
+Configure the key one of two ways (env wins if both are set):
+
+1. ` + "`NOEMA_MCP_KEY`" + ` environment variable.
+2. An optional ` + "`access`" + ` block in ` + "`cortex.md`" + ` pointing at a sidecar file:
+
+` + "```yaml" + `
+access:
+  shared_key_file: .access.secret   # path relative to the cortex dir, or absolute
+` + "```" + `
+
+The sidecar file **must** be mode ` + "`0600`" + ` — Noema refuses to load a group- or world-readable key file. The key is the first non-empty line of the file.
+
+Both config sources generate the same SSH-style fingerprint, logged at startup as ` + "`access=keyed source=... fingerprint=SHA256:...`" + ` and queryable with ` + "`noema federation key fingerprint`" + `. Every host in a federation ring must produce the same fingerprint, or peers will 401 each other on sync.
+
+If you're an agent reading this file, the access posture is transparent to MCP tool calls — your client either has the key configured and everything works, or it doesn't and you'll see a 401 response. You don't manipulate the key yourself.
 `
 }
 
