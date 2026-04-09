@@ -193,10 +193,20 @@ noema serve [--transport stdio|http] [--host <addr>] [--tls-cert <file> --tls-ke
 noema serve --print-config                Print a ready-to-use .mcp.json snippet and exit
 noema serve ... --print-systemd-unit      Print a systemd service unit for the current serve flags
 noema serve ... --print-launchd-plist     Print a launchd LaunchAgent plist for the current serve flags
-noema tui                                 Open the interactive TUI
+noema tui [--theme auto|dark|light]       Open the interactive TUI
+noema config get <key>                    Print a user-level setting (ui.theme, trash_days)
+noema config set <key> <value>            Update and persist a user-level setting
+noema config list                         List every known config key with its current value
 noema completion [bash|zsh|fish|install]  Generate shell completions
 noema version                             Print version, commit, and build date
 ```
+
+**TUI theme priority** (highest wins):
+
+1. `--theme` flag on `noema tui`
+2. `NOEMA_THEME` environment variable
+3. `ui.theme` in `~/.config/noema/config.yaml` (`noema config set ui.theme dark`)
+4. `auto` — detected from the terminal's reported background color
 
 **Common flags:**
 

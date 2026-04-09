@@ -88,10 +88,11 @@ func init() {
 		serveCmd(), tuiCmd(), completionCmd(),
 	)
 
-	// versionCmd is intentionally ungrouped — it's meta (about the
-	// binary itself, not Traces or Cortexes), so it lands under
-	// cobra's "Additional Commands:" section at the bottom of help.
-	rootCmd.AddCommand(versionCmd())
+	// versionCmd and configCmd are intentionally ungrouped — they're
+	// meta (about the binary or user settings, not Traces or
+	// Cortexes), so they land under cobra's "Additional Commands:"
+	// section at the bottom of help.
+	rootCmd.AddCommand(versionCmd(), configCmd())
 }
 
 func addGrouped(group string, cmds ...*cobra.Command) {

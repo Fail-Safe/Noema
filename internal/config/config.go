@@ -12,11 +12,52 @@ type Config struct {
 	Default   string                 `yaml:"default"`
 	Cortexes  map[string]CortexEntry `yaml:"cortexes"`
 	TrashDays int                    `yaml:"trash_days,omitempty"` // 0 means use default (30)
+	UI        *UIConfig              `yaml:"ui,omitempty"`
 }
 
 type CortexEntry struct {
 	Path string `yaml:"path"`
 	ID   string `yaml:"id,omitempty"` // ULID, used to disambiguate same-named cortexes
+}
+
+// UIConfig holds user-level TUI preferences. Stored as a pointer on
+// Config so it can be omitted from the YAML output entirely when the
+// user has never touched any of these settings — a fresh config stays
+// visually identical to what older Noema binaries produced.
+type UIConfig struct {
+	// Theme is the TUI color scheme: "auto", "dark", or "light".
+	// Empty is treated as "auto" (detect terminal background).
+	Theme string `yaml:"theme,omitempty"`
+}
+
+// Theme returns the configured UI theme, defaulting to "auto" when
+// UI is nil or Theme is unset. This is the single source of truth
+// for what "no explicit theme configured" means.
+func (c *Config) Theme() string {
+	if c == nil || c.UI == nil || c.UI.Theme == "" {
+		return "auto"
+	}
+	return c.UI.Theme
+}
+
+// SetTheme records a theme preference, allocating the UI block if
+// needed. An empty string clears the preference (falls back to auto).
+func (c *Config) SetTheme(theme string) {
+	if theme == "" {
+		if c.UI != nil {
+			c.UI.Theme = ""
+			// If the UI block is now entirely empty, drop it so the
+			// serialized config stays clean.
+			if *c.UI == (UIConfig{}) {
+				c.UI = nil
+			}
+		}
+		return
+	}
+	if c.UI == nil {
+		c.UI = &UIConfig{}
+	}
+	c.UI.Theme = theme
 }
 
 func Path() (string, error) {

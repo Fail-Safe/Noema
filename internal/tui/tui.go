@@ -17,106 +17,269 @@ import (
 
 // ---- styles ----------------------------------------------------------------
 
-// Brand palette — mirrors the Noema website (src/styles/global.css).
-// We use CompleteColor rather than bare hex so 256-color terminals get
-// hand-picked palette indices instead of termenv's automatic downmatch
-// (which picks color 232 — near-black — for the brand red, rendering
-// the wordmark period invisible on dark backgrounds).
-//
-// Kept as package-level vars so a future light/dark toggle only has to
-// swap these assignments without touching the style definitions below.
+// Brand palette — locked to BRAND.md (three values, no supporting
+// palettes). We use CompleteColor rather than bare hex so 256-color
+// terminals get hand-picked indices instead of termenv's automatic
+// downmatch (which picks color 232 — near-black — for the brand red,
+// rendering the period invisible on dark backgrounds).
 var (
-	// brandFg — cream "Noema" wordmark.
-	//   TrueColor: #ece4d4 (website --fg)
-	//   ANSI256:   223      (#ffd7af — warm beige, closest to cream)
-	//   ANSI:      7        (white)
-	brandFg = lipgloss.CompleteColor{
+	// brandCream — warm cream `#ece4d4`. Foreground in dark mode,
+	// background in light mode.
+	brandCream = lipgloss.CompleteColor{
 		TrueColor: "#ece4d4",
-		ANSI256:   "223",
-		ANSI:      "7",
+		ANSI256:   "223", // #ffd7af — warm beige, closest to cream
+		ANSI:      "7",   // white
 	}
 
-	// brandRed — accent period in "Noema."
-	//   TrueColor: #e10032 (website --red)
-	//   ANSI256:   161      (#d7005f — closest saturated red)
-	//   ANSI:      1        (red)
+	// brandInk — near-black `#1a1a1a`. Background in dark mode,
+	// foreground in light mode.
+	brandInk = lipgloss.CompleteColor{
+		TrueColor: "#1a1a1a",
+		ANSI256:   "234", // very dark gray
+		ANSI:      "0",   // black
+	}
+
+	// brandRed — rubricated accent `#e10032`. Period only; never
+	// recolored. One value across both themes per BRAND.md.
 	brandRed = lipgloss.CompleteColor{
 		TrueColor: "#e10032",
-		ANSI256:   "161",
-		ANSI:      "1",
+		ANSI256:   "161", // #d7005f — closest saturated red
+		ANSI:      "1",   // red
 	}
 )
+
+// palette holds every color the TUI uses for a single theme variant.
+// Two instances exist — darkPalette() and lightPalette() — selected
+// at startup by loadPalette(). All style vars below are assigned from
+// the active palette, so a theme swap rebuilds every style without
+// touching the render paths.
+type palette struct {
+	bg       lipgloss.TerminalColor // surface background
+	fg       lipgloss.TerminalColor // brand accent — wordmark + chip fill ONLY
+	body     lipgloss.TerminalColor // default body text (row titles, detail values)
+	red      lipgloss.TerminalColor // accent (period only)
+	label    lipgloss.TerminalColor // dimmer than body — row labels, metadata keys
+	value    lipgloss.TerminalColor // metadata values; matches body in current themes
+	dim      lipgloss.TerminalColor // header decoration, "no rows" placeholder
+	divider  lipgloss.TerminalColor // pane divider + separator lines
+	footer   lipgloss.TerminalColor // footer hint text
+	selBg    lipgloss.TerminalColor // selected row backdrop
+	selFg    lipgloss.TerminalColor // selected row text
+	dimRow   lipgloss.TerminalColor // background-pane rows when detail has focus
+	selDim   lipgloss.TerminalColor // selected row when detail has focus
+	newRow   lipgloss.TerminalColor // highlight for just-arrived rows
+	newDim   lipgloss.TerminalColor // newRow shade while detail has focus
+	live     lipgloss.TerminalColor // live-mode badge
+	errorFg  lipgloss.TerminalColor // footer error text
+	statusFg lipgloss.TerminalColor // footer status text
+}
+
+// darkPalette is the primary brand surface: near-black background,
+// cream foreground, rubricated red accent.
+func darkPalette() palette {
+	return palette{
+		bg:       brandInk,
+		fg:       brandCream,
+		body:     lipgloss.Color("250"),
+		red:      brandRed,
+		label:    lipgloss.Color("244"),
+		value:    lipgloss.Color("250"),
+		dim:      lipgloss.Color("240"),
+		divider:  lipgloss.Color("238"),
+		footer:   lipgloss.Color("241"),
+		selBg:    lipgloss.Color("236"),
+		selFg:    lipgloss.Color("255"),
+		dimRow:   lipgloss.Color("238"),
+		selDim:   lipgloss.Color("244"),
+		newRow:   lipgloss.Color("71"),
+		newDim:   lipgloss.Color("65"),
+		live:     lipgloss.Color("71"),
+		errorFg:  lipgloss.Color("196"),
+		statusFg: lipgloss.Color("71"),
+	}
+}
+
+// lightPalette uses a cool off-white background (ANSI 230) so the
+// warm brand cream can serve as an accent (selected row, chips)
+// rather than flooding the entire surface. Ink stays the wordmark
+// accent, mirroring cream's role in dark mode.
+func lightPalette() palette {
+	return palette{
+		bg:       lipgloss.Color("255"), // near-white, no color cast — cream is the accent
+		fg:       brandInk,
+		body:     lipgloss.Color("238"),
+		red:      brandRed,
+		label:    lipgloss.Color("243"),
+		value:    lipgloss.Color("238"),
+		dim:      lipgloss.Color("248"),
+		divider:  lipgloss.Color("249"),
+		footer:   lipgloss.Color("244"),
+		selBg:    brandCream, // cream as accent — the cursor row is the warm band
+		selFg:    lipgloss.Color("232"),
+		dimRow:   lipgloss.Color("249"),
+		selDim:   lipgloss.Color("244"),
+		newRow:   lipgloss.Color("22"),
+		newDim:   lipgloss.Color("28"),
+		live:     lipgloss.Color("22"),
+		errorFg:  lipgloss.Color("124"),
+		statusFg: lipgloss.Color("22"),
+	}
+}
+
+// activePalette is set by loadPalette() at startup. Tests that need
+// deterministic styling can call loadPalette("dark") explicitly.
+var activePalette = darkPalette()
 
 var (
 	// styleHeader renders the "Noema" portion of the wordmark in the
 	// brand cream. styleHeaderAccent renders the trailing period in
-	// brand red — matching the website's wordmark. Splitting them
-	// keeps the two colors independent for theming.
-	styleHeader = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(brandFg)
+	// brand red. Splitting them keeps the two colors independent.
+	styleHeader       lipgloss.Style
+	styleHeaderAccent lipgloss.Style
 
-	styleHeaderAccent = lipgloss.NewStyle().
-				Bold(true).
-				Foreground(brandRed)
+	styleSelected lipgloss.Style
+	styleDim      lipgloss.Style
 
-	styleSelected = lipgloss.NewStyle().
-			Bold(true).
-			Background(lipgloss.Color("236")).
-			Foreground(lipgloss.Color("255"))
+	// styleChip renders tag values (and the type value) as inline
+	// pills — inverted brand palette with 1-cell padding. See
+	// renderTagChips for the wrap logic.
+	styleChip lipgloss.Style
 
-	styleDim = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("240"))
-
-	styleBadge = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("214"))
-
-	styleDivider = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("238"))
-
-	styleLabel = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("244"))
-
-	styleValue = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("252"))
-
-	styleFooter = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("241"))
-
-	styleError = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("196"))
-
-	styleStatus = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("71"))
+	styleDivider lipgloss.Style
+	styleLabel   lipgloss.Style
+	styleValue   lipgloss.Style
+	styleFooter  lipgloss.Style
+	styleError   lipgloss.Style
+	styleStatus  lipgloss.Style
 
 	// styleNewRow tints rows that arrived on the most recent refresh —
 	// the visible "pop in" effect when watching live updates.
-	styleNewRow = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("71"))
+	styleNewRow lipgloss.Style
 
 	// styleLive is the header badge shown while follow mode is active.
-	styleLive = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("71")).
-			Bold(true)
+	styleLive lipgloss.Style
 
 	// When the detail pane owns focus, the list pane gets a "modal
 	// backdrop" treatment — every row renders through a dim palette
 	// so it visibly recedes. The selected row stays a notch brighter
 	// than the rest so the cursor position is still legible.
-	//
-	// Brightness ladder (dim mode):
-	//   styleRowDim        238  very faint   — unselected rows
-	//   styleNewRowDim      65  muted green  — highlighted arrivals
-	//   styleSelectedDim   244  soft gray    — current selection
+	styleSelectedDim lipgloss.Style
+	styleRowDim      lipgloss.Style
+	styleNewRowDim   lipgloss.Style
+
+	// styleSurface paints the active palette's background on any
+	// region passed through it. Used for header, footer, and the
+	// implicit fill behind the list/detail/divider block so the
+	// whole TUI reads as one brand surface.
+	styleSurface lipgloss.Style
+)
+
+func init() {
+	loadPalette("dark")
+}
+
+// loadPalette reassigns every style variable from the named theme
+// ("dark", "light", or "auto" — auto consults lipgloss' terminal
+// background detection). Safe to call multiple times; call once at
+// startup before Run().
+func loadPalette(theme string) {
+	switch resolveTheme(theme) {
+	case "light":
+		activePalette = lightPalette()
+	default:
+		activePalette = darkPalette()
+	}
+	p := activePalette
+
+	styleSurface = lipgloss.NewStyle().Background(p.bg).Foreground(p.body)
+
+	styleHeader = lipgloss.NewStyle().
+		Bold(true).
+		Background(p.bg).
+		Foreground(p.fg)
+
+	styleHeaderAccent = lipgloss.NewStyle().
+		Bold(true).
+		Background(p.bg).
+		Foreground(p.red)
+
+	styleSelected = lipgloss.NewStyle().
+		Bold(true).
+		Background(p.selBg).
+		Foreground(p.selFg)
+
+	styleDim = lipgloss.NewStyle().
+		Background(p.bg).
+		Foreground(p.dim)
+
+	// Chips use the inverted palette — a small "patch of light mode"
+	// in dark mode, and vice versa — so they read as a distinct
+	// labeled object without introducing a fourth brand color.
+	styleChip = lipgloss.NewStyle().
+		Background(p.fg).
+		Foreground(p.bg).
+		Padding(0, 1)
+
+	styleDivider = lipgloss.NewStyle().
+		Background(p.bg).
+		Foreground(p.divider)
+
+	styleLabel = lipgloss.NewStyle().
+		Background(p.bg).
+		Foreground(p.label)
+
+	styleValue = lipgloss.NewStyle().
+		Background(p.bg).
+		Foreground(p.value)
+
+	styleFooter = lipgloss.NewStyle().
+		Background(p.bg).
+		Foreground(p.footer)
+
+	styleError = lipgloss.NewStyle().
+		Background(p.bg).
+		Foreground(p.errorFg)
+
+	styleStatus = lipgloss.NewStyle().
+		Background(p.bg).
+		Foreground(p.statusFg)
+
+	styleNewRow = lipgloss.NewStyle().
+		Background(p.bg).
+		Foreground(p.newRow)
+
+	styleLive = lipgloss.NewStyle().
+		Background(p.bg).
+		Foreground(p.live).
+		Bold(true)
+
 	styleSelectedDim = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("244"))
+		Background(p.bg).
+		Foreground(p.selDim)
 
 	styleRowDim = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("238"))
+		Background(p.bg).
+		Foreground(p.dimRow)
 
 	styleNewRowDim = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("65"))
-)
+		Background(p.bg).
+		Foreground(p.newDim)
+}
+
+// resolveTheme picks a concrete theme ("dark" or "light") from an
+// input that may be "auto", empty, or already concrete. Empty and
+// "auto" consult the terminal background via lipgloss.
+func resolveTheme(in string) string {
+	switch in {
+	case "dark", "light":
+		return in
+	default:
+		if lipgloss.HasDarkBackground() {
+			return "dark"
+		}
+		return "light"
+	}
+}
 
 // followInterval is how often the TUI polls the cortex when follow mode
 // is on. 1s is fast enough to feel live when an agent is writing into
@@ -749,7 +912,17 @@ func (m model) detailMetaLineCount() int {
 		n++
 	}
 	if len(m.current.Tags) > 0 {
-		n++
+		// Tags render as chip rows — potentially more than one line
+		// when the chips wrap. Query renderTagChips directly with the
+		// same width inputs renderDetail uses, so the body budget
+		// stays honest even when a trace has a lot of tags.
+		_, detailW := m.paneWidths()
+		labelW := 10
+		metaValW := detailW - labelW - 2
+		if metaValW < 4 {
+			metaValW = 4
+		}
+		n += len(renderTagChips(m.current.Tags, labelW, metaValW))
 	}
 	return n
 }
@@ -865,11 +1038,14 @@ func (m model) View() string {
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, list, divider, detail)
 
-	return lipgloss.JoinVertical(lipgloss.Left,
-		m.renderHeader(),
-		body,
-		m.renderFooter(),
-	)
+	// Header and footer are single-row strings that only stretch as
+	// far as their content goes; right-pad them with surface cells so
+	// the entire row renders on the same brand background rather than
+	// leaking the terminal default at the right edge.
+	header := padLineToWidth(m.renderHeader(), m.width)
+	footer := padLineToWidth(m.renderFooter(), m.width)
+
+	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
 }
 
 func (m model) renderHeader() string {
@@ -891,7 +1067,10 @@ func (m model) renderHeader() string {
 	if gap < 1 {
 		gap = 1
 	}
-	return left + strings.Repeat(" ", gap) + right
+	// Gap spacer is painted with the surface background so the raw
+	// space characters don't leak the terminal default through the
+	// middle of the header row.
+	return left + styleSurface.Render(strings.Repeat(" ", gap)) + right
 }
 
 func (m model) renderList(width, height int) string {
@@ -976,7 +1155,7 @@ func (m model) renderList(width, height int) string {
 			if dim {
 				sb.WriteString(styleRowDim.Width(width).Render(line))
 			} else {
-				sb.WriteString(lipgloss.NewStyle().Width(width).Render(line))
+				sb.WriteString(styleSurface.Width(width).Render(line))
 			}
 		}
 		if i < end-1 {
@@ -988,7 +1167,7 @@ func (m model) renderList(width, height int) string {
 	rendered := sb.String()
 	lines := strings.Count(rendered, "\n") + 1
 	for lines < height {
-		rendered += "\n" + lipgloss.NewStyle().Width(width).Render("")
+		rendered += "\n" + styleSurface.Width(width).Render("")
 		lines++
 	}
 	return rendered
@@ -1018,15 +1197,24 @@ func (m model) renderDetail(width, height int) string {
 		return l + v
 	}
 
+	// chipLine renders a metadata row where the value is a single chip
+	// (e.g. the type field). The label column is rendered plain so the
+	// chip lines up with wrapped tag chips below.
+	chipLine := func(label, value string) string {
+		l := styleLabel.Render(fmt.Sprintf("  %-*s", labelW, label+":"))
+		chip := styleChip.Render(chipContent(value))
+		return l + chip
+	}
+
 	var lines []string
 	lines = append(lines, metaLine("id", t.ID))
 	lines = append(lines, metaLine("title", t.Title))
-	lines = append(lines, metaLine("type", t.Type))
+	lines = append(lines, chipLine("type", t.Type))
 	if t.Author != "" {
 		lines = append(lines, metaLine("author", t.Author))
 	}
 	if len(t.Tags) > 0 {
-		lines = append(lines, metaLine("tags", strings.Join(t.Tags, ", ")))
+		lines = append(lines, renderTagChips(t.Tags, labelW, metaValW)...)
 	}
 	created := t.Created
 	if len(created) > 10 {
@@ -1088,7 +1276,7 @@ func (m model) renderDetail(width, height int) string {
 		if sepRule > indW+2 {
 			dashW := sepRule - indW - 1
 			lines = append(lines,
-				"  "+styleDivider.Render(strings.Repeat("─", dashW))+" "+styleDim.Render(indicator))
+				surfacePad(2)+styleDivider.Render(strings.Repeat("─", dashW))+surfacePad(1)+styleDim.Render(indicator))
 		} else {
 			lines = append(lines, styleDivider.Render("  "+strings.Repeat("─", sepRule)))
 		}
@@ -1114,13 +1302,13 @@ func (m model) renderDetail(width, height int) string {
 	}
 
 	content := strings.Join(lines, "\n")
-	return lipgloss.NewStyle().Width(width).Height(height).Render(content)
+	return styleSurface.Width(width).Height(height).Render(content)
 }
 
 func (m model) renderFooter() string {
 	switch m.state {
 	case stateSearch:
-		return " /" + m.search.View()
+		return styleSurface.Render(" /") + m.search.View()
 
 	case stateConfirm:
 		prompt := fmt.Sprintf("  %s %q? [y/N] ", m.confirm.action, m.confirm.id)
@@ -1156,10 +1344,113 @@ func (m model) renderFooter() string {
 			if pad < 0 {
 				pad = 0
 			}
-			return strings.Repeat(" ", pad) + styled + "  "
+			return surfacePad(pad) + styled + surfacePad(2)
 		}
-		return "  " + styled
+		return surfacePad(2) + styled
 	}
+}
+
+// surfacePad returns n space characters painted with the active
+// surface background. Used anywhere raw spaces would otherwise leak
+// the terminal default background through the brand surface —
+// header/footer gaps, pane-fill padding, alignment indents.
+func surfacePad(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return styleSurface.Render(strings.Repeat(" ", n))
+}
+
+// padLineToWidth right-pads an already-rendered line with surface
+// background cells so its visual width equals `width`. Lines that
+// already meet or exceed the target width are returned unchanged.
+func padLineToWidth(line string, width int) string {
+	cur := lipgloss.Width(line)
+	if cur >= width {
+		return line
+	}
+	return line + surfacePad(width-cur)
+}
+
+// chipContent returns the inner text of a chip — prefixed with a
+// hash so the glyph reinforces the "this is a tag/label" meaning
+// even before the inverted-bg color registers. `type` chips also
+// share this prefix for visual consistency across the metadata
+// block.
+func chipContent(s string) string {
+	return "#" + s
+}
+
+// renderTagChips returns one or more pre-rendered metadata lines for
+// the tags field, wrapping chips across rows when the total width
+// exceeds the pane's value column. Wrapped rows are indented to sit
+// under the first chip (so the "tags:" label only appears once).
+//
+// The chips themselves are rendered with styleChip (inverted brand
+// palette). Each chip consumes `chipCellWidth` cells: `#tag` plus one
+// cell of padding on each side. A single trailing space between chips
+// acts as the gap.
+func renderTagChips(tags []string, labelW, valueW int) []string {
+	if len(tags) == 0 {
+		return nil
+	}
+	// Label column for the first row; subsequent rows use spaces so
+	// wrapped chips line up under the first chip visually.
+	head := styleLabel.Render(fmt.Sprintf("  %-*s", labelW, "tags:"))
+	blank := styleLabel.Render(strings.Repeat(" ", labelW+2))
+
+	// Gap between adjacent chips on the same row.
+	const chipGap = " "
+	gapW := lipgloss.Width(chipGap)
+
+	var rows []string
+	var current strings.Builder
+	currentW := 0 // visual width of chips in `current`, excluding the leading label
+
+	flush := func(first bool) {
+		var prefix string
+		if first {
+			prefix = head
+		} else {
+			prefix = blank
+		}
+		rows = append(rows, prefix+current.String())
+		current.Reset()
+		currentW = 0
+	}
+
+	first := true
+	for _, tag := range tags {
+		chip := styleChip.Render(chipContent(tag))
+		chipW := lipgloss.Width(chip)
+		// Project the row width as if we appended this chip (plus the
+		// gap separator if there's already something on the row). If
+		// that overflows the value column, flush the current row first
+		// and start a new one with this chip alone.
+		//
+		// Chips wider than the whole value column still get rendered
+		// in full — truncation would lie about the tag content, and
+		// the pane scroll math budgets by row count, not rendered
+		// width, so an overflow row is harmless.
+		projected := currentW + chipW
+		if currentW > 0 {
+			projected += gapW
+		}
+		if currentW > 0 && projected > valueW {
+			flush(first)
+			first = false
+		}
+		if currentW > 0 {
+			current.WriteString(chipGap)
+			currentW += gapW
+		}
+		current.WriteString(chip)
+		currentW += chipW
+	}
+	if currentW > 0 {
+		flush(first)
+	}
+	return rows
 }
 
 // ---- helpers ---------------------------------------------------------------
@@ -1182,11 +1473,15 @@ func padRunes(s string, n int) string {
 	return s + strings.Repeat(" ", n-len(r))
 }
 
-// padBlock pads a rendered block to width × height with empty lines.
+// padBlock pads a rendered block to width × height with empty lines
+// painted in the active surface background. Without the palette paint
+// the empty filler rows would leak the terminal default background
+// through, producing a visible gray-shade mismatch against the styled
+// rows above them.
 func padBlock(content string, width, height int) string {
 	lines := strings.Split(content, "\n")
 	for len(lines) < height {
-		lines = append(lines, lipgloss.NewStyle().Width(width).Render(""))
+		lines = append(lines, styleSurface.Width(width).Render(""))
 	}
 	return strings.Join(lines[:height], "\n")
 }
@@ -1223,8 +1518,12 @@ func wrapLine(line string, width int) []string {
 
 // ---- entry point -----------------------------------------------------------
 
-// Run starts the full-screen TUI against the given Cortex.
-func Run(cx *cortex.Cortex) error {
+// Run starts the full-screen TUI against the given Cortex using the
+// supplied theme ("auto", "dark", or "light"). Callers resolve the
+// theme string from their own flag/env/config chain and pass it in;
+// this function is the single place that actually applies it.
+func Run(cx *cortex.Cortex, theme string) error {
+	loadPalette(theme)
 	p := tea.NewProgram(
 		initialModel(cx),
 		tea.WithAltScreen(),
