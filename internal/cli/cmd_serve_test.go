@@ -2,9 +2,12 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"encoding/xml"
 	"strings"
 	"testing"
+
+	"github.com/Fail-Safe/Noema/internal/cortex"
 )
 
 // TestValidateHTTPServe pins the flag invariants for `noema serve --transport
@@ -478,6 +481,347 @@ func TestRunPrintLaunchdPlist_HappyPath(t *testing.T) {
 	}
 	if !strings.Contains(s, "com.fail-safe.noema.agentbrain") {
 		t.Errorf("plist label does not include cortex name:\n%s", s)
+	}
+}
+
+// TestRequireTLSForKeyedMode pins the auth-requires-TLS guard: shared-key
+// mode over plaintext HTTP is a worse security posture than open mode (it
+// leaks the key on every request while creating the appearance of security),
+// so the combination is a hard startup error. The guard must fire for both
+// "file" and "env" sources, must be a no-op in open mode, and must be a
+// no-op when TLS is configured.
+func TestRequireTLSForKeyedMode(t *testing.T) {
+	cases := []struct {
+		name          string
+		access        cortex.AccessKey
+		useTLS        bool
+		wantErrSubstr string // empty = expect nil
+	}{
+		{
+			name:   "open mode no TLS — fine",
+			access: cortex.AccessKey{}, // Keyed() == false
+			useTLS: false,
+		},
+		{
+			name:   "open mode with TLS — fine",
+			access: cortex.AccessKey{},
+			useTLS: true,
+		},
+		{
+			name:   "keyed mode with TLS — fine",
+			access: cortex.AccessKey{Value: "k", Source: "file", Fingerprint: "SHA256:aa"},
+			useTLS: true,
+		},
+		{
+			name:          "keyed mode from file, no TLS — reject",
+			access:        cortex.AccessKey{Value: "k", Source: "file", Path: ".access.secret"},
+			useTLS:        false,
+			wantErrSubstr: "source=file",
+		},
+		{
+			name:          "keyed mode from env, no TLS — reject",
+			access:        cortex.AccessKey{Value: "k", Source: "env"},
+			useTLS:        false,
+			wantErrSubstr: "source=env",
+		},
+		{
+			name:          "keyed mode error mentions plaintext",
+			access:        cortex.AccessKey{Value: "k", Source: "file"},
+			useTLS:        false,
+			wantErrSubstr: "plaintext HTTP",
+		},
+		{
+			name:          "keyed mode error suggests remediation",
+			access:        cortex.AccessKey{Value: "k", Source: "file"},
+			useTLS:        false,
+			wantErrSubstr: "--tls-cert and --tls-key",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := requireTLSForKeyedMode(tc.access, tc.useTLS)
+			if tc.wantErrSubstr == "" {
+				if err != nil {
+					t.Fatalf("expected nil, got: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.wantErrSubstr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Errorf("error %q does not contain %q", err.Error(), tc.wantErrSubstr)
+			}
+		})
+	}
+}
+
+// --------- buildSystemdUnit auth plumbing ---------
+
+// TestBuildSystemdUnit_EmitsOptionalEnvironmentFile pins the shared-key
+// plumbing in the generated unit. The line must be present, use a
+// leading "-" so open-mode cortexes are not broken by a missing file,
+// and live inside the [Service] section (not [Unit]) — a misplaced
+// EnvironmentFile= is silently ignored by systemd and produces a unit
+// that looks fine but never injects NOEMA_MCP_KEY.
+func TestBuildSystemdUnit_EmitsOptionalEnvironmentFile(t *testing.T) {
+	out := buildSystemdUnit(systemdUnitParams{
+		Cortex:    "agentbrain",
+		User:      "mark",
+		Exe:       "/usr/local/bin/noema",
+		ServeArgs: []string{"serve", "--cortex", "agentbrain", "--transport", "http", "--host", "127.0.0.1"},
+	})
+
+	// The "-" prefix is load-bearing: without it, systemd refuses to
+	// start the unit when the env file does not exist, which is the
+	// default state for open-mode cortexes. The test pins the exact
+	// path form so a refactor that changes ~/.config to /etc (or
+	// drops the "-") is caught here.
+	const wantLine = "EnvironmentFile=-%h/.config/noema/agentbrain.env"
+	if !strings.Contains(out, wantLine) {
+		t.Errorf("unit missing optional EnvironmentFile line %q\nfull:\n%s", wantLine, out)
+	}
+
+	// Structurally verify the directive lives in [Service]. We look
+	// at the substring between [Service] and [Install] to make sure
+	// EnvironmentFile= isn't sitting in [Unit] where systemd would
+	// silently ignore it.
+	svcIdx := strings.Index(out, "[Service]")
+	instIdx := strings.Index(out, "[Install]")
+	if svcIdx < 0 || instIdx < 0 || svcIdx >= instIdx {
+		t.Fatalf("unit is missing [Service] or [Install] section:\n%s", out)
+	}
+	serviceBlock := out[svcIdx:instIdx]
+	if !strings.Contains(serviceBlock, "EnvironmentFile=-") {
+		t.Errorf("EnvironmentFile is not inside [Service] section:\n%s", out)
+	}
+}
+
+// TestBuildSystemdUnit_IncludesKeyedModeInstallInstructions pins that
+// the header comment explains how to populate the env file for keyed
+// mode. If the instructions regress, operators will install the unit
+// expecting keyed mode to "just work" and hit a 401 on first peer
+// sync instead of getting the env file checklist up front.
+func TestBuildSystemdUnit_IncludesKeyedModeInstallInstructions(t *testing.T) {
+	out := buildSystemdUnit(systemdUnitParams{
+		Cortex:    "agentbrain",
+		User:      "mark",
+		Exe:       "/usr/local/bin/noema",
+		ServeArgs: []string{"serve", "--cortex", "agentbrain", "--transport", "http", "--host", "127.0.0.1"},
+	})
+	for _, want := range []string{
+		"keyed-mode MCP auth",
+		"NOEMA_MCP_KEY=<paste-key>",
+		"chmod 600",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("install comment missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// --------- buildLaunchdPlist auth plumbing ---------
+
+// TestBuildLaunchdPlist_EmitsEnvironmentVariablesBlock pins the shape
+// of the EnvironmentVariables dict: one key named NOEMA_MCP_KEY, with
+// a placeholder value operators must replace before loading the plist.
+// launchd has no EnvironmentFile= equivalent, so the key lives in the
+// plist itself — this test exists so a refactor can't silently drop
+// the dict (which would downgrade every keyed-mode Mac to open mode).
+func TestBuildLaunchdPlist_EmitsEnvironmentVariablesBlock(t *testing.T) {
+	out := buildLaunchdPlist(launchdPlistParams{
+		Cortex:    "agentbrain",
+		Exe:       "/usr/local/bin/noema",
+		HomeDir:   "/Users/mark",
+		ServeArgs: []string{"serve", "--cortex", "agentbrain", "--transport", "http", "--host", "127.0.0.1"},
+	})
+	for _, want := range []string{
+		"<key>EnvironmentVariables</key>",
+		"<key>NOEMA_MCP_KEY</key>",
+		"<string>" + launchdKeyPlaceholder + "</string>",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("plist missing fragment %q\nfull:\n%s", want, out)
+		}
+	}
+
+	// The placeholder must NOT look like a real key. If someone ever
+	// changes it to a short, plausible-looking string an operator
+	// could skip the install warning and load the plist with a
+	// literal "s3cret" as NOEMA_MCP_KEY. The "REPLACE" marker is the
+	// anti-footgun: it's ugly on purpose so `launchd load` surfaces
+	// the 401 immediately.
+	if !strings.Contains(launchdKeyPlaceholder, "REPLACE") {
+		t.Errorf("placeholder %q does not obviously require replacement", launchdKeyPlaceholder)
+	}
+
+	// The emitted plist must still be valid XML — adding a nested
+	// dict is easy to get wrong (unclosed <dict>), and if it does we
+	// want to catch it in CI, not when an operator runs launchctl
+	// bootstrap. Re-run the full parse to be sure.
+	dec := xml.NewDecoder(bytes.NewBufferString(out))
+	for {
+		_, err := dec.Token()
+		if err != nil {
+			if err.Error() == "EOF" {
+				break
+			}
+			t.Fatalf("plist with EnvironmentVariables is not valid XML: %v\nfull:\n%s", err, out)
+		}
+	}
+}
+
+// --------- runPrintMCPConfig ---------
+
+// TestRunPrintMCPConfig_StdioShape pins the stdio output: a single
+// mcpServers.noema entry with command/args, no url/headers. This is
+// the shape Claude Code and every other stdio-based MCP client
+// expects; regressing to the http form here would silently break
+// local-only workflows.
+func TestRunPrintMCPConfig_StdioShape(t *testing.T) {
+	prev := cortexFlag
+	cortexFlag = "agentbrain"
+	t.Cleanup(func() { cortexFlag = prev })
+
+	var buf bytes.Buffer
+	if err := runPrintMCPConfig(&buf, "stdio", "", 0, "", ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var parsed struct {
+		McpServers map[string]struct {
+			Command string   `json:"command"`
+			Args    []string `json:"args"`
+			URL     string   `json:"url"`
+			Headers map[string]string
+		} `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &parsed); err != nil {
+		t.Fatalf("output is not valid JSON: %v\noutput:\n%s", err, buf.String())
+	}
+	entry, ok := parsed.McpServers["noema"]
+	if !ok {
+		t.Fatalf("output missing mcpServers.noema:\n%s", buf.String())
+	}
+	if entry.Command == "" {
+		t.Errorf("stdio entry missing command:\n%s", buf.String())
+	}
+	if entry.URL != "" {
+		t.Errorf("stdio entry must not include url:\n%s", buf.String())
+	}
+	if entry.Headers != nil {
+		t.Errorf("stdio entry must not include headers:\n%s", buf.String())
+	}
+	// The --cortex flag must be part of args so the generated config
+	// pins exactly the cortex the operator was viewing at print time.
+	found := false
+	for _, a := range entry.Args {
+		if a == "agentbrain" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("stdio entry args do not pin --cortex agentbrain: %v", entry.Args)
+	}
+}
+
+// TestRunPrintMCPConfig_HTTPShape pins the http output: url + headers
+// with the Authorization placeholder literal. This is the whole point
+// of the PR (c) work — a Claude Code client pointing at a keyed
+// remote peer needs the bearer header in the config, and the
+// placeholder form lets operators commit the file to source control
+// without leaking the key.
+func TestRunPrintMCPConfig_HTTPShape(t *testing.T) {
+	var buf bytes.Buffer
+	if err := runPrintMCPConfig(&buf, "http", "10.0.0.1", 3443, "/tls.crt", "/tls.key"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var parsed struct {
+		McpServers map[string]struct {
+			URL     string            `json:"url"`
+			Headers map[string]string `json:"headers"`
+			Command string            `json:"command"`
+		} `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &parsed); err != nil {
+		t.Fatalf("output is not valid JSON: %v\noutput:\n%s", err, buf.String())
+	}
+	entry := parsed.McpServers["noema"]
+
+	if entry.Command != "" {
+		t.Errorf("http entry must not include command:\n%s", buf.String())
+	}
+	// TLS flags present → https scheme; port included; /mcp path.
+	wantURL := "https://10.0.0.1:3443/mcp"
+	if entry.URL != wantURL {
+		t.Errorf("url = %q, want %q", entry.URL, wantURL)
+	}
+	// The Authorization header must be the literal placeholder. We
+	// DO NOT expand env vars here — the whole point is that the
+	// client (Claude Code) performs the expansion at runtime, and
+	// the file is safe to commit.
+	wantAuth := "Bearer ${NOEMA_MCP_KEY}"
+	if got := entry.Headers["Authorization"]; got != wantAuth {
+		t.Errorf("Authorization header = %q, want %q", got, wantAuth)
+	}
+}
+
+// TestRunPrintMCPConfig_HTTPNoTLS pins that http (without --tls-cert)
+// produces an http:// URL, not https://. Getting this wrong would
+// point the generated client config at the wrong scheme and every
+// request would fail on TLS handshake before the 401 even runs.
+func TestRunPrintMCPConfig_HTTPNoTLS(t *testing.T) {
+	var buf bytes.Buffer
+	if err := runPrintMCPConfig(&buf, "http", "127.0.0.1", 3000, "", ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(buf.String(), "http://127.0.0.1:3000/mcp") {
+		t.Errorf("no-TLS http mode should emit http:// URL:\n%s", buf.String())
+	}
+	if strings.Contains(buf.String(), "https://") {
+		t.Errorf("no-TLS http mode must not emit https:// URL:\n%s", buf.String())
+	}
+}
+
+// TestRunPrintMCPConfig_HTTPRejectsMissingHost pins the guard that
+// refuses to print an http config without --host. A missing host
+// would silently produce a ":3000/mcp" URL that's meaningless.
+func TestRunPrintMCPConfig_HTTPRejectsMissingHost(t *testing.T) {
+	var buf bytes.Buffer
+	err := runPrintMCPConfig(&buf, "http", "", 3000, "", "")
+	if err == nil {
+		t.Fatal("expected error for http without --host, got nil")
+	}
+	if !strings.Contains(err.Error(), "--host") {
+		t.Errorf("error does not mention --host: %v", err)
+	}
+}
+
+// TestRunPrintMCPConfig_HTTPRejectsWildcardHost pins that 0.0.0.0
+// is rejected here for the same reason serve rejects it on the
+// listen side: a wildcard is not a dialable address for a client.
+// This guard exists so an operator who copy-pastes their serve
+// args into --print-config doesn't get a useless config file.
+func TestRunPrintMCPConfig_HTTPRejectsWildcardHost(t *testing.T) {
+	var buf bytes.Buffer
+	err := runPrintMCPConfig(&buf, "http", "0.0.0.0", 3000, "", "")
+	if err == nil {
+		t.Fatal("expected error for 0.0.0.0 host, got nil")
+	}
+}
+
+// TestRunPrintMCPConfig_HTTPIPv6Brackets pins the URL formatting for
+// IPv6 literals. An IPv6 host without brackets produces a URL that
+// url.Parse rejects, so MCP clients would fail at config load.
+func TestRunPrintMCPConfig_HTTPIPv6Brackets(t *testing.T) {
+	var buf bytes.Buffer
+	if err := runPrintMCPConfig(&buf, "http", "fe80::1", 3000, "", ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(buf.String(), "http://[fe80::1]:3000/mcp") {
+		t.Errorf("IPv6 host not bracketed:\n%s", buf.String())
 	}
 }
 
