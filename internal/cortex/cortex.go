@@ -33,7 +33,20 @@ type Manifest struct {
 	Owner      string            `yaml:"owner,omitempty"`
 	Created    string            `yaml:"created"`
 	Version    int               `yaml:"version"`
+	Access     *AccessConfig     `yaml:"access,omitempty"`
 	Federation *FederationConfig `yaml:"federation,omitempty"`
+}
+
+// AccessConfig holds MCP endpoint authentication settings for cortex.md.
+// When SharedKeyFile is set, the HTTP MCP endpoint runs in shared-key mode
+// and every incoming request must carry a matching Authorization bearer
+// header. See docs/design/mcp-auth-plan.md for the full design.
+type AccessConfig struct {
+	// SharedKeyFile is a path to a sidecar file whose first non-empty
+	// line is the shared bearer token. Relative paths are resolved
+	// against the cortex directory. The manifest itself never holds the
+	// secret — only a pointer to where it lives.
+	SharedKeyFile string `yaml:"shared_key_file,omitempty"`
 }
 
 // FederationConfig holds peer declarations for cortex.md.
