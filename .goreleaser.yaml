@@ -1,0 +1,156 @@
+# .goreleaser.yaml — release automation for Noema.
+#
+# Triggered by the `release.yml` GitHub Actions workflow on any `v*` tag
+# pushed to `main`. GoReleaser cross-compiles the binary for every
+# supported OS/arch, produces archives + checksums, and publishes a
+# GitHub Release populated from commit messages.
+#
+# Local testing (no publish):
+#   goreleaser release --snapshot --clean --skip=publish
+#
+# Cut a real release from a clean main checkout:
+#   git tag v0.3.0 && git push origin v0.3.0
+# (the GitHub Actions workflow takes it from there)
+#
+# Note: v0.1.x and v0.2.x tags exist in git history from early
+# development but were never published as downloadable releases —
+# v0.3.0 is the first tag with pre-built binaries attached.
+#
+# Why CGO_ENABLED=0 across every target: Noema's only native-code
+# dependency is modernc.org/sqlite, a pure-Go translation of C SQLite.
+# Disabling CGo produces a fully static binary on every platform, with
+# no surprise libc linkage and no cross-compilation toolchain needed —
+# this is the single biggest reason GoReleaser is a good fit for this
+# project specifically.
+version: 2
+
+project_name: noema
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: noema
+    binary: noema
+    main: ./cmd/noema
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    # ldflags inject build metadata into internal/cli at link time.
+    # The Makefile only injects Version; GoReleaser additionally
+    # populates Commit and Date so `noema version` shows the full
+    # fingerprint on any binary downloaded from the Releases page.
+    #
+    # CommitDate (not Date) is used so re-cutting a tag produces a
+    # bit-identical archive — Date is the build clock, CommitDate is
+    # the tag's commit timestamp.
+    ldflags:
+      - -s -w
+      - -X github.com/Fail-Safe/Noema/internal/cli.Version={{.Version}}
+      - -X github.com/Fail-Safe/Noema/internal/cli.Commit={{.Commit}}
+      - -X github.com/Fail-Safe/Noema/internal/cli.Date={{.CommitDate}}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: noema
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    # Only repo-root docs. AGENT.md is generated per-cortex by
+    # `noema init` at runtime, so it does not exist at build time.
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot-{{.ShortCommit}}"
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+      - "Merge pull request"
+      - "Merge branch"
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: Bug fixes
+      regexp: '^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    - title: Other changes
+      order: 999
+
+release:
+  draft: false
+  # prerelease: auto lets GoReleaser mark v0.x.y-rc.N, -beta, -alpha as
+  # prereleases automatically. Clean v0.x.y tags become full releases.
+  prerelease: auto
+  name_template: "{{.ProjectName}} {{.Tag}}"
+  header: |
+    ## Noema {{.Tag}}
+
+    Pre-built binaries for macOS, Linux, and Windows (amd64 + arm64).
+    Verify downloads against `checksums.txt`.
+
+    **Noema is pre-1.0 — expect breaking changes between minor releases
+    until v1.0. Cortex data on disk is forward-compatible via
+    non-destructive migrations; on-disk `cortex.md` version bumps that
+    require a manual step ship with an explicit `noema migrate` command.**
+  footer: |
+    ---
+    **Install:** see [README — Installation](https://github.com/Fail-Safe/Noema#installation).
+    **First run:** `noema init --name my-cortex`
+
+# Homebrew tap — intentionally disabled until the tap repository exists.
+#
+# To enable:
+#   1. Create a public GitHub repo `Fail-Safe/homebrew-noema` (or an org
+#      equivalent) with a single empty `Formula/` directory.
+#   2. Create a GitHub Personal Access Token with `repo` scope that can
+#      push to that tap repo, and add it to this repo's Actions secrets
+#      as `HOMEBREW_TAP_TOKEN`.
+#   3. Uncomment the block below.
+#   4. In `.github/workflows/release.yml`, expose the secret to the
+#      release step:
+#        env:
+#          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+#   5. Cut a new tag. GoReleaser will open a PR (or push directly) to
+#      the tap repo updating `Formula/noema.rb` on every release from
+#      then on — no manual formula maintenance.
+#
+# brews:
+#   - name: noema
+#     repository:
+#       owner: Fail-Safe
+#       name: homebrew-noema
+#       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+#     homepage: "https://github.com/Fail-Safe/Noema"
+#     description: "The intentional memory layer for your AI agents"
+#     license: "MIT"
+#     test: |
+#       system "#{bin}/noema version"
+#     install: |
+#       bin.install "noema"

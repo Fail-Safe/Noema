@@ -7,8 +7,9 @@
 *.db-shm
 *.db-wal
 
-# macOS
-.DS_Store
+# OS dir caches
+**/.DS_Store
+**/Thumbs.db
 
 # Local MCP config (machine-specific paths)
 .mcp.json
