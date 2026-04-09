@@ -124,33 +124,103 @@ release:
     **Install:** see [README — Installation](https://github.com/Fail-Safe/Noema#installation).
     **First run:** `noema init --name my-cortex`
 
-# Homebrew tap — intentionally disabled until the tap repository exists.
+# Homebrew publishing — dual strategy: formula + cask.
 #
-# To enable:
-#   1. Create a public GitHub repo `Fail-Safe/homebrew-noema` (or an org
-#      equivalent) with a single empty `Formula/` directory.
-#   2. Create a GitHub Personal Access Token with `repo` scope that can
-#      push to that tap repo, and add it to this repo's Actions secrets
-#      as `HOMEBREW_TAP_TOKEN`.
-#   3. Uncomment the block below.
-#   4. In `.github/workflows/release.yml`, expose the secret to the
-#      release step:
-#        env:
-#          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-#   5. Cut a new tag. GoReleaser will open a PR (or push directly) to
-#      the tap repo updating `Formula/noema.rb` on every release from
-#      then on — no manual formula maintenance.
+# Both blocks target the same tap repo (Fail-Safe/homebrew-noema) and the
+# same bearer token (HOMEBREW_TAP_TOKEN in the Noema repo's Actions
+# secrets). The two blocks write to different subdirectories of the tap:
+# Formula/noema.rb for `brews:`, Casks/noema.rb for `homebrew_casks:`.
 #
-# brews:
-#   - name: noema
-#     repository:
-#       owner: Fail-Safe
-#       name: homebrew-noema
-#       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
-#     homepage: "https://github.com/Fail-Safe/Noema"
-#     description: "The intentional memory layer for your AI agents"
-#     license: "MIT"
-#     test: |
-#       system "#{bin}/noema version"
-#     install: |
-#       bin.install "noema"
+# Known warning during build: GoReleaser logs "artifact already present
+# in the list name=noema.rb — this might cause errors when publishing"
+# because its internal artifact tracker is keyed on basename and both
+# blocks emit `noema.rb`. This is a false positive for the formula+cask
+# dual-publish pattern: the publish pipes filter by artifact TYPE, not
+# NAME (brew.go:128 uses `artifact.ByType(artifact.BrewFormula)`,
+# cask.go:128 uses `artifact.ByType(artifact.BrewCask)`), and brew.go
+# tags the formula with `Type: BrewFormula` while cask.go tags the cask
+# with `Type: BrewCask`. Each publish pipe picks up exactly its own
+# artifact; nothing is dropped. The warning is cosmetic.
+#
+# Why both:
+#
+#   * `brews:` (Formula) is the cross-platform path. It generates a
+#     formula covering darwin amd64/arm64 + linux amd64/arm64, so both
+#     macOS Homebrew and Linuxbrew users can run
+#     `brew install Fail-Safe/noema/noema` and get a working binary.
+#     This is the primary UX path and the only one Linux users can use.
+#
+#   * `homebrew_casks:` is GoReleaser's current-recommended path (brews:
+#     was deprecated in v2.10). Casks are strictly macOS-only, so this
+#     adds a secondary `brew install --cask Fail-Safe/noema/noema` path
+#     for macOS users who prefer the cask ecosystem. It does NOT replace
+#     the formula path — it augments it.
+#
+# Precedence on macOS: when a tap contains both a formula and a cask of
+# the same name, `brew install Fail-Safe/noema/noema` (without --cask)
+# resolves the formula first. macOS users get the formula by default;
+# typing `--cask` opts into the cask path explicitly.
+#
+# When a future GoReleaser major removes `brews:` entirely, Linux users
+# will need an alternative (Linuxbrew cask support if it lands, or the
+# GitHub Release tarball from `curl | tar`). Revisit at that point —
+# no action required until the deprecation actually becomes a removal.
+brews:
+  - name: noema
+    repository:
+      owner: Fail-Safe
+      name: homebrew-noema
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/Fail-Safe/Noema"
+    description: "The intentional memory layer for your AI agents"
+    license: "MIT"
+    # Skip pushing the formula on prerelease tags (v0.3.1-rc1, -beta,
+    # -alpha). Matches `release.prerelease: auto` above so the tap only
+    # gets stable releases — prereleases stay on the GitHub Releases
+    # page only.
+    skip_upload: auto
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
+    commit_msg_template: "brews: update {{ .ProjectName }} to {{ .Tag }}"
+    test: |
+      system "#{bin}/noema", "version"
+    install: |
+      bin.install "noema"
+
+homebrew_casks:
+  - name: noema
+    binaries:
+      - noema
+    repository:
+      owner: Fail-Safe
+      name: homebrew-noema
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Casks
+    homepage: "https://github.com/Fail-Safe/Noema"
+    description: "The intentional memory layer for your AI agents"
+    skip_upload: auto
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
+    commit_msg_template: "casks: update {{ .ProjectName }} to {{ .Tag }}"
+    # Noema binaries are unsigned (pre-1.0, solo project, no Apple
+    # Developer account). Gatekeeper's quarantine bit would block
+    # first-run launches on recent macOS. The xattr hook below is
+    # GoReleaser's documented workaround for unsigned cask binaries.
+    #
+    # This is a known-fragile bypass: Apple has reserved the right to
+    # disable it in future macOS versions without notice. If that
+    # happens, macOS cask users can always fall back to the formula
+    # path (brew install without --cask), which doesn't trigger
+    # quarantine because it fetches via curl rather than the
+    # browser-downloaded archive flow.
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/noema"]
+          end
