@@ -1,4 +1,9 @@
-# Noema
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/noema-dark.svg">
+    <img alt="Noema." src="assets/brand/noema-light.svg" width="600">
+  </picture>
+</p>
 
 **The intentional memory layer for your AI agents.**
 
@@ -110,13 +115,15 @@ noema events backfill [--dry-run] [--yes]
 noema resolve <divergence-id> --accept <origin> | --custom <body>
                                           Resolve a divergence (concurrent edit conflict)
 
-noema federation status                   Show federation config, peer sync state, and vector clock
+noema federation status                   Show federation config, MCP access posture, peer sync state, and vector clock
 noema federation peers                    List configured federation peers
 noema federation add-peer <name> <endpoint>
                                           Add a federation peer to cortex.md
 noema federation reset-peer <name>...     Clear stored state for a peer (forces a fresh handshake; use after a peer
                                           ran `noema migrate cortex-id --reset` and the syncer is now reporting an
                                           identity mismatch)
+noema federation key fingerprint          Print the SHA-256 fingerprint of the active MCP shared key (safe to
+                                          say aloud over an out-of-band channel to confirm a pairing)
 
 noema serve [--transport stdio|http] [--host <addr>] [--tls-cert <file> --tls-key <file>]
                                           Start the MCP server (http requires --host; endpoint is /mcp)
@@ -228,6 +235,56 @@ Add the running endpoint to Zed's `settings.json`:
 
 Any MCP client that supports Streamable HTTP works the same way — point its `url` field at `<scheme>://<host>:<port>/mcp`.
 
+### Shared-key authentication
+
+The HTTP endpoint can be gated behind a shared bearer key so only clients that know the secret can reach it. This is the recommended posture for any non-local deployment — federation peers, remote IDE clients, multi-host clusters. The HTTP endpoint runs in **open mode** by default, so existing deployments keep working until you opt in. Stdio is unaffected (stdio implies local-process trust).
+
+**Two ways to configure a key** (in priority order):
+
+1. **`NOEMA_MCP_KEY` environment variable** — the simplest form. Ideal for `systemd` with an `EnvironmentFile=` drop-in.
+2. **`access.shared_key_file` in `cortex.md`** — a path (absolute or relative to the cortex directory) pointing at a sidecar file that contains the key on its first non-empty line. The file **must** be mode `0600`; Noema refuses to load a file that's group- or world-readable. Useful when you want the key to travel with the cortex directory rather than with the service environment.
+
+If both are set, the env var wins and the server logs a warning so operators notice the override.
+
+**TLS is required.** Keyed mode refuses to start over plaintext HTTP — a bearer token sent without TLS is stolen by the first adversary on the network path. Pair `--tls-cert` with `--tls-key`, or run in open mode.
+
+**Sidecar-file example:**
+
+```yaml
+# cortex.md
+name: my-cortex
+purpose: Primary memory
+owner: mark
+created: 2026-03-29
+version: 2
+access:
+  shared_key_file: .access.secret
+```
+
+```bash
+openssl rand -base64 32 > /path/to/my-cortex/.access.secret
+chmod 600 /path/to/my-cortex/.access.secret
+
+noema serve --cortex my-cortex --transport http --host 10.0.0.5 \
+            --tls-cert /path/server.crt --tls-key /path/server.key
+```
+
+On startup the server logs the active posture:
+
+```
+[serve] access=keyed source=file fingerprint=SHA256:8e:76:62:80:f0:85:9c:05:...
+```
+
+**Verifying a pairing.** The fingerprint is a non-secret SHA-256 of the key, safe to say aloud over an out-of-band channel. Every host in a federation ring should produce the **same** fingerprint:
+
+```bash
+noema federation key fingerprint
+```
+
+If two hosts report different fingerprints, they have different keys and will 401 each other on federation sync. If a host reports `access=open` while its peers are keyed, it will be fully isolated.
+
+MCP clients talking to a keyed endpoint must send `Authorization: Bearer <key>`. The `.mcp.json` snippet emitted by `noema serve --print-config` already uses `"Bearer ${NOEMA_MCP_KEY}"` — clients that support env interpolation (Claude Code) resolve it at runtime; clients that don't will produce a searchable 401.
+
 ### Running as a persistent service
 
 For ad-hoc use, backgrounding with `nohup` works fine:
@@ -261,6 +318,13 @@ Both flags require `--transport http` (stdio has no endpoint to supervise) and a
 
 The emitted unit filename convention is `noema-<cortex>.service` / `com.fail-safe.noema.<cortex>.plist`, so running multiple cortexes on one host never collides.
 
+**Keyed mode under a supervisor.** When `NOEMA_MCP_KEY` gates the endpoint, the unit/plist needs a way to reach the secret without embedding it in a world-readable file. The emitted templates don't inline keys — they leave you a seam:
+
+- **systemd** — the unit already contains `EnvironmentFile=-%h/.config/noema/<cortex>.env` (the leading `-` makes the file optional, so open-mode installs keep working). Create the env file with `NOEMA_MCP_KEY=...`, mode `0600`, owned by the user the unit runs as, and `systemctl restart` picks it up.
+- **launchd** — the plist includes an `EnvironmentVariables` dict with a commented `NOEMA_MCP_KEY` placeholder. Uncomment and fill it in, or prefer the `access.shared_key_file` sidecar path inside `cortex.md` so the secret travels with the cortex directory instead of the plist.
+
+Either way you still need `--tls-cert`/`--tls-key` on the serve command that generated the template — the preview flag validates the TLS-for-keyed-mode rule before emitting, so you catch the footgun at install time. See [Shared-key authentication](#shared-key-authentication) above for the full rollout story.
+
 ---
 
 ## Federation
@@ -290,6 +354,16 @@ Or add a peer from the CLI:
 ```bash
 noema federation add-peer beta http://192.168.1.10:3000
 ```
+
+### Authentication
+
+Federation peers share a single bearer key — the same `NOEMA_MCP_KEY` / `access.shared_key_file` described in [Shared-key authentication](#shared-key-authentication) above. When the syncer polls a peer's `sync_events` tool, it automatically attaches `Authorization: Bearer <key>` from the local host's active key; nothing peer-specific lives in `cortex.md`. This means:
+
+- Every host in a federation ring must produce the **same** fingerprint. Verify on each box with `noema federation key fingerprint` and compare out-of-band.
+- If one host rotates its key without the others, the rotated host will 401 its peers on the next sync tick. Federation status on both sides reports the failure, and the syncer falls back to exponential backoff (`2m → 4m → 8m`) until the mismatch is resolved.
+- A host running in open mode while its peers are keyed — or vice versa — is effectively isolated: keyed peers reject its unauthenticated requests, and it rejects theirs. Mixed-mode rings aren't supported; roll the whole ring in one window.
+
+Because the bearer key is required for every MCP call on a keyed endpoint, the same key also gates any human or tooling that wants to call `federation_status`, `sync_events`, or any other MCP tool over HTTP — there is no federation-only carve-out.
 
 ### How sync works
 

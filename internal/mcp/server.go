@@ -409,7 +409,20 @@ func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
 		}
 
 		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("Cortex: %s\n\n", m.Name))
+		sb.WriteString(fmt.Sprintf("Cortex: %s\n", m.Name))
+
+		// Surface the MCP access posture alongside federation state so a
+		// peer calling this tool sees exactly what the middleware is
+		// enforcing locally. Resolution errors are non-fatal: print them
+		// and keep going rather than blanking the rest of the status.
+		if key, kerr := cortex.LoadAccessKey(cx.Dir, m.Access); kerr != nil {
+			sb.WriteString(fmt.Sprintf("Access: error loading key: %v\n", kerr))
+		} else if key.Keyed() {
+			sb.WriteString(fmt.Sprintf("Access: keyed (source=%s, fingerprint=%s)\n", key.Source, key.Fingerprint))
+		} else {
+			sb.WriteString("Access: open\n")
+		}
+		sb.WriteByte('\n')
 
 		if m.Federation == nil || len(m.Federation.Peers) == 0 {
 			sb.WriteString("Federation: not configured (no peers in cortex.md)\n")
@@ -615,7 +628,8 @@ Choose the type that best reflects the intent of the memory:
                                    manifest version (used by federation peers
                                    to verify identity on every sync)
   sync_events [since] [limit]    → pull events for federation (JSON array)
-  federation_status              → federation config, peer states, vector clock
+  federation_status              → MCP access posture, federation config,
+                                   peer states, vector clock
   announce_peer name endpoint    → accept a peer announcement for discovery
 
 ## Filtering
@@ -646,6 +660,21 @@ Choose the type that best reflects the intent of the memory:
   custom merge.
 - Use list_traces with type filter or tag=needs-resolution to find unresolved divergences.
 - federation_status shows the count of unresolved divergences.
+
+## Access Posture
+- The HTTP MCP endpoint runs either "open" (no auth) or "keyed" (bearer key required).
+  federation_status reports the active posture as "Access: open" or
+  "Access: keyed (source=env|file, fingerprint=SHA256:...)".
+- Keyed mode is mandatory for any non-loopback deployment and for federation rings.
+  In keyed mode the server also requires TLS — it refuses to start over plaintext HTTP.
+- The fingerprint is a non-secret SHA-256 of the key; every host in a federation ring
+  must report the same fingerprint or peers will 401 each other on sync.
+- Key configuration is operator-side: NOEMA_MCP_KEY environment variable, or an
+  access.shared_key_file sidecar path in cortex.md pointing at a 0600 file. Env wins
+  if both are set. As an agent you do not read, write, or rotate the key yourself —
+  your client either has it configured and every tool call works, or it doesn't and
+  you'll see a 401 from the transport layer.
+- Stdio is unaffected by this posture: stdio implies local-process trust.
 
 ## Tips
 - Prefer specific types over "note" — it helps retrieval and reasoning later.
