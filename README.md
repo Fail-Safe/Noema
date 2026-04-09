@@ -36,7 +36,7 @@ A Trace has a **type** that describes its intent:
 
 ## Installation
 
-Requires Go 1.21+.
+Requires Go 1.25+.
 
 ```bash
 go install github.com/Fail-Safe/Noema/cmd/noema@latest
