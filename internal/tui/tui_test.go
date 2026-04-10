@@ -3,6 +3,7 @@ package tui
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -13,6 +14,14 @@ import (
 	"github.com/Fail-Safe/Noema/internal/cortex"
 	"github.com/Fail-Safe/Noema/internal/trace"
 )
+
+// ansiSGR matches the SGR escape sequences lipgloss emits so tests
+// that need to assert on visible (post-style) text structure can
+// strip them. Using a narrow SGR-only pattern — not a general ESC
+// matcher — so malformed sequences still show up in diagnostics.
+var ansiSGR = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+func stripANSI(s string) string { return ansiSGR.ReplaceAllString(s, "") }
 
 // TestMain forces lipgloss into a known color profile for the whole
 // test binary. Without this, lipgloss detects the go-test environment
@@ -885,18 +894,23 @@ func TestHeader_BrandWordmark(t *testing.T) {
 	}
 
 	// Brand cream resolves to 256-color 223 on the ANSI256 profile
-	// pinned by TestMain. Bold + fg 223.
-	if !strings.Contains(header, "\x1b[1;38;5;223m") {
+	// pinned by TestMain. Bold + fg 223. The matcher anchors on the
+	// fg portion of the SGR sequence so it tolerates a trailing
+	// background specifier (added when the dark surface was painted
+	// across the whole TUI in v0.4.1).
+	if !strings.Contains(header, "\x1b[1;38;5;223") {
 		t.Errorf("header missing brand cream SGR (1;38;5;223):\n%q", header)
 	}
 
 	// Brand red resolves to 256-color 161 on the ANSI256 profile.
 	// Bold + fg 161. The old bug downconverted to 232 (near-black);
 	// guard against any regression that reintroduces it.
-	if !strings.Contains(header, "\x1b[1;38;5;161m") {
+	if !strings.Contains(header, "\x1b[1;38;5;161") {
 		t.Errorf("header missing brand red SGR (1;38;5;161):\n%q", header)
 	}
-	if strings.Contains(header, "\x1b[1;38;5;232m") {
+	// Foreground 232 specifically — the broken downconversion shows
+	// up as `[1;38;5;232` (period only, bold). Background 232 is fine.
+	if strings.Contains(header, "\x1b[1;38;5;232") {
 		t.Error("header period downconverted to near-black (232) — " +
 			"CompleteColor ANSI256 fallback is broken")
 	}
@@ -1269,8 +1283,11 @@ func TestFooter_AlignmentTracksFocus(t *testing.T) {
 	addTrace(t, cx, "first", "note")
 	m := loadedModel(t, cx)
 
-	// List focus: leading gutter, no trailing pad run.
-	listHint := m.renderFooter()
+	// List focus: leading gutter, no trailing pad run. Strip SGR so
+	// the prefix check sees the visible text — surfacePad now wraps
+	// padding in background-fill escape codes to stop terminal
+	// default gray from bleeding through.
+	listHint := stripANSI(m.renderFooter())
 	if !strings.HasPrefix(listHint, "  ") {
 		t.Errorf("list-focus footer missing leading 2-space gutter:\n%q", listHint)
 	}
@@ -1279,13 +1296,14 @@ func TestFooter_AlignmentTracksFocus(t *testing.T) {
 	// footer (leading pad + styled hint + trailing pad) should equal
 	// the model width — i.e. the hint is pinned to the right edge.
 	m.focus = focusDetail
-	detailHint := m.renderFooter()
+	rawDetail := m.renderFooter()
+	detailHint := stripANSI(rawDetail)
 	if !strings.HasSuffix(detailHint, "  ") {
 		t.Errorf("detail-focus footer missing trailing 2-space gutter:\n%q", detailHint)
 	}
-	if lipgloss.Width(detailHint) != m.width {
+	if lipgloss.Width(rawDetail) != m.width {
 		t.Errorf("detail-focus footer width = %d, want %d (full pane width)",
-			lipgloss.Width(detailHint), m.width)
+			lipgloss.Width(rawDetail), m.width)
 	}
 	// Spot-check: a lot of leading spaces, meaning the hint was pushed
 	// right — it should start with at least a dozen blanks.
@@ -1347,14 +1365,171 @@ func TestList_WholePaneDimsWhenDetailFocused(t *testing.T) {
 			"non-selected rows aren't dimming")
 	}
 
-	// The dim-row ANSI color (238) should be somewhere in the detail-
+	// The dim-row foreground (238) should be somewhere in the detail-
 	// focus render, and absent from the active render (where unselected
-	// rows render through a plain zero-style).
-	const dimFgSeq = "\x1b[38;5;238m"
+	// rows render through a plain zero-style). The matcher anchors on
+	// the fg portion of the SGR (`38;5;238`) so it tolerates a
+	// trailing background specifier added by the v0.4.1 surface paint.
+	const dimFgSeq = "\x1b[38;5;238"
 	if !strings.Contains(dim, dimFgSeq) {
 		t.Errorf("detail-focus render missing dim fg ANSI (238):\n%q", dim)
 	}
 	if strings.Contains(active, dimFgSeq) {
 		t.Errorf("list-focus render should not contain dim fg ANSI (238):\n%q", active)
+	}
+}
+
+// ---- theme palette ---------------------------------------------------------
+
+// TestLoadPalette_DarkSetsBrandInkBackground verifies that loading the
+// dark theme paints the surface background as brand ink (#1a1a1a →
+// ANSI256 234) and body text as soft gray (250). Brand cream (223) is
+// reserved for the wordmark and chip fill — styleSurface intentionally
+// does NOT use cream as its foreground.
+func TestLoadPalette_DarkSetsBrandInkBackground(t *testing.T) {
+	loadPalette("dark")
+	defer loadPalette("dark") // restore for downstream tests
+
+	rendered := styleSurface.Render("hello")
+	if !strings.Contains(rendered, "48;5;234") {
+		t.Errorf("dark surface missing brand-ink background (48;5;234):\n%q", rendered)
+	}
+	if !strings.Contains(rendered, "38;5;250") {
+		t.Errorf("dark surface missing body foreground (38;5;250):\n%q", rendered)
+	}
+	// Cream must still appear on the wordmark, not on the surface.
+	wordmark := styleHeader.Render("Noema")
+	if !strings.Contains(wordmark, "38;5;223") {
+		t.Errorf("dark wordmark missing brand-cream (38;5;223):\n%q", wordmark)
+	}
+}
+
+// TestLoadPalette_LightInvertsRoles verifies the light theme uses a
+// cool off-white background (230) — not full cream — so cream can
+// serve as the selected-row accent. Ink stays the wordmark color.
+func TestLoadPalette_LightInvertsRoles(t *testing.T) {
+	loadPalette("light")
+	defer loadPalette("dark") // restore
+
+	rendered := styleSurface.Render("hello")
+	if !strings.Contains(rendered, "48;5;255") {
+		t.Errorf("light surface missing near-white background (48;5;255):\n%q", rendered)
+	}
+	if !strings.Contains(rendered, "38;5;238") {
+		t.Errorf("light surface missing body foreground (38;5;238):\n%q", rendered)
+	}
+	// Cream is now the selected-row accent, not the surface bg.
+	sel := styleSelected.Render("cursor")
+	if !strings.Contains(sel, "48;5;223") {
+		t.Errorf("light selected row missing cream background (48;5;223):\n%q", sel)
+	}
+}
+
+// TestResolveTheme_PassesThroughExplicit verifies the auto-detection
+// guard only kicks in when the input is empty or "auto" — explicit
+// "dark" and "light" pass through unchanged so the user's flag/env/
+// config choice is honored on terminals where lipgloss would otherwise
+// guess differently.
+func TestResolveTheme_PassesThroughExplicit(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"dark", "dark"},
+		{"light", "light"},
+	}
+	for _, c := range cases {
+		if got := resolveTheme(c.in); got != c.want {
+			t.Errorf("resolveTheme(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// ---- tag chip rendering ----------------------------------------------------
+
+// TestRenderTagChips_FitsOneRow checks the happy path: a handful of
+// short tags whose total rendered width fits comfortably in the value
+// column produces exactly one output row.
+func TestRenderTagChips_FitsOneRow(t *testing.T) {
+	loadPalette("dark")
+	tags := []string{"go", "tui", "brand"}
+	rows := renderTagChips(tags, 10, 80)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d:\n%v", len(rows), rows)
+	}
+	// Each tag must appear with its hash prefix.
+	for _, tag := range tags {
+		if !strings.Contains(rows[0], "#"+tag) {
+			t.Errorf("row missing chip for %q:\n%q", tag, rows[0])
+		}
+	}
+	// The label appears exactly once (on the first row only).
+	if !strings.Contains(rows[0], "tags:") {
+		t.Errorf("first row missing 'tags:' label:\n%q", rows[0])
+	}
+}
+
+// TestRenderTagChips_WrapsWhenOverflow verifies the wrap behavior:
+// when the accumulated chip width exceeds the value column, chips
+// flow to a second row whose label column is blank (so the "tags:"
+// label only renders on the first row). The total chip count must
+// be preserved across the two rows.
+func TestRenderTagChips_WrapsWhenOverflow(t *testing.T) {
+	loadPalette("dark")
+	// Each chip renders as `#tagN ` with 1-cell padding on each side
+	// — roughly 8 cells per chip. With valueW=20 we should get
+	// ~2 chips per row, forcing the 5-tag set onto multiple rows.
+	tags := []string{"alpha", "beta", "gamma", "delta", "epsilon"}
+	rows := renderTagChips(tags, 10, 20)
+	if len(rows) < 2 {
+		t.Fatalf("expected wrap to produce ≥2 rows, got %d:\n%v", len(rows), rows)
+	}
+	// First row carries the "tags:" label; subsequent rows do not.
+	if !strings.Contains(rows[0], "tags:") {
+		t.Errorf("first row missing 'tags:' label:\n%q", rows[0])
+	}
+	for i := 1; i < len(rows); i++ {
+		if strings.Contains(rows[i], "tags:") {
+			t.Errorf("wrapped row %d should not repeat the 'tags:' label:\n%q", i, rows[i])
+		}
+	}
+	// Every tag's chip text appears exactly once across all rows.
+	joined := strings.Join(rows, "\n")
+	for _, tag := range tags {
+		if c := strings.Count(joined, "#"+tag); c != 1 {
+			t.Errorf("expected exactly 1 chip for %q across wrapped rows, got %d", tag, c)
+		}
+	}
+}
+
+// TestRenderTagChips_EmptyReturnsNil documents the no-tags case so a
+// future caller doesn't accidentally render an empty "tags:" row.
+func TestRenderTagChips_EmptyReturnsNil(t *testing.T) {
+	loadPalette("dark")
+	if rows := renderTagChips(nil, 10, 80); rows != nil {
+		t.Errorf("expected nil for empty tags, got %v", rows)
+	}
+	if rows := renderTagChips([]string{}, 10, 80); rows != nil {
+		t.Errorf("expected nil for empty slice, got %v", rows)
+	}
+}
+
+// TestRenderTagChips_UsesInvertedPalette confirms each chip renders
+// with the inverted brand palette in dark mode — cream background,
+// ink foreground — so the chip reads as a "patch of light mode"
+// against the dark surface. This is the brand-compliant alternative
+// to introducing a fourth accent color.
+func TestRenderTagChips_UsesInvertedPalette(t *testing.T) {
+	loadPalette("dark")
+	rows := renderTagChips([]string{"go"}, 10, 80)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+	// 48;5;223 = cream bg, 38;5;234 = ink fg.
+	if !strings.Contains(rows[0], "48;5;223") {
+		t.Errorf("chip missing inverted cream background (48;5;223):\n%q", rows[0])
+	}
+	if !strings.Contains(rows[0], "38;5;234") {
+		t.Errorf("chip missing inverted ink foreground (38;5;234):\n%q", rows[0])
 	}
 }

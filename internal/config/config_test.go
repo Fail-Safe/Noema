@@ -96,6 +96,76 @@ func TestSave_NormalizesPathBeforeComparing(t *testing.T) {
 	}
 }
 
+// TestUITheme_RoundTrip pins the YAML round-trip behavior of the
+// UI.Theme field added in v0.4.1: it serializes under a `ui:` block,
+// loads back identically, and the Theme()/SetTheme() helpers reflect
+// the persisted value. The pointer-typed UI struct also means an
+// untouched config never writes a `ui:` block, which keeps the file
+// shape identical to what older Noema binaries produced.
+func TestUITheme_RoundTrip(t *testing.T) {
+	original := &config.Config{
+		Default:  "work",
+		Cortexes: map[string]config.CortexEntry{"work": {Path: "/tmp/work"}},
+	}
+	original.SetTheme("dark")
+
+	data, err := yaml.Marshal(original)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !strings.Contains(string(data), "theme: dark") {
+		t.Errorf("YAML missing theme: dark\n%s", data)
+	}
+
+	var restored config.Config
+	if err := yaml.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if restored.Theme() != "dark" {
+		t.Errorf("restored theme = %q, want dark", restored.Theme())
+	}
+}
+
+// TestUITheme_DefaultsToAuto verifies the zero-value contract: a
+// fresh Config (no UI block) reports its theme as "auto", which is
+// what the TUI's resolveTheme treats as "consult the terminal".
+func TestUITheme_DefaultsToAuto(t *testing.T) {
+	cfg := &config.Config{}
+	if got := cfg.Theme(); got != "auto" {
+		t.Errorf("empty config Theme() = %q, want auto", got)
+	}
+}
+
+// TestUITheme_ClearOnEmpty verifies SetTheme("") removes the UI block
+// entirely, so a config that toggled to dark and back doesn't leave
+// a stale `ui: {}` artifact in the file.
+func TestUITheme_ClearOnEmpty(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.SetTheme("dark")
+	cfg.SetTheme("")
+	if cfg.UI != nil {
+		t.Errorf("SetTheme(\"\") should drop the UI block, got %+v", cfg.UI)
+	}
+}
+
+// TestConfig_OmitsUIWhenNil documents that an untouched config has
+// no `ui:` field at all in the marshaled YAML — so older Noema
+// binaries (which don't know about the field) parse the file
+// unchanged.
+func TestConfig_OmitsUIWhenNil(t *testing.T) {
+	cfg := &config.Config{
+		Default:  "x",
+		Cortexes: map[string]config.CortexEntry{"x": {Path: "/tmp/x"}},
+	}
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(data), "ui:") {
+		t.Errorf("YAML should not contain a ui: block when UI is nil:\n%s", data)
+	}
+}
+
 func TestLoadMissingFile(t *testing.T) {
 	// Load should return an empty config (not an error) when the file doesn't exist.
 	// We can't easily redirect os.UserConfigDir on macOS, so we test via the Load
