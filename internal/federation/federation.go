@@ -4,15 +4,23 @@ import "time"
 
 const DefaultInterval = 30 * time.Second
 
+// Peer mode constants — checked by the syncer to skip paused peers.
+const (
+	PeerModeSync   = "sync"
+	PeerModePaused = "paused"
+)
+
 // PeerConfig is a peer entry as declared in cortex.md.
 type PeerConfig struct {
 	Name     string `yaml:"name"`
 	Endpoint string `yaml:"endpoint"`
 	CA       string `yaml:"ca,omitempty"` // path to CA certificate for TLS verification
+	Mode     string `yaml:"mode,omitempty"` // sync | paused
 }
 
 // Config holds federation settings from cortex.md.
 type Config struct {
+	Mode     string        // federation-level mode: sync | publish | subscribe
 	Peers    []PeerConfig  `yaml:"peers,omitempty"`
 	Interval time.Duration // parsed from string
 

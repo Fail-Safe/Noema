@@ -48,6 +48,10 @@ func NewSyncer(replayer EventReplayer, state *State, cfg Config) *Syncer {
 
 func (s *Syncer) Start() {
 	for _, peer := range s.config.Peers {
+		if peer.Mode == PeerModePaused {
+			log.Printf("[federation] peer %q is paused, skipping", peer.Name)
+			continue
+		}
 		s.wg.Add(1)
 		go s.syncLoop(peer)
 	}

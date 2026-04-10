@@ -138,7 +138,29 @@ Lineage is a separate `trace_lineage` join table populated from the `derived_fro
 
 Federation is opt-in via a `federation:` block in `cortex.md` (peers + interval). When `noema serve --transport http` starts on a Cortex with peers configured, a background syncer polls each peer's `sync_events` MCP tool over Streamable HTTP (the `/mcp` endpoint, MCP 2025-03-26), replays new events into the local Cortex, and merges the remote vector clock into the local one. Replayed events are stored with their original ID, cortex_id, and origin so the event log becomes the union of all peers' events (no event amplification). When two peers update the same trace concurrently — vector clocks neither dominate nor are dominated — Noema creates a `type: divergence` Trace preserving every conflicting version under deterministically-sorted `### Version from <name> (<id-prefix>)` headers, rather than overwriting. Resolve via `noema resolve <divergence-id> --accept <name|id-prefix>` or `--custom <body>` (or the `resolve_divergence` MCP tool).
 
+**Federation modes.** The `federation.mode` field in `cortex.md` controls sync directionality:
+
+| Mode | Syncer runs? | `sync_events` serves? | HTTP write tools? |
+|------|-------------|----------------------|-------------------|
+| `sync` (default) | Yes | Yes | Yes |
+| `publish` | No | Yes | Blocked (read-only for remote peers) |
+| `subscribe` | Yes | Blocked | Yes |
+
+In publish mode, mutating MCP tools (`create_trace`, `update_trace`, `delete_trace`, `recover_trace`, `archive_trace`, `unarchive_trace`, `resolve_divergence`) return a clear error on the HTTP transport. The local stdio transport retains full write access so operators can manage content locally. In subscribe mode, `sync_events` returns an error so remote peers cannot pull events from this cortex.
+
+Each peer can also declare `mode: paused` to temporarily skip syncing without losing cursor/identity state. CLI commands: `noema federation set-mode <sync|publish|subscribe>`, `noema federation pause-peer <name>`, `noema federation resume-peer <name>`.
+
 The full design rationale, edge cases, and phase breakdown live in `docs/design/federation-plan.md`.
+
+**Content hashing and source-locking.** Every trace mutation (`Add`, `Update`) computes a SHA-256 hash of the body (`sha256:<hex>`) and stores it in the `content_hash` frontmatter field and DB column. The hash travels through federation events so peers receive it. Three frontmatter fields support integrity:
+
+- `content_hash` — current body hash, recomputed on every write
+- `source_hash` — the origin's `content_hash` at publish time, carried through federation
+- `source_locked` — when `true`, consumer-side tooling refuses `Update`, `Trash`, and `Remove` on this trace (only enforced when `origin != local cortex name`; the publisher can always edit its own traces)
+
+`Archive` and `Unarchive` remain allowed on source-locked traces (non-destructive). CLI commands accept `--force` to bypass the lock. MCP tools surface `ErrSourceLocked` as a tool error. The TUI blocks the `e` key with a status message.
+
+CLI: `noema verify` checks all trace file hashes against their frontmatter `content_hash` (with `--backfill` for old traces). `noema drift` checks federated traces against their `source_hash`.
 
 **MCP access posture.** The HTTP MCP endpoint runs either in **open mode** (no auth, the default — suitable only for loopback) or in **keyed mode** (every request must carry `Authorization: Bearer <key>`). Keyed mode is mandatory for federation rings and any non-loopback deployment, and it also requires TLS — the server refuses to start with a bearer key over plaintext HTTP. The key is supplied via `NOEMA_MCP_KEY` (env var, wins if both are set) or via an optional `access.shared_key_file` block in `cortex.md` pointing at a 0600 sidecar file. The server logs the active posture on startup as `access=keyed source=env|file fingerprint=SHA256:...`, and `noema federation key fingerprint` reproduces the same non-secret fingerprint for out-of-band verification across ring members. The federation syncer automatically injects the local host's bearer key into every outbound `sync_events` call; there is no per-peer key config, so every host in a ring must share one key. Mixed-mode rings (some keyed, some open) are not supported — they isolate by design. See `docs/design/mcp-auth-plan.md` for the full threat model and decision log, and `internal/mcp/middleware.go` for the CORS + auth middleware chain (CORS outermost so browser preflights bypass the auth gate as the spec requires).
 
@@ -156,7 +178,7 @@ Schema changes must always be transparent and non-destructive. Rules:
 - If a migration would require removing or restructuring data, provide a separate explicit `noema migrate` command with a clear description of what it does, requiring user confirmation
 - Migration failures abort startup with a clear error; they never partially apply
 
-The runner is a thin hand-rolled loop over embedded `*.sql` files in `internal/db/migrations/`, sorted by leading version number. Currently applied: `001_initial.sql`, `002_trash.sql`, `003_events_and_lineage.sql` (event log + `trace_lineage` + `traces.origin` column), `004_federation_state.sql` (key-value store for vector clocks and per-peer cursors), and `005_cortex_identity.sql` (`cortex_id` column on `traces` and `events`).
+The runner is a thin hand-rolled loop over embedded `*.sql` files in `internal/db/migrations/`, sorted by leading version number. Currently applied: `001_initial.sql`, `002_trash.sql`, `003_events_and_lineage.sql` (event log + `trace_lineage` + `traces.origin` column), `004_federation_state.sql` (key-value store for vector clocks and per-peer cursors), `005_cortex_identity.sql` (`cortex_id` column on `traces` and `events`), `006_content_hash.sql` (`content_hash` column on `traces`), and `007_source_locking.sql` (`source_locked` + `source_hash` columns on `traces`).
 
 `cortex.md` carries a `version` field. The current `ManifestVersion` is **2** — version 2 carries a stable cortex `id` (a ULID) and re-keys the local event log + vector clock from cortex-name to cortex-id. Cortexes written by older binaries must run `noema migrate cortex-id` (an explicit, interactive, backed-up migration in `internal/cli/cmd_migrate.go`) before they can be opened by this binary; the `--reset` flag handles the case where the directory is a copy of another cortex (Gotcha #3 in the design doc).
 

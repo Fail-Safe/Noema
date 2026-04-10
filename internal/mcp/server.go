@@ -21,13 +21,31 @@ import (
 // noema build they're talking to without grepping logs. Callers should
 // pass cli.version() so the value matches `noema --version`. An empty
 // string is normalized to "dev" so the protocol field is never blank.
-func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
+// NewServer creates a new MCP server for the given cortex. federationMode
+// controls tool access: "publish" blocks mutating tools (source of truth),
+// "subscribe" blocks sync_events (consumer only), "sync"/empty allows all.
+func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *server.MCPServer {
 	if noemaVersion == "" {
 		noemaVersion = "dev"
 	}
 	s := server.NewMCPServer("noema", noemaVersion,
 		server.WithToolCapabilities(true),
 	)
+
+	// readOnlyGuard wraps a tool handler to reject calls when the cortex is
+	// in publish mode. Publish-mode cortexes are read-only for remote peers;
+	// local writes go through a separate stdio transport process.
+	type toolHandler = func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error)
+	readOnlyGuard := func(next toolHandler) toolHandler {
+		if federationMode != cortex.FederationModePublish {
+			return next
+		}
+		return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultError(
+				"this cortex is in publish mode (read-only for remote peers); " +
+					"use a local stdio transport for writes"), nil
+		}
+	}
 
 	s.AddTool(mcp.NewTool("get_instructions",
 		mcp.WithDescription("Returns a reference guide for working with this Cortex: terminology, trace types, field definitions, filtering options, and tool usage. Call this first if you are unfamiliar with Noema."),
@@ -90,6 +108,15 @@ func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
 		if len(row.DerivedFrom) > 0 {
 			out += fmt.Sprintf("\nDerived From: %s", strings.Join(row.DerivedFrom, ", "))
 		}
+		if row.SourceLocked {
+			out += "\nSource Locked: yes"
+		}
+		if row.SourceHash != "" {
+			out += fmt.Sprintf("\nSource Hash: %s", row.SourceHash)
+		}
+		if row.ContentHash != "" {
+			out += fmt.Sprintf("\nContent Hash: %s", row.ContentHash)
+		}
 		out += fmt.Sprintf("\n\n%s", t.Body)
 		return mcp.NewToolResultText(out), nil
 	})
@@ -104,7 +131,9 @@ func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
 		mcp.WithString("tags", mcp.Description("Comma-separated tags")),
 		mcp.WithString("derived_from", mcp.Description("Comma-separated trace IDs this trace was derived from")),
 		mcp.WithString("origin", mcp.Description("Origin cortex name (defaults to current cortex)")),
-	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		mcp.WithBoolean("source_locked", mcp.Description("Mark trace as source-locked (immutable on consumer side)")),
+		mcp.WithString("source_hash", mcp.Description("Content hash from the source/publisher cortex")),
+	), readOnlyGuard(func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		title, err := req.RequireString("title")
 		if err != nil {
 			return nil, err
@@ -137,11 +166,17 @@ func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
 		if origin := req.GetString("origin", ""); origin != "" {
 			t.Origin = origin
 		}
+		if req.GetBool("source_locked", false) {
+			t.SourceLocked = true
+		}
+		if sh := req.GetString("source_hash", ""); sh != "" {
+			t.SourceHash = sh
+		}
 		if err := cx.Add(t); err != nil {
 			return nil, err
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("Trace created: %s", t.ID)), nil
-	})
+	}))
 
 	s.AddTool(mcp.NewTool("search_traces",
 		mcp.WithDescription("Full-text search across traces"),
@@ -164,7 +199,7 @@ func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
 	s.AddTool(mcp.NewTool("delete_trace",
 		mcp.WithDescription("Move a trace to trash (soft-delete, recoverable for 30 days). Use recover_trace to restore it."),
 		mcp.WithString("id", mcp.Description("Trace ID"), mcp.Required()),
-	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	), readOnlyGuard(func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id, err := req.RequireString("id")
 		if err != nil {
 			return nil, err
@@ -173,12 +208,12 @@ func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
 			return nil, err
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("Trace %s moved to trash.", id)), nil
-	})
+	}))
 
 	s.AddTool(mcp.NewTool("recover_trace",
 		mcp.WithDescription("Restore a trace from trash back to active"),
 		mcp.WithString("id", mcp.Description("Trace ID"), mcp.Required()),
-	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	), readOnlyGuard(func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id, err := req.RequireString("id")
 		if err != nil {
 			return nil, err
@@ -187,12 +222,12 @@ func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
 			return nil, err
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("Trace %s recovered.", id)), nil
-	})
+	}))
 
 	s.AddTool(mcp.NewTool("archive_trace",
 		mcp.WithDescription("Archive a trace"),
 		mcp.WithString("id", mcp.Description("Trace ID"), mcp.Required()),
-	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	), readOnlyGuard(func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id, err := req.RequireString("id")
 		if err != nil {
 			return nil, err
@@ -201,12 +236,12 @@ func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
 			return nil, err
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("Trace %s archived.", id)), nil
-	})
+	}))
 
 	s.AddTool(mcp.NewTool("unarchive_trace",
 		mcp.WithDescription("Restore an archived trace"),
 		mcp.WithString("id", mcp.Description("Trace ID"), mcp.Required()),
-	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	), readOnlyGuard(func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id, err := req.RequireString("id")
 		if err != nil {
 			return nil, err
@@ -215,7 +250,7 @@ func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
 			return nil, err
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("Trace %s restored.", id)), nil
-	})
+	}))
 
 	s.AddTool(mcp.NewTool("update_trace",
 		mcp.WithDescription("Update fields of an existing trace. Only provided fields are changed."),
@@ -227,7 +262,7 @@ func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
 		mcp.WithString("tags", mcp.Description("New tags, comma-separated (replaces existing tags)")),
 		mcp.WithString("derived_from", mcp.Description("New derived_from, comma-separated trace IDs (replaces existing lineage)")),
 		mcp.WithString("body", mcp.Description("New body content")),
-	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	), readOnlyGuard(func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id, err := req.RequireString("id")
 		if err != nil {
 			return nil, err
@@ -271,6 +306,9 @@ func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
 			}
 			t.DerivedFrom = sources
 		}
+		if err := cx.CheckSourceLock(id); err != nil {
+			return nil, err
+		}
 		if err := t.Write(path); err != nil {
 			return nil, err
 		}
@@ -278,7 +316,7 @@ func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
 			return nil, err
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("Trace %s updated.", id)), nil
-	})
+	}))
 
 	// ---- Event Log & Lineage tools ----
 
@@ -342,7 +380,7 @@ func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
 		mcp.WithString("id", mcp.Description("Divergence trace ID"), mcp.Required()),
 		mcp.WithString("accept", mcp.Description("Origin name whose version to accept. See the '**Conflicting origins:**' line in the divergence body for valid values.")),
 		mcp.WithString("body", mcp.Description("Custom merged body content. Mutually exclusive with 'accept'.")),
-	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	), readOnlyGuard(func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id, err := req.RequireString("id")
 		if err != nil {
 			return nil, err
@@ -356,7 +394,7 @@ func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
 			return mcp.NewToolResultText(fmt.Sprintf("Divergence %s resolved (accepted %s).", id, accept)), nil
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("Divergence %s resolved (custom merge).", id)), nil
-	})
+	}))
 
 	// ---- Federation tools ----
 
@@ -371,6 +409,7 @@ func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
 			"id":      cx.ID,
 			"name":    m.Name,
 			"version": m.Version,
+			"mode":    m.Federation.EffectiveMode(),
 		}
 		data, err := json.Marshal(payload)
 		if err != nil {
@@ -384,6 +423,10 @@ func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
 		mcp.WithString("since", mcp.Description("ULID cursor — return only events after this ID")),
 		mcp.WithNumber("limit", mcp.Description("Max events to return (default 100, max 1000)")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if federationMode == cortex.FederationModeSubscribe {
+			return mcp.NewToolResultError(
+				"this cortex is in subscribe mode and does not serve events"), nil
+		}
 		since := req.GetString("since", "")
 		limit := req.GetInt("limit", 100)
 		if limit <= 0 || limit > 1000 {
@@ -410,6 +453,7 @@ func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
 
 		var sb strings.Builder
 		sb.WriteString(fmt.Sprintf("Cortex: %s\n", m.Name))
+		sb.WriteString(fmt.Sprintf("Mode: %s\n", m.Federation.EffectiveMode()))
 
 		// Surface the MCP access posture alongside federation state so a
 		// peer calling this tool sees exactly what the middleware is
@@ -452,8 +496,9 @@ func NewServer(cx *cortex.Cortex, noemaVersion string) *server.MCPServer {
 				if ps.CortexID != "" {
 					cortexID = ps.CortexID
 				}
-				sb.WriteString(fmt.Sprintf("  %s\n    endpoint:   %s\n    cortex_id:  %s\n    last_seen:  %s\n    last_event: %s\n",
-					p.Name, p.Endpoint, cortexID, lastSeen, lastEvent))
+				peerMode := p.EffectiveMode()
+				sb.WriteString(fmt.Sprintf("  %s\n    endpoint:   %s\n    mode:       %s\n    cortex_id:  %s\n    last_seen:  %s\n    last_event: %s\n",
+					p.Name, p.Endpoint, peerMode, cortexID, lastSeen, lastEvent))
 			}
 		}
 
@@ -595,6 +640,9 @@ Choose the type that best reflects the intent of the memory:
   tags          optional  list of keyword strings
   derived_from  optional  list of trace IDs this trace was derived from
   origin        optional  cortex name that created this trace (auto-set)
+  content_hash  auto      SHA-256 of body (sha256:<hex>), recomputed on every write
+  source_hash   optional  origin's content_hash at publish time (immutable on consumer)
+  source_locked optional  when true, consumer-side mutations are refused
 
 ## Tools
 
@@ -602,7 +650,7 @@ Choose the type that best reflects the intent of the memory:
   list_traces [type] [author] [tag] [origin] [archived] [all]
                                  → list traces; defaults to active only
   get_trace id                   → full content including body, origin, lineage
-  create_trace title type body [author] [tags] [derived_from] [origin]
+  create_trace title type body [author] [tags] [derived_from] [origin] [source_locked] [source_hash]
                                  → create a new trace; tags/derived_from = comma-separated.
                                    Do NOT include a date in the title — the ID
                                    generator prepends today's date automatically,
@@ -675,6 +723,34 @@ Choose the type that best reflects the intent of the memory:
   your client either has it configured and every tool call works, or it doesn't and
   you'll see a 401 from the transport layer.
 - Stdio is unaffected by this posture: stdio implies local-process trust.
+
+## Federation Modes
+The cortex-level federation mode controls how this instance participates in a ring:
+
+  sync        (default) Bidirectional: pull events from peers and serve events to them.
+  publish     Outbound only: serve events via sync_events, but never pull. Write tools
+              (create/update/delete/archive/recover/resolve) are blocked on HTTP — use
+              a local stdio transport for content management.
+  subscribe   Inbound only: pull events from peers normally. sync_events refuses to
+              serve — remote peers cannot pull from this cortex.
+
+Each peer can also be paused individually (mode=paused in cortex.md) without affecting
+the rest of the ring. A paused peer keeps its cursor and identity pin intact.
+
+cortex_identity reports the active mode. federation_status shows both the cortex mode
+and per-peer modes.
+
+## Source-Locking
+Traces can be source-locked by setting source_locked=true on creation. A source-locked
+trace refuses update, delete, and remove when the local cortex is not the trace's origin.
+This enforces publisher authority: consumers receive the trace via federation but cannot
+modify it. archive/unarchive remain allowed (non-destructive).
+
+content_hash is auto-computed (SHA-256 of the body) on every write and carried through
+federation events. source_hash records the origin's content_hash at publish time so
+consumers can detect drift.
+
+get_trace shows Source Locked, Source Hash, and Content Hash fields when present.
 
 ## Tips
 - Prefer specific types over "note" — it helps retrieval and reasoning later.

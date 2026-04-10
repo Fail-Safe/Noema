@@ -23,6 +23,9 @@ func federationCmd() *cobra.Command {
 		federationPeersCmd(),
 		federationAddPeerCmd(),
 		federationResetPeerCmd(),
+		federationSetModeCmd(),
+		federationPausePeerCmd(),
+		federationResumePeerCmd(),
 		federationKeyCmd(),
 	)
 	return cmd
@@ -134,6 +137,7 @@ func federationStatusCmd() *cobra.Command {
 				return nil
 			}
 
+			fmt.Printf("Mode: %s\n", m.Federation.EffectiveMode())
 			fmt.Printf("Peers: %d\n", len(m.Federation.Peers))
 			if m.Federation.Interval != "" {
 				fmt.Printf("Interval: %s\n", m.Federation.Interval)
@@ -155,8 +159,9 @@ func federationStatusCmd() *cobra.Command {
 				if ps.LastEvent != "" {
 					lastEvent = ps.LastEvent
 				}
-				fmt.Printf("  %s\n    endpoint:   %s\n    last_seen:  %s\n    last_event: %s\n",
-					p.Name, p.Endpoint, lastSeen, lastEvent)
+				peerMode := p.EffectiveMode()
+				fmt.Printf("  %s\n    endpoint:   %s\n    mode:       %s\n    last_seen:  %s\n    last_event: %s\n",
+					p.Name, p.Endpoint, peerMode, lastSeen, lastEvent)
 			}
 
 			vc, err := cx.GetClock()
@@ -364,6 +369,160 @@ func runFederationResetPeer(out io.Writer, in io.Reader, cx *cortex.Cortex, name
 		fmt.Fprintf(out, "  vector-clock buckets dropped: %d\n", bucketsDropped)
 	}
 	fmt.Fprintln(out, "Restart `noema serve` (or wait for the next syncer poll) to re-pin the peers.")
+	return nil
+}
+
+func federationSetModeCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "set-mode <sync|publish|subscribe>",
+		Short: "Set the federation mode for this cortex",
+		Long: `Sets the cortex-level federation mode in cortex.md:
+
+  sync        Bidirectional: pull events from peers and serve events to them (default)
+  publish     Outbound only: serve events but never pull; write tools are blocked on HTTP
+  subscribe   Inbound only: pull events from peers but refuse to serve them
+
+Changes take effect on the next ` + "`noema serve`" + ` restart.`,
+		Example: "  noema federation set-mode publish\n  noema federation set-mode sync",
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			mode := args[0]
+			switch mode {
+			case cortex.FederationModeSync, cortex.FederationModePublish, cortex.FederationModeSubscribe:
+			default:
+				return fmt.Errorf("invalid mode %q; use sync, publish, or subscribe", mode)
+			}
+
+			cx, err := resolveCortex()
+			if err != nil {
+				return err
+			}
+			defer cx.Close()
+
+			m, err := cortex.ReadManifest(cx.Dir)
+			if err != nil {
+				return err
+			}
+
+			if m.Federation == nil {
+				m.Federation = &cortex.FederationConfig{}
+			}
+
+			prev := m.Federation.EffectiveMode()
+			if mode == cortex.FederationModeSync {
+				m.Federation.Mode = "" // omitempty: sync is the default
+			} else {
+				m.Federation.Mode = mode
+			}
+
+			if err := cortex.WriteManifest(cx.Dir, m); err != nil {
+				return err
+			}
+
+			out := cmd.OutOrStdout()
+			if prev == mode {
+				fmt.Fprintf(out, "Federation mode is already %q — no change.\n", mode)
+				return nil
+			}
+
+			fmt.Fprintf(out, "Federation mode changed: %s -> %s\n\n", prev, mode)
+			switch mode {
+			case cortex.FederationModePublish:
+				fmt.Fprintln(out, "Behavior:")
+				fmt.Fprintln(out, "  - The syncer will NOT start (no pulling from peers)")
+				fmt.Fprintln(out, "  - sync_events will continue serving events to peers")
+				fmt.Fprintln(out, "  - Write tools (create/update/delete) are blocked on HTTP")
+				fmt.Fprintln(out, "  - Local stdio transport retains full write access")
+			case cortex.FederationModeSubscribe:
+				fmt.Fprintln(out, "Behavior:")
+				fmt.Fprintln(out, "  - The syncer will pull events from peers normally")
+				fmt.Fprintln(out, "  - sync_events will refuse to serve events")
+				fmt.Fprintln(out, "  - Write tools remain available on all transports")
+			case cortex.FederationModeSync:
+				fmt.Fprintln(out, "Behavior:")
+				fmt.Fprintln(out, "  - The syncer will pull events from peers")
+				fmt.Fprintln(out, "  - sync_events will serve events to peers")
+				fmt.Fprintln(out, "  - Write tools available on all transports")
+			}
+			fmt.Fprintln(out, "\nRestart `noema serve` for the change to take effect.")
+			return nil
+		},
+	}
+}
+
+func federationPausePeerCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:     "pause-peer <name>",
+		Short:   "Pause syncing with a federation peer",
+		Long:    "Sets a peer's mode to \"paused\" in cortex.md. The syncer will skip this peer\nuntil it is resumed. No state is lost — the cursor and pinned identity are preserved.",
+		Example: "  noema federation pause-peer ai-2",
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return setPeerMode(cmd, args[0], cortex.PeerModePaused)
+		},
+	}
+}
+
+func federationResumePeerCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:     "resume-peer <name>",
+		Short:   "Resume syncing with a paused federation peer",
+		Long:    "Clears a peer's mode back to \"sync\" in cortex.md. The syncer will resume\npulling from this peer on the next poll.",
+		Example: "  noema federation resume-peer ai-2",
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return setPeerMode(cmd, args[0], cortex.PeerModeSync)
+		},
+	}
+}
+
+// setPeerMode updates a single peer's mode in cortex.md.
+func setPeerMode(cmd *cobra.Command, name string, mode string) error {
+	cx, err := resolveCortex()
+	if err != nil {
+		return err
+	}
+	defer cx.Close()
+
+	m, err := cortex.ReadManifest(cx.Dir)
+	if err != nil {
+		return err
+	}
+
+	if m.Federation == nil || len(m.Federation.Peers) == 0 {
+		return fmt.Errorf("no federation peers configured in cortex.md")
+	}
+
+	found := false
+	for i := range m.Federation.Peers {
+		if m.Federation.Peers[i].Name == name {
+			found = true
+			prev := m.Federation.Peers[i].EffectiveMode()
+			if prev == mode {
+				fmt.Fprintf(cmd.OutOrStdout(), "Peer %q is already %s — no change.\n", name, mode)
+				return nil
+			}
+			if mode == cortex.PeerModeSync {
+				m.Federation.Peers[i].Mode = "" // omitempty: sync is the default
+			} else {
+				m.Federation.Peers[i].Mode = mode
+			}
+			if err := cortex.WriteManifest(cx.Dir, m); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Peer %q: %s -> %s\n", name, prev, mode)
+			fmt.Fprintln(cmd.OutOrStdout(), "Restart `noema serve` for the change to take effect.")
+			return nil
+		}
+	}
+
+	if !found {
+		known := make([]string, 0, len(m.Federation.Peers))
+		for _, p := range m.Federation.Peers {
+			known = append(known, p.Name)
+		}
+		return fmt.Errorf("peer %q is not configured in cortex.md (known: %s)", name, strings.Join(known, ", "))
+	}
 	return nil
 }
 

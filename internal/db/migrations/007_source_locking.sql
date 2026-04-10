@@ -1,0 +1,2 @@
+ALTER TABLE traces ADD COLUMN source_locked INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE traces ADD COLUMN source_hash TEXT;

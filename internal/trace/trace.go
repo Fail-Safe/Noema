@@ -1,6 +1,8 @@
 package trace
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strings"
@@ -46,9 +48,12 @@ type Frontmatter struct {
 	Author      string   `yaml:"author,omitempty"`
 	Tags        []string `yaml:"tags,omitempty"`
 	DerivedFrom []string `yaml:"derived_from,omitempty"`
-	Origin      string   `yaml:"origin,omitempty"`
-	Created     string   `yaml:"created"`
-	Updated     string   `yaml:"updated"`
+	Origin       string   `yaml:"origin,omitempty"`
+	Created      string   `yaml:"created"`
+	Updated      string   `yaml:"updated"`
+	ContentHash  string   `yaml:"content_hash,omitempty"`
+	SourceHash   string   `yaml:"source_hash,omitempty"`
+	SourceLocked bool     `yaml:"source_locked,omitempty"`
 }
 
 type Trace struct {
@@ -160,6 +165,14 @@ func allDigits(s string) bool {
 		}
 	}
 	return true
+}
+
+// ContentHash returns the SHA-256 hash of a trace body, prefixed with
+// "sha256:" for algorithm-explicitness. Used for integrity verification
+// and federation sync optimization.
+func ContentHash(body string) string {
+	h := sha256.Sum256([]byte(body))
+	return "sha256:" + hex.EncodeToString(h[:])
 }
 
 func slug(s string) string {

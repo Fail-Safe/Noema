@@ -62,11 +62,11 @@ func serveCmd() *cobra.Command {
 			// not just the human-readable name.
 			fmt.Printf("[serve] cortex %q (id=%s) at %s\n", cx.Name, cx.ID, cx.Dir)
 
-			s := mcpserver.NewServer(cx, version())
-
 			var syncer *federation.Syncer
 			switch transport {
 			case "stdio", "":
+				// Stdio is local — no federation guards on tool access.
+				s := mcpserver.NewServer(cx, version(), "")
 				err = mcpgo.ServeStdio(s)
 			case "http":
 				// Read the manifest BEFORE validateHTTPServe so the
@@ -103,12 +103,16 @@ func serveCmd() *cobra.Command {
 				// Federation only runs over the HTTP transport (peers
 				// need an HTTP endpoint to call sync_events on). Start
 				// the syncer only when the bound cortex actually has
-				// peers configured. Pass the shared key so outbound
-				// sync calls carry the same Authorization header the
-				// middleware enforces on inbound calls (ring model).
-				if m.Federation != nil && len(m.Federation.Peers) > 0 {
-					syncer = startSyncer(cx, accessKey.Value)
+				// peers configured AND the mode is not "publish" (a
+				// publish-mode cortex serves events but never pulls).
+				fedMode := m.Federation.EffectiveMode()
+				if m.Federation != nil && len(m.Federation.Peers) > 0 && fedMode != cortex.FederationModePublish {
+					syncer = startSyncer(cx, accessKey.Value, m.Federation)
 				}
+				fmt.Printf("[serve] federation mode: %s\n", fedMode)
+
+				// HTTP transport: apply federation mode guards.
+				s := mcpserver.NewServer(cx, version(), fedMode)
 
 				// Surface the access posture on startup. The
 				// fingerprint lets two operators confirm they're
@@ -191,29 +195,32 @@ func serveCmd() *cobra.Command {
 	return cmd
 }
 
-// startSyncer reads the cortex manifest and, if federation peers are configured,
-// starts a background syncer that polls remote peers for new events.
-// Returns nil if federation is not configured. sharedKey is attached as an
-// Authorization: Bearer header on every outbound sync when non-empty; pass ""
-// for open-mode peers.
-func startSyncer(cx *cortex.Cortex, sharedKey string) *federation.Syncer {
-	m, err := cortex.ReadManifest(cx.Dir)
-	if err != nil || m.Federation == nil || len(m.Federation.Peers) == 0 {
+// startSyncer converts the manifest's federation config into a running
+// syncer. The caller has already verified that peers exist and the mode
+// is not "publish". sharedKey is attached as an Authorization: Bearer
+// header on every outbound sync when non-empty; pass "" for open-mode
+// peers.
+func startSyncer(cx *cortex.Cortex, sharedKey string, fc *cortex.FederationConfig) *federation.Syncer {
+	if fc == nil || len(fc.Peers) == 0 {
 		return nil
 	}
 
 	var peers []federation.PeerConfig
-	for _, p := range m.Federation.Peers {
-		peers = append(peers, federation.PeerConfig{Name: p.Name, Endpoint: p.Endpoint, CA: p.CA})
+	for _, p := range fc.Peers {
+		peers = append(peers, federation.PeerConfig{
+			Name: p.Name, Endpoint: p.Endpoint, CA: p.CA, Mode: p.Mode,
+		})
 	}
 
 	var interval time.Duration
-	if m.Federation.Interval != "" {
-		interval, _ = time.ParseDuration(m.Federation.Interval)
+	if fc.Interval != "" {
+		interval, _ = time.ParseDuration(fc.Interval)
 	}
 
 	state := federation.NewState(cx.DB.DB)
-	cfg := federation.Config{Peers: peers, Interval: interval, SharedKey: sharedKey}
+	cfg := federation.Config{
+		Mode: fc.EffectiveMode(), Peers: peers, Interval: interval, SharedKey: sharedKey,
+	}
 
 	syncer := federation.NewSyncer(cx, state, cfg)
 	syncer.Start()

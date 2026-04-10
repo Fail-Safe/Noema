@@ -49,10 +49,32 @@ type AccessConfig struct {
 	SharedKeyFile string `yaml:"shared_key_file,omitempty"`
 }
 
+// Federation mode constants.
+const (
+	FederationModeSync      = "sync"      // bidirectional: pull from peers + serve events
+	FederationModePublish   = "publish"   // outbound only: serve events, never pull
+	FederationModeSubscribe = "subscribe" // inbound only: pull from peers, refuse to serve
+)
+
+// Peer mode constants.
+const (
+	PeerModeSync   = "sync"   // actively pull from this peer
+	PeerModePaused = "paused" // configured but skipped by the syncer
+)
+
 // FederationConfig holds peer declarations for cortex.md.
 type FederationConfig struct {
+	Mode     string      `yaml:"mode,omitempty"`     // sync | publish | subscribe
 	Peers    []PeerEntry `yaml:"peers,omitempty"`
 	Interval string      `yaml:"interval,omitempty"` // e.g. "30s", "1m"
+}
+
+// EffectiveMode returns the configured federation mode, defaulting to "sync".
+func (fc *FederationConfig) EffectiveMode() string {
+	if fc == nil || fc.Mode == "" {
+		return FederationModeSync
+	}
+	return fc.Mode
 }
 
 // PeerEntry is a peer declared in cortex.md.
@@ -60,13 +82,48 @@ type PeerEntry struct {
 	Name     string `yaml:"name"`
 	Endpoint string `yaml:"endpoint"`
 	CA       string `yaml:"ca,omitempty"` // path to CA cert for TLS verification
+	Mode     string `yaml:"mode,omitempty"` // sync | paused
 }
 
+// EffectiveMode returns the configured peer mode, defaulting to "sync".
+func (pe PeerEntry) EffectiveMode() string {
+	if pe.Mode == "" {
+		return PeerModeSync
+	}
+	return pe.Mode
+}
+
+// ErrSourceLocked is returned when a mutation is attempted on a
+// source-locked trace from a foreign origin.
+var ErrSourceLocked = errors.New("trace is source-locked")
+
 type Cortex struct {
-	ID   string // ULID, stable across renames; the federation identity key
-	Name string // human-readable display label
-	Dir  string
-	DB   *db.DB
+	ID              string // ULID, stable across renames; the federation identity key
+	Name            string // human-readable display label
+	Dir             string
+	DB              *db.DB
+	forceSourceLock bool // when true, checkSourceLock is a no-op
+}
+
+// SetForceSourceLock enables or disables the source-lock override. When
+// enabled, mutations on source-locked traces succeed with a warning instead
+// of being refused. Intended for CLI --force flags only.
+func (c *Cortex) SetForceSourceLock(v bool) { c.forceSourceLock = v }
+
+// CheckSourceLock returns ErrSourceLocked if the trace is source-locked
+// by a foreign origin. The check is skipped when forceSourceLock is set.
+func (c *Cortex) CheckSourceLock(id string) error {
+	if c.forceSourceLock {
+		return nil
+	}
+	r, err := c.Get(id)
+	if err != nil {
+		return err
+	}
+	if r.SourceLocked && r.Origin != c.Name {
+		return fmt.Errorf("%w by origin %q", ErrSourceLocked, r.Origin)
+	}
+	return nil
 }
 
 // Create initialises a new Cortex on disk and registers it.
@@ -106,6 +163,28 @@ func Create(name, dir string) (Manifest, error) {
 	return manifest, conn.Close()
 }
 
+// ValidateFederation checks that the federation mode and per-peer modes in
+// the manifest are recognized values. Returns nil when there is no
+// federation block or when all values are valid.
+func (m Manifest) ValidateFederation() error {
+	if m.Federation == nil {
+		return nil
+	}
+	switch m.Federation.EffectiveMode() {
+	case FederationModeSync, FederationModePublish, FederationModeSubscribe:
+	default:
+		return fmt.Errorf("federation.mode %q is not valid; use sync, publish, or subscribe", m.Federation.Mode)
+	}
+	for _, p := range m.Federation.Peers {
+		switch p.EffectiveMode() {
+		case PeerModeSync, PeerModePaused:
+		default:
+			return fmt.Errorf("federation.peers[%s].mode %q is not valid; use sync or paused", p.Name, p.Mode)
+		}
+	}
+	return nil
+}
+
 // ReadManifest parses the cortex.md manifest in the given cortex directory.
 func ReadManifest(dir string) (Manifest, error) {
 	data, err := os.ReadFile(filepath.Join(dir, "cortex.md"))
@@ -115,6 +194,9 @@ func ReadManifest(dir string) (Manifest, error) {
 	var m Manifest
 	if err := yaml.Unmarshal(data, &m); err != nil {
 		return Manifest{}, fmt.Errorf("parsing cortex.md: %w", err)
+	}
+	if err := m.ValidateFederation(); err != nil {
+		return Manifest{}, err
 	}
 	return m, nil
 }
@@ -490,6 +572,7 @@ func (c *Cortex) Add(t *trace.Trace) error {
 	if t.Origin == "" {
 		t.Origin = c.Name
 	}
+	t.ContentHash = trace.ContentHash(t.Body)
 	path := c.TraceFile(t.ID, false)
 	if err := t.Write(path); err != nil {
 		return fmt.Errorf("writing trace file: %w", err)
@@ -509,8 +592,8 @@ func (c *Cortex) insertDB(t *trace.Trace) error {
 	defer tx.Rollback()
 
 	_, err = tx.Exec(
-		`INSERT INTO traces (id, title, type, author, origin, cortex_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.Title, t.Type, t.Author, t.Origin, c.ID, t.Created, t.Updated,
+		`INSERT INTO traces (id, title, type, author, origin, cortex_id, created_at, updated_at, content_hash, source_locked, source_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.Title, t.Type, t.Author, t.Origin, c.ID, t.Created, t.Updated, t.ContentHash, boolToInt(t.SourceLocked), nullIfEmpty(t.SourceHash),
 	)
 	if err != nil {
 		return err
@@ -537,17 +620,20 @@ func (c *Cortex) insertDB(t *trace.Trace) error {
 
 // Row is a DB row joined with tags, returned by list/search operations.
 type Row struct {
-	ID          string
-	Title       string
-	Type        string
-	Author      string
-	Origin      string
-	Tags        []string
-	DerivedFrom []string
-	ArchivedAt  string
-	TrashedAt   string
-	CreatedAt   string
-	UpdatedAt   string
+	ID           string
+	Title        string
+	Type         string
+	Author       string
+	Origin       string
+	Tags         []string
+	DerivedFrom  []string
+	ArchivedAt   string
+	TrashedAt    string
+	CreatedAt    string
+	UpdatedAt    string
+	ContentHash  string
+	SourceLocked bool
+	SourceHash   string
 }
 
 type ListOptions struct {
@@ -561,7 +647,7 @@ type ListOptions struct {
 }
 
 func (c *Cortex) List(opts ListOptions) ([]Row, error) {
-	q := `SELECT id, title, type, author, origin, archived_at, trashed_at, created_at, updated_at FROM traces WHERE 1=1`
+	q := `SELECT id, title, type, author, origin, archived_at, trashed_at, created_at, updated_at, content_hash, source_locked, source_hash FROM traces WHERE 1=1`
 	var args []any
 
 	switch {
@@ -602,7 +688,7 @@ func (c *Cortex) List(opts ListOptions) ([]Row, error) {
 
 func (c *Cortex) Search(query string, opts ListOptions) ([]Row, error) {
 	q := `
-		SELECT t.id, t.title, t.type, t.author, t.origin, t.archived_at, t.trashed_at, t.created_at, t.updated_at
+		SELECT t.id, t.title, t.type, t.author, t.origin, t.archived_at, t.trashed_at, t.created_at, t.updated_at, t.content_hash, t.source_locked, t.source_hash
 		FROM traces t
 		WHERE t.id IN (SELECT id FROM traces_fts WHERE traces_fts MATCH ?)`
 	args := []any{query}
@@ -641,10 +727,11 @@ func (c *Cortex) Search(query string, opts ListOptions) ([]Row, error) {
 
 func (c *Cortex) Get(id string) (*Row, error) {
 	var r Row
-	var archivedAt, trashedAt *string
+	var archivedAt, trashedAt, contentHash, sourceHash *string
+	var sourceLocked int
 	err := c.DB.QueryRow(
-		`SELECT id, title, type, author, origin, archived_at, trashed_at, created_at, updated_at FROM traces WHERE id = ?`, id,
-	).Scan(&r.ID, &r.Title, &r.Type, &r.Author, &r.Origin, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt)
+		`SELECT id, title, type, author, origin, archived_at, trashed_at, created_at, updated_at, content_hash, source_locked, source_hash FROM traces WHERE id = ?`, id,
+	).Scan(&r.ID, &r.Title, &r.Type, &r.Author, &r.Origin, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt, &contentHash, &sourceLocked, &sourceHash)
 	if err != nil {
 		return nil, err
 	}
@@ -653,6 +740,13 @@ func (c *Cortex) Get(id string) (*Row, error) {
 	}
 	if trashedAt != nil {
 		r.TrashedAt = *trashedAt
+	}
+	if contentHash != nil {
+		r.ContentHash = *contentHash
+	}
+	r.SourceLocked = sourceLocked != 0
+	if sourceHash != nil {
+		r.SourceHash = *sourceHash
 	}
 	r.Tags, err = c.tagsFor(id)
 	if err != nil {
@@ -668,6 +762,9 @@ func (c *Cortex) Get(id string) (*Row, error) {
 // Remove permanently deletes a trace from disk and the database.
 // Use Trash for recoverable deletion.
 func (c *Cortex) Remove(id string) error {
+	if err := c.CheckSourceLock(id); err != nil {
+		return err
+	}
 	r, err := c.Get(id)
 	if err != nil {
 		return err
@@ -681,6 +778,9 @@ func (c *Cortex) Remove(id string) error {
 
 // Trash moves a trace to the trash directory for deferred deletion.
 func (c *Cortex) Trash(id string) error {
+	if err := c.CheckSourceLock(id); err != nil {
+		return err
+	}
 	r, err := c.Get(id)
 	if err != nil {
 		return err
@@ -847,6 +947,9 @@ func (c *Cortex) Unarchive(id string) error {
 // Update rewrites an existing trace's DB row and FTS entry from its (potentially
 // edited) markdown file on disk.
 func (c *Cortex) Update(id string) error {
+	if err := c.CheckSourceLock(id); err != nil {
+		return err
+	}
 	r, err := c.Get(id)
 	if err != nil {
 		return err
@@ -861,6 +964,7 @@ func (c *Cortex) Update(id string) error {
 	// editor left in the frontmatter — and write it back to the file so disk,
 	// DB, and emitted event all agree.
 	t.Updated = time.Now().UTC().Format(time.RFC3339)
+	t.ContentHash = trace.ContentHash(t.Body)
 	if err := t.Write(path); err != nil {
 		return fmt.Errorf("rewriting trace file with updated timestamp: %w", err)
 	}
@@ -872,8 +976,8 @@ func (c *Cortex) Update(id string) error {
 	defer tx.Rollback()
 
 	_, err = tx.Exec(
-		`UPDATE traces SET title=?, type=?, author=?, origin=?, updated_at=? WHERE id=?`,
-		t.Title, t.Type, t.Author, t.Origin, t.Updated, id,
+		`UPDATE traces SET title=?, type=?, author=?, origin=?, updated_at=?, content_hash=?, source_locked=?, source_hash=? WHERE id=?`,
+		t.Title, t.Type, t.Author, t.Origin, t.Updated, t.ContentHash, boolToInt(t.SourceLocked), nullIfEmpty(t.SourceHash), id,
 	)
 	if err != nil {
 		return err
@@ -910,8 +1014,9 @@ func (c *Cortex) scanRows(rows *sql.Rows) ([]Row, error) { //nolint:govet
 	var result []Row
 	for rows.Next() {
 		var r Row
-		var archivedAt, trashedAt *string
-		if err := rows.Scan(&r.ID, &r.Title, &r.Type, &r.Author, &r.Origin, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		var archivedAt, trashedAt, contentHash, sourceHash *string
+		var sourceLocked int
+		if err := rows.Scan(&r.ID, &r.Title, &r.Type, &r.Author, &r.Origin, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt, &contentHash, &sourceLocked, &sourceHash); err != nil {
 			return nil, err
 		}
 		if archivedAt != nil {
@@ -919,6 +1024,13 @@ func (c *Cortex) scanRows(rows *sql.Rows) ([]Row, error) { //nolint:govet
 		}
 		if trashedAt != nil {
 			r.TrashedAt = *trashedAt
+		}
+		if contentHash != nil {
+			r.ContentHash = *contentHash
+		}
+		r.SourceLocked = sourceLocked != 0
+		if sourceHash != nil {
+			r.SourceHash = *sourceHash
 		}
 		tags, err := c.tagsFor(r.ID)
 		if err != nil {
@@ -1032,11 +1144,18 @@ func (c *Cortex) SyncWithOptions(opts SyncOptions) (SyncResult, error) {
 			cortexID = c.lookupCortexIDForTrace(t.ID)
 		}
 
+		contentHash := trace.ContentHash(t.Body)
+		if t.ContentHash != contentHash {
+			t.ContentHash = contentHash
+			if err := t.Write(e.path); err != nil {
+				return result, fmt.Errorf("updating content hash for %s: %w", t.ID, err)
+			}
+		}
 		if dbErr != nil {
 			// Not in DB — insert.
 			_, err = tx.Exec(
-				`INSERT INTO traces (id, title, type, author, origin, cortex_id, created_at, updated_at, archived_at, trashed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				t.ID, t.Title, t.Type, t.Author, t.Origin, cortexID, t.Created, t.Updated, archivedAt, trashedAt,
+				`INSERT INTO traces (id, title, type, author, origin, cortex_id, created_at, updated_at, archived_at, trashed_at, content_hash, source_locked, source_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				t.ID, t.Title, t.Type, t.Author, t.Origin, cortexID, t.Created, t.Updated, archivedAt, trashedAt, contentHash, boolToInt(t.SourceLocked), nullIfEmpty(t.SourceHash),
 			)
 			if err != nil {
 				tx.Rollback()
@@ -1046,8 +1165,8 @@ func (c *Cortex) SyncWithOptions(opts SyncOptions) (SyncResult, error) {
 		} else {
 			// Already in DB — update metadata and reconcile state.
 			_, err = tx.Exec(
-				`UPDATE traces SET title=?, type=?, author=?, origin=?, cortex_id=?, updated_at=?, archived_at=?, trashed_at=? WHERE id=?`,
-				t.Title, t.Type, t.Author, t.Origin, cortexID, t.Updated, archivedAt, trashedAt, t.ID,
+				`UPDATE traces SET title=?, type=?, author=?, origin=?, cortex_id=?, updated_at=?, archived_at=?, trashed_at=?, content_hash=?, source_locked=?, source_hash=? WHERE id=?`,
+				t.Title, t.Type, t.Author, t.Origin, cortexID, t.Updated, archivedAt, trashedAt, contentHash, boolToInt(t.SourceLocked), nullIfEmpty(t.SourceHash), t.ID,
 			)
 			if err != nil {
 				tx.Rollback()
@@ -1145,13 +1264,16 @@ func (c *Cortex) recoverOrphanFromEventLog(id string) (bool, error) {
 	}
 
 	var data struct {
-		Title       string   `json:"title"`
-		Type        string   `json:"type"`
-		Author      string   `json:"author"`
-		Tags        []string `json:"tags"`
-		DerivedFrom []string `json:"derived_from"`
-		Origin      string   `json:"origin"`
-		Body        string   `json:"body"`
+		Title        string   `json:"title"`
+		Type         string   `json:"type"`
+		Author       string   `json:"author"`
+		Tags         []string `json:"tags"`
+		DerivedFrom  []string `json:"derived_from"`
+		Origin       string   `json:"origin"`
+		Body         string   `json:"body"`
+		ContentHash  string   `json:"content_hash"`
+		SourceHash   string   `json:"source_hash"`
+		SourceLocked bool     `json:"source_locked"`
 	}
 	if err := json.Unmarshal(last.Data, &data); err != nil {
 		return false, fmt.Errorf("parsing event data: %w", err)
@@ -1166,15 +1288,18 @@ func (c *Cortex) recoverOrphanFromEventLog(id string) (bool, error) {
 
 	t := &trace.Trace{
 		Frontmatter: trace.Frontmatter{
-			ID:          id,
-			Title:       data.Title,
-			Type:        data.Type,
-			Author:      data.Author,
-			Tags:        data.Tags,
-			DerivedFrom: data.DerivedFrom,
-			Origin:      data.Origin,
-			Created:     r.CreatedAt,
-			Updated:     last.Timestamp,
+			ID:           id,
+			Title:        data.Title,
+			Type:         data.Type,
+			Author:       data.Author,
+			Tags:         data.Tags,
+			DerivedFrom:  data.DerivedFrom,
+			Origin:       data.Origin,
+			Created:      r.CreatedAt,
+			Updated:      last.Timestamp,
+			ContentHash:  data.ContentHash,
+			SourceHash:   data.SourceHash,
+			SourceLocked: data.SourceLocked,
 		},
 		Body: data.Body,
 	}
@@ -1289,6 +1414,11 @@ func (c *Cortex) ResolveDivergence(divergenceID, acceptOrigin, customBody string
 	}
 
 	originalID := divRow.DerivedFrom[0]
+
+	if err := c.CheckSourceLock(originalID); err != nil {
+		return err
+	}
+
 	divPath := c.filePath(divRow)
 
 	if customBody != "" {
@@ -1577,13 +1707,16 @@ func (c *Cortex) ReplayEvent(e event.Event) error {
 
 func (c *Cortex) replayCreate(e event.Event) error {
 	var data struct {
-		Title       string   `json:"title"`
-		Type        string   `json:"type"`
-		Author      string   `json:"author"`
-		Tags        []string `json:"tags"`
-		DerivedFrom []string `json:"derived_from"`
-		Origin      string   `json:"origin"`
-		Body        string   `json:"body"`
+		Title        string   `json:"title"`
+		Type         string   `json:"type"`
+		Author       string   `json:"author"`
+		Tags         []string `json:"tags"`
+		DerivedFrom  []string `json:"derived_from"`
+		Origin       string   `json:"origin"`
+		Body         string   `json:"body"`
+		ContentHash  string   `json:"content_hash"`
+		SourceHash   string   `json:"source_hash"`
+		SourceLocked bool     `json:"source_locked"`
 	}
 	if err := json.Unmarshal(e.Data, &data); err != nil {
 		return fmt.Errorf("parsing create event data: %w", err)
@@ -1591,15 +1724,18 @@ func (c *Cortex) replayCreate(e event.Event) error {
 
 	t := &trace.Trace{
 		Frontmatter: trace.Frontmatter{
-			ID:          e.TraceID,
-			Title:       data.Title,
-			Type:        data.Type,
-			Author:      data.Author,
-			Tags:        data.Tags,
-			DerivedFrom: data.DerivedFrom,
-			Origin:      data.Origin,
-			Created:     e.Timestamp,
-			Updated:     e.Timestamp,
+			ID:           e.TraceID,
+			Title:        data.Title,
+			Type:         data.Type,
+			Author:       data.Author,
+			Tags:         data.Tags,
+			DerivedFrom:  data.DerivedFrom,
+			Origin:       data.Origin,
+			Created:      e.Timestamp,
+			Updated:      e.Timestamp,
+			ContentHash:  data.ContentHash,
+			SourceHash:   data.SourceHash,
+			SourceLocked: data.SourceLocked,
 		},
 		Body: data.Body,
 	}
@@ -1626,8 +1762,8 @@ func (c *Cortex) replayCreate(e event.Event) error {
 	defer tx.Rollback()
 
 	_, err = tx.Exec(
-		`INSERT INTO traces (id, title, type, author, origin, cortex_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.Title, t.Type, t.Author, t.Origin, e.CortexID, t.Created, t.Updated,
+		`INSERT INTO traces (id, title, type, author, origin, cortex_id, created_at, updated_at, content_hash, source_locked, source_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.Title, t.Type, t.Author, t.Origin, e.CortexID, t.Created, t.Updated, t.ContentHash, boolToInt(t.SourceLocked), nullIfEmpty(t.SourceHash),
 	)
 	if err != nil {
 		cleanupFile(err)
@@ -1658,13 +1794,16 @@ func (c *Cortex) replayCreate(e event.Event) error {
 
 func (c *Cortex) replayUpdate(e event.Event) error {
 	var data struct {
-		Title       string   `json:"title"`
-		Type        string   `json:"type"`
-		Author      string   `json:"author"`
-		Tags        []string `json:"tags"`
-		DerivedFrom []string `json:"derived_from"`
-		Origin      string   `json:"origin"`
-		Body        string   `json:"body"`
+		Title        string   `json:"title"`
+		Type         string   `json:"type"`
+		Author       string   `json:"author"`
+		Tags         []string `json:"tags"`
+		DerivedFrom  []string `json:"derived_from"`
+		Origin       string   `json:"origin"`
+		Body         string   `json:"body"`
+		ContentHash  string   `json:"content_hash"`
+		SourceHash   string   `json:"source_hash"`
+		SourceLocked bool     `json:"source_locked"`
 	}
 	if err := json.Unmarshal(e.Data, &data); err != nil {
 		return fmt.Errorf("parsing update event data: %w", err)
@@ -1700,15 +1839,18 @@ func (c *Cortex) replayUpdate(e event.Event) error {
 
 	t := &trace.Trace{
 		Frontmatter: trace.Frontmatter{
-			ID:          e.TraceID,
-			Title:       data.Title,
-			Type:        data.Type,
-			Author:      data.Author,
-			Tags:        data.Tags,
-			DerivedFrom: data.DerivedFrom,
-			Origin:      data.Origin,
-			Created:     r.CreatedAt,
-			Updated:     e.Timestamp,
+			ID:           e.TraceID,
+			Title:        data.Title,
+			Type:         data.Type,
+			Author:       data.Author,
+			Tags:         data.Tags,
+			DerivedFrom:  data.DerivedFrom,
+			Origin:       data.Origin,
+			Created:      r.CreatedAt,
+			Updated:      e.Timestamp,
+			ContentHash:  data.ContentHash,
+			SourceHash:   data.SourceHash,
+			SourceLocked: data.SourceLocked,
 		},
 		Body: data.Body,
 	}
@@ -1725,8 +1867,8 @@ func (c *Cortex) replayUpdate(e event.Event) error {
 	defer tx.Rollback()
 
 	if _, err := tx.Exec(
-		`UPDATE traces SET title=?, type=?, author=?, origin=?, updated_at=? WHERE id=?`,
-		t.Title, t.Type, t.Author, t.Origin, t.Updated, e.TraceID,
+		`UPDATE traces SET title=?, type=?, author=?, origin=?, updated_at=?, content_hash=?, source_locked=?, source_hash=? WHERE id=?`,
+		t.Title, t.Type, t.Author, t.Origin, t.Updated, t.ContentHash, boolToInt(t.SourceLocked), nullIfEmpty(t.SourceHash), e.TraceID,
 	); err != nil {
 		return err
 	}
@@ -2195,23 +2337,43 @@ func (c *Cortex) backfillCreateEvent(traceID string) error {
 // marshalTraceData builds a JSON snapshot of a trace for event payloads.
 func marshalTraceData(t *trace.Trace) json.RawMessage {
 	payload := struct {
-		Title       string   `json:"title"`
-		Type        string   `json:"type"`
-		Author      string   `json:"author,omitempty"`
-		Tags        []string `json:"tags,omitempty"`
-		DerivedFrom []string `json:"derived_from,omitempty"`
-		Origin      string   `json:"origin,omitempty"`
-		Body        string   `json:"body"`
+		Title        string   `json:"title"`
+		Type         string   `json:"type"`
+		Author       string   `json:"author,omitempty"`
+		Tags         []string `json:"tags,omitempty"`
+		DerivedFrom  []string `json:"derived_from,omitempty"`
+		Origin       string   `json:"origin,omitempty"`
+		Body         string   `json:"body"`
+		ContentHash  string   `json:"content_hash,omitempty"`
+		SourceHash   string   `json:"source_hash,omitempty"`
+		SourceLocked bool     `json:"source_locked,omitempty"`
 	}{
-		Title:       t.Title,
-		Type:        t.Type,
-		Author:      t.Author,
-		Tags:        t.Tags,
-		DerivedFrom: t.DerivedFrom,
-		Origin:      t.Origin,
-		Body:        t.Body,
+		Title:        t.Title,
+		Type:         t.Type,
+		Author:       t.Author,
+		Tags:         t.Tags,
+		DerivedFrom:  t.DerivedFrom,
+		Origin:       t.Origin,
+		Body:         t.Body,
+		ContentHash:  t.ContentHash,
+		SourceHash:   t.SourceHash,
+		SourceLocked: t.SourceLocked,
 	}
 	data, _ := json.Marshal(payload)
 	return data
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func nullIfEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 

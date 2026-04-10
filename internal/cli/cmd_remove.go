@@ -14,7 +14,7 @@ func removeCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:               "remove <id>",
 		Aliases:           []string{"rm", "delete"},
-		Short:             "Move a Trace to trash (use --force to hard-delete)",
+		Short:             "Move a Trace to trash (use --force to hard-delete or bypass source-lock)",
 		Args:              cobra.ExactArgs(1),
 		ValidArgsFunction: completionsFor(cortex.ListOptions{}),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -30,6 +30,7 @@ func removeCmd() *cobra.Command {
 			}
 
 			if force {
+				cx.SetForceSourceLock(true)
 				if err := cx.Remove(id); err != nil {
 					return err
 				}
@@ -45,6 +46,6 @@ func removeCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().BoolVarP(&force, "force", "f", false, "hard-delete immediately, bypassing trash")
+	cmd.Flags().BoolVarP(&force, "force", "f", false, "hard-delete immediately (also bypasses source-lock)")
 	return cmd
 }
