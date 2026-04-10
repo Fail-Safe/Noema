@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -16,10 +17,48 @@ import (
 
 // ---- styles ----------------------------------------------------------------
 
+// Brand palette — mirrors the Noema website (src/styles/global.css).
+// We use CompleteColor rather than bare hex so 256-color terminals get
+// hand-picked palette indices instead of termenv's automatic downmatch
+// (which picks color 232 — near-black — for the brand red, rendering
+// the wordmark period invisible on dark backgrounds).
+//
+// Kept as package-level vars so a future light/dark toggle only has to
+// swap these assignments without touching the style definitions below.
 var (
+	// brandFg — cream "Noema" wordmark.
+	//   TrueColor: #ece4d4 (website --fg)
+	//   ANSI256:   223      (#ffd7af — warm beige, closest to cream)
+	//   ANSI:      7        (white)
+	brandFg = lipgloss.CompleteColor{
+		TrueColor: "#ece4d4",
+		ANSI256:   "223",
+		ANSI:      "7",
+	}
+
+	// brandRed — accent period in "Noema."
+	//   TrueColor: #e10032 (website --red)
+	//   ANSI256:   161      (#d7005f — closest saturated red)
+	//   ANSI:      1        (red)
+	brandRed = lipgloss.CompleteColor{
+		TrueColor: "#e10032",
+		ANSI256:   "161",
+		ANSI:      "1",
+	}
+)
+
+var (
+	// styleHeader renders the "Noema" portion of the wordmark in the
+	// brand cream. styleHeaderAccent renders the trailing period in
+	// brand red — matching the website's wordmark. Splitting them
+	// keeps the two colors independent for theming.
 	styleHeader = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("99"))
+			Foreground(brandFg)
+
+	styleHeaderAccent = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(brandRed)
 
 	styleSelected = lipgloss.NewStyle().
 			Bold(true).
@@ -49,7 +88,46 @@ var (
 
 	styleStatus = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("71"))
+
+	// styleNewRow tints rows that arrived on the most recent refresh —
+	// the visible "pop in" effect when watching live updates.
+	styleNewRow = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("71"))
+
+	// styleLive is the header badge shown while follow mode is active.
+	styleLive = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("71")).
+			Bold(true)
+
+	// When the detail pane owns focus, the list pane gets a "modal
+	// backdrop" treatment — every row renders through a dim palette
+	// so it visibly recedes. The selected row stays a notch brighter
+	// than the rest so the cursor position is still legible.
+	//
+	// Brightness ladder (dim mode):
+	//   styleRowDim        238  very faint   — unselected rows
+	//   styleNewRowDim      65  muted green  — highlighted arrivals
+	//   styleSelectedDim   244  soft gray    — current selection
+	styleSelectedDim = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("244"))
+
+	styleRowDim = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("238"))
+
+	styleNewRowDim = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("65"))
 )
+
+// followInterval is how often the TUI polls the cortex when follow mode
+// is on. 1s is fast enough to feel live when an agent is writing into
+// the cortex in the background, but slow enough to be invisible CPU load
+// (List is sub-millisecond on a local SQLite file).
+const followInterval = 1 * time.Second
+
+// newRowHighlightTicks is how many consecutive refresh ticks a newly-
+// arrived trace stays highlighted. With followInterval=1s this gives
+// ~2 seconds of green tint before the row fades back to normal.
+const newRowHighlightTicks = 2
 
 // ---- state machine ---------------------------------------------------------
 
@@ -59,6 +137,16 @@ const (
 	stateList    viewState = iota
 	stateSearch
 	stateConfirm
+)
+
+// focusPane tracks which pane (list or detail) receives navigation keys.
+// Only the list/detail split is focus-aware — modal states like search
+// and confirm pre-empt focus while active.
+type focusPane int
+
+const (
+	focusList focusPane = iota
+	focusDetail
 )
 
 // ---- messages --------------------------------------------------------------
@@ -73,6 +161,12 @@ type editorDoneMsg struct {
 }
 
 type errMsg struct{ err error }
+
+// tickMsg drives the follow-mode polling loop. `gen` is a generation
+// counter used to discard stale ticks left over from a previous
+// follow-mode session — without it, rapid f-on → f-off → f-on toggling
+// could leave multiple tick chains running in parallel.
+type tickMsg struct{ gen int }
 
 // ---- model -----------------------------------------------------------------
 
@@ -96,6 +190,28 @@ type model struct {
 	confirm     confirmAction
 	err         error
 	status      string
+
+	// Follow-mode state (auto-refresh).
+	follow    bool           // true when auto-refresh is on
+	followGen int            // bumped each time follow turns on; stale ticks discarded
+	newRowTTL map[string]int // trace ID → ticks of highlight remaining
+
+	// Pane focus + detail-pane scroll position (body lines only —
+	// metadata always stays pinned). detailScroll is reset whenever the
+	// trace under the cursor changes, but preserved across tab toggles
+	// so you can glance at the list and come back to where you were.
+	focus        focusPane
+	detailScroll int
+
+	// Snapshot of the filter context at the time of the last accepted
+	// rowsLoadedMsg. Used to detect when a refresh crosses a context
+	// boundary (e.g. user toggled `a`/`t`/`/`) — in that case the new
+	// rowset isn't comparable to the previous one, so we skip the
+	// new-row diff and the sticky-cursor reseat.
+	prevSeen        bool
+	lastShowAll     bool
+	lastShowTrashed bool
+	lastQuery       string
 }
 
 func initialModel(cx *cortex.Cortex) model {
@@ -104,9 +220,10 @@ func initialModel(cx *cortex.Cortex) model {
 	ti.CharLimit = 120
 
 	return model{
-		cx:     cx,
-		search: ti,
-		state:  stateList,
+		cx:        cx,
+		search:    ti,
+		state:     stateList,
+		newRowTTL: map[string]int{},
 	}
 }
 
@@ -129,6 +246,15 @@ func loadRows(cx *cortex.Cortex, query string, all, trashed bool) tea.Cmd {
 		}
 		return rowsLoadedMsg(rows)
 	}
+}
+
+// tickCmd schedules the next follow-mode poll. The generation is
+// carried inside the message so that Update can reject ticks left over
+// from a stopped-and-restarted follow session.
+func tickCmd(gen int) tea.Cmd {
+	return tea.Tick(followInterval, func(_ time.Time) tea.Msg {
+		return tickMsg{gen: gen}
+	})
 }
 
 func editorCmd(path, id string, isNew bool) tea.Cmd {
@@ -159,12 +285,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case rowsLoadedMsg:
-		m.rows = []cortex.Row(msg)
-		if m.cursor >= len(m.rows) {
-			m.cursor = max(0, len(m.rows)-1)
+		return m.handleRowsLoaded([]cortex.Row(msg)), nil
+
+	case tickMsg:
+		// Discard stale ticks from a prior follow-mode session.
+		if !m.follow || msg.gen != m.followGen {
+			return m, nil
 		}
-		m.current = m.loadCurrent()
-		return m, nil
+		// Always re-queue the next tick — we want the chain to keep
+		// spinning even when we suppress the actual refresh (search
+		// focus, confirm modal), so the loop resumes automatically
+		// when the user returns to the list.
+		cmds := []tea.Cmd{tickCmd(msg.gen)}
+		if m.state == stateList {
+			cmds = append(cmds, loadRows(m.cx, m.searchQuery, m.showAll, m.showTrashed))
+		}
+		return m, tea.Batch(cmds...)
 
 	case editorDoneMsg:
 		return m.handleEditorDone(msg)
@@ -194,26 +330,80 @@ func (m model) updateList(msg tea.KeyMsg) (model, tea.Cmd) {
 	case "q", "ctrl+c":
 		return m, tea.Quit
 
+	case "tab":
+		// Cycle focus between the list and detail panes. Modal states
+		// (search/confirm) can't be reached from here, so there are
+		// only two stops.
+		if m.focus == focusList {
+			m.focus = focusDetail
+		} else {
+			m.focus = focusList
+		}
+		return m, nil
+
+	case "left":
+		// Absolute focus: left arrow always lands on the list pane,
+		// regardless of current focus. Pairs with "right" for
+		// one-handed browsing — you can scroll a trace with j/k on the
+		// right side and jump back to the list without thinking about
+		// which pane you're currently in.
+		m.focus = focusList
+		return m, nil
+
+	case "right":
+		m.focus = focusDetail
+		return m, nil
+
 	case "j", "down":
+		if m.focus == focusDetail {
+			return m.scrollDetail(1), nil
+		}
 		if m.cursor < len(m.rows)-1 {
-			m.cursor++
-			m.current = m.loadCurrent()
+			m = m.selectCursor(m.cursor + 1)
 		}
 
 	case "k", "up":
+		if m.focus == focusDetail {
+			return m.scrollDetail(-1), nil
+		}
 		if m.cursor > 0 {
-			m.cursor--
-			m.current = m.loadCurrent()
+			m = m.selectCursor(m.cursor - 1)
 		}
 
 	case "g":
-		m.cursor = 0
-		m.current = m.loadCurrent()
+		if m.focus == focusDetail {
+			m.detailScroll = 0
+			return m, nil
+		}
+		m = m.selectCursor(0)
 
 	case "G":
+		if m.focus == focusDetail {
+			m.detailScroll = m.detailMaxScroll()
+			return m, nil
+		}
 		if len(m.rows) > 0 {
-			m.cursor = len(m.rows) - 1
-			m.current = m.loadCurrent()
+			m = m.selectCursor(len(m.rows) - 1)
+		}
+
+	case "pgdown", "ctrl+d":
+		// Half-page scroll is detail-only. In list focus these keys
+		// are no-ops (existing behavior).
+		if m.focus == focusDetail {
+			step := m.detailVisibleBodyH() / 2
+			if step < 1 {
+				step = 1
+			}
+			return m.scrollDetail(step), nil
+		}
+
+	case "pgup", "ctrl+u":
+		if m.focus == focusDetail {
+			step := m.detailVisibleBodyH() / 2
+			if step < 1 {
+				step = 1
+			}
+			return m.scrollDetail(-step), nil
 		}
 
 	case "n":
@@ -302,7 +492,31 @@ func (m model) updateList(msg tea.KeyMsg) (model, tea.Cmd) {
 		m.search, cmd = m.search.Update(nil)
 		return m, cmd
 
+	case "f":
+		// Toggle follow (auto-refresh) mode. A fresh generation is
+		// minted on every on-transition so stale ticks from a prior
+		// on→off→on cycle are discarded on arrival.
+		m.follow = !m.follow
+		if m.follow {
+			m.followGen++
+			m.status = "Live mode on"
+			return m, tickCmd(m.followGen)
+		}
+		m.status = "Live mode off"
+		return m, nil
+
+	case "R":
+		// Manual refresh — useful when follow is off, or as a
+		// "refresh now, don't wait for the next tick" escape hatch.
+		return m, loadRows(m.cx, m.searchQuery, m.showAll, m.showTrashed)
+
 	case "esc":
+		// First esc pops detail focus back to the list; second esc
+		// (or esc with list already focused) clears any active search.
+		if m.focus == focusDetail {
+			m.focus = focusList
+			return m, nil
+		}
 		if m.searchQuery != "" {
 			m.searchQuery = ""
 			m.cursor = 0
@@ -408,6 +622,90 @@ func (m model) handleEditorDone(msg editorDoneMsg) (model, tea.Cmd) {
 	return m, loadRows(m.cx, m.searchQuery, m.showAll, m.showTrashed)
 }
 
+// handleRowsLoaded folds a fresh rowset into the model, preserving the
+// cursor's trace ID across the refresh and tracking which rows arrived
+// on this tick so they can be highlighted briefly. Context changes
+// (user toggled a/t/search) skip the sticky + diff logic because the
+// new rowset isn't comparable to the previous one. Detail scroll is
+// reset if the refresh lands on a different trace than before.
+func (m model) handleRowsLoaded(newRows []cortex.Row) model {
+	var prevCurrentID string
+	if m.current != nil {
+		prevCurrentID = m.current.ID
+	}
+	sameContext := m.prevSeen &&
+		m.lastShowAll == m.showAll &&
+		m.lastShowTrashed == m.showTrashed &&
+		m.lastQuery == m.searchQuery
+
+	if sameContext {
+		// Fade the highlight on rows that were flagged previously.
+		// Delete-during-iterate is safe for Go maps.
+		for id, ttl := range m.newRowTTL {
+			if ttl-1 <= 0 {
+				delete(m.newRowTTL, id)
+			} else {
+				m.newRowTTL[id] = ttl - 1
+			}
+		}
+		// Flag rows that weren't in the previous snapshot as new.
+		prev := make(map[string]bool, len(m.rows))
+		for _, r := range m.rows {
+			prev[r.ID] = true
+		}
+		for _, r := range newRows {
+			if !prev[r.ID] {
+				m.newRowTTL[r.ID] = newRowHighlightTicks
+			}
+		}
+	} else {
+		// Context change — the old highlights belong to a different
+		// view. Drop them to avoid a misleading green flash.
+		m.newRowTTL = map[string]int{}
+	}
+
+	// Sticky cursor by trace ID. Capture what's selected *before*
+	// swapping the rows out.
+	var selectedID string
+	if m.cursor >= 0 && m.cursor < len(m.rows) {
+		selectedID = m.rows[m.cursor].ID
+	}
+	m.rows = newRows
+
+	if sameContext && selectedID != "" {
+		for i, r := range m.rows {
+			if r.ID == selectedID {
+				m.cursor = i
+				break
+			}
+		}
+	}
+	if m.cursor >= len(m.rows) {
+		m.cursor = max(0, len(m.rows)-1)
+	}
+
+	m.prevSeen = true
+	m.lastShowAll = m.showAll
+	m.lastShowTrashed = m.showTrashed
+	m.lastQuery = m.searchQuery
+
+	m.current = m.loadCurrent()
+
+	// If the refresh landed on a different trace (sticky-cursor
+	// failed because the row was archived/deleted, or context
+	// changed), reset the detail scroll — the old offset belongs
+	// to a different body.
+	var newCurrentID string
+	if m.current != nil {
+		newCurrentID = m.current.ID
+	}
+	if newCurrentID != prevCurrentID {
+		m.detailScroll = 0
+	}
+
+	return m
+}
+
 func (m model) loadCurrent() *trace.Trace {
 	if len(m.rows) == 0 {
 		return nil
@@ -421,6 +719,115 @@ func (m model) loadCurrent() *trace.Trace {
 	}
 	t, _ := trace.ParseFile(path)
 	return t
+}
+
+// paneWidths returns the widths of the list pane and the detail pane
+// given the current terminal width. Single source of truth so the
+// scroll math stays consistent with what View() actually renders.
+func (m model) paneWidths() (listW, detailW int) {
+	listW = m.width * listPct / 100
+	detailW = m.width - listW - 1 // -1 for the divider column
+	return
+}
+
+// bodyHeight returns the height of the body region between the header
+// and footer rows.
+func (m model) bodyHeight() int {
+	return m.height - 2
+}
+
+// detailMetaLineCount returns how many metadata rows the detail pane
+// will render for the current trace (excluding the separator). This
+// matches the append order in renderDetail — keep them in sync.
+func (m model) detailMetaLineCount() int {
+	if m.current == nil {
+		return 0
+	}
+	// id, title, type, created are always present.
+	n := 4
+	if m.current.Author != "" {
+		n++
+	}
+	if len(m.current.Tags) > 0 {
+		n++
+	}
+	return n
+}
+
+// detailBodyLines returns the body of the current trace, pre-wrapped
+// to the detail pane's body width. Returns an empty slice if there is
+// no current trace or no body.
+func (m model) detailBodyLines() []string {
+	if m.current == nil || m.current.Body == "" {
+		return nil
+	}
+	_, detailW := m.paneWidths()
+	bodyW := detailW - 4
+	if bodyW < 10 {
+		bodyW = 10
+	}
+	var out []string
+	for _, raw := range strings.Split(m.current.Body, "\n") {
+		for _, wrapped := range wrapLine(raw, bodyW) {
+			out = append(out, "  "+wrapped)
+		}
+	}
+	return out
+}
+
+// detailVisibleBodyH returns how many body rows fit in the detail pane
+// after the metadata block and separator.
+func (m model) detailVisibleBodyH() int {
+	h := m.bodyHeight() - m.detailMetaLineCount() - 1 // -1 for the separator
+	if h < 0 {
+		return 0
+	}
+	return h
+}
+
+// detailMaxScroll returns the largest valid detailScroll offset — i.e.
+// the offset where the last body line sits on the last visible row.
+func (m model) detailMaxScroll() int {
+	total := len(m.detailBodyLines())
+	visible := m.detailVisibleBodyH()
+	if total <= visible {
+		return 0
+	}
+	return total - visible
+}
+
+// scrollDetail advances (or rewinds) detailScroll by delta lines,
+// clamped to the valid range for the current trace and pane size.
+func (m model) scrollDetail(delta int) model {
+	m.detailScroll += delta
+	if m.detailScroll < 0 {
+		m.detailScroll = 0
+	}
+	if max := m.detailMaxScroll(); m.detailScroll > max {
+		m.detailScroll = max
+	}
+	return m
+}
+
+// selectCursor moves the row cursor, reloads the current trace, and
+// resets the detail scroll only if the trace actually changed. Used
+// by every list-focus navigation handler so we don't drop scroll state
+// on no-op moves (e.g. pressing `k` at the top of the list).
+func (m model) selectCursor(idx int) model {
+	var prevID string
+	if m.current != nil {
+		prevID = m.current.ID
+	}
+	m.cursor = idx
+	m.current = m.loadCurrent()
+	var newID string
+	if m.current != nil {
+		newID = m.current.ID
+	}
+	if newID != prevID {
+		m.detailScroll = 0
+	}
+	return m
 }
 
 // newTraceTempFile writes a blank trace template to a temp file.
@@ -443,9 +850,8 @@ func (m model) View() string {
 		return "Loading…\n"
 	}
 
-	listW := m.width * listPct / 100
-	detailW := m.width - listW - 1 // -1 for divider column
-	bodyH := m.height - 2          // header + footer
+	listW, detailW := m.paneWidths()
+	bodyH := m.bodyHeight()
 
 	list := m.renderList(listW, bodyH)
 	detail := m.renderDetail(detailW, bodyH)
@@ -467,7 +873,7 @@ func (m model) View() string {
 }
 
 func (m model) renderHeader() string {
-	left := styleHeader.Render("Noema") + styleDim.Render("  "+m.cx.Name)
+	left := styleHeader.Render("Noema") + styleHeaderAccent.Render(".") + styleDim.Render("  "+m.cx.Name)
 	if m.searchQuery != "" {
 		left += styleDim.Render(`  search:"` + m.searchQuery + `"`)
 	}
@@ -476,6 +882,9 @@ func (m model) renderHeader() string {
 		left += styleDim.Render("  [trash]")
 	case m.showAll:
 		left += styleDim.Render("  [all]")
+	}
+	if m.follow {
+		left += styleLive.Render("  ● live")
 	}
 	right := styleDim.Render(fmt.Sprintf("%d traces", len(m.rows)))
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
@@ -525,10 +934,17 @@ func (m model) renderList(width, height int) string {
 		}
 		title = truncRune(title, titleW)
 
-		// Build plain-text line with rune-padding for alignment
+		// Build plain-text line with rune-padding for alignment.
+		// Cursor glyph is "▸" when the list pane owns focus, "·" when the
+		// detail pane owns it — visible feedback that arrow keys will
+		// drive the other side.
 		cursor := " "
 		if i == m.cursor {
-			cursor = ">"
+			if m.focus == focusList {
+				cursor = "▸"
+			} else {
+				cursor = "·"
+			}
 		}
 		line := fmt.Sprintf("%s %-*s %-*s %s",
 			cursor,
@@ -537,10 +953,31 @@ func (m model) renderList(width, height int) string {
 			date,
 		)
 
-		if i == m.cursor {
-			sb.WriteString(styleSelected.Width(width).Render(line))
-		} else {
-			sb.WriteString(lipgloss.NewStyle().Width(width).Render(line))
+		// When the detail pane owns focus, every row in the list is
+		// rendered through a dim palette — the entire pane fades like
+		// a modal backdrop, not just the selected row. The cursor row
+		// still sits one brightness step above the rest so the
+		// selection is findable at a glance when tabbing back.
+		dim := m.focus == focusDetail
+		switch {
+		case i == m.cursor:
+			if dim {
+				sb.WriteString(styleSelectedDim.Width(width).Render(line))
+			} else {
+				sb.WriteString(styleSelected.Width(width).Render(line))
+			}
+		case m.newRowTTL[r.ID] > 0:
+			if dim {
+				sb.WriteString(styleNewRowDim.Width(width).Render(line))
+			} else {
+				sb.WriteString(styleNewRow.Width(width).Render(line))
+			}
+		default:
+			if dim {
+				sb.WriteString(styleRowDim.Width(width).Render(line))
+			} else {
+				sb.WriteString(lipgloss.NewStyle().Width(width).Render(line))
+			}
 		}
 		if i < end-1 {
 			sb.WriteByte('\n')
@@ -567,15 +1004,23 @@ func (m model) renderDetail(width, height int) string {
 
 	labelW := 10 // "  created:" is 10 chars
 
+	// Every metadata value gets truncated to fit the pane. Without
+	// this, lipgloss soft-wraps an overlong id/author/tags row into
+	// 2 visible rows, the internal line count underestimates the
+	// true render height, and the whole UI scrolls up by one row.
+	metaValW := width - labelW - 2
+	if metaValW < 4 {
+		metaValW = 4
+	}
 	metaLine := func(label, val string) string {
 		l := styleLabel.Render(fmt.Sprintf("  %-*s", labelW, label+":"))
-		v := styleValue.Render(val)
+		v := styleValue.Render(truncRune(val, metaValW))
 		return l + v
 	}
 
 	var lines []string
 	lines = append(lines, metaLine("id", t.ID))
-	lines = append(lines, metaLine("title", truncRune(t.Title, width-labelW-4)))
+	lines = append(lines, metaLine("title", t.Title))
 	lines = append(lines, metaLine("type", t.Type))
 	if t.Author != "" {
 		lines = append(lines, metaLine("author", t.Author))
@@ -588,23 +1033,82 @@ func (m model) renderDetail(width, height int) string {
 		created = created[:10]
 	}
 	lines = append(lines, metaLine("created", created))
-	lines = append(lines, styleDivider.Render("  "+strings.Repeat("─", width-4)))
 
-	bodyW := width - 4
-	if bodyW < 10 {
-		bodyW = 10
+	// Pre-wrap the body so we can scroll line-by-line and compute an
+	// accurate scroll indicator.
+	bodyLines := m.detailBodyLines()
+	totalBody := len(bodyLines)
+
+	// Visible body region sits below the metadata + separator.
+	visibleBodyH := height - len(lines) - 1 // -1 for the separator line
+	if visibleBodyH < 0 {
+		visibleBodyH = 0
 	}
-	if t.Body == "" {
-		lines = append(lines, styleDim.Render("  (no body)"))
-	} else {
-		for _, raw := range strings.Split(t.Body, "\n") {
-			for _, wrapped := range wrapLine(raw, bodyW) {
-				lines = append(lines, "  "+wrapped)
-			}
+
+	// Clamp the stored scroll offset for this render. The clamp in
+	// scrollDetail handles the common case; this catches the edge
+	// where width changed (and therefore the wrap width, and therefore
+	// total body line count) without a scroll key being pressed.
+	scroll := m.detailScroll
+	maxScroll := 0
+	if totalBody > visibleBodyH {
+		maxScroll = totalBody - visibleBodyH
+	}
+	if scroll > maxScroll {
+		scroll = maxScroll
+	}
+	if scroll < 0 {
+		scroll = 0
+	}
+
+	// Separator line — decorated with a scroll indicator on the right
+	// when there's more body than fits, so users always know whether
+	// there's content above/below regardless of focus.
+	sepRule := width - 4
+	if sepRule < 1 {
+		sepRule = 1
+	}
+	if totalBody > visibleBodyH {
+		// Glyph shows scroll direction: ▴ above, ▾ below, ▴▾ both.
+		var glyph string
+		switch {
+		case scroll > 0 && scroll < maxScroll:
+			glyph = "▴▾"
+		case scroll > 0:
+			glyph = "▴"
+		default:
+			glyph = "▾"
 		}
+		upper := scroll + visibleBodyH
+		if upper > totalBody {
+			upper = totalBody
+		}
+		indicator := fmt.Sprintf("%s %d/%d", glyph, upper, totalBody)
+		indW := lipgloss.Width(indicator)
+		if sepRule > indW+2 {
+			dashW := sepRule - indW - 1
+			lines = append(lines,
+				"  "+styleDivider.Render(strings.Repeat("─", dashW))+" "+styleDim.Render(indicator))
+		} else {
+			lines = append(lines, styleDivider.Render("  "+strings.Repeat("─", sepRule)))
+		}
+	} else {
+		lines = append(lines, styleDivider.Render("  "+strings.Repeat("─", sepRule)))
 	}
 
-	// Clip to height
+	// Body slice with scroll offset applied.
+	switch {
+	case totalBody == 0:
+		lines = append(lines, styleDim.Render("  (no body)"))
+	default:
+		end := scroll + visibleBodyH
+		if end > totalBody {
+			end = totalBody
+		}
+		lines = append(lines, bodyLines[scroll:end]...)
+	}
+
+	// Clip to height as a belt-and-braces safety net.
 	if len(lines) > height {
 		lines = lines[:height]
 	}
@@ -630,15 +1134,31 @@ func (m model) renderFooter() string {
 			return styleStatus.Render("  " + m.status)
 		}
 		var hint string
-		if m.showTrashed {
-			hint = "j/k:nav  r:recover  D:purge  t:back  /:search  q:quit"
-		} else {
-			hint = "j/k:nav  n:new  e:edit  d:archive  u:unarchive  D:trash  t:trash-view  a:all  /:search  q:quit"
+		switch {
+		case m.focus == focusDetail:
+			// Detail-pane focus: arrow keys scroll the body, everything
+			// else is either reach-through (quit) or tab back to list.
+			hint = "j/k:scroll  g/G:top/bot  PgUp/PgDn:half  ←/tab:list  esc:list  q:quit"
+		case m.showTrashed:
+			hint = "j/k:nav  r:recover  D:purge  t:back  /:search  →/tab:body  f:live  R:refresh  q:quit"
+		default:
+			hint = "j/k:nav  n:new  e:edit  d:archive  u:unarchive  D:trash  t:trash-view  a:all  /:search  →/tab:body  f:live  R:refresh  q:quit"
 		}
-		if m.searchQuery != "" {
+		if m.focus == focusList && m.searchQuery != "" {
 			hint = "esc:clear  " + hint
 		}
-		return styleFooter.Render("  " + hint)
+		styled := styleFooter.Render(hint)
+		// Right-align the hint when the detail pane owns focus — a
+		// secondary visual cue (on top of the pane-dim backdrop and
+		// cursor glyph swap) that attention has moved to the right.
+		if m.focus == focusDetail {
+			pad := m.width - lipgloss.Width(styled) - 2
+			if pad < 0 {
+				pad = 0
+			}
+			return strings.Repeat(" ", pad) + styled + "  "
+		}
+		return "  " + styled
 	}
 }
 
