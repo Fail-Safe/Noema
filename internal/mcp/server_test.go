@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/Fail-Safe/Noema/internal/cortex"
 )
@@ -174,7 +175,7 @@ func newTestCortex(t *testing.T) *cortex.Cortex {
 // can ever talk to, so a failed handshake is never a "soft" condition.
 func initializeServer(t *testing.T, cx *cortex.Cortex, version string) mcp.InitializeResult {
 	t.Helper()
-	s := NewServer(cx, version)
+	s := NewServer(cx, version, "")
 
 	initReq := mcp.JSONRPCRequest{
 		JSONRPC: mcp.JSONRPC_VERSION,
@@ -243,5 +244,173 @@ func TestNewServer_EmptyVersionNormalizesToDev(t *testing.T) {
 
 	if result.ServerInfo.Version != "dev" {
 		t.Errorf("ServerInfo.Version = %q, want %q (empty should normalize)", result.ServerInfo.Version, "dev")
+	}
+}
+
+// --------- Federation mode guards ---------
+
+// callTool invokes a named tool on an already-initialized MCP server
+// and returns the result text + whether it was an error result.
+func callTool(t *testing.T, s *server.MCPServer, toolName string, args map[string]any) (string, bool) {
+	t.Helper()
+	if args == nil {
+		args = map[string]any{}
+	}
+	params, _ := json.Marshal(map[string]any{
+		"name":      toolName,
+		"arguments": args,
+	})
+	req := mcp.JSONRPCRequest{
+		JSONRPC: mcp.JSONRPC_VERSION,
+		ID:      mcp.NewRequestId(int64(42)),
+		Request: mcp.Request{Method: "tools/call"},
+	}
+	reqBytes, _ := json.Marshal(req)
+	// Splice params into the raw JSON.
+	reqBytes = []byte(strings.TrimSuffix(string(reqBytes), "}") + `,"params":` + string(params) + "}")
+
+	result := s.HandleMessage(context.Background(), reqBytes)
+	if result == nil {
+		t.Fatalf("HandleMessage returned nil for %s", toolName)
+	}
+	resp, ok := result.(mcp.JSONRPCResponse)
+	if !ok {
+		t.Fatalf("expected JSONRPCResponse for %s, got %T", toolName, result)
+	}
+	data, _ := json.Marshal(resp.Result)
+	var toolResult mcp.CallToolResult
+	if err := json.Unmarshal(data, &toolResult); err != nil {
+		t.Fatalf("unmarshal CallToolResult for %s: %v", toolName, err)
+	}
+	text := ""
+	if len(toolResult.Content) > 0 {
+		if tc, ok := toolResult.Content[0].(mcp.TextContent); ok {
+			text = tc.Text
+		}
+	}
+	return text, toolResult.IsError
+}
+
+// initServer drives the MCP initialize handshake so tools can be called.
+func initServer(t *testing.T, s *server.MCPServer) {
+	t.Helper()
+	initReq := mcp.JSONRPCRequest{
+		JSONRPC: mcp.JSONRPC_VERSION,
+		ID:      mcp.NewRequestId(int64(1)),
+		Request: mcp.Request{Method: "initialize"},
+		Params: struct {
+			ProtocolVersion string                 `json:"protocolVersion"`
+			ClientInfo      mcp.Implementation     `json:"clientInfo"`
+			Capabilities    mcp.ClientCapabilities `json:"capabilities"`
+		}{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: "test", Version: "1.0"},
+		},
+	}
+	body, _ := json.Marshal(initReq)
+	resp := s.HandleMessage(context.Background(), body)
+	if resp == nil {
+		t.Fatal("initialize returned nil")
+	}
+}
+
+func TestPublishMode_BlocksMutatingTools(t *testing.T) {
+	cx := newTestCortex(t)
+	s := NewServer(cx, "test", "publish")
+	initServer(t, s)
+
+	mutating := []struct {
+		name string
+		args map[string]any
+	}{
+		{"create_trace", map[string]any{"title": "x", "type": "note", "body": "y"}},
+		{"update_trace", map[string]any{"id": "nonexistent", "title": "x"}},
+		{"delete_trace", map[string]any{"id": "nonexistent"}},
+		{"recover_trace", map[string]any{"id": "nonexistent"}},
+		{"archive_trace", map[string]any{"id": "nonexistent"}},
+		{"unarchive_trace", map[string]any{"id": "nonexistent"}},
+		{"resolve_divergence", map[string]any{"id": "nonexistent"}},
+	}
+
+	for _, tc := range mutating {
+		text, isErr := callTool(t, s, tc.name, tc.args)
+		if !isErr {
+			t.Errorf("%s: expected error result in publish mode, got success: %s", tc.name, text)
+		}
+		if !strings.Contains(text, "publish mode") {
+			t.Errorf("%s: error should mention publish mode, got: %s", tc.name, text)
+		}
+	}
+}
+
+func TestPublishMode_AllowsReadTools(t *testing.T) {
+	cx := newTestCortex(t)
+	s := NewServer(cx, "test", "publish")
+	initServer(t, s)
+
+	// These should all succeed (not return publish-mode errors).
+	readTools := []struct {
+		name string
+		args map[string]any
+	}{
+		{"list_traces", nil},
+		{"search_traces", map[string]any{"query": "test"}},
+		{"sync_events", nil},
+		{"federation_status", nil},
+	}
+
+	for _, tc := range readTools {
+		text, isErr := callTool(t, s, tc.name, tc.args)
+		if isErr && strings.Contains(text, "publish mode") {
+			t.Errorf("%s: should not be blocked in publish mode, got: %s", tc.name, text)
+		}
+	}
+}
+
+func TestSubscribeMode_BlocksSyncEvents(t *testing.T) {
+	cx := newTestCortex(t)
+	s := NewServer(cx, "test", "subscribe")
+	initServer(t, s)
+
+	text, isErr := callTool(t, s, "sync_events", nil)
+	if !isErr {
+		t.Errorf("sync_events should be blocked in subscribe mode, got: %s", text)
+	}
+	if !strings.Contains(text, "subscribe mode") {
+		t.Errorf("error should mention subscribe mode, got: %s", text)
+	}
+}
+
+func TestSubscribeMode_AllowsMutatingTools(t *testing.T) {
+	cx := newTestCortex(t)
+	s := NewServer(cx, "test", "subscribe")
+	initServer(t, s)
+
+	// create_trace should work in subscribe mode.
+	text, isErr := callTool(t, s, "create_trace", map[string]any{
+		"title": "sub-test", "type": "note", "body": "hello",
+	})
+	if isErr {
+		t.Errorf("create_trace should work in subscribe mode, got error: %s", text)
+	}
+}
+
+func TestSyncMode_AllowsEverything(t *testing.T) {
+	cx := newTestCortex(t)
+	s := NewServer(cx, "test", "")
+	initServer(t, s)
+
+	// create_trace should work.
+	text, isErr := callTool(t, s, "create_trace", map[string]any{
+		"title": "sync-test", "type": "note", "body": "hello",
+	})
+	if isErr {
+		t.Errorf("create_trace should work in sync mode, got error: %s", text)
+	}
+
+	// sync_events should work.
+	text, isErr = callTool(t, s, "sync_events", nil)
+	if isErr && strings.Contains(text, "subscribe mode") {
+		t.Errorf("sync_events should work in sync mode, got: %s", text)
 	}
 }

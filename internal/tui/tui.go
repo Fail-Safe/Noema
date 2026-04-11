@@ -585,6 +585,10 @@ func (m model) updateList(msg tea.KeyMsg) (model, tea.Cmd) {
 			return m, nil
 		}
 		row := m.rows[m.cursor]
+		if row.SourceLocked && row.Origin != m.cx.Name {
+			m.status = "Trace is source-locked by " + row.Origin
+			return m, nil
+		}
 		path := m.cx.TraceFile(row.ID, row.ArchivedAt != "")
 		return m, editorCmd(path, row.ID, false)
 

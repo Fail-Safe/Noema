@@ -138,6 +138,41 @@ func TestReplayBatch_AdvancesOnAllSuccess(t *testing.T) {
 	}
 }
 
+// TestSyncer_Start_SkipsPausedPeers verifies that the syncer does not
+// spawn a goroutine for peers whose mode is "paused". The test creates
+// a syncer with three peers (one paused, two active with unreachable
+// endpoints) and checks that the paused peer never gets a state entry.
+func TestSyncer_Start_SkipsPausedPeers(t *testing.T) {
+	fr := &fakeReplayer{}
+	dir := t.TempDir()
+	conn, err := db.Open(dir)
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	state := NewState(conn.DB)
+	s := NewSyncer(fr, state, Config{
+		Peers: []PeerConfig{
+			{Name: "active-1", Endpoint: "http://127.0.0.1:1", Mode: PeerModeSync},
+			{Name: "paused-1", Endpoint: "http://127.0.0.1:2", Mode: PeerModePaused},
+			{Name: "active-2", Endpoint: "http://127.0.0.1:3"}, // empty = defaults to sync
+		},
+	})
+
+	s.Start()
+	s.Stop()
+
+	// The paused peer should have no state at all — the syncer never
+	// even attempted to reach it.
+	for _, key := range []string{PeerCursorKey("paused-1"), PeerSeenKey("paused-1")} {
+		val, _ := state.Get(key)
+		if val != "" {
+			t.Errorf("paused peer state %q = %q, want empty", key, val)
+		}
+	}
+}
+
 // TestReplayBatch_FirstEventFailure_LeavesCursorUnset covers the edge
 // case where the very first event fails: there is no previous successful
 // event to pin the cursor against, so the cursor must remain whatever it

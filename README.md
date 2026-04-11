@@ -177,6 +177,9 @@ noema events backfill [--dry-run] [--yes]
                                           Synthesize create events for active traces missing one (e.g. traces added via `noema sync`)
 noema resolve <divergence-id> --accept <origin> | --custom <body>
                                           Resolve a divergence (concurrent edit conflict)
+noema verify [--backfill]                 Check trace content hashes for integrity; --backfill populates
+                                          hashes for old traces
+noema drift                               Check federated traces for drift from their source hash
 
 noema federation status                   Show federation config, MCP access posture, peer sync state, and vector clock
 noema federation peers                    List configured federation peers
@@ -185,6 +188,10 @@ noema federation add-peer <name> <endpoint>
 noema federation reset-peer <name>...     Clear stored state for a peer (forces a fresh handshake; use after a peer
                                           ran `noema migrate cortex-id --reset` and the syncer is now reporting an
                                           identity mismatch)
+noema federation set-mode <sync|publish|subscribe>
+                                          Set the cortex-level federation mode
+noema federation pause-peer <name>        Pause syncing with a peer (preserves cursor + identity)
+noema federation resume-peer <name>       Resume syncing with a paused peer
 noema federation key fingerprint          Print the SHA-256 fingerprint of the active MCP shared key (safe to
                                           say aloud over an out-of-band channel to confirm a pairing)
 
@@ -427,6 +434,66 @@ Or add a peer from the CLI:
 
 ```bash
 noema federation add-peer beta http://192.168.1.10:3000
+```
+
+### Federation modes
+
+The `federation.mode` field controls how a Cortex participates in the ring:
+
+| Mode | Syncer runs? | `sync_events` serves? | HTTP write tools? |
+|------|-------------|----------------------|-------------------|
+| `sync` (default) | Yes | Yes | Yes |
+| `publish` | No | Yes | Blocked |
+| `subscribe` | Yes | Blocked | Yes |
+
+**Publish mode** is for source-of-truth cortexes: a company knowledgebase, a curated dataset, a reference corpus. Content is managed locally via stdio; remote peers pull events via `sync_events` but cannot write back. **Subscribe mode** is the complement: pull everything, share nothing.
+
+```yaml
+federation:
+  mode: publish
+  interval: 30s
+  peers:
+    - name: consumer-1
+      endpoint: https://consumer-1.example:3000
+    - name: consumer-2
+      endpoint: https://consumer-2.example:3000
+      mode: paused    # temporarily skip this peer
+```
+
+Individual peers can be paused without affecting the rest of the ring:
+
+```bash
+noema federation pause-peer consumer-2   # skip until resumed
+noema federation resume-peer consumer-2  # re-enable
+noema federation set-mode subscribe      # switch cortex mode
+```
+
+Changes take effect on the next `noema serve` restart.
+
+### Content hashing and source-locking
+
+Every trace carries a `content_hash` (SHA-256 of the body, recomputed on every write). This enables integrity verification and federation sync optimization.
+
+Publishers can mark traces as **source-locked** — immutable on the consumer side:
+
+```yaml
+---
+id: 20260329-api-rate-limits
+title: API Rate Limits
+type: fact
+origin: company-kb
+source_hash: sha256:a3f2b8c...
+source_locked: true
+---
+```
+
+Source-locked traces refuse `update`, `delete`, and `remove` operations when the local cortex is not the origin. `archive`/`unarchive` remain allowed (non-destructive). Use `--force` on CLI commands to override in emergencies.
+
+```bash
+noema verify               # check all trace hashes for integrity
+noema verify --backfill     # populate hashes for old traces
+noema drift                 # check federated traces against source hashes
+noema edit <id> --force     # override source-lock
 ```
 
 ### Authentication

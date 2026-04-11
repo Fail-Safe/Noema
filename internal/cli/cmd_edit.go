@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,7 +12,9 @@ import (
 )
 
 func editCmd() *cobra.Command {
-	return &cobra.Command{
+	var force bool
+
+	cmd := &cobra.Command{
 		Use:               "edit <id>",
 		Short:             "Edit a Trace in $EDITOR",
 		Args:              cobra.ExactArgs(1),
@@ -27,6 +30,10 @@ func editCmd() *cobra.Command {
 			row, err := cx.Get(id)
 			if err != nil {
 				return fmt.Errorf("trace %q not found", id)
+			}
+
+			if row.SourceLocked && row.Origin != cx.Name && !force {
+				return fmt.Errorf("trace %q is source-locked by origin %q (use --force to override)", id, row.Origin)
 			}
 
 			path := cx.TraceFile(id, row.ArchivedAt != "")
@@ -46,11 +53,19 @@ func editCmd() *cobra.Command {
 				return fmt.Errorf("editor exited with error: %w", err)
 			}
 
+			if force {
+				cx.SetForceSourceLock(true)
+			}
 			if err := cx.Update(id); err != nil {
+				if errors.Is(err, cortex.ErrSourceLocked) {
+					return fmt.Errorf("%w (use --force to override)", err)
+				}
 				return fmt.Errorf("syncing database: %w", err)
 			}
 			fmt.Printf("Trace %s updated.\n", id)
 			return nil
 		},
 	}
+	cmd.Flags().BoolVarP(&force, "force", "f", false, "bypass source-lock protection")
+	return cmd
 }

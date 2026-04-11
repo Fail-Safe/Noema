@@ -1934,3 +1934,88 @@ func TestReplayEvent_SoftStateOnMissingTrace_NoOpAndStored(t *testing.T) {
 // Verify the _ imports are used
 var _ = federation.VClock{}
 var _ = trace.TypeDivergence
+
+// ---- federation mode validation -------------------------------------------
+
+func TestFederationConfig_EffectiveMode_Defaults(t *testing.T) {
+	// nil config
+	var fc *cortex.FederationConfig
+	if got := fc.EffectiveMode(); got != cortex.FederationModeSync {
+		t.Errorf("nil config: got %q, want %q", got, cortex.FederationModeSync)
+	}
+	// empty mode
+	fc = &cortex.FederationConfig{}
+	if got := fc.EffectiveMode(); got != cortex.FederationModeSync {
+		t.Errorf("empty mode: got %q, want %q", got, cortex.FederationModeSync)
+	}
+}
+
+func TestPeerEntry_EffectiveMode_Defaults(t *testing.T) {
+	pe := cortex.PeerEntry{Name: "x", Endpoint: "http://x"}
+	if got := pe.EffectiveMode(); got != cortex.PeerModeSync {
+		t.Errorf("empty peer mode: got %q, want %q", got, cortex.PeerModeSync)
+	}
+}
+
+func TestValidateFederation_ValidModes(t *testing.T) {
+	for _, mode := range []string{"sync", "publish", "subscribe"} {
+		m := cortex.Manifest{
+			Federation: &cortex.FederationConfig{Mode: mode},
+		}
+		if err := m.ValidateFederation(); err != nil {
+			t.Errorf("mode %q: unexpected error: %v", mode, err)
+		}
+	}
+}
+
+func TestValidateFederation_InvalidCortexMode(t *testing.T) {
+	m := cortex.Manifest{
+		Federation: &cortex.FederationConfig{Mode: "broadcast"},
+	}
+	err := m.ValidateFederation()
+	if err == nil {
+		t.Fatal("expected error on invalid federation mode")
+	}
+	if !strings.Contains(err.Error(), "broadcast") {
+		t.Errorf("error should name the bad mode, got: %v", err)
+	}
+}
+
+func TestValidateFederation_InvalidPeerMode(t *testing.T) {
+	m := cortex.Manifest{
+		Federation: &cortex.FederationConfig{
+			Peers: []cortex.PeerEntry{
+				{Name: "bob", Endpoint: "http://bob", Mode: "push"},
+			},
+		},
+	}
+	err := m.ValidateFederation()
+	if err == nil {
+		t.Fatal("expected error on invalid peer mode")
+	}
+	if !strings.Contains(err.Error(), "bob") || !strings.Contains(err.Error(), "push") {
+		t.Errorf("error should name the peer and bad mode, got: %v", err)
+	}
+}
+
+func TestValidateFederation_ValidPeerModes(t *testing.T) {
+	for _, mode := range []string{"sync", "paused", ""} {
+		m := cortex.Manifest{
+			Federation: &cortex.FederationConfig{
+				Peers: []cortex.PeerEntry{
+					{Name: "x", Endpoint: "http://x", Mode: mode},
+				},
+			},
+		}
+		if err := m.ValidateFederation(); err != nil {
+			t.Errorf("peer mode %q: unexpected error: %v", mode, err)
+		}
+	}
+}
+
+func TestValidateFederation_NilFederation(t *testing.T) {
+	m := cortex.Manifest{}
+	if err := m.ValidateFederation(); err != nil {
+		t.Errorf("nil federation should pass validation: %v", err)
+	}
+}
