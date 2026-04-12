@@ -45,19 +45,19 @@ A Trace has a **type** that describes its intent:
 
 ### With Homebrew (macOS + Linux)
 
-The fastest path. One command taps `Fail-Safe/homebrew-noema` and
+The fastest path. One command taps `Fail-Safe/homebrew-tap` and
 installs the cross-platform formula covering `darwin/{amd64,arm64}`
 and `linux/{amd64,arm64}`:
 
 ```bash
-brew install Fail-Safe/noema/noema
+brew install Fail-Safe/tap/noema
 ```
 
 On macOS a cask is also published for users who prefer the cask
 ecosystem:
 
 ```bash
-brew install --cask Fail-Safe/noema/noema
+brew install --cask Fail-Safe/tap/noema
 ```
 
 > The formula path is the default on macOS — when a tap contains both a
@@ -68,7 +68,7 @@ brew install --cask Fail-Safe/noema/noema
 Prefer the two-step form? It works the same:
 
 ```bash
-brew tap Fail-Safe/noema
+brew tap Fail-Safe/tap
 brew install noema          # formula (macOS + Linux)
 brew install --cask noema   # cask (macOS only)
 ```

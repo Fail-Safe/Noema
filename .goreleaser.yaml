@@ -126,7 +126,7 @@ release:
 
 # Homebrew publishing — dual strategy: formula + cask.
 #
-# Both blocks target the same tap repo (Fail-Safe/homebrew-noema) and the
+# Both blocks target the same tap repo (Fail-Safe/homebrew-tap) and the
 # same bearer token (HOMEBREW_TAP_TOKEN in the Noema repo's Actions
 # secrets). The two blocks write to different subdirectories of the tap:
 # Formula/noema.rb for `brews:`, Casks/noema.rb for `homebrew_casks:`.
@@ -169,7 +169,7 @@ brews:
   - name: noema
     repository:
       owner: Fail-Safe
-      name: homebrew-noema
+      name: homebrew-tap
       branch: main
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     directory: Formula
@@ -196,7 +196,7 @@ homebrew_casks:
       - noema
     repository:
       owner: Fail-Safe
-      name: homebrew-noema
+      name: homebrew-tap
       branch: main
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     directory: Casks
