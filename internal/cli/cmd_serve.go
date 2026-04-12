@@ -154,8 +154,10 @@ func serveCmd() *cobra.Command {
 				mux.Handle("/mcp", wrapped)
 
 				httpSrv := &http.Server{
-					Addr:    addr,
-					Handler: mux,
+					Addr:              addr,
+					Handler:           mux,
+					ReadHeaderTimeout: 30 * time.Second,
+					IdleTimeout:       120 * time.Second,
 				}
 
 				scheme := "http"

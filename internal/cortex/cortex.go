@@ -97,6 +97,10 @@ func (pe PeerEntry) EffectiveMode() string {
 // source-locked trace from a foreign origin.
 var ErrSourceLocked = errors.New("trace is source-locked")
 
+// MaxSearchQueryLen caps the length of FTS5 search queries to prevent
+// denial of service via expensive wildcard or deeply nested expressions.
+const MaxSearchQueryLen = 1000
+
 type Cortex struct {
 	ID              string // ULID, stable across renames; the federation identity key
 	Name            string // human-readable display label
@@ -687,6 +691,9 @@ func (c *Cortex) List(opts ListOptions) ([]Row, error) {
 }
 
 func (c *Cortex) Search(query string, opts ListOptions) ([]Row, error) {
+	if len(query) > MaxSearchQueryLen {
+		return nil, fmt.Errorf("search query too long (%d chars, max %d)", len(query), MaxSearchQueryLen)
+	}
 	q := `
 		SELECT t.id, t.title, t.type, t.author, t.origin, t.archived_at, t.trashed_at, t.created_at, t.updated_at, t.content_hash, t.source_locked, t.source_hash
 		FROM traces t
@@ -1666,6 +1673,11 @@ func setClockTx(tx *sql.Tx, vc federation.VClock) error {
 // ReplayEvent materializes a remote event locally without emitting a new event.
 // The remote event is stored in the local log with its original ID and origin.
 func (c *Cortex) ReplayEvent(e event.Event) error {
+	// Guard: reject trace IDs that could escape the cortex directory.
+	if !trace.IsValidID(e.TraceID) {
+		return fmt.Errorf("rejecting remote event %s: %w: %q", e.ID, trace.ErrInvalidTraceID, e.TraceID)
+	}
+
 	// Idempotency: skip if already in local log.
 	existing, err := event.ForTrace(c.DB.DB, e.TraceID)
 	if err != nil {
@@ -1722,6 +1734,19 @@ func (c *Cortex) replayCreate(e event.Event) error {
 		return fmt.Errorf("parsing create event data: %w", err)
 	}
 
+	// Verify content hash integrity: the peer-supplied hash must match the
+	// actual body. Without this check a compromised peer could send tampered
+	// content with the original hash, and noema verify would report it clean.
+	if data.ContentHash != "" {
+		if got := trace.ContentHash(data.Body); got != data.ContentHash {
+			return fmt.Errorf("content hash mismatch on create event %s for trace %s: expected %s, got %s", e.ID, e.TraceID, data.ContentHash, got)
+		}
+	}
+
+	// Only honor source_locked from genuinely foreign events. A peer should
+	// not be able to lock traces that originate from the local cortex.
+	sourceLocked := data.SourceLocked && e.CortexID != c.ID
+
 	t := &trace.Trace{
 		Frontmatter: trace.Frontmatter{
 			ID:           e.TraceID,
@@ -1735,7 +1760,7 @@ func (c *Cortex) replayCreate(e event.Event) error {
 			Updated:      e.Timestamp,
 			ContentHash:  data.ContentHash,
 			SourceHash:   data.SourceHash,
-			SourceLocked: data.SourceLocked,
+			SourceLocked: sourceLocked,
 		},
 		Body: data.Body,
 	}
@@ -1825,6 +1850,13 @@ func (c *Cortex) replayUpdate(e event.Event) error {
 		return fmt.Errorf("trace %s not found for replay update: %w", e.TraceID, err)
 	}
 
+	// Verify content hash integrity before applying the update.
+	if data.ContentHash != "" {
+		if got := trace.ContentHash(data.Body); got != data.ContentHash {
+			return fmt.Errorf("content hash mismatch on update event %s for trace %s: expected %s, got %s", e.ID, e.TraceID, data.ContentHash, got)
+		}
+	}
+
 	// Conflict detection: compare vector clocks with last local mutation.
 	if len(e.VClock) > 0 {
 		localEvents, _ := event.ForTrace(c.DB.DB, e.TraceID)
@@ -1836,6 +1868,8 @@ func (c *Cortex) replayUpdate(e event.Event) error {
 			}
 		}
 	}
+
+	sourceLocked := data.SourceLocked && e.CortexID != c.ID
 
 	t := &trace.Trace{
 		Frontmatter: trace.Frontmatter{
@@ -1850,7 +1884,7 @@ func (c *Cortex) replayUpdate(e event.Event) error {
 			Updated:      e.Timestamp,
 			ContentHash:  data.ContentHash,
 			SourceHash:   data.SourceHash,
-			SourceLocked: data.SourceLocked,
+			SourceLocked: sourceLocked,
 		},
 		Body: data.Body,
 	}
