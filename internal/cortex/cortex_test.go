@@ -812,6 +812,148 @@ func TestUpdate(t *testing.T) {
 	}
 }
 
+// ---- Append ----
+
+func TestAppend(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Append target", "note", "agent-1", []string{"log"}, "Line one.")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	if err := cx.Append(tr.ID, "Line two."); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	// Verify the file on disk has the appended content.
+	path := cx.TraceFile(tr.ID, false)
+	parsed, err := trace.ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	want := "Line one.\nLine two."
+	if parsed.Body != want {
+		t.Errorf("Body = %q, want %q", parsed.Body, want)
+	}
+
+	// FTS5 should find the appended content.
+	results, err := cx.Search("line two", cortex.ListOptions{})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 1 || results[0].ID != tr.ID {
+		t.Errorf("FTS not updated: search returned %v", results)
+	}
+
+	// Content hash should be recomputed.
+	row, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	wantHash := trace.ContentHash(want)
+	if row.ContentHash != wantHash {
+		t.Errorf("ContentHash = %q, want %q", row.ContentHash, wantHash)
+	}
+}
+
+func TestAppend_ToEmptyBody(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Empty body append", "note", "", nil, "")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	if err := cx.Append(tr.ID, "First entry."); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	path := cx.TraceFile(tr.ID, false)
+	parsed, err := trace.ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if parsed.Body != "First entry." {
+		t.Errorf("Body = %q, want %q", parsed.Body, "First entry.")
+	}
+}
+
+func TestAppend_MultipleAppends(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Multi append", "note", "", nil, "A")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	for _, line := range []string{"B", "C", "D"} {
+		if err := cx.Append(tr.ID, line); err != nil {
+			t.Fatalf("Append %q: %v", line, err)
+		}
+	}
+
+	path := cx.TraceFile(tr.ID, false)
+	parsed, err := trace.ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	want := "A\nB\nC\nD"
+	if parsed.Body != want {
+		t.Errorf("Body = %q, want %q", parsed.Body, want)
+	}
+}
+
+func TestAppend_EmitsUpdateEvent(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Event test", "note", "", nil, "Initial.")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	if err := cx.Append(tr.ID, "Appended."); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	events, err := cx.Events(tr.ID)
+	if err != nil {
+		t.Fatalf("History: %v", err)
+	}
+	// Should have create + update.
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	if events[1].Action != "update" {
+		t.Errorf("second event action = %q, want %q", events[1].Action, "update")
+	}
+}
+
+func TestAppend_RespectsSourceLock(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Locked trace", "note", "", nil, "Body.")
+	tr.Origin = "remote-peer"
+	tr.SourceLocked = true
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	err := cx.Append(tr.ID, "Should fail.")
+	if err == nil {
+		t.Fatal("expected source lock error, got nil")
+	}
+}
+
+func TestAppend_NotFound(t *testing.T) {
+	cx := setup(t)
+
+	err := cx.Append("99999999-nonexistent", "content")
+	if err == nil {
+		t.Fatal("expected error for missing trace, got nil")
+	}
+}
+
 // ---- Origin ----
 
 func TestOrigin_DefaultsToCortexName(t *testing.T) {

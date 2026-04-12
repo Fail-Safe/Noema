@@ -146,13 +146,13 @@ Federation is opt-in via a `federation:` block in `cortex.md` (peers + interval)
 | `publish` | No | Yes | Blocked (read-only for remote peers) |
 | `subscribe` | Yes | Blocked | Yes |
 
-In publish mode, mutating MCP tools (`create_trace`, `update_trace`, `delete_trace`, `recover_trace`, `archive_trace`, `unarchive_trace`, `resolve_divergence`) return a clear error on the HTTP transport. The local stdio transport retains full write access so operators can manage content locally. In subscribe mode, `sync_events` returns an error so remote peers cannot pull events from this cortex.
+In publish mode, mutating MCP tools (`create_trace`, `update_trace`, `append_trace`, `delete_trace`, `recover_trace`, `archive_trace`, `unarchive_trace`, `resolve_divergence`) return a clear error on the HTTP transport. The local stdio transport retains full write access so operators can manage content locally. In subscribe mode, `sync_events` returns an error so remote peers cannot pull events from this cortex.
 
 Each peer can also declare `mode: paused` to temporarily skip syncing without losing cursor/identity state. CLI commands: `noema federation set-mode <sync|publish|subscribe>`, `noema federation pause-peer <name>`, `noema federation resume-peer <name>`.
 
 The full design rationale, edge cases, and phase breakdown live in `docs/design/federation-plan.md`.
 
-**Content hashing and source-locking.** Every trace mutation (`Add`, `Update`) computes a SHA-256 hash of the body (`sha256:<hex>`) and stores it in the `content_hash` frontmatter field and DB column. The hash travels through federation events so peers receive it. Three frontmatter fields support integrity:
+**Content hashing and source-locking.** Every trace mutation (`Add`, `Update`, `Append`) computes a SHA-256 hash of the body (`sha256:<hex>`) and stores it in the `content_hash` frontmatter field and DB column. The hash travels through federation events so peers receive it. Three frontmatter fields support integrity:
 
 - `content_hash` — current body hash, recomputed on every write
 - `source_hash` — the origin's `content_hash` at publish time, carried through federation
@@ -166,7 +166,7 @@ CLI: `noema verify` checks all trace file hashes against their frontmatter `cont
 
 ### MCP Tools
 
-The MCP server (`internal/mcp/server.go`) exposes the full Cortex surface: `get_instructions`, `list_traces`, `get_trace`, `create_trace`, `update_trace`, `delete_trace`, `recover_trace`, `archive_trace`, `unarchive_trace`, `search_traces`, `trace_history`, `trace_lineage`, `resolve_divergence`, `cortex_identity`, `sync_events`, `federation_status`, and `announce_peer`. The `get_instructions` tool returns a live reference guide for the active Cortex; agents should call it first in any new session. `cortex_identity` returns the stable ULID + display name + manifest version and is called by federation peers on every sync to verify the remote endpoint still belongs to the cortex they paired with.
+The MCP server (`internal/mcp/server.go`) exposes the full Cortex surface: `get_instructions`, `list_traces`, `get_trace`, `create_trace`, `update_trace`, `append_trace`, `delete_trace`, `recover_trace`, `archive_trace`, `unarchive_trace`, `search_traces`, `trace_history`, `trace_lineage`, `resolve_divergence`, `cortex_identity`, `sync_events`, `federation_status`, and `announce_peer`. The `get_instructions` tool returns a live reference guide for the active Cortex; agents should call it first in any new session. `cortex_identity` returns the stable ULID + display name + manifest version and is called by federation peers on every sync to verify the remote endpoint still belongs to the cortex they paired with.
 
 ### DB Schema Migrations
 

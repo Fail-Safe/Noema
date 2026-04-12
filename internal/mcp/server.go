@@ -318,6 +318,25 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 		return mcp.NewToolResultText(fmt.Sprintf("Trace %s updated.", id)), nil
 	}))
 
+	s.AddTool(mcp.NewTool("append_trace",
+		mcp.WithDescription("Append content to an existing trace's body without reading the full trace first. Ideal for fire-and-forget logging, running journals, or any case where an agent needs to add to a trace without consuming its current content."),
+		mcp.WithString("id", mcp.Description("Trace ID"), mcp.Required()),
+		mcp.WithString("content", mcp.Description("Content to append to the trace body"), mcp.Required()),
+	), readOnlyGuard(func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id, err := req.RequireString("id")
+		if err != nil {
+			return nil, err
+		}
+		content, err := req.RequireString("content")
+		if err != nil {
+			return nil, err
+		}
+		if err := cx.Append(id, content); err != nil {
+			return nil, err
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("Content appended to trace %s.", id)), nil
+	}))
+
 	// ---- Event Log & Lineage tools ----
 
 	s.AddTool(mcp.NewTool("trace_history",
@@ -661,6 +680,9 @@ Choose the type that best reflects the intent of the memory:
                                    or in a tag (e.g. tags=event-2026-04-02) instead
   update_trace id [title] [type] [author] [tags] [derived_from] [body]
                                  → update any subset of fields
+  append_trace id content        → append content to an existing trace's body
+                                   without reading the full trace first; ideal
+                                   for running logs and fire-and-forget writes
   search_traces query [all]      → FTS5 full-text search
   archive_trace id               → move to archive (reversible)
   unarchive_trace id             → restore from archive
