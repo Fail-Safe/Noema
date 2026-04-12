@@ -268,3 +268,38 @@ func TestNew(t *testing.T) {
 		t.Error("Created/Updated timestamps must be set")
 	}
 }
+
+// ---- IsValidID ----
+
+func TestIsValidID(t *testing.T) {
+	valid := []string{
+		"20260329-why-we-chose-go",
+		"20260401-a",
+		"20260401-a-b-c",
+		"20260401-abc123",
+	}
+	for _, id := range valid {
+		if !trace.IsValidID(id) {
+			t.Errorf("IsValidID(%q) = false, want true", id)
+		}
+	}
+
+	invalid := []string{
+		"",
+		"no-date-prefix",
+		"../etc/passwd",
+		"20260329-../../etc/passwd",
+		"20260329-hello/world",
+		"20260329-hello\\world",
+		"20260329-",
+		"20260329-UPPERCASE",
+		"20260329-hello world",
+		"2026032-short-date",
+		"20260329-" + strings.Repeat("a", 66), // exceeds max slug length
+	}
+	for _, id := range invalid {
+		if trace.IsValidID(id) {
+			t.Errorf("IsValidID(%q) = true, want false", id)
+		}
+	}
+}
