@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,6 +15,20 @@ import (
 	"github.com/Fail-Safe/Noema/internal/trace"
 )
 
+// sandboxConfigHome redirects HOME and XDG_CONFIG_HOME to a temp directory
+// so that config.Save() writes into the test's sandbox instead of the real
+// user config. Without this, tests that call runCortexIDMigration overwrite
+// ~/Library/Application Support/noema/config.yaml (macOS) or
+// ~/.config/noema/config.yaml (Linux) with test data.
+func sandboxConfigHome(t *testing.T) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	// Ensure the noema config directory exists so Save() doesn't fail.
+	os.MkdirAll(filepath.Join(home, ".config", "noema"), 0o750)
+}
+
 // setupV1Cortex builds a fresh v2 cortex (the only kind cortex.Create knows
 // how to write) and then degrades it back to v1 in place: clears the manifest
 // id, drops the version to 1, blanks every cortex_id column, and replaces the
@@ -21,6 +36,7 @@ import (
 // stand-in for a cortex written by an older binary.
 func setupV1Cortex(t *testing.T, name string) (dir string, traceID string) {
 	t.Helper()
+	sandboxConfigHome(t)
 	parent := t.TempDir()
 	if _, err := cortex.Create(name, parent); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -167,6 +183,7 @@ func TestMigrateCortexID_HappyPath(t *testing.T) {
 }
 
 func TestMigrateCortexID_Idempotent(t *testing.T) {
+	sandboxConfigHome(t)
 	const name = "already-migrated"
 	parent := t.TempDir()
 	if _, err := cortex.Create(name, parent); err != nil {
