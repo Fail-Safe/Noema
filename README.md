@@ -5,6 +5,13 @@
   </picture>
 </p>
 
+<p align="center">
+  <a href="https://github.com/Fail-Safe/Noema/actions/workflows/ci.yml"><img src="https://github.com/Fail-Safe/Noema/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://github.com/Fail-Safe/Noema/releases/latest"><img src="https://img.shields.io/github/v/release/Fail-Safe/Noema" alt="Latest Release"></a>
+  <a href="https://github.com/Fail-Safe/Noema/blob/main/go.mod"><img src="https://img.shields.io/github/go-mod/go-version/Fail-Safe/Noema" alt="Go Version"></a>
+  <a href="https://github.com/Fail-Safe/Noema/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Fail-Safe/Noema" alt="License"></a>
+</p>
+
 **The intentional memory layer for your AI agents.**
 
 Noema gives AI agents — and the humans working alongside them — a persistent, structured place to record what they know, decide, observe, and intend. Every memory is a plain markdown file. The index is a local SQLite database. Nothing lives in the cloud; nothing requires an API key.
@@ -248,6 +255,7 @@ Noema can run as an [MCP](https://modelcontextprotocol.io) server, giving any MC
 | `get_trace` | Fetch a trace's full body, origin, and lineage |
 | `create_trace` | Create a new trace (supports `derived_from`, `origin`) |
 | `update_trace` | Update any subset of fields on an existing trace |
+| `append_trace` | Append content to an existing trace without reading it first (fire-and-forget logging) |
 | `search_traces` | FTS5 full-text search |
 | `archive_trace` / `unarchive_trace` | Archive a trace or restore it |
 | `delete_trace` / `recover_trace` | Soft-delete (move to trash) or restore from trash |
