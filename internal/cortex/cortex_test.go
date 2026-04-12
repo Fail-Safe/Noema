@@ -2019,3 +2019,196 @@ func TestValidateFederation_NilFederation(t *testing.T) {
 		t.Errorf("nil federation should pass validation: %v", err)
 	}
 }
+
+// ---- Security: path traversal ----
+
+func TestReplayEvent_RejectsPathTraversal(t *testing.T) {
+	cx := setup(t)
+
+	maliciousIDs := []string{
+		"../../etc/passwd",
+		"20260405-../../etc/shadow",
+		"20260405-hello/world",
+		"20260405-hello\\world",
+		"../db/noema",
+	}
+
+	for _, id := range maliciousIDs {
+		data, _ := json.Marshal(map[string]any{
+			"title": "Evil", "type": "note", "body": "pwned",
+		})
+		e := event.Event{
+			ID:        event.NewULID(),
+			Action:    event.ActionCreate,
+			TraceID:   id,
+			Origin:    "evil-peer",
+			Timestamp: "2026-04-05T12:00:00Z",
+			Data:      data,
+		}
+		err := cx.ReplayEvent(e)
+		if err == nil {
+			t.Errorf("ReplayEvent with TraceID %q should have been rejected", id)
+		}
+		if !strings.Contains(err.Error(), "invalid trace ID") {
+			t.Errorf("expected invalid trace ID error for %q, got: %v", id, err)
+		}
+	}
+}
+
+// ---- Security: content hash verification ----
+
+func TestReplayEvent_RejectsContentHashMismatch(t *testing.T) {
+	cx := setup(t)
+
+	body := "legitimate content"
+	wrongHash := trace.ContentHash("tampered content")
+
+	data, _ := json.Marshal(map[string]any{
+		"title":        "Tampered",
+		"type":         "note",
+		"body":         body,
+		"content_hash": wrongHash,
+	})
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionCreate,
+		TraceID:   "20260405-tampered-trace",
+		Origin:    "evil-peer",
+		Timestamp: "2026-04-05T12:00:00Z",
+		Data:      data,
+	}
+
+	err := cx.ReplayEvent(e)
+	if err == nil {
+		t.Fatal("ReplayEvent should reject event with mismatched content_hash")
+	}
+	if !strings.Contains(err.Error(), "content hash mismatch") {
+		t.Errorf("expected content hash mismatch error, got: %v", err)
+	}
+
+	// Verify no file was written.
+	if _, err := os.Stat(cx.TraceFile("20260405-tampered-trace", false)); err == nil {
+		t.Error("tampered trace file should not exist on disk")
+	}
+}
+
+func TestReplayEvent_AcceptsMatchingContentHash(t *testing.T) {
+	cx := setup(t)
+
+	body := "legitimate content"
+	hash := trace.ContentHash(body)
+
+	data, _ := json.Marshal(map[string]any{
+		"title":        "Legit",
+		"type":         "note",
+		"body":         body,
+		"content_hash": hash,
+	})
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionCreate,
+		TraceID:   "20260405-legit-trace",
+		Origin:    "good-peer",
+		Timestamp: "2026-04-05T12:00:00Z",
+		Data:      data,
+	}
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent should accept matching hash: %v", err)
+	}
+}
+
+// ---- Security: source-lock restriction ----
+
+func TestReplayEvent_IgnoresSourceLockFromSameCortex(t *testing.T) {
+	cx := setup(t)
+
+	data, _ := json.Marshal(map[string]any{
+		"title":         "Locked by self",
+		"type":          "note",
+		"body":          "Should not actually lock.",
+		"source_locked": true,
+	})
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionCreate,
+		TraceID:   "20260405-self-locked",
+		Origin:    cx.Name,
+		CortexID:  cx.ID, // same as local cortex
+		Timestamp: "2026-04-05T12:00:00Z",
+		Data:      data,
+	}
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent: %v", err)
+	}
+
+	row, err := cx.Get("20260405-self-locked")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if row.SourceLocked {
+		t.Error("source_locked should be false when CortexID matches local cortex")
+	}
+}
+
+func TestReplayEvent_HonorsSourceLockFromForeignCortex(t *testing.T) {
+	cx := setup(t)
+
+	data, _ := json.Marshal(map[string]any{
+		"title":         "Locked by peer",
+		"type":          "note",
+		"body":          "Should be locked.",
+		"source_locked": true,
+	})
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionCreate,
+		TraceID:   "20260405-peer-locked",
+		Origin:    "foreign-peer",
+		CortexID:  "01JTESTFOREIGN000000000000", // different from local
+		Timestamp: "2026-04-05T12:00:00Z",
+		Data:      data,
+	}
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent: %v", err)
+	}
+
+	row, err := cx.Get("20260405-peer-locked")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !row.SourceLocked {
+		t.Error("source_locked should be true when CortexID differs from local cortex")
+	}
+}
+
+// ---- Security: FTS5 query length cap ----
+
+func TestSearch_RejectsOversizedQuery(t *testing.T) {
+	cx := setup(t)
+
+	longQuery := strings.Repeat("a", cortex.MaxSearchQueryLen+1)
+	_, err := cx.Search(longQuery, cortex.ListOptions{})
+	if err == nil {
+		t.Fatal("Search should reject query exceeding MaxSearchQueryLen")
+	}
+	if !strings.Contains(err.Error(), "too long") {
+		t.Errorf("expected 'too long' error, got: %v", err)
+	}
+}
+
+func TestSearch_AcceptsQueryAtMaxLength(t *testing.T) {
+	cx := setup(t)
+
+	// This will fail the FTS5 MATCH (no results), but should not be rejected
+	// by the length check.
+	query := strings.Repeat("a", cortex.MaxSearchQueryLen)
+	_, err := cx.Search(query, cortex.ListOptions{})
+	// FTS5 may return an error for a nonsensical query, but it should not
+	// be our "too long" error.
+	if err != nil && strings.Contains(err.Error(), "too long") {
+		t.Errorf("query at max length should not be rejected: %v", err)
+	}
+}
