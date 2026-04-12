@@ -1017,6 +1017,62 @@ func (c *Cortex) Update(id string) error {
 	return tx.Commit()
 }
 
+// Append adds content to the end of an existing trace's body. It reads the
+// current file, appends the new content (with a newline separator if the
+// existing body doesn't already end with one), recomputes the content hash,
+// and emits a standard "update" event. Designed for fire-and-forget logging
+// where agents append to a running trace without consuming its full body.
+func (c *Cortex) Append(id, content string) error {
+	if err := c.CheckSourceLock(id); err != nil {
+		return err
+	}
+	r, err := c.Get(id)
+	if err != nil {
+		return err
+	}
+	path := c.filePath(r)
+	t, err := trace.ParseFile(path)
+	if err != nil {
+		return err
+	}
+
+	// Append with a newline separator if the body doesn't already end with one.
+	if t.Body != "" && !strings.HasSuffix(t.Body, "\n") {
+		t.Body += "\n"
+	}
+	t.Body += content
+
+	t.Updated = time.Now().UTC().Format(time.RFC3339)
+	t.ContentHash = trace.ContentHash(t.Body)
+	if err := t.Write(path); err != nil {
+		return fmt.Errorf("rewriting trace file for append: %w", err)
+	}
+
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(
+		`UPDATE traces SET updated_at=?, content_hash=? WHERE id=?`,
+		t.Updated, t.ContentHash, id,
+	)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM traces_fts WHERE id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`, id, t.Title, t.Body); err != nil {
+		return err
+	}
+	if err := c.emitEvent(tx, event.ActionUpdate, id, t.Updated, marshalTraceData(t)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (c *Cortex) scanRows(rows *sql.Rows) ([]Row, error) { //nolint:govet
 	var result []Row
 	for rows.Next() {

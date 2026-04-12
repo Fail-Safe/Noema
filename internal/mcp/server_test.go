@@ -110,6 +110,13 @@ func TestRenderInstructions_ManifestVersionReflectsInput(t *testing.T) {
 // the Tools section could quietly drop the warning and the doubled-
 // prefix bug would re-emerge from agent habit even though the code-
 // level defense would still catch it.
+func TestRenderInstructions_IncludesAppendTrace(t *testing.T) {
+	out := renderInstructions(cortex.Manifest{Name: "test", Version: 2}, "dev")
+	if !strings.Contains(out, "append_trace") {
+		t.Errorf("instructions should mention append_trace\nfull output:\n%s", out)
+	}
+}
+
 func TestRenderInstructions_WarnsAgainstDateInTitle(t *testing.T) {
 	out := renderInstructions(cortex.Manifest{Name: "test", Version: 2}, "dev")
 
@@ -325,6 +332,7 @@ func TestPublishMode_BlocksMutatingTools(t *testing.T) {
 	}{
 		{"create_trace", map[string]any{"title": "x", "type": "note", "body": "y"}},
 		{"update_trace", map[string]any{"id": "nonexistent", "title": "x"}},
+		{"append_trace", map[string]any{"id": "nonexistent", "content": "x"}},
 		{"delete_trace", map[string]any{"id": "nonexistent"}},
 		{"recover_trace", map[string]any{"id": "nonexistent"}},
 		{"archive_trace", map[string]any{"id": "nonexistent"}},
