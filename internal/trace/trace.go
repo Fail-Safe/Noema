@@ -3,14 +3,32 @@ package trace
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
+
+// ErrInvalidTraceID is returned when a trace ID contains characters that
+// could escape the cortex directory (path traversal). Only IDs matching
+// the YYYYMMDD-slug format produced by NewID are accepted.
+var ErrInvalidTraceID = errors.New("invalid trace ID")
+
+// validTraceID matches the format produced by NewID: 8 digits, a hyphen,
+// then 1–65 characters of lowercase alphanumerics and hyphens.
+var validTraceID = regexp.MustCompile(`^[0-9]{8}-[a-z0-9][a-z0-9-]{0,64}$`)
+
+// IsValidID reports whether id is a well-formed trace ID safe for use in
+// filesystem paths. It rejects any ID containing path separators, dot
+// segments, or characters outside the NewID slug alphabet.
+func IsValidID(id string) bool {
+	return validTraceID.MatchString(id)
+}
 
 type Type string
 

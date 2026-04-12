@@ -277,6 +277,13 @@ func (s *Syncer) syncPeer(peer PeerConfig) error {
 		return nil
 	}
 
+	// Guard against a hostile peer returning an oversized payload.
+	// 100 events * 1 MB body each = 100 MB is a generous upper bound.
+	const maxSyncResponseBytes = 100 * 1024 * 1024 // 100 MiB
+	if len(text) > maxSyncResponseBytes {
+		return fmt.Errorf("sync_events response too large (%d bytes, max %d)", len(text), maxSyncResponseBytes)
+	}
+
 	var events []event.Event
 	if err := json.Unmarshal([]byte(text), &events); err != nil {
 		return fmt.Errorf("parsing sync_events response: %w", err)
