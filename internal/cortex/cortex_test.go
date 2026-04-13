@@ -408,6 +408,70 @@ func TestSearch_MalformedQuery(t *testing.T) {
 	}
 }
 
+func TestSearch_HyphenatedTerms(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("format-test-create", "note", "hermes/testbot", []string{"hermes-contract-test"}, "Testing create response format.")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	// Search by hyphenated title — previously caused "no such column" FTS5 error.
+	rows, err := cx.Search("format-test-create", cortex.ListOptions{})
+	if err != nil {
+		t.Fatalf("Search with hyphenated query: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d results for hyphenated query, want 1", len(rows))
+	}
+	if rows[0].ID != tr.ID {
+		t.Errorf("result = %q, want %q", rows[0].ID, tr.ID)
+	}
+}
+
+func TestSearch_ColonInQuery(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("hermes-session: my-session", "context", "hermes/agent", nil, "Session log content.")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	// Colons are FTS5 column-prefix syntax — must be quoted.
+	rows, err := cx.Search("hermes-session:", cortex.ListOptions{})
+	if err != nil {
+		t.Fatalf("Search with colon query: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d results for colon query, want 1", len(rows))
+	}
+}
+
+func TestSanitizeFTS5Query(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"simple query", "simple query"},
+		{"format-test-create", "\"format-test-create\""},
+		{"hermes-session: log", "\"hermes-session:\" log"},
+		{"single-binary deployment", "\"single-binary\" deployment"},
+		{"word AND other", "word AND other"},
+		{"word OR other", "word OR other"},
+		{"NOT bad", "NOT bad"},
+		{"prefix*", "prefix*"},
+		{"\"already quoted\"", "\"already quoted\""},
+		{"", ""},
+		{"no-hyphens-here AND plain", "\"no-hyphens-here\" AND plain"},
+	}
+	for _, tt := range tests {
+		got := cortex.SanitizeFTS5Query(tt.input)
+		if got != tt.want {
+			t.Errorf("SanitizeFTS5Query(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
 // ---- Archive / Unarchive ----
 
 func TestArchiveUnarchive(t *testing.T) {
