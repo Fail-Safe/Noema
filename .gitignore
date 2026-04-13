@@ -21,5 +21,5 @@
 .vscode/
 
 # Local dev
+.claude/layout.md
 push-binary.sh
-docs/design/
