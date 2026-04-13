@@ -618,6 +618,30 @@ Each agent identifies itself via the `author` field when creating Traces. Filter
 
 ---
 
+## Hermes Integration
+
+Noema ships a [Hermes](https://hermes-agent.nousresearch.com/) memory provider plugin in `plugins/hermes/`. It implements the Hermes `MemoryProvider` ABC so any Hermes agent can use a Noema Cortex as its memory backend — structured traces with types, tags, lineage, and full-text search, all through the standard Hermes lifecycle hooks.
+
+**Quick setup:**
+
+```bash
+# Download the plugin from the latest release
+curl -LO https://github.com/Fail-Safe/Noema/releases/latest/download/noema-hermes-plugin.tar.gz
+mkdir -p <hermes-install>/plugins/memory/noema
+tar -xzf noema-hermes-plugin.tar.gz -C <hermes-install>/plugins/memory/noema/
+
+# Configure
+hermes memory setup    # select "noema", provide your cortex name
+```
+
+The plugin exposes six tools to the agent (`noema_search`, `noema_remember`, `noema_recall`, `noema_list`, `noema_update`, `noema_lineage`), manages a session log trace across turns, creates a summary trace at session end, and mirrors Hermes built-in memory writes as Noema traces.
+
+By default the plugin spawns `noema serve --transport stdio` as a subprocess — no network config needed. For remote cortexes or multi-agent setups, set `transport=http` to connect to an already-running HTTP endpoint.
+
+See [`plugins/hermes/README.md`](plugins/hermes/README.md) for full configuration and usage details.
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
