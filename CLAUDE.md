@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+Also read .claude/layout.md when it exists.
+
 ## Project
 
 **Noema** — "The intentional memory layer for your AI agents."
@@ -29,7 +31,8 @@ go vet ./...           # static analysis
 ## Branch Strategy
 
 - `main` is the stable/release branch
-- Use a `dev` or `next` branch for active feature work; PRs go feature-branch → `main`
+- Use a `feature` or `bug` branch for active work; PRs go feature/bug-branch → `next`
+- Use a `next` branch for staging/testing upcoming (beta) work; PRs go `next` → `main`
 
 ## Tech Stack
 
