@@ -60,7 +60,7 @@ func serveCmd() *cobra.Command {
 			// first log line instead of finding out via peer drift hours
 			// later. The ULID is the federation key — print it explicitly,
 			// not just the human-readable name.
-			fmt.Printf("[serve] cortex %q (id=%s) at %s\n", cx.Name, cx.ID, cx.Dir)
+			fmt.Fprintf(os.Stderr, "[serve] cortex %q (id=%s) at %s\n", cx.Name, cx.ID, cx.Dir)
 
 			var syncer *federation.Syncer
 			switch transport {
@@ -87,7 +87,7 @@ func serveCmd() *cobra.Command {
 					return fmt.Errorf("loading MCP access key: %w", accessErr)
 				}
 				if accessKey.EnvOverride() {
-					fmt.Printf("[serve] %s overrides access.shared_key_file at %s\n",
+					fmt.Fprintf(os.Stderr, "[serve] %s overrides access.shared_key_file at %s\n",
 						cortex.AccessKeyEnvVar, accessKey.Path)
 				}
 
@@ -109,7 +109,7 @@ func serveCmd() *cobra.Command {
 				if m.Federation != nil && len(m.Federation.Peers) > 0 && fedMode != cortex.FederationModePublish {
 					syncer = startSyncer(cx, accessKey.Value, m.Federation)
 				}
-				fmt.Printf("[serve] federation mode: %s\n", fedMode)
+				fmt.Fprintf(os.Stderr, "[serve] federation mode: %s\n", fedMode)
 
 				// HTTP transport: apply federation mode guards.
 				s := mcpserver.NewServer(cx, version(), fedMode)
@@ -119,10 +119,10 @@ func serveCmd() *cobra.Command {
 				// running the same key without speaking the secret
 				// itself.
 				if accessKey.Keyed() {
-					fmt.Printf("[serve] access=keyed source=%s fingerprint=%s\n",
+					fmt.Fprintf(os.Stderr, "[serve] access=keyed source=%s fingerprint=%s\n",
 						accessKey.Source, accessKey.Fingerprint)
 				} else {
-					fmt.Printf("[serve] access=open\n")
+					fmt.Fprintf(os.Stderr, "[serve] access=open\n")
 				}
 
 				// IPv6 addresses need brackets in listen addresses.
@@ -164,7 +164,7 @@ func serveCmd() *cobra.Command {
 				if useTLS {
 					scheme = "https"
 				}
-				fmt.Printf("Starting Streamable HTTP server on %s://%s/mcp\n", scheme, addr)
+				fmt.Fprintf(os.Stderr, "Starting Streamable HTTP server on %s://%s/mcp\n", scheme, addr)
 				if useTLS {
 					err = httpSrv.ListenAndServeTLS(tlsCert, tlsKey)
 				} else {
@@ -227,7 +227,7 @@ func startSyncer(cx *cortex.Cortex, sharedKey string, fc *cortex.FederationConfi
 	syncer := federation.NewSyncer(cx, state, cfg)
 	syncer.Start()
 
-	fmt.Printf("Federation syncer started (%d peers, interval %s)\n", len(peers), cfg.EffectiveInterval())
+	fmt.Fprintf(os.Stderr, "Federation syncer started (%d peers, interval %s)\n", len(peers), cfg.EffectiveInterval())
 	return syncer
 }
 

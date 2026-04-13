@@ -171,6 +171,16 @@ CLI: `noema verify` checks all trace file hashes against their frontmatter `cont
 
 The MCP server (`internal/mcp/server.go`) exposes the full Cortex surface: `get_instructions`, `list_traces`, `get_trace`, `create_trace`, `update_trace`, `append_trace`, `delete_trace`, `recover_trace`, `archive_trace`, `unarchive_trace`, `search_traces`, `trace_history`, `trace_lineage`, `resolve_divergence`, `cortex_identity`, `sync_events`, `federation_status`, and `announce_peer`. The `get_instructions` tool returns a live reference guide for the active Cortex; agents should call it first in any new session. `cortex_identity` returns the stable ULID + display name + manifest version and is called by federation peers on every sync to verify the remote endpoint still belongs to the cortex they paired with.
 
+### Hermes Memory Provider Plugin
+
+A Python plugin at `plugins/hermes/` implements the Hermes `MemoryProvider` ABC, letting any [Hermes](https://hermes-agent.nousresearch.com/) agent use a Noema Cortex as its memory backend. The plugin communicates with Noema via MCP (JSON-RPC 2.0 over stdio or HTTP) — it does not import any Go code.
+
+**Files:** `__init__.py` (NoemaMemoryProvider + register()), `transport.py` (StdioTransport, HttpTransport), `plugin.yaml` (metadata), `README.md` (setup).
+
+**Agent-facing tools:** `noema_search`, `noema_remember`, `noema_recall`, `noema_list`, `noema_update`, `noema_lineage` — mapped to `search_traces`, `create_trace`, `get_trace`, `list_traces`, `update_trace`, `trace_lineage` respectively.
+
+**Internal tools used:** `get_instructions` (system prompt), `cortex_identity` (connectivity check), `append_trace` (session log), `archive_trace` (session end).
+
 ### DB Schema Migrations
 
 Schema changes must always be transparent and non-destructive. Rules:
