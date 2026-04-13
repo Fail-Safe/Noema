@@ -1,0 +1,8 @@
+name: noema
+version: 0.1.0
+description: "Structured memory backed by a Noema Cortex — markdown traces with types, tags, lineage, and full-text search."
+hooks:
+  - sync_turn
+  - on_session_end
+  - on_pre_compress
+  - on_memory_write
