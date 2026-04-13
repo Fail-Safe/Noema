@@ -101,6 +101,33 @@ var ErrSourceLocked = errors.New("trace is source-locked")
 // denial of service via expensive wildcard or deeply nested expressions.
 const MaxSearchQueryLen = 1000
 
+// SanitizeFTS5Query quotes each whitespace-delimited token so that FTS5
+// treats hyphens, colons, and other operator characters as literals.
+// Tokens that are already quoted or use explicit FTS5 operators (AND, OR,
+// NOT, prefix*) are passed through unchanged to preserve power-user syntax.
+func SanitizeFTS5Query(q string) string {
+	tokens := strings.Fields(q)
+	if len(tokens) == 0 {
+		return q
+	}
+	out := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		switch {
+		case t == "AND" || t == "OR" || t == "NOT":
+			out = append(out, t)
+		case strings.HasPrefix(t, "\""):
+			out = append(out, t) // already quoted
+		case strings.HasSuffix(t, "*"):
+			out = append(out, t) // prefix search
+		case strings.ContainsAny(t, "-:"):
+			out = append(out, "\""+t+"\"")
+		default:
+			out = append(out, t)
+		}
+	}
+	return strings.Join(out, " ")
+}
+
 type Cortex struct {
 	ID              string // ULID, stable across renames; the federation identity key
 	Name            string // human-readable display label
@@ -694,11 +721,12 @@ func (c *Cortex) Search(query string, opts ListOptions) ([]Row, error) {
 	if len(query) > MaxSearchQueryLen {
 		return nil, fmt.Errorf("search query too long (%d chars, max %d)", len(query), MaxSearchQueryLen)
 	}
+	ftsQuery := SanitizeFTS5Query(query)
 	q := `
 		SELECT t.id, t.title, t.type, t.author, t.origin, t.archived_at, t.trashed_at, t.created_at, t.updated_at, t.content_hash, t.source_locked, t.source_hash
 		FROM traces t
 		WHERE t.id IN (SELECT id FROM traces_fts WHERE traces_fts MATCH ?)`
-	args := []any{query}
+	args := []any{ftsQuery}
 
 	switch {
 	case opts.Trashed:

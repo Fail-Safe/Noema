@@ -29,6 +29,8 @@ project_name: noema
 before:
   hooks:
     - go mod tidy
+    # Bundle the Hermes memory provider plugin as a release asset.
+    - tar -czf noema-hermes-plugin.tar.gz -C plugins hermes
 
 builds:
   - id: noema
@@ -119,6 +121,8 @@ release:
     until v1.0. Cortex data on disk is forward-compatible via
     non-destructive migrations; on-disk `cortex.md` version bumps that
     require a manual step ship with an explicit `noema migrate` command.**
+  extra_files:
+    - glob: ./noema-hermes-plugin.tar.gz
   footer: |
     ---
     **Install:** see [README — Installation](https://github.com/Fail-Safe/Noema#installation).
