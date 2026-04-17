@@ -116,7 +116,7 @@ func SanitizeFTS5Query(q string) string {
 		case t == "AND" || t == "OR" || t == "NOT":
 			out = append(out, t)
 		case strings.HasPrefix(t, "\""):
-			out = append(out, t) // already quoted
+			out = append(out, t) // already quoted (may be part of multi-token phrase)
 		case strings.HasSuffix(t, "*"):
 			out = append(out, t) // prefix search
 		case strings.ContainsAny(t, "-:"):
@@ -125,7 +125,18 @@ func SanitizeFTS5Query(q string) string {
 			out = append(out, t)
 		}
 	}
-	return strings.Join(out, " ")
+	result := strings.Join(out, " ")
+
+	// Safety net: if the result has an odd number of quote marks, the
+	// string has unbalanced quotes that would cause an FTS5 syntax
+	// error (and leak the raw query in the error message). Strip all
+	// quotes to fall back to default FTS5 tokenization. Legitimate
+	// quoted phrases always have matched pairs, so this only fires on
+	// malformed input.
+	if strings.Count(result, "\"")%2 != 0 {
+		result = strings.ReplaceAll(result, "\"", "")
+	}
+	return result
 }
 
 type Cortex struct {
@@ -2313,14 +2324,19 @@ func (c *Cortex) storeRemoteEvent(e event.Event) error {
 	return tx.Commit()
 }
 
-// MergeClock merges a remote vector clock into the local clock.
+// MergeClock merges a remote vector clock into the local clock. The
+// merge is capped at federation.MaxVClockEntries to prevent a malicious
+// peer from inflating the clock with synthetic cortex IDs.
 func (c *Cortex) MergeClock(remote federation.VClock) error {
 	state := federation.NewState(c.DB.DB)
 	local, err := state.GetClock()
 	if err != nil {
 		return err
 	}
-	merged := federation.Merge(local, remote)
+	merged, err := federation.MergeCapped(local, remote)
+	if err != nil {
+		return err
+	}
 	return state.SetClock(merged)
 }
 
