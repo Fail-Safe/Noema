@@ -453,25 +453,30 @@ Sync walks all three trace directories, upserts every file it finds into the
 database, and reports how many entries were added, updated, or are orphaned
 (in the database but missing on disk).
 
-## External Edits Are First-Class (under ` + "`noema serve --transport http`" + `)
+## External Edits Are First-Class (under any ` + "`noema serve`" + `)
 
-When a ` + "`noema serve --transport http`" + ` process is running on this cortex,
-a background watcher observes ` + "`traces/`" + `, ` + "`archive/traces/`" + `, and
-` + "`trash/traces/`" + `. External changes (Obsidian, VS Code, Finder drags,
-` + "`rm`" + `, etc.) are ingested as real mutation events — identical to what
-the MCP tools emit — so federation peers see them too. You get:
+Whenever a ` + "`noema serve`" + ` process is running on this cortex — under
+` + "`--transport stdio`" + ` OR ` + "`--transport http`" + ` — a background watcher
+observes ` + "`traces/`" + `, ` + "`archive/traces/`" + `, and ` + "`trash/traces/`" + `.
+External changes (Obsidian, VS Code, Finder drags, ` + "`rm`" + `, iCloud sync
+from another device, a second noema process on the same cortex) are
+ingested as real mutation events — identical to what the MCP tools emit.
+You get:
 
 - edit an .md file → ` + "`update`" + ` event
 - drop a new valid .md → ` + "`create`" + ` event
 - move between ` + "`traces/`" + `, ` + "`archive/traces/`" + `, ` + "`trash/traces/`" + ` → the matching archive/trash/recover event
 - delete a file outright → ` + "`trash`" + ` event; the body is restored to ` + "`trash/traces/`" + ` from the event log so ` + "`noema recover`" + ` still works
 
-Source-locked foreign traces are skipped (the watcher logs a warning rather
-than poisoning federation). Malformed frontmatter is skipped. The watcher is
-on by default; opt out with ` + "`watch: { enabled: false }`" + ` in ` + "`cortex.md`" + `.
-When no ` + "`noema serve --transport http`" + ` is running, external edits stay
-invisible until you run ` + "`noema sync`" + ` — but ` + "`sync`" + ` emits no events, so
-federation peers won't see them.
+Source-locked foreign traces are skipped (the watcher logs a warning
+rather than poisoning federation). Malformed frontmatter is skipped.
+The watcher is on by default; opt out with ` + "`watch: { enabled: false }`" + `
+in ` + "`cortex.md`" + `. Federation propagation still only happens under
+` + "`--transport http`" + ` (peers need a network endpoint), but external-edit
+events land in the local log during stdio sessions and flow outward the
+next time an HTTP serve runs. When no ` + "`noema serve`" + ` is running at
+all, external edits stay invisible until you run ` + "`noema sync`" + ` — but
+` + "`sync`" + ` emits no events, so federation peers won't see them.
 
 ## MCP Tools (if available)
 
