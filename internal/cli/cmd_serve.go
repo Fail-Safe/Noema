@@ -25,7 +25,7 @@ import (
 func serveCmd() *cobra.Command {
 	var (
 		transport         string
-		host              string
+		hosts             []string
 		port              int
 		tlsCert           string
 		tlsKey            string
@@ -40,13 +40,34 @@ func serveCmd() *cobra.Command {
 		Aliases: []string{"server"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if printConfig {
-				return runPrintMCPConfig(cmd.OutOrStdout(), transport, host, port, tlsCert, tlsKey)
+				return runPrintMCPConfig(cmd.OutOrStdout(), transport, hosts, port, tlsCert, tlsKey)
 			}
 			if printSystemdUnit {
-				return runPrintSystemdUnit(cmd.OutOrStdout(), transport, host, port, tlsCert, tlsKey)
+				return runPrintSystemdUnit(cmd.OutOrStdout(), transport, hosts, port, tlsCert, tlsKey)
 			}
 			if printLaunchdPlist {
-				return runPrintLaunchdPlist(cmd.OutOrStdout(), transport, host, port, tlsCert, tlsKey)
+				return runPrintLaunchdPlist(cmd.OutOrStdout(), transport, hosts, port, tlsCert, tlsKey)
+			}
+
+			// HTTP-only flags (--host/--port/--tls-cert/--tls-key) are
+			// meaningless in stdio mode, and silently ignoring them is
+			// exactly the footgun that eats operator time: you pass
+			// --host/--port expecting a listener, the process sits
+			// reading JSON-RPC from stdin, and netstat shows nothing.
+			// Check this BEFORE resolveCortex so the error fires even
+			// when the cortex is in some broken state — the flag mistake
+			// is independent of cortex health and diagnosing it first
+			// saves the operator from chasing the wrong problem.
+			if transport == "stdio" || transport == "" {
+				f := cmd.Flags()
+				if err := guardStdioFlags(
+					f.Changed("host"),
+					f.Changed("port"),
+					f.Changed("tls-cert"),
+					f.Changed("tls-key"),
+				); err != nil {
+					return err
+				}
 			}
 
 			cx, err := resolveCortex()
@@ -91,7 +112,7 @@ func serveCmd() *cobra.Command {
 						cortex.AccessKeyEnvVar, accessKey.Path)
 				}
 
-				if err := validateHTTPServe(host, tlsCert, tlsKey, cx.Name, cortexFlag != ""); err != nil {
+				if err := validateHTTPServe(hosts, tlsCert, tlsKey, cx.Name, cortexFlag != ""); err != nil {
 					return err
 				}
 				useTLS := tlsCert != "" && tlsKey != ""
@@ -125,13 +146,6 @@ func serveCmd() *cobra.Command {
 					fmt.Fprintf(os.Stderr, "[serve] access=open\n")
 				}
 
-				// IPv6 addresses need brackets in listen addresses.
-				hostForAddr := host
-				if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
-					hostForAddr = "[" + host + "]"
-				}
-				addr := fmt.Sprintf("%s:%d", hostForAddr, port)
-
 				// Build the MCP handler. No WithEndpointPath — our
 				// own mux routes /mcp. No WithTLSCert — we drive
 				// ListenAndServeTLS ourselves so the middleware chain
@@ -153,22 +167,47 @@ func serveCmd() *cobra.Command {
 				mux := http.NewServeMux()
 				mux.Handle("/mcp", wrapped)
 
-				httpSrv := &http.Server{
-					Addr:              addr,
-					Handler:           mux,
-					ReadHeaderTimeout: 30 * time.Second,
-					IdleTimeout:       120 * time.Second,
-				}
-
 				scheme := "http"
 				if useTLS {
 					scheme = "https"
 				}
-				fmt.Fprintf(os.Stderr, "Starting Streamable HTTP server on %s://%s/mcp\n", scheme, addr)
-				if useTLS {
-					err = httpSrv.ListenAndServeTLS(tlsCert, tlsKey)
-				} else {
-					err = httpSrv.ListenAndServe()
+
+				// Start one HTTP listener per --host address. All
+				// share the same mux (same auth, same handler). The
+				// first fatal error from any listener stops the
+				// process; remaining listeners are closed on the way
+				// out. This lets a single `noema serve` bind to both
+				// a private ring address and a LAN address.
+				var servers []*http.Server
+				for _, h := range hosts {
+					hostForAddr := h
+					if ip := net.ParseIP(h); ip != nil && ip.To4() == nil {
+						hostForAddr = "[" + h + "]"
+					}
+					addr := fmt.Sprintf("%s:%d", hostForAddr, port)
+					srv := &http.Server{
+						Addr:              addr,
+						Handler:           mux,
+						ReadHeaderTimeout: 30 * time.Second,
+						IdleTimeout:       120 * time.Second,
+					}
+					servers = append(servers, srv)
+					fmt.Fprintf(os.Stderr, "Starting Streamable HTTP server on %s://%s/mcp\n", scheme, addr)
+				}
+
+				errCh := make(chan error, len(servers))
+				for _, srv := range servers {
+					go func() {
+						if useTLS {
+							errCh <- srv.ListenAndServeTLS(tlsCert, tlsKey)
+						} else {
+							errCh <- srv.ListenAndServe()
+						}
+					}()
+				}
+				err = <-errCh
+				for _, srv := range servers {
+					srv.Close()
 				}
 			case "sse":
 				err = fmt.Errorf(
@@ -187,7 +226,7 @@ func serveCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&transport, "transport", "stdio", "transport: stdio or http (Streamable HTTP, MCP 2025-03-26)")
-	cmd.Flags().StringVar(&host, "host", "", "listen address for HTTP transport (required, e.g. 127.0.0.1 or LAN IP)")
+	cmd.Flags().StringArrayVar(&hosts, "host", nil, "listen address for HTTP transport (repeatable, e.g. --host 10.0.0.1 --host 192.168.1.1)")
 	cmd.Flags().IntVar(&port, "port", 3000, "port for HTTP transport")
 	cmd.Flags().StringVar(&tlsCert, "tls-cert", "", "path to TLS certificate file (enables HTTPS)")
 	cmd.Flags().StringVar(&tlsKey, "tls-key", "", "path to TLS private key file")
@@ -250,6 +289,50 @@ func requireTLSForKeyedMode(access cortex.AccessKey, useTLS bool) error {
 	)
 }
 
+// guardStdioFlags returns an error when any HTTP-only flag was explicitly
+// passed on the command line while transport is stdio. It exists because
+// the default transport is stdio, and an operator who forgets --transport
+// http will see their --host/--port/--tls-* flags silently ignored — the
+// process then sits reading JSON-RPC from stdin while netstat shows no
+// listener, which is a miserable diagnostic loop. Failing at startup
+// with the list of offending flags short-circuits that loop.
+//
+// Parameters are bools (cobra's Flags().Changed()) rather than the raw
+// values so the check is about *explicit operator intent*, not about
+// the flag values themselves: --port has a non-zero default (3000), so a
+// value check would fire on every stdio invocation. Only flags the user
+// actually typed count as a conflict.
+func guardStdioFlags(hostSet, portSet, tlsCertSet, tlsKeySet bool) error {
+	var flags []string
+	if hostSet {
+		flags = append(flags, "--host")
+	}
+	if portSet {
+		flags = append(flags, "--port")
+	}
+	if tlsCertSet {
+		flags = append(flags, "--tls-cert")
+	}
+	if tlsKeySet {
+		flags = append(flags, "--tls-key")
+	}
+	if len(flags) == 0 {
+		return nil
+	}
+	verb := "is"
+	if len(flags) > 1 {
+		verb = "are"
+	}
+	return fmt.Errorf(
+		"%s %s only meaningful with --transport http.\n"+
+			"  noema serve defaults to stdio, which reads JSON-RPC from stdin\n"+
+			"  and has no network endpoint to bind. Re-run with --transport http,\n"+
+			"  or remove the flag(s).",
+		strings.Join(flags, ", "),
+		verb,
+	)
+}
+
 // validateHTTPServe enforces the flag invariants for `noema serve --transport
 // http`. It is split out from RunE so the explicit-cortex requirement (the
 // most common federation footgun) can be unit-tested without standing up an
@@ -264,25 +347,31 @@ func requireTLSForKeyedMode(access cortex.AccessKey, useTLS bool) error {
 // specific identity. The peer-side handshake catches the resulting mismatch
 // but only logs the failure on the OTHER host, which is the diagnostic
 // asymmetry this guard exists to prevent.
-func validateHTTPServe(host, tlsCert, tlsKey, cortexName string, cortexExplicit bool) error {
-	if host == "" {
+func validateHTTPServe(hosts []string, tlsCert, tlsKey, cortexName string, cortexExplicit bool) error {
+	if len(hosts) == 0 {
 		return fmt.Errorf("--host is required for HTTP transport (e.g. --host 10.0.0.1 or --host 127.0.0.1)")
 	}
-	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
-		return fmt.Errorf("binding to %s is not allowed — it may expose your cortex to the network.\n  Use an explicit address: --host 127.0.0.1 (local only) or --host <your-lan-ip> (federation)", host)
+	for _, host := range hosts {
+		if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+			return fmt.Errorf("binding to %s is not allowed — it may expose your cortex to the network.\n  Use an explicit address: --host 127.0.0.1 (local only) or --host <your-lan-ip> (federation)", host)
+		}
 	}
 	if (tlsCert == "") != (tlsKey == "") {
 		return fmt.Errorf("--tls-cert and --tls-key must be provided together")
 	}
 	if !cortexExplicit {
+		var hostFlags string
+		for _, h := range hosts {
+			hostFlags += " --host " + h
+		}
 		return fmt.Errorf(
 			"refusing to start HTTP server on cortex %q without an explicit --cortex flag.\n"+
 				"  The HTTP transport exposes this cortex's event stream to the network.\n"+
 				"  Inheriting the cortex from NOEMA_CORTEX or the config default makes it\n"+
 				"  easy to bind the wrong one — and on a host where peers are pinned to a\n"+
 				"  specific identity, that produces silent failures on the peer side.\n"+
-				"  Re-run with: noema serve --cortex %s --transport http --host %s",
-			cortexName, cortexName, host,
+				"  Re-run with: noema serve --cortex %s --transport http%s",
+			cortexName, cortexName, hostFlags,
 		)
 	}
 	return nil
@@ -293,10 +382,10 @@ func validateHTTPServe(host, tlsCert, tlsKey, cortexName string, cortexExplicit 
 // truth for --print-systemd-unit and --print-launchd-plist so both emit
 // identical arguments, and so the unit/plist reflects every flag the
 // operator actually passed on the command line that generated it.
-func buildServeArgs(cortexName, transport, host string, port int, tlsCert, tlsKey string) []string {
+func buildServeArgs(cortexName, transport string, hosts []string, port int, tlsCert, tlsKey string) []string {
 	args := []string{"serve", "--cortex", cortexName, "--transport", transport}
-	if host != "" {
-		args = append(args, "--host", host)
+	for _, h := range hosts {
+		args = append(args, "--host", h)
 	}
 	if port != 0 {
 		args = append(args, "--port", fmt.Sprintf("%d", port))
@@ -317,14 +406,14 @@ func buildServeArgs(cortexName, transport, host string, port int, tlsCert, tlsKe
 // service environment anyway. All HTTP flag invariants are validated via
 // validateHTTPServe so a broken config is caught at preview time rather
 // than on first `systemctl start`.
-func runPrintSystemdUnit(out io.Writer, transport, host string, port int, tlsCert, tlsKey string) error {
+func runPrintSystemdUnit(out io.Writer, transport string, hosts []string, port int, tlsCert, tlsKey string) error {
 	if cortexFlag == "" {
 		return fmt.Errorf("--print-systemd-unit requires an explicit --cortex flag (the unit file pins one cortex to supervise)")
 	}
 	if transport != "http" {
 		return fmt.Errorf("--print-systemd-unit requires --transport http (stdio has no network endpoint to supervise)")
 	}
-	if err := validateHTTPServe(host, tlsCert, tlsKey, cortexFlag, true); err != nil {
+	if err := validateHTTPServe(hosts, tlsCert, tlsKey, cortexFlag, true); err != nil {
 		return err
 	}
 
@@ -341,7 +430,7 @@ func runPrintSystemdUnit(out io.Writer, transport, host string, port int, tlsCer
 		Cortex:    cortexFlag,
 		User:      u.Username,
 		Exe:       exe,
-		ServeArgs: buildServeArgs(cortexFlag, transport, host, port, tlsCert, tlsKey),
+		ServeArgs: buildServeArgs(cortexFlag, transport, hosts, port, tlsCert, tlsKey),
 	})
 	_, err = io.WriteString(out, unit)
 	return err
@@ -359,14 +448,14 @@ func runPrintSystemdUnit(out io.Writer, transport, host string, port int, tlsCer
 // that trip that rule. Writing instructions to stderr keeps the plist
 // well-formed while still showing operators the install steps when they
 // run the command interactively.
-func runPrintLaunchdPlist(out io.Writer, transport, host string, port int, tlsCert, tlsKey string) error {
+func runPrintLaunchdPlist(out io.Writer, transport string, hosts []string, port int, tlsCert, tlsKey string) error {
 	if cortexFlag == "" {
 		return fmt.Errorf("--print-launchd-plist requires an explicit --cortex flag (the plist pins one cortex to supervise)")
 	}
 	if transport != "http" {
 		return fmt.Errorf("--print-launchd-plist requires --transport http (stdio has no network endpoint to supervise)")
 	}
-	if err := validateHTTPServe(host, tlsCert, tlsKey, cortexFlag, true); err != nil {
+	if err := validateHTTPServe(hosts, tlsCert, tlsKey, cortexFlag, true); err != nil {
 		return err
 	}
 
@@ -379,7 +468,7 @@ func runPrintLaunchdPlist(out io.Writer, transport, host string, port int, tlsCe
 		return fmt.Errorf("resolving user home dir: %w", err)
 	}
 
-	serveArgs := buildServeArgs(cortexFlag, transport, host, port, tlsCert, tlsKey)
+	serveArgs := buildServeArgs(cortexFlag, transport, hosts, port, tlsCert, tlsKey)
 	label := "com.fail-safe.noema." + cortexFlag
 
 	// Install hint to stderr so `--print-launchd-plist > foo.plist`
@@ -589,7 +678,7 @@ func xmlEscape(s string) string {
 // http --host 10.0.0.1 ...` invocation produces the exact config a
 // remote client would need, including the URL scheme that matches the
 // --tls-cert/--tls-key pair.
-func runPrintMCPConfig(out io.Writer, transport, host string, port int, tlsCert, tlsKey string) error {
+func runPrintMCPConfig(out io.Writer, transport string, hosts []string, port int, tlsCert, tlsKey string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("resolving executable path: %w", err)
@@ -618,9 +707,13 @@ func runPrintMCPConfig(out io.Writer, transport, host string, port int, tlsCert,
 		// the .mcp.json snippet is emitted for a client that's talking
 		// TO a server, not launching one, so there's no network-
 		// exposure risk in printing an http config without --cortex.
-		if host == "" {
+		if len(hosts) == 0 {
 			return fmt.Errorf("--print-config --transport http requires --host (the address a client will dial, e.g. 10.0.0.1 or my.lan)")
 		}
+		// Use the first host for the client URL. When multiple hosts
+		// are configured (e.g. a TB ring + LAN), the client config
+		// points at whichever the operator listed first.
+		host := hosts[0]
 		if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
 			return fmt.Errorf("--host %s is a wildcard bind address; pass the address clients should dial instead", host)
 		}
