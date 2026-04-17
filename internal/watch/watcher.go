@@ -1,10 +1,13 @@
 // Package watch turns external edits to trace files (Obsidian, VS Code,
-// Finder drags, etc.) into first-class mutation events. It runs as a
-// goroutine under `noema serve --transport http`, alongside the federation
-// syncer, watching the cortex's traces/, archive/traces/, and trash/traces/
-// directories with fsnotify and dispatching to existing Cortex mutation
-// methods so events, vector clocks, and the SQL write path are shared with
-// MCP-initiated mutations.
+// Finder drags, iCloud sync, etc.) into first-class mutation events. It
+// runs as a goroutine under `noema serve` on both the stdio and http
+// transports, watching the cortex's traces/, archive/traces/, and
+// trash/traces/ directories with fsnotify and dispatching to existing
+// Cortex mutation methods so events, vector clocks, and the SQL write
+// path are shared with MCP-initiated mutations. Federation propagation
+// is still HTTP-only (peers need a network endpoint), but external-edit
+// events land in the local log under stdio too and flow outward the next
+// time an HTTP serve runs on this cortex.
 package watch
 
 import (
