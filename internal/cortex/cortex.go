@@ -35,6 +35,7 @@ type Manifest struct {
 	Version    int               `yaml:"version"`
 	Access     *AccessConfig     `yaml:"access,omitempty"`
 	Federation *FederationConfig `yaml:"federation,omitempty"`
+	Watch      *WatchConfig      `yaml:"watch,omitempty"`
 }
 
 // AccessConfig holds MCP endpoint authentication settings for cortex.md.
@@ -91,6 +92,38 @@ func (pe PeerEntry) EffectiveMode() string {
 		return PeerModeSync
 	}
 	return pe.Mode
+}
+
+// WatchConfig controls the filesystem watcher that turns external edits to
+// trace files (Obsidian, VS Code, Finder, etc.) into first-class mutation
+// events. When unset, the watcher is enabled by default during
+// `noema serve --transport http`.
+type WatchConfig struct {
+	// Enabled is a pointer so an omitted field means "default on."
+	// Explicitly setting `enabled: false` disables the watcher.
+	Enabled *bool `yaml:"enabled,omitempty"`
+	// DebounceMs is the per-path debounce window in milliseconds.
+	// Zero means use the default (300ms).
+	DebounceMs int `yaml:"debounce_ms,omitempty"`
+}
+
+// WatchEnabled reports whether the watcher should run given the parsed
+// manifest value. Nil manifest or nil Enabled pointer both mean "on."
+func (wc *WatchConfig) WatchEnabled() bool {
+	if wc == nil || wc.Enabled == nil {
+		return true
+	}
+	return *wc.Enabled
+}
+
+// EffectiveDebounce returns the configured debounce duration, defaulting
+// to 300ms when unset.
+func (wc *WatchConfig) EffectiveDebounce() time.Duration {
+	const defaultDebounce = 300 * time.Millisecond
+	if wc == nil || wc.DebounceMs <= 0 {
+		return defaultDebounce
+	}
+	return time.Duration(wc.DebounceMs) * time.Millisecond
 }
 
 // ErrSourceLocked is returned when a mutation is attempted on a
@@ -419,6 +452,26 @@ noema sync
 Sync walks all three trace directories, upserts every file it finds into the
 database, and reports how many entries were added, updated, or are orphaned
 (in the database but missing on disk).
+
+## External Edits Are First-Class (under ` + "`noema serve --transport http`" + `)
+
+When a ` + "`noema serve --transport http`" + ` process is running on this cortex,
+a background watcher observes ` + "`traces/`" + `, ` + "`archive/traces/`" + `, and
+` + "`trash/traces/`" + `. External changes (Obsidian, VS Code, Finder drags,
+` + "`rm`" + `, etc.) are ingested as real mutation events — identical to what
+the MCP tools emit — so federation peers see them too. You get:
+
+- edit an .md file → ` + "`update`" + ` event
+- drop a new valid .md → ` + "`create`" + ` event
+- move between ` + "`traces/`" + `, ` + "`archive/traces/`" + `, ` + "`trash/traces/`" + ` → the matching archive/trash/recover event
+- delete a file outright → ` + "`trash`" + ` event; the body is restored to ` + "`trash/traces/`" + ` from the event log so ` + "`noema recover`" + ` still works
+
+Source-locked foreign traces are skipped (the watcher logs a warning rather
+than poisoning federation). Malformed frontmatter is skipped. The watcher is
+on by default; opt out with ` + "`watch: { enabled: false }`" + ` in ` + "`cortex.md`" + `.
+When no ` + "`noema serve --transport http`" + ` is running, external edits stay
+invisible until you run ` + "`noema sync`" + ` — but ` + "`sync`" + ` emits no events, so
+federation peers won't see them.
 
 ## MCP Tools (if available)
 
@@ -984,6 +1037,240 @@ func (c *Cortex) Unarchive(id string) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// MarkArchivedNoMove updates the DB to mark a trace as archived and emits
+// an ActionArchive event — without moving any files. The filesystem watcher
+// uses this when an external tool (e.g. Finder drag) has already moved the
+// file from traces/ to archive/traces/. Returns nil if the trace is already
+// archived (idempotent). Errors if the trace is in the trash.
+func (c *Cortex) MarkArchivedNoMove(id string) error {
+	r, err := c.Get(id)
+	if err != nil {
+		return err
+	}
+	if r.TrashedAt != "" {
+		return fmt.Errorf("trace %s is in trash — recover it first", id)
+	}
+	if r.ArchivedAt != "" {
+		return nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE traces SET archived_at = ? WHERE id = ?`, now, id); err != nil {
+		return err
+	}
+	if err := c.emitEvent(tx, event.ActionArchive, id, now, nil); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// MarkUnarchivedNoMove clears archived_at and emits ActionUnarchive without
+// moving the file. Used by the watcher when a file reappears in traces/
+// after being in archive/traces/. Idempotent if already unarchived.
+func (c *Cortex) MarkUnarchivedNoMove(id string) error {
+	r, err := c.Get(id)
+	if err != nil {
+		return err
+	}
+	if r.ArchivedAt == "" {
+		return nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE traces SET archived_at = NULL WHERE id = ?`, id); err != nil {
+		return err
+	}
+	if err := c.emitEvent(tx, event.ActionUnarchive, id, now, nil); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// MarkTrashedNoMove stamps trashed_at and emits ActionTrash without moving
+// the file. Used when the watcher sees a file appear in trash/traces/ via
+// an external move. Clears archived_at to match existing Trash semantics.
+// Idempotent if already trashed.
+func (c *Cortex) MarkTrashedNoMove(id string) error {
+	if err := c.CheckSourceLock(id); err != nil {
+		return err
+	}
+	r, err := c.Get(id)
+	if err != nil {
+		return err
+	}
+	if r.TrashedAt != "" {
+		return nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE traces SET trashed_at = ?, archived_at = NULL WHERE id = ?`, now, id); err != nil {
+		return err
+	}
+	if err := c.emitEvent(tx, event.ActionTrash, id, now, nil); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// MarkRecoveredNoMove clears trashed_at and emits ActionRecover without
+// moving the file. Used when the watcher sees a trashed trace's file
+// reappear in traces/ or archive/traces/.
+func (c *Cortex) MarkRecoveredNoMove(id string) error {
+	r, err := c.Get(id)
+	if err != nil {
+		return err
+	}
+	if r.TrashedAt == "" {
+		return nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE traces SET trashed_at = NULL WHERE id = ?`, id); err != nil {
+		return err
+	}
+	if err := c.emitEvent(tx, event.ActionRecover, id, now, nil); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// IngestExternalDelete handles the case where a trace file vanishes from
+// traces/ or archive/traces/ entirely (user deleted via Finder or rm).
+// Restores the last known body from the local event log into
+// trash/traces/<id>.md so the delete is recoverable, then stamps trashed_at
+// and emits ActionTrash. When no event snapshot exists (pre-event-log
+// traces), skips the restore and emits the event anyway with an empty body
+// so federation peers still see the state transition.
+//
+// Source-locked foreign traces are refused with ErrSourceLocked — the
+// watcher must skip rather than poison downstream peers with a tamper.
+func (c *Cortex) IngestExternalDelete(id string) error {
+	if err := c.CheckSourceLock(id); err != nil {
+		return err
+	}
+	r, err := c.Get(id)
+	if err != nil {
+		return err
+	}
+	if r.TrashedAt != "" {
+		return nil
+	}
+	// Best-effort: restore body from the event log so the delete stays
+	// recoverable. If there's no snapshot, skip the file restore — the
+	// state transition still gets an event so federation is consistent.
+	if _, err := c.restoreBodyToTrash(id, r); err != nil {
+		return fmt.Errorf("restoring deleted trace body to trash: %w", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE traces SET trashed_at = ?, archived_at = NULL WHERE id = ?`, now, id); err != nil {
+		return err
+	}
+	if err := c.emitEvent(tx, event.ActionTrash, id, now, nil); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ApplyExternalPurge handles the case where a trace file vanishes from
+// trash/traces/ — the user emptied Noema's trash via the filesystem.
+// Deletes the DB row and emits ActionPurge. This is the only path outside
+// the age-based Purge() that permanently removes a trace through the event
+// log, so federation peers see it too.
+func (c *Cortex) ApplyExternalPurge(id string) error {
+	r, err := c.Get(id)
+	if err != nil {
+		return err
+	}
+	if r.TrashedAt == "" {
+		return fmt.Errorf("trace %s is not in trash — refusing to purge", id)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM traces WHERE id = ?`, id); err != nil {
+		return err
+	}
+	if err := c.emitEvent(tx, event.ActionPurge, id, now, nil); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// restoreBodyToTrash reads the last create/update event for a trace and
+// writes the snapshot to trash/traces/<id>.md. Returns (true, nil) on a
+// successful write, (false, nil) when there's no snapshot to restore, and
+// (false, err) on a real I/O or parse failure. Used by IngestExternalDelete.
+func (c *Cortex) restoreBodyToTrash(id string, r *Row) (bool, error) {
+	events, err := event.ForTrace(c.DB.DB, id)
+	if err != nil {
+		return false, err
+	}
+	last := lastMutationEvent(events)
+	if last == nil || len(last.Data) == 0 {
+		return false, nil
+	}
+	var data struct {
+		Title        string   `json:"title"`
+		Type         string   `json:"type"`
+		Author       string   `json:"author"`
+		Tags         []string `json:"tags"`
+		DerivedFrom  []string `json:"derived_from"`
+		Origin       string   `json:"origin"`
+		Body         string   `json:"body"`
+		ContentHash  string   `json:"content_hash"`
+		SourceHash   string   `json:"source_hash"`
+		SourceLocked bool     `json:"source_locked"`
+	}
+	if err := json.Unmarshal(last.Data, &data); err != nil {
+		return false, fmt.Errorf("parsing event snapshot: %w", err)
+	}
+	t := &trace.Trace{
+		Frontmatter: trace.Frontmatter{
+			ID:           id,
+			Title:        data.Title,
+			Type:         data.Type,
+			Author:       data.Author,
+			Tags:         data.Tags,
+			DerivedFrom:  data.DerivedFrom,
+			Origin:       data.Origin,
+			Created:      r.CreatedAt,
+			Updated:      last.Timestamp,
+			ContentHash:  data.ContentHash,
+			SourceHash:   data.SourceHash,
+			SourceLocked: data.SourceLocked,
+		},
+		Body: data.Body,
+	}
+	if err := t.Write(c.TrashFile(id)); err != nil {
+		return false, fmt.Errorf("writing recovered body: %w", err)
+	}
+	return true, nil
 }
 
 // Update rewrites an existing trace's DB row and FTS entry from its (potentially
