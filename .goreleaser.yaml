@@ -71,7 +71,7 @@ archives:
       - goos: windows
         formats:
           - zip
-    # Only repo-root docs. AGENT.md is generated per-cortex by
+    # Only repo-root docs. AGENTS.md is generated per-cortex by
     # `noema init` at runtime, so it does not exist at build time.
     files:
       - LICENSE

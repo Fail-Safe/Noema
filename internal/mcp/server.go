@@ -687,13 +687,16 @@ Choose the type that best reflects the intent of the memory:
   get_trace id                   → full content including body, origin, lineage
   create_trace title type body [author] [tags] [derived_from] [origin] [source_locked] [source_hash]
                                  → create a new trace; tags/derived_from = comma-separated.
-                                   Do NOT include a date in the title — the ID
-                                   generator prepends today's date automatically,
-                                   and leading YYYYMMDD- or YYYY-MM-DD- prefixes
-                                   in the title are stripped to prevent doubled IDs
-                                   like 20260402-20260402-foo. If a trace is *about*
-                                   a specific date, put that information in the body
-                                   or in a tag (e.g. tags=event-2026-04-02) instead
+                                   Aim for short descriptive titles (under 80 chars); the ID
+                                   slug is capped at 100 chars and longer titles are silently
+                                   truncated. Do NOT include a date in the title — the ID
+                                   generator prepends today's date automatically, and leading
+                                   YYYYMMDD- or YYYY-MM-DD- prefixes in the title are stripped
+                                   to prevent doubled IDs like 20260402-20260402-foo. Avoid
+                                   mid-title dates too (e.g. "session 20260416 142000") —
+                                   only leading prefixes are stripped, so mid-title date
+                                   fragments survive. If a trace is *about* a specific date,
+                                   put it in a tag (e.g. tags=event-2026-04-02) or the body
   update_trace id [title] [type] [author] [tags] [derived_from] [body]
                                  → update any subset of fields
   append_trace id content        → append content to an existing trace's body
