@@ -21,7 +21,7 @@ func TestValidateHTTPServe(t *testing.T) {
 
 	cases := []struct {
 		name           string
-		host           string
+		hosts          []string
 		tlsCert        string
 		tlsKey         string
 		cortexExplicit bool
@@ -29,44 +29,44 @@ func TestValidateHTTPServe(t *testing.T) {
 	}{
 		{
 			name:           "happy path no TLS",
-			host:           "127.0.0.1",
+			hosts:          []string{"127.0.0.1"},
 			cortexExplicit: true,
 		},
 		{
 			name:           "happy path with TLS",
-			host:           "ai-1.example.com",
+			hosts:          []string{"ai-1.example.com"},
 			tlsCert:        "/etc/ssl/cert.pem",
 			tlsKey:         "/etc/ssl/key.pem",
 			cortexExplicit: true,
 		},
 		{
 			name:           "missing host",
-			host:           "",
+			hosts:          nil,
 			cortexExplicit: true,
 			wantErrSubstr:  "--host is required for HTTP transport",
 		},
 		{
 			name:           "0.0.0.0 unspecified IPv4",
-			host:           "0.0.0.0",
+			hosts:          []string{"0.0.0.0"},
 			cortexExplicit: true,
 			wantErrSubstr:  "binding to 0.0.0.0 is not allowed",
 		},
 		{
 			name:           "IPv6 unspecified",
-			host:           "::",
+			hosts:          []string{"::"},
 			cortexExplicit: true,
 			wantErrSubstr:  "is not allowed",
 		},
 		{
 			name:           "TLS cert without key",
-			host:           "127.0.0.1",
+			hosts:          []string{"127.0.0.1"},
 			tlsCert:        "/etc/ssl/cert.pem",
 			cortexExplicit: true,
 			wantErrSubstr:  "--tls-cert and --tls-key must be provided together",
 		},
 		{
 			name:           "TLS key without cert",
-			host:           "127.0.0.1",
+			hosts:          []string{"127.0.0.1"},
 			tlsKey:         "/etc/ssl/key.pem",
 			cortexExplicit: true,
 			wantErrSubstr:  "--tls-cert and --tls-key must be provided together",
@@ -77,7 +77,7 @@ func TestValidateHTTPServe(t *testing.T) {
 			// TLS look fine, the implicit binding is a federation
 			// footgun and must be rejected.
 			name:           "implicit cortex on HTTP",
-			host:           "ai-1.example.com",
+			hosts:          []string{"ai-1.example.com"},
 			tlsCert:        "/etc/ssl/cert.pem",
 			tlsKey:         "/etc/ssl/key.pem",
 			cortexExplicit: false,
@@ -90,15 +90,29 @@ func TestValidateHTTPServe(t *testing.T) {
 			// find a different identity. The guard must fire regardless
 			// of the bound cortex's federation config.
 			name:           "implicit cortex on HTTP includes cortex name in error",
-			host:           "ai-1-tb.home-dns.com",
+			hosts:          []string{"ai-1-tb.home-dns.com"},
 			cortexExplicit: false,
 			wantErrSubstr:  "\"ai-1\"",
+		},
+		{
+			// Multi-host: all hosts must be valid. The second host is
+			// a wildcard that should be rejected even though the first
+			// host is fine.
+			name:           "multi-host rejects wildcard in any position",
+			hosts:          []string{"10.0.0.1", "0.0.0.0"},
+			cortexExplicit: true,
+			wantErrSubstr:  "binding to 0.0.0.0 is not allowed",
+		},
+		{
+			name:           "multi-host happy path",
+			hosts:          []string{"10.0.0.1", "192.168.45.3"},
+			cortexExplicit: true,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateHTTPServe(tc.host, tc.tlsCert, tc.tlsKey, cortexName, tc.cortexExplicit)
+			err := validateHTTPServe(tc.hosts, tc.tlsCert, tc.tlsKey, cortexName, tc.cortexExplicit)
 			if tc.wantErrSubstr == "" {
 				if err != nil {
 					t.Fatalf("expected nil, got: %v", err)
@@ -110,6 +124,85 @@ func TestValidateHTTPServe(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tc.wantErrSubstr) {
 				t.Errorf("error %q does not contain %q", err.Error(), tc.wantErrSubstr)
+			}
+		})
+	}
+}
+
+// --------- guardStdioFlags ---------
+
+// TestGuardStdioFlags pins the footgun short-circuit: an operator who
+// forgets --transport http and passes HTTP-only flags should hit a loud
+// error at startup rather than a silent stdio process that swallows
+// stdin forever. The guard keys off cobra's Flags().Changed() — i.e.
+// *explicit* flag presence — so default-valued --port=3000 is not a
+// conflict on its own.
+func TestGuardStdioFlags(t *testing.T) {
+	cases := []struct {
+		name                                         string
+		hostSet, portSet, tlsCertSet, tlsKeySet bool
+		wantErrSubstrs                               []string // empty = expect nil
+	}{
+		{
+			name: "nothing set — fine",
+		},
+		{
+			name:           "only --host set",
+			hostSet:        true,
+			wantErrSubstrs: []string{"--host", "is only meaningful", "--transport http"},
+		},
+		{
+			name:           "only --port set",
+			portSet:        true,
+			wantErrSubstrs: []string{"--port", "is only meaningful", "--transport http"},
+		},
+		{
+			name:           "only --tls-cert set",
+			tlsCertSet:     true,
+			wantErrSubstrs: []string{"--tls-cert", "is only meaningful", "--transport http"},
+		},
+		{
+			name:           "only --tls-key set",
+			tlsKeySet:      true,
+			wantErrSubstrs: []string{"--tls-key", "is only meaningful", "--transport http"},
+		},
+		{
+			// Plural flip: when two or more flags conflict, the error
+			// says "are only meaningful" not "is only meaningful".
+			// Trivial, but a user-facing grammar bug reads as sloppy.
+			name:           "multiple flags — plural verb",
+			hostSet:        true,
+			portSet:        true,
+			wantErrSubstrs: []string{"--host, --port", "are only meaningful"},
+		},
+		{
+			// All four flags. The error must list them all so the
+			// operator can see the full conflict in one shot.
+			name:           "all four flags",
+			hostSet:        true,
+			portSet:        true,
+			tlsCertSet:     true,
+			tlsKeySet:      true,
+			wantErrSubstrs: []string{"--host", "--port", "--tls-cert", "--tls-key", "are only meaningful"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := guardStdioFlags(tc.hostSet, tc.portSet, tc.tlsCertSet, tc.tlsKeySet)
+			if len(tc.wantErrSubstrs) == 0 {
+				if err != nil {
+					t.Fatalf("expected nil, got: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			for _, want := range tc.wantErrSubstrs {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not contain %q", err.Error(), want)
+				}
 			}
 		})
 	}
@@ -127,14 +220,14 @@ func TestBuildServeArgs_OmitsEmptyOptionals(t *testing.T) {
 	// should NOT appear; callers using the real serve command always
 	// have port=3000 by default, but the print functions can be called
 	// with arbitrary values and must not emit --port 0.
-	got := buildServeArgs("agentbrain", "http", "", 0, "", "")
+	got := buildServeArgs("agentbrain", "http", nil, 0, "", "")
 	want := []string{"serve", "--cortex", "agentbrain", "--transport", "http"}
 	if !equalSlices(got, want) {
 		t.Errorf("minimal args: got %v, want %v", got, want)
 	}
 
-	// Full: every optional flag set.
-	got = buildServeArgs("agentbrain", "http", "10.0.0.5", 3000, "/etc/ssl/cert.pem", "/etc/ssl/key.pem")
+	// Full: every optional flag set, single host.
+	got = buildServeArgs("agentbrain", "http", []string{"10.0.0.5"}, 3000, "/etc/ssl/cert.pem", "/etc/ssl/key.pem")
 	want = []string{
 		"serve", "--cortex", "agentbrain", "--transport", "http",
 		"--host", "10.0.0.5",
@@ -143,7 +236,19 @@ func TestBuildServeArgs_OmitsEmptyOptionals(t *testing.T) {
 		"--tls-key", "/etc/ssl/key.pem",
 	}
 	if !equalSlices(got, want) {
-		t.Errorf("full args: got %v, want %v", got, want)
+		t.Errorf("full args (single host): got %v, want %v", got, want)
+	}
+
+	// Multi-host: each host gets its own --host flag.
+	got = buildServeArgs("agentbrain", "http", []string{"10.0.0.5", "192.168.45.3"}, 3000, "", "")
+	want = []string{
+		"serve", "--cortex", "agentbrain", "--transport", "http",
+		"--host", "10.0.0.5",
+		"--host", "192.168.45.3",
+		"--port", "3000",
+	}
+	if !equalSlices(got, want) {
+		t.Errorf("multi-host args: got %v, want %v", got, want)
 	}
 }
 
@@ -356,7 +461,7 @@ func TestRunPrintSystemdUnit_RejectsMissingCortex(t *testing.T) {
 	t.Cleanup(func() { cortexFlag = prev })
 
 	var out bytes.Buffer
-	err := runPrintSystemdUnit(&out, "http", "127.0.0.1", 3000, "", "")
+	err := runPrintSystemdUnit(&out, "http", []string{"127.0.0.1"}, 3000, "", "")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -377,7 +482,7 @@ func TestRunPrintSystemdUnit_RejectsStdioTransport(t *testing.T) {
 	t.Cleanup(func() { cortexFlag = prev })
 
 	var out bytes.Buffer
-	err := runPrintSystemdUnit(&out, "stdio", "", 0, "", "")
+	err := runPrintSystemdUnit(&out, "stdio", nil, 0, "", "")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -396,7 +501,7 @@ func TestRunPrintSystemdUnit_PropagatesHTTPValidationErrors(t *testing.T) {
 	t.Cleanup(func() { cortexFlag = prev })
 
 	var out bytes.Buffer
-	err := runPrintSystemdUnit(&out, "http", "0.0.0.0", 3000, "", "")
+	err := runPrintSystemdUnit(&out, "http", []string{"0.0.0.0"}, 3000, "", "")
 	if err == nil {
 		t.Fatal("expected error on 0.0.0.0 bind, got nil")
 	}
@@ -417,7 +522,7 @@ func TestRunPrintSystemdUnit_HappyPath(t *testing.T) {
 	t.Cleanup(func() { cortexFlag = prev })
 
 	var out bytes.Buffer
-	if err := runPrintSystemdUnit(&out, "http", "127.0.0.1", 3000, "", ""); err != nil {
+	if err := runPrintSystemdUnit(&out, "http", []string{"127.0.0.1"}, 3000, "", ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	s := out.String()
@@ -437,7 +542,7 @@ func TestRunPrintLaunchdPlist_RejectsMissingCortex(t *testing.T) {
 	t.Cleanup(func() { cortexFlag = prev })
 
 	var out bytes.Buffer
-	err := runPrintLaunchdPlist(&out, "http", "127.0.0.1", 3000, "", "")
+	err := runPrintLaunchdPlist(&out, "http", []string{"127.0.0.1"}, 3000, "", "")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -454,7 +559,7 @@ func TestRunPrintLaunchdPlist_RejectsStdioTransport(t *testing.T) {
 	t.Cleanup(func() { cortexFlag = prev })
 
 	var out bytes.Buffer
-	err := runPrintLaunchdPlist(&out, "stdio", "", 0, "", "")
+	err := runPrintLaunchdPlist(&out, "stdio", nil, 0, "", "")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -472,7 +577,7 @@ func TestRunPrintLaunchdPlist_HappyPath(t *testing.T) {
 	t.Cleanup(func() { cortexFlag = prev })
 
 	var out bytes.Buffer
-	if err := runPrintLaunchdPlist(&out, "http", "127.0.0.1", 3000, "", ""); err != nil {
+	if err := runPrintLaunchdPlist(&out, "http", []string{"127.0.0.1"}, 3000, "", ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	s := out.String()
@@ -684,7 +789,7 @@ func TestRunPrintMCPConfig_StdioShape(t *testing.T) {
 	t.Cleanup(func() { cortexFlag = prev })
 
 	var buf bytes.Buffer
-	if err := runPrintMCPConfig(&buf, "stdio", "", 0, "", ""); err != nil {
+	if err := runPrintMCPConfig(&buf, "stdio", nil, 0, "", ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -734,7 +839,7 @@ func TestRunPrintMCPConfig_StdioShape(t *testing.T) {
 // without leaking the key.
 func TestRunPrintMCPConfig_HTTPShape(t *testing.T) {
 	var buf bytes.Buffer
-	if err := runPrintMCPConfig(&buf, "http", "10.0.0.1", 3443, "/tls.crt", "/tls.key"); err != nil {
+	if err := runPrintMCPConfig(&buf, "http", []string{"10.0.0.1"}, 3443, "/tls.crt", "/tls.key"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -774,7 +879,7 @@ func TestRunPrintMCPConfig_HTTPShape(t *testing.T) {
 // request would fail on TLS handshake before the 401 even runs.
 func TestRunPrintMCPConfig_HTTPNoTLS(t *testing.T) {
 	var buf bytes.Buffer
-	if err := runPrintMCPConfig(&buf, "http", "127.0.0.1", 3000, "", ""); err != nil {
+	if err := runPrintMCPConfig(&buf, "http", []string{"127.0.0.1"}, 3000, "", ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !strings.Contains(buf.String(), "http://127.0.0.1:3000/mcp") {
@@ -790,7 +895,7 @@ func TestRunPrintMCPConfig_HTTPNoTLS(t *testing.T) {
 // would silently produce a ":3000/mcp" URL that's meaningless.
 func TestRunPrintMCPConfig_HTTPRejectsMissingHost(t *testing.T) {
 	var buf bytes.Buffer
-	err := runPrintMCPConfig(&buf, "http", "", 3000, "", "")
+	err := runPrintMCPConfig(&buf, "http", nil, 3000, "", "")
 	if err == nil {
 		t.Fatal("expected error for http without --host, got nil")
 	}
@@ -806,7 +911,7 @@ func TestRunPrintMCPConfig_HTTPRejectsMissingHost(t *testing.T) {
 // args into --print-config doesn't get a useless config file.
 func TestRunPrintMCPConfig_HTTPRejectsWildcardHost(t *testing.T) {
 	var buf bytes.Buffer
-	err := runPrintMCPConfig(&buf, "http", "0.0.0.0", 3000, "", "")
+	err := runPrintMCPConfig(&buf, "http", []string{"0.0.0.0"}, 3000, "", "")
 	if err == nil {
 		t.Fatal("expected error for 0.0.0.0 host, got nil")
 	}
@@ -817,7 +922,7 @@ func TestRunPrintMCPConfig_HTTPRejectsWildcardHost(t *testing.T) {
 // url.Parse rejects, so MCP clients would fail at config load.
 func TestRunPrintMCPConfig_HTTPIPv6Brackets(t *testing.T) {
 	var buf bytes.Buffer
-	if err := runPrintMCPConfig(&buf, "http", "fe80::1", 3000, "", ""); err != nil {
+	if err := runPrintMCPConfig(&buf, "http", []string{"fe80::1"}, 3000, "", ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !strings.Contains(buf.String(), "http://[fe80::1]:3000/mcp") {
@@ -833,7 +938,7 @@ func TestRunPrintMCPConfig_HTTPIPv6Brackets(t *testing.T) {
 // --cortex" error would be technically correct but would put the operator
 // right back in the same diagnostic loop the guard exists to short-circuit.
 func TestValidateHTTPServe_ImplicitCortexErrorMessage(t *testing.T) {
-	err := validateHTTPServe("ai-1.example.com", "", "", "ai-1", false)
+	err := validateHTTPServe([]string{"ai-1.example.com"}, "", "", "ai-1", false)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
