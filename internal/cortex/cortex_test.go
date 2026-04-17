@@ -138,6 +138,113 @@ func TestOpen_RemovesLegacyAgentMD(t *testing.T) {
 	}
 }
 
+// TestOpen_RemovesLegacyAgentMD_WhenBothExist covers the mixed state that
+// occurs when an older Noema wrote AGENT.md, then a newer Noema wrote
+// AGENTS.md alongside it without cleaning up the legacy name. Both files
+// end up on disk; Open must drop the legacy one so there's a single
+// source of truth for agent tooling.
+func TestOpen_RemovesLegacyAgentMD_WhenBothExist(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := cortex.Create("mixed", dir); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	root := filepath.Join(dir, "mixed")
+	// Put a stale AGENT.md on disk alongside the generated AGENTS.md.
+	if err := os.WriteFile(filepath.Join(root, "AGENT.md"), []byte("stale legacy content\n"), 0o640); err != nil {
+		t.Fatalf("write legacy: %v", err)
+	}
+
+	cx, err := cortex.Open("mixed", root)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	cx.Close()
+
+	if _, err := os.Stat(filepath.Join(root, "AGENTS.md")); err != nil {
+		t.Error("AGENTS.md must still exist after Open")
+	}
+	if _, err := os.Stat(filepath.Join(root, "AGENT.md")); !os.IsNotExist(err) {
+		t.Error("legacy AGENT.md must be removed even when AGENTS.md is present")
+	}
+}
+
+// TestOpen_RefreshesStaleAgentsMD verifies that an AGENTS.md whose content
+// has drifted from the current template (e.g. a cortex created under an
+// older binary whose template predated a feature) is rewritten on Open so
+// the operator doesn't have to manually delete the file to pick up the
+// new template.
+func TestOpen_RefreshesStaleAgentsMD(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := cortex.Create("stale", dir); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	root := filepath.Join(dir, "stale")
+	staleContent := "# this was written by an older noema and no longer matches the template\n"
+	agentsPath := filepath.Join(root, "AGENTS.md")
+	if err := os.WriteFile(agentsPath, []byte(staleContent), 0o640); err != nil {
+		t.Fatalf("write stale: %v", err)
+	}
+
+	cx, err := cortex.Open("stale", root)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	cx.Close()
+
+	got, err := os.ReadFile(agentsPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(got) == staleContent {
+		t.Error("AGENTS.md must be refreshed when content has drifted from the current template")
+	}
+	// Sanity: refreshed content should contain current-template markers.
+	for _, marker := range []string{"Noema Cortex — Agent Guide", "Trace Types", "Titles"} {
+		if !strings.Contains(string(got), marker) {
+			t.Errorf("refreshed AGENTS.md missing expected marker %q", marker)
+		}
+	}
+}
+
+// TestOpen_PreservesAgentsMDWhenMatching verifies that a cortex whose
+// AGENTS.md already matches the current template is left untouched — the
+// mtime must not advance on an idempotent open, because cortex
+// directories live on iCloud/Dropbox/Syncthing and a phantom mtime bump
+// would trigger unnecessary sync traffic.
+func TestOpen_PreservesAgentsMDWhenMatching(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := cortex.Create("fresh", dir); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	root := filepath.Join(dir, "fresh")
+	agentsPath := filepath.Join(root, "AGENTS.md")
+
+	before, err := os.Stat(agentsPath)
+	if err != nil {
+		t.Fatalf("stat before: %v", err)
+	}
+
+	// Some filesystems quantize mtime to 1s; wait past that so a real
+	// write would produce a distinct timestamp.
+	time.Sleep(1100 * time.Millisecond)
+
+	cx, err := cortex.Open("fresh", root)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	cx.Close()
+
+	after, err := os.Stat(agentsPath)
+	if err != nil {
+		t.Fatalf("stat after: %v", err)
+	}
+
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Errorf("AGENTS.md mtime changed (%s -> %s) despite matching template — drift-aware write is broken",
+			before.ModTime(), after.ModTime())
+	}
+}
+
 func TestReadManifest(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := cortex.Create("manifested", dir); err != nil {

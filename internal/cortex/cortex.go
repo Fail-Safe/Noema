@@ -573,15 +573,26 @@ func Open(name, dir string) (*Cortex, error) {
 	}
 	_ = cx.Purge(days)
 
-	// Write AGENTS.md if it doesn't exist. Covers both fresh cortexes created
-	// before this file existed and cortexes being upgraded from the older
-	// AGENT.md naming — we silently remove any legacy AGENT.md in that case so
-	// the directory matches the current agents.md convention.
-	agentsMDPath := filepath.Join(dir, "AGENTS.md")
-	if _, err := os.Stat(agentsMDPath); os.IsNotExist(err) {
-		if mErr == nil {
-			_ = os.WriteFile(agentsMDPath, []byte(agentsMDContent(m)), 0o640)
-			_ = os.Remove(filepath.Join(dir, "AGENT.md"))
+	// Refresh the per-cortex agent-instructions file on every Open so
+	// existing cortexes pick up template changes (new sections, renamed
+	// commands, etc.) without the operator having to delete the file
+	// first. The file's header documents it as auto-generated.
+	//
+	// The write is drift-aware: we only overwrite when the on-disk
+	// content diverges from the current template. That keeps the mtime
+	// stable under iCloud/Dropbox/Syncthing so a noop open doesn't cause
+	// a sync ripple.
+	//
+	// Any legacy AGENT.md (singular, pre-#27 naming) is removed
+	// unconditionally — regardless of whether AGENTS.md also exists —
+	// so mixed states from partial upgrades clean themselves up.
+	_ = os.Remove(filepath.Join(dir, "AGENT.md"))
+	if mErr == nil {
+		agentsMDPath := filepath.Join(dir, "AGENTS.md")
+		want := agentsMDContent(m)
+		existing, _ := os.ReadFile(agentsMDPath)
+		if string(existing) != want {
+			_ = os.WriteFile(agentsMDPath, []byte(want), 0o640)
 		}
 	}
 
