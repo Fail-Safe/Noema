@@ -61,6 +61,25 @@ func encodeRandom(buf []byte, rnd [10]byte) {
 	}
 }
 
+// IsValidULID reports whether s is a well-formed 26-character Crockford
+// base32 ULID. It does not check whether the timestamp or random portion
+// is semantically valid — only the length and character set.
+func IsValidULID(s string) bool {
+	if len(s) != 26 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'A' || c > 'Z') {
+			return false
+		}
+		// Crockford base32 excludes I, L, O, U.
+		if c == 'I' || c == 'L' || c == 'O' || c == 'U' {
+			return false
+		}
+	}
+	return true
+}
+
 func incrementRnd() {
 	for i := 9; i >= 0; i-- {
 		lastRnd[i]++

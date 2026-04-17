@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/Fail-Safe/Noema/internal/cortex"
+	"github.com/Fail-Safe/Noema/internal/event"
 	"github.com/Fail-Safe/Noema/internal/federation"
 	"github.com/Fail-Safe/Noema/internal/trace"
 )
@@ -447,6 +449,10 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 				"this cortex is in subscribe mode and does not serve events"), nil
 		}
 		since := req.GetString("since", "")
+		if since != "" && !event.IsValidULID(since) {
+			return mcp.NewToolResultError(
+				"since must be a valid ULID cursor (26-char Crockford base32)"), nil
+		}
 		limit := req.GetInt("limit", 100)
 		if limit <= 0 || limit > 1000 {
 			limit = 100
@@ -567,6 +573,16 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 		endpoint, err := req.RequireString("endpoint")
 		if err != nil {
 			return nil, err
+		}
+
+		// Validate that the endpoint is a reachable HTTP(S) URL.
+		// Accepting arbitrary schemes (file://, javascript:, etc.)
+		// risks confusion if the value is later copy-pasted into
+		// federation config or rendered in status output.
+		u, parseErr := url.ParseRequestURI(endpoint)
+		if parseErr != nil || (u.Scheme != "http" && u.Scheme != "https") {
+			return mcp.NewToolResultError(
+				"endpoint must be a valid http:// or https:// URL"), nil
 		}
 
 		m, err := cortex.ReadManifest(cx.Dir)
