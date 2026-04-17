@@ -151,6 +151,12 @@ noema search "sqlite"
 noema get 20260329-we-chose-go
 ```
 
+> `noema init` also writes an `AGENTS.md` at the cortex root — the
+> [agents.md](https://agents.md/) convention that Codex, Cursor, Aider, Zed,
+> Copilot, and most other coding-agent tooling pick up automatically. Any
+> agent pointed at the directory will find a complete reference for the
+> Trace format and the MCP tools without any additional onboarding.
+
 ---
 
 ## CLI Reference
@@ -591,6 +597,8 @@ iteration. We can revisit Rust if the MCP server demands higher concurrency.
 ```
 
 `derived_from` records which traces informed this one (used by `trace_lineage` to build a knowledge graph). `origin` is the name of the Cortex that created the trace — set automatically and used by federation to attribute remote traces. Both fields are optional; existing traces without them parse unchanged.
+
+**Trace IDs and titles.** The ID is `YYYYMMDD-<slug>` — today's date prepended to a slugified title. The slug portion is capped at 100 characters (longer titles are silently truncated); aim for titles under 80 characters for scannability. Don't include the date in the title — `noema` prepends today's date automatically, and leading `YYYYMMDD-` / `YYYY-MM-DD-` prefixes in the title are stripped to prevent doubled-date IDs. Mid-title date fragments aren't stripped, so put date context in a tag (`tags: [event-2026-04-02]`) or the body instead of the title.
 
 **Cortex layout on disk:**
 
