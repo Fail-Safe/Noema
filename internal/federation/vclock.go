@@ -1,5 +1,15 @@
 package federation
 
+import "fmt"
+
+// MaxVClockEntries caps the number of distinct cortex IDs in a merged
+// vector clock. A legitimate federation ring rarely exceeds a handful of
+// peers; a clock with hundreds of entries is a strong signal of a clock
+// inflation attack (a malicious peer injecting synthetic cortex IDs into
+// its event payloads). The cap prevents unbounded growth of the
+// federation_state row that is serialized on every mutation.
+const MaxVClockEntries = 256
+
 // VClock is a vector clock: one counter per known peer.
 type VClock map[string]uint64
 
@@ -29,6 +39,20 @@ func Merge(a, b VClock) VClock {
 		}
 	}
 	return result
+}
+
+// MergeCapped is like Merge but returns an error when the merged clock
+// would exceed MaxVClockEntries. Use this on the federation ingest path
+// to prevent a malicious peer from inflating the local clock with
+// synthetic cortex IDs.
+func MergeCapped(a, b VClock) (VClock, error) {
+	merged := Merge(a, b)
+	if len(merged) > MaxVClockEntries {
+		return nil, fmt.Errorf(
+			"vector clock too large (%d entries, max %d): possible clock inflation attack",
+			len(merged), MaxVClockEntries)
+	}
+	return merged, nil
 }
 
 // Compare returns the causal relationship between two clocks:

@@ -1,6 +1,10 @@
 package federation
 
-import "testing"
+import (
+	"fmt"
+	"strings"
+	"testing"
+)
 
 func TestVClock_Increment(t *testing.T) {
 	vc := VClock{"a": 5, "b": 3}
@@ -41,6 +45,34 @@ func TestMerge_DisjointKeys(t *testing.T) {
 	m := Merge(a, b)
 	if m["a"] != 5 || m["b"] != 3 {
 		t.Errorf("Merge = %v, want {a:5, b:3}", m)
+	}
+}
+
+func TestMergeCapped_UnderLimit(t *testing.T) {
+	a := VClock{"a": 1, "b": 2}
+	b := VClock{"c": 3}
+	merged, err := MergeCapped(a, b)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(merged) != 3 {
+		t.Errorf("len = %d, want 3", len(merged))
+	}
+}
+
+func TestMergeCapped_OverLimit(t *testing.T) {
+	a := make(VClock, MaxVClockEntries)
+	for i := range MaxVClockEntries {
+		a[fmt.Sprintf("peer-%d", i)] = uint64(i)
+	}
+	// b adds one more distinct key, pushing past the cap.
+	b := VClock{"attacker-injected": 1}
+	_, err := MergeCapped(a, b)
+	if err == nil {
+		t.Fatal("expected error for oversized clock, got nil")
+	}
+	if !strings.Contains(err.Error(), "too large") {
+		t.Errorf("error %q does not mention 'too large'", err.Error())
 	}
 }
 
