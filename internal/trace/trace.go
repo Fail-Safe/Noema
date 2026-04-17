@@ -20,8 +20,16 @@ import (
 var ErrInvalidTraceID = errors.New("invalid trace ID")
 
 // validTraceID matches the format produced by NewID: 8 digits, a hyphen,
-// then 1–65 characters of lowercase alphanumerics and hyphens.
-var validTraceID = regexp.MustCompile(`^[0-9]{8}-[a-z0-9][a-z0-9-]{0,64}$`)
+// then 1–100 characters of lowercase alphanumerics and hyphens. Pre-existing
+// traces produced under the old 65-char cap remain valid — the regex is
+// strictly a superset of the old pattern.
+var validTraceID = regexp.MustCompile(`^[0-9]{8}-[a-z0-9][a-z0-9-]{0,99}$`)
+
+// MaxSlugLen is the maximum length of the slug portion of a trace ID
+// (the part after YYYYMMDD-). NewID truncates longer slugs. AGENTS.md
+// documents this so agents can aim for short titles rather than
+// discovering silent truncation after the fact.
+const MaxSlugLen = 100
 
 // IsValidID reports whether id is a well-formed trace ID safe for use in
 // filesystem paths. It rejects any ID containing path separators, dot
@@ -148,8 +156,8 @@ func (t *Trace) Write(path string) error {
 func NewID(title string) string {
 	date := time.Now().UTC().Format("20060102")
 	s := stripLeadingDatePrefix(slug(title))
-	if len(s) > 60 {
-		s = strings.TrimRight(s[:60], "-")
+	if len(s) > MaxSlugLen {
+		s = strings.TrimRight(s[:MaxSlugLen], "-")
 	}
 	return date + "-" + s
 }

@@ -139,11 +139,12 @@ func TestNewID_Format(t *testing.T) {
 }
 
 func TestNewID_Truncation(t *testing.T) {
-	longTitle := strings.Repeat("a", 120)
+	longTitle := strings.Repeat("a", 200)
 	id := trace.NewID(longTitle)
-	// max: 8 (date) + 1 (-) + 60 (slug) = 69 chars
-	if len(id) > 69 {
-		t.Errorf("ID length = %d, want <= 69", len(id))
+	// max: 8 (date) + 1 (-) + MaxSlugLen (slug) = 109 chars at MaxSlugLen=100
+	maxLen := 8 + 1 + trace.MaxSlugLen
+	if len(id) > maxLen {
+		t.Errorf("ID length = %d, want <= %d", len(id), maxLen)
 	}
 	if strings.HasSuffix(id, "-") {
 		t.Error("ID must not end with a hyphen after truncation")
@@ -295,7 +296,7 @@ func TestIsValidID(t *testing.T) {
 		"20260329-UPPERCASE",
 		"20260329-hello world",
 		"2026032-short-date",
-		"20260329-" + strings.Repeat("a", 66), // exceeds max slug length
+		"20260329-" + strings.Repeat("a", trace.MaxSlugLen+1), // exceeds max slug length
 	}
 	for _, id := range invalid {
 		if trace.IsValidID(id) {

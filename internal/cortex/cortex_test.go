@@ -49,21 +49,21 @@ func TestCreate_DirectoryLayout(t *testing.T) {
 			t.Errorf("%q is not a directory", sub)
 		}
 	}
-	for _, file := range []string{"cortex.md", "AGENT.md", filepath.Join("db", "noema.db")} {
+	for _, file := range []string{"cortex.md", "AGENTS.md", filepath.Join("db", "noema.db")} {
 		if _, err := os.Stat(filepath.Join(root, file)); err != nil {
 			t.Errorf("%s missing: %v", file, err)
 		}
 	}
 }
 
-func TestCreate_AgentMDContent(t *testing.T) {
+func TestCreate_AgentsMDContent(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := cortex.Create("myagent", dir); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	data, err := os.ReadFile(filepath.Join(dir, "myagent", "AGENT.md"))
+	data, err := os.ReadFile(filepath.Join(dir, "myagent", "AGENTS.md"))
 	if err != nil {
-		t.Fatalf("AGENT.md missing: %v", err)
+		t.Fatalf("AGENTS.md missing: %v", err)
 	}
 	content := string(data)
 	for _, want := range []string{
@@ -78,22 +78,24 @@ func TestCreate_AgentMDContent(t *testing.T) {
 		"origin",
 		"trace_history",
 		"trace_lineage",
+		"Titles",      // new naming-rules section
+		"under 80",    // title length guidance
+		"100 character", // slug cap guidance
 	} {
 		if !strings.Contains(content, want) {
-			t.Errorf("AGENT.md missing expected content %q", want)
+			t.Errorf("AGENTS.md missing expected content %q", want)
 		}
 	}
 }
 
-func TestOpen_GeneratesAgentMDIfMissing(t *testing.T) {
+func TestOpen_GeneratesAgentsMDIfMissing(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := cortex.Create("legacy", dir); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	// Simulate a cortex created before AGENT.md was introduced.
-	agentMDPath := filepath.Join(dir, "legacy", "AGENT.md")
-	if err := os.Remove(agentMDPath); err != nil {
-		t.Fatalf("Remove AGENT.md: %v", err)
+	agentsMDPath := filepath.Join(dir, "legacy", "AGENTS.md")
+	if err := os.Remove(agentsMDPath); err != nil {
+		t.Fatalf("Remove AGENTS.md: %v", err)
 	}
 
 	cx, err := cortex.Open("legacy", filepath.Join(dir, "legacy"))
@@ -102,8 +104,37 @@ func TestOpen_GeneratesAgentMDIfMissing(t *testing.T) {
 	}
 	cx.Close()
 
-	if _, err := os.Stat(agentMDPath); err != nil {
-		t.Error("Open must regenerate AGENT.md when it is missing")
+	if _, err := os.Stat(agentsMDPath); err != nil {
+		t.Error("Open must regenerate AGENTS.md when it is missing")
+	}
+}
+
+// TestOpen_RemovesLegacyAgentMD verifies that a cortex upgraded from the
+// older AGENT.md naming has the legacy file removed when AGENTS.md is
+// regenerated. The agents.md convention is one-file-per-cortex; leaving
+// AGENT.md around would create a dangling stale copy after upgrade.
+func TestOpen_RemovesLegacyAgentMD(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := cortex.Create("legacy", dir); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	root := filepath.Join(dir, "legacy")
+	// Simulate the legacy state: AGENT.md exists, AGENTS.md does not.
+	if err := os.Rename(filepath.Join(root, "AGENTS.md"), filepath.Join(root, "AGENT.md")); err != nil {
+		t.Fatalf("rename to legacy: %v", err)
+	}
+
+	cx, err := cortex.Open("legacy", root)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	cx.Close()
+
+	if _, err := os.Stat(filepath.Join(root, "AGENTS.md")); err != nil {
+		t.Error("AGENTS.md must be generated on upgrade")
+	}
+	if _, err := os.Stat(filepath.Join(root, "AGENT.md")); !os.IsNotExist(err) {
+		t.Error("legacy AGENT.md must be removed on upgrade")
 	}
 }
 
@@ -746,7 +777,7 @@ func TestSync_RecoverRebuildsFromEventLog(t *testing.T) {
 func TestSync_ReconcilesArchivedByAgent(t *testing.T) {
 	cx := setup(t)
 
-	// Agent writes a file directly into archive/traces/ (e.g. after reading AGENT.md).
+	// Agent writes a file directly into archive/traces/ (e.g. after reading AGENTS.md).
 	tr := trace.New("Agent archived", "note", "", nil, "Body.")
 	if err := tr.Write(cx.TraceFile(tr.ID, true)); err != nil {
 		t.Fatalf("Write to archive: %v", err)
