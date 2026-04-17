@@ -84,19 +84,37 @@ func serveCmd() *cobra.Command {
 			// not just the human-readable name.
 			fmt.Fprintf(os.Stderr, "[serve] cortex %q (id=%s) at %s\n", cx.Name, cx.ID, cx.Dir)
 
+			// Read the manifest once up front. The HTTP branch needs it
+			// for access-key resolution, federation config, and mode
+			// gating; both branches need it for the filesystem watcher
+			// config. A missing/unreadable manifest is fatal for HTTP
+			// (access posture and federation depend on it) but tolerable
+			// for stdio — an older cortex without a manifest can still
+			// serve stdio, it just won't get a watcher.
+			m, manifestErr := cortex.ReadManifest(cx.Dir)
+
 			var syncer *federation.Syncer
 			var watcher *watch.Watcher
+
+			// Filesystem watcher: on by default so external edits
+			// (Obsidian, VS Code, Finder, iCloud sync, another agent on
+			// the same cortex) emit real mutation events. Runs under
+			// BOTH stdio and http — a stdio serve is not always the
+			// only mutator (the user may be editing in Obsidian while
+			// Claude Code uses stdio; iCloud may be delivering deltas
+			// from another device; another noema process may be writing
+			// via HTTP). Opt out with `watch: { enabled: false }` in
+			// cortex.md.
+			if manifestErr == nil && m.Watch.WatchEnabled() {
+				watcher = startWatcher(cx, m.Watch)
+			}
+
 			switch transport {
 			case "stdio", "":
 				// Stdio is local — no federation guards on tool access.
 				s := mcpserver.NewServer(cx, version(), "")
 				err = mcpgo.ServeStdio(s)
 			case "http":
-				// Read the manifest BEFORE validateHTTPServe so the
-				// access-key resolution and the keyed-TLS check below
-				// share the same view of cortex.md with everything
-				// downstream (syncer, middleware).
-				m, manifestErr := cortex.ReadManifest(cx.Dir)
 				if manifestErr != nil {
 					return fmt.Errorf("reading cortex.md: %w", manifestErr)
 				}
@@ -133,17 +151,6 @@ func serveCmd() *cobra.Command {
 					syncer = startSyncer(cx, accessKey.Value, m.Federation)
 				}
 				fmt.Fprintf(os.Stderr, "[serve] federation mode: %s\n", fedMode)
-
-				// Filesystem watcher: on by default so external edits
-				// (Obsidian, VS Code, Finder) emit proper mutation
-				// events and propagate to federation peers. Opt out via
-				// `watch: { enabled: false }` in cortex.md. Gated to
-				// HTTP transport to match the federation syncer — stdio
-				// serve sessions are short-lived and typically the
-				// mutator themselves.
-				if m.Watch.WatchEnabled() {
-					watcher = startWatcher(cx, m.Watch)
-				}
 
 				// HTTP transport: apply federation mode guards.
 				s := mcpserver.NewServer(cx, version(), fedMode)
