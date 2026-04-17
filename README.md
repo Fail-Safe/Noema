@@ -16,6 +16,14 @@
 
 Noema gives AI agents — and the humans working alongside them — a persistent, structured place to record what they know, decide, observe, and intend. Every memory is a plain markdown file. The index is a local SQLite database. Nothing lives in the cloud; nothing requires an API key.
 
+**In short:**
+
+- **Local-first agent memory** exposed as an [MCP](https://modelcontextprotocol.io/) server (stdio + Streamable HTTP). Works out of the box with Claude Code, GitHub Copilot, Zed, Cursor, Aider, and anything else that speaks MCP.
+- **Plain markdown on disk** as the source of truth; a local SQLite database with FTS5 as the index. No cloud, no API keys, no telemetry.
+- **Peer-to-peer federation** across Cortexes with vector clocks, event-log audit trail, and `divergence` traces on concurrent edits.
+- **Your editor is a first-class client.** A filesystem watcher turns Obsidian / VS Code / Finder / iCloud edits into real mutation events — same events as MCP-initiated writes, propagated through federation.
+- **Standards-friendly.** Ships an auto-generated [`AGENTS.md`](https://agents.md/) per Cortex, a native [Hermes](https://hermes-agent.nousresearch.com/) memory-provider plugin, and SHA-256 content hashing with optional source-locking for publishers.
+
 ---
 
 ## Concepts
