@@ -18,7 +18,6 @@ import json
 import logging
 import os
 import threading
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -30,7 +29,12 @@ except ImportError:
     class MemoryProvider:  # type: ignore[no-redef]
         pass
 
-from .transport import StdioTransport, HttpTransport, find_binary, reset_binary_cache
+from .transport import (
+    HttpTransport,
+    StdioTransport,
+    find_binary,
+    reset_binary_cache as reset_binary_cache,
+)
 
 logger = logging.getLogger(__name__)
 
