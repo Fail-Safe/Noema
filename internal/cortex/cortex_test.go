@@ -463,6 +463,11 @@ func TestSanitizeFTS5Query(t *testing.T) {
 		{"\"already quoted\"", "\"already quoted\""},
 		{"", ""},
 		{"no-hyphens-here AND plain", "\"no-hyphens-here\" AND plain"},
+		// Unbalanced quotes: stripped to prevent FTS5 syntax errors.
+		// Odd quote count → all quotes removed → safe default tokenization.
+		{"\"unterminated", "unterminated"},
+		{"\"injected) UNION SELECT --", "injected) UNION SELECT --"},
+		{"\"has\"embedded\"quotes", "hasembeddedquotes"},
 	}
 	for _, tt := range tests {
 		got := cortex.SanitizeFTS5Query(tt.input)

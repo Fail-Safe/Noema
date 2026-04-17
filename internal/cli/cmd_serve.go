@@ -188,7 +188,9 @@ func serveCmd() *cobra.Command {
 					srv := &http.Server{
 						Addr:              addr,
 						Handler:           mux,
+						ReadTimeout:       60 * time.Second,
 						ReadHeaderTimeout: 30 * time.Second,
+						WriteTimeout:      120 * time.Second,
 						IdleTimeout:       120 * time.Second,
 					}
 					servers = append(servers, srv)
