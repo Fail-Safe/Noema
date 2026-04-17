@@ -2,10 +2,6 @@
 
 import json
 import os
-import stat
-import tempfile
-import threading
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -160,9 +156,9 @@ class TestFindBinary:
         # After reset, with no PATH or override, should return None
         # (assuming shutil.which won't find it in tmp_path).
         with patch("plugins.hermes.transport.shutil.which", return_value=None):
-            result = find_binary()
-            # May find it in well-known locations; just verify cache was reset.
-            # The important thing is no exception.
+            # May find it in well-known locations; just verify cache was reset
+            # and the call completes without exception.
+            find_binary()
 
 
 # ---------------------------------------------------------------------------

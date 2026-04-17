@@ -7,7 +7,6 @@ Skip with: pytest -m "not integration"
 """
 
 import json
-import os
 import shutil
 import subprocess
 import tempfile
