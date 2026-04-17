@@ -19,6 +19,7 @@ import (
 	"github.com/Fail-Safe/Noema/internal/cortex"
 	"github.com/Fail-Safe/Noema/internal/federation"
 	mcpserver "github.com/Fail-Safe/Noema/internal/mcp"
+	"github.com/Fail-Safe/Noema/internal/watch"
 	mcpgo "github.com/mark3labs/mcp-go/server"
 )
 
@@ -84,6 +85,7 @@ func serveCmd() *cobra.Command {
 			fmt.Fprintf(os.Stderr, "[serve] cortex %q (id=%s) at %s\n", cx.Name, cx.ID, cx.Dir)
 
 			var syncer *federation.Syncer
+			var watcher *watch.Watcher
 			switch transport {
 			case "stdio", "":
 				// Stdio is local — no federation guards on tool access.
@@ -131,6 +133,17 @@ func serveCmd() *cobra.Command {
 					syncer = startSyncer(cx, accessKey.Value, m.Federation)
 				}
 				fmt.Fprintf(os.Stderr, "[serve] federation mode: %s\n", fedMode)
+
+				// Filesystem watcher: on by default so external edits
+				// (Obsidian, VS Code, Finder) emit proper mutation
+				// events and propagate to federation peers. Opt out via
+				// `watch: { enabled: false }` in cortex.md. Gated to
+				// HTTP transport to match the federation syncer — stdio
+				// serve sessions are short-lived and typically the
+				// mutator themselves.
+				if m.Watch.WatchEnabled() {
+					watcher = startWatcher(cx, m.Watch)
+				}
 
 				// HTTP transport: apply federation mode guards.
 				s := mcpserver.NewServer(cx, version(), fedMode)
@@ -223,6 +236,9 @@ func serveCmd() *cobra.Command {
 			if syncer != nil {
 				syncer.Stop()
 			}
+			if watcher != nil {
+				watcher.Stop()
+			}
 			return err
 		},
 	}
@@ -236,6 +252,22 @@ func serveCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&printSystemdUnit, "print-systemd-unit", false, "print a systemd service unit for this serve command and exit")
 	cmd.Flags().BoolVar(&printLaunchdPlist, "print-launchd-plist", false, "print a launchd LaunchAgent plist for this serve command and exit")
 	return cmd
+}
+
+// startWatcher constructs and starts a filesystem watcher for the bound
+// cortex. Returns nil (and logs a warning) on construction failure so a
+// flaky fsnotify init doesn't take down the whole serve process.
+func startWatcher(cx *cortex.Cortex, cfg *cortex.WatchConfig) *watch.Watcher {
+	w, err := watch.New(cx, cfg)
+	if err != nil {
+		fmt.Printf("[watch] failed to construct: %v (serving without watcher)\n", err)
+		return nil
+	}
+	if err := w.Start(); err != nil {
+		fmt.Printf("[watch] start failed: %v (serving without watcher)\n", err)
+		return nil
+	}
+	return w
 }
 
 // startSyncer converts the manifest's federation config into a running
