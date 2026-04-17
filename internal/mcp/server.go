@@ -793,6 +793,30 @@ consumers can detect drift.
 
 get_trace shows Source Locked, Source Hash, and Content Hash fields when present.
 
+## External Filesystem Edits
+When noema runs under --transport http, a background watcher observes the
+traces/, archive/traces/, and trash/traces/ directories. External changes
+(Obsidian, VS Code, Finder drags, rm, etc.) are treated as first-class
+mutations:
+
+  edit a trace's .md file      → update event, federation-propagated
+  drop a new valid .md in      → create event (frontmatter must be complete)
+  move traces/ → archive/      → archive event
+  move archive/ → traces/      → unarchive event
+  move to trash/               → trash event
+  move out of trash/           → recover event
+  delete from traces/          → trash event; body is restored to trash/
+                                 from the event log so recover_trace works
+  delete from trash/           → purge event; trace is permanently removed
+
+Source-locked foreign traces are refused on external edit (watcher logs a
+warning and skips). Malformed frontmatter is skipped with a warning —
+drop-in files must carry a valid id, title, type, created, updated.
+
+The watcher is on by default; opt out by setting watch.enabled=false in
+cortex.md. A short per-path debounce (default 300ms) collapses editor
+save bursts into a single event.
+
 ## Tips
 - Prefer specific types over "note" — it helps retrieval and reasoning later.
 - Use tags to group related traces across types.
