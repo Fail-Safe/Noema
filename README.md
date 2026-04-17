@@ -416,7 +416,7 @@ Either way you still need `--tls-cert`/`--tls-key` on the serve command that gen
 
 ### External edits as first-class mutations
 
-When `noema serve --transport http` is running on a cortex, a background watcher observes the `traces/`, `archive/traces/`, and `trash/traces/` directories and turns external filesystem changes into real mutation events. Edit a trace in Obsidian, drop a new `.md` into `traces/`, drag a file to the archive directory in Finder, or `rm` one from the terminal — Noema ingests the change, writes an event to the log, and propagates it to federation peers. Deletes are restored to `trash/traces/` from the last event snapshot so `noema recover` still works.
+Whenever `noema serve` is running on a cortex (under **either** `--transport stdio` or `--transport http`), a background watcher observes the `traces/`, `archive/traces/`, and `trash/traces/` directories and turns external filesystem changes into real mutation events. Edit a trace in Obsidian, drop a new `.md` into `traces/`, drag a file to the archive directory in Finder, or `rm` one from the terminal — Noema ingests the change, writes an event to the log, and (under HTTP) propagates it to federation peers. Deletes are restored to `trash/traces/` from the last event snapshot so `noema recover` still works.
 
 ```yaml
 # cortex.md
@@ -427,7 +427,7 @@ watch:
 
 Loopback is prevented by content hash comparison: when the watcher sees a write, it hashes the body and compares to the DB's `content_hash` — matches are skipped, so Noema's own writes don't trigger duplicate events. Source-locked foreign traces are refused on external edit and logged (the watcher will not silently circumvent a publisher's authority). Malformed drop-in files (missing frontmatter, invalid id) are skipped with a warning.
 
-The watcher only runs under `--transport http` — stdio sessions are typically the mutator themselves, so a watcher there would be noise. Without a running `serve` process, external edits still sit on disk safely, but stay invisible to the DB until `noema sync` (which, by design, emits no events — federation peers won't see those edits).
+The watcher runs under both transports because stdio sessions are not always the only mutator — the user may be editing in Obsidian while Claude Code holds a stdio connection, iCloud may deliver deltas from another device, or another noema process may be writing over HTTP on the same cortex. Federation propagation still only happens under `--transport http` (peers need a network endpoint), but external-edit events land in the local log and flow outward the next time an HTTP serve is running. Without any running `serve` process, external edits sit on disk safely, but stay invisible to the DB until `noema sync` (which, by design, emits no events — federation peers won't see those edits).
 
 ---
 

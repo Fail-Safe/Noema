@@ -794,12 +794,13 @@ consumers can detect drift.
 get_trace shows Source Locked, Source Hash, and Content Hash fields when present.
 
 ## External Filesystem Edits
-When noema runs under --transport http, a background watcher observes the
-traces/, archive/traces/, and trash/traces/ directories. External changes
-(Obsidian, VS Code, Finder drags, rm, etc.) are treated as first-class
-mutations:
+Whenever noema serve is running (stdio OR http), a background watcher
+observes the traces/, archive/traces/, and trash/traces/ directories.
+External changes (Obsidian, VS Code, Finder drags, rm, iCloud sync from
+another device, a second noema process on the same cortex) are treated
+as first-class mutations:
 
-  edit a trace's .md file      → update event, federation-propagated
+  edit a trace's .md file      → update event
   drop a new valid .md in      → create event (frontmatter must be complete)
   move traces/ → archive/      → archive event
   move archive/ → traces/      → unarchive event
@@ -815,7 +816,10 @@ drop-in files must carry a valid id, title, type, created, updated.
 
 The watcher is on by default; opt out by setting watch.enabled=false in
 cortex.md. A short per-path debounce (default 300ms) collapses editor
-save bursts into a single event.
+save bursts into a single event. Federation propagation is HTTP-only
+(peers need a network endpoint), but external-edit events land in the
+local log under stdio too and flow outward the next time an HTTP serve
+runs.
 
 ## Tips
 - Prefer specific types over "note" — it helps retrieval and reasoning later.
