@@ -18,9 +18,8 @@ import shutil
 import subprocess
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 from urllib.request import Request, urlopen
-from urllib.error import URLError
 
 logger = logging.getLogger(__name__)
 
@@ -172,24 +171,40 @@ class StdioTransport:
             "method": "notifications/initialized",
         }).encode("utf-8") + b"\n"
         with self._lock:
-            self._process.stdin.write(notif)
-            self._process.stdin.flush()
+            stdin = self._require_pipes()[0]
+            stdin.write(notif)
+            stdin.flush()
 
-    def _send(self, method: str, params: dict) -> dict:
+    def _require_pipes(self):
+        """Return (stdin, stdout) as non-Optional handles or raise.
+
+        Popen(stdin=PIPE, stdout=PIPE) guarantees both are non-None, but the
+        stdlib types expose them as Optional[IO[bytes]]. Rather than repeat
+        `assert self._process.stdin is not None` at every I/O site, funnel
+        through this helper so the narrowing is in one place and the
+        is-not-running check stays consistent with start()/close().
+        """
+        p = self._process
+        if p is None or p.poll() is not None:
+            raise RuntimeError("Noema subprocess is not running")
+        if p.stdin is None or p.stdout is None:
+            raise RuntimeError("Noema subprocess has no stdin/stdout pipes")
+        return p.stdin, p.stdout
+
+    def _send(self, method: str, params: Dict[str, Any]) -> dict:
         """Send a JSON-RPC request and read the response. Thread-safe.
 
         Skips non-JSON lines (e.g. server log output on startup) by
         reading until a line starting with '{' is found.
         """
         with self._lock:
-            if self._process is None or self._process.poll() is not None:
-                raise RuntimeError("Noema subprocess is not running")
+            stdin, stdout = self._require_pipes()
             self._req_id += 1
             req = _jsonrpc_request(method, params, self._req_id)
-            self._process.stdin.write(req)
-            self._process.stdin.flush()
+            stdin.write(req)
+            stdin.flush()
             while True:
-                line = self._process.stdout.readline()
+                line = stdout.readline()
                 if not line:
                     raise RuntimeError("Noema subprocess returned no output (EOF)")
                 text = line.decode("utf-8").strip()
@@ -199,7 +214,7 @@ class StdioTransport:
 
     def call_tool(self, name: str, arguments: Optional[Dict[str, Any]] = None) -> str:
         """Call a Noema MCP tool. Returns the text content of the result."""
-        params = {"name": name}
+        params: Dict[str, Any] = {"name": name}
         if arguments:
             params["arguments"] = arguments
         result = self._send("tools/call", params)
@@ -257,7 +272,7 @@ class HttpTransport:
             req.add_header("Mcp-Session-Id", self._session_id)
         return req
 
-    def _send(self, method: str, params: dict) -> dict:
+    def _send(self, method: str, params: Dict[str, Any]) -> dict:
         """Send a JSON-RPC request over HTTP. Thread-safe."""
         with self._lock:
             self._req_id += 1
@@ -292,7 +307,7 @@ class HttpTransport:
 
     def call_tool(self, name: str, arguments: Optional[Dict[str, Any]] = None) -> str:
         """Call a Noema MCP tool. Returns the text content of the result."""
-        params = {"name": name}
+        params: Dict[str, Any] = {"name": name}
         if arguments:
             params["arguments"] = arguments
         result = self._send("tools/call", params)
