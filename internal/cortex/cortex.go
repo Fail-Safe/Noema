@@ -193,8 +193,8 @@ func Create(name, dir string) (Manifest, error) {
 	if err := os.WriteFile(filepath.Join(root, "cortex.md"), data, 0o640); err != nil {
 		return Manifest{}, fmt.Errorf("writing cortex.md: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "AGENT.md"), []byte(agentMDContent(manifest)), 0o640); err != nil {
-		return Manifest{}, fmt.Errorf("writing AGENT.md: %w", err)
+	if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte(agentsMDContent(manifest)), 0o640); err != nil {
+		return Manifest{}, fmt.Errorf("writing AGENTS.md: %w", err)
 	}
 
 	// Open (and migrate) the DB to initialise the schema.
@@ -277,8 +277,13 @@ func (c *Cortex) lookupCortexIDForTrace(traceID string) string {
 	return id
 }
 
-// agentMDContent returns the generated AGENT.md content for the given manifest.
-func agentMDContent(m Manifest) string {
+// agentsMDContent returns the generated AGENTS.md content for the given
+// manifest. AGENTS.md is the de facto cross-tool agent-instructions filename
+// (see agents.md) and is picked up by Codex, Cursor, Aider, Zed, Copilot, and
+// most other coding-agent tooling. Content is intentionally scoped to what an
+// agent needs to use the Cortex — operator-only material (TLS, key rotation,
+// service install) lives in the project README.
+func agentsMDContent(m Manifest) string {
 	purposeLine := ""
 	if m.Purpose != "" {
 		purposeLine = "- **Purpose:** " + m.Purpose + "\n"
@@ -310,7 +315,7 @@ any time with ` + "`noema sync`" + `.
 
 ` + "```" + `
 ` + m.Name + `/
-  AGENT.md              ← this file
+  AGENTS.md             ← this file
   cortex.md             ← cortex manifest
   traces/               ← active traces
   archive/
@@ -370,15 +375,24 @@ Choose the type that best reflects the **intent** of the memory:
 | ` + "`observation`" + ` | Something witnessed but not yet verified |
 | ` + "`note`" + ` | Anything else |
 
+## Titles
+
+- Keep titles short and descriptive — aim for under 80 characters.
+- The ID slug is capped at 100 characters; longer titles are silently
+  truncated before the date prefix is prepended.
+- **Do not include the date in the title.** ` + "`noema`" + ` prepends today's date
+  automatically, and leading ` + "`YYYYMMDD-`" + ` / ` + "`YYYY-MM-DD-`" + ` prefixes in the
+  title are stripped to prevent doubled-date IDs.
+- **Avoid embedded dates or timestamps mid-title** (e.g. "session 20260416
+  142000"). Only leading dates are stripped, so mid-title date fragments
+  survive and produce awkward IDs. If a trace is *about* a specific date,
+  put it in a tag (` + "`tags: [event-2026-04-02]`" + `) or in the body.
+
 ## Creating a Trace (filesystem)
 
 1. Pick a type and write your content.
-2. Generate an ID: today's date + slugified title, e.g. ` + "`20260330-decision-to-use-sqlite`" + `.
-   **Do not include the date in the title** — the ID generator adds today's date
-   automatically. A leading ` + "`YYYYMMDD-`" + ` or ` + "`YYYY-MM-DD-`" + ` in the title
-   is stripped before the ID is built so you don't end up with two date prefixes.
-   If a trace is *about* a specific date, put that information in the body or in
-   a tag (e.g. ` + "`tags: [event-2026-04-02]`" + `) instead of the title.
+2. Generate an ID: today's date + slugified title, e.g.
+   ` + "`20260330-decision-to-use-sqlite`" + `. See **Titles** above for naming rules.
 3. Write the file to ` + "`traces/<id>.md`" + ` with the frontmatter shown above.
 4. Run ` + "`noema sync`" + ` (if available) to update the database index.
 
@@ -417,6 +431,7 @@ they keep the database in sync automatically:
 | ` + "`get_trace`" + ` | Fetch full content of a trace by ID |
 | ` + "`create_trace`" + ` | Create a new trace (supports derived_from, origin) |
 | ` + "`update_trace`" + ` | Update fields of an existing trace |
+| ` + "`append_trace`" + ` | Append content to a trace body (fire-and-forget) |
 | ` + "`search_traces`" + ` | Full-text search across titles and bodies |
 | ` + "`archive_trace`" + ` | Archive a trace |
 | ` + "`unarchive_trace`" + ` | Restore an archived trace |
@@ -448,29 +463,6 @@ noema resolve <divergence-id> --custom "<merged body>"    # apply a custom merge
 
 Either choice updates the original trace, federates the resolution, and trashes
 the divergence trace. The MCP equivalent is the ` + "`resolve_divergence`" + ` tool.
-
-## Access Posture
-
-The HTTP MCP endpoint runs in one of two postures, logged on every ` + "`noema serve`" + ` startup:
-
-- **Open** — no bearer key required. Fine for ` + "`127.0.0.1`" + ` stdio-adjacent use; not safe for anything else.
-- **Keyed** — every request must carry ` + "`Authorization: Bearer <key>`" + `. Required for federation rings, remote IDEs, and any non-loopback host. Keyed mode also refuses to start without ` + "`--tls-cert`" + `/` + "`--tls-key`" + ` — a bearer token over plaintext HTTP is stolen by the first adversary on the network path.
-
-Configure the key one of two ways (env wins if both are set):
-
-1. ` + "`NOEMA_MCP_KEY`" + ` environment variable.
-2. An optional ` + "`access`" + ` block in ` + "`cortex.md`" + ` pointing at a sidecar file:
-
-` + "```yaml" + `
-access:
-  shared_key_file: .access.secret   # path relative to the cortex dir, or absolute
-` + "```" + `
-
-The sidecar file **must** be mode ` + "`0600`" + ` — Noema refuses to load a group- or world-readable key file. The key is the first non-empty line of the file.
-
-Both config sources generate the same SSH-style fingerprint, logged at startup as ` + "`access=keyed source=... fingerprint=SHA256:...`" + ` and queryable with ` + "`noema federation key fingerprint`" + `. Every host in a federation ring must produce the same fingerprint, or peers will 401 each other on sync.
-
-If you're an agent reading this file, the access posture is transparent to MCP tool calls — your client either has the key configured and everything works, or it doesn't and you'll see a 401 response. You don't manipulate the key yourself.
 `
 }
 
@@ -523,11 +515,15 @@ func Open(name, dir string) (*Cortex, error) {
 	}
 	_ = cx.Purge(days)
 
-	// Write AGENT.md if it doesn't exist (e.g. cortex created before this feature).
-	agentMDPath := filepath.Join(dir, "AGENT.md")
-	if _, err := os.Stat(agentMDPath); os.IsNotExist(err) {
+	// Write AGENTS.md if it doesn't exist. Covers both fresh cortexes created
+	// before this file existed and cortexes being upgraded from the older
+	// AGENT.md naming — we silently remove any legacy AGENT.md in that case so
+	// the directory matches the current agents.md convention.
+	agentsMDPath := filepath.Join(dir, "AGENTS.md")
+	if _, err := os.Stat(agentsMDPath); os.IsNotExist(err) {
 		if mErr == nil {
-			_ = os.WriteFile(agentMDPath, []byte(agentMDContent(m)), 0o640)
+			_ = os.WriteFile(agentsMDPath, []byte(agentsMDContent(m)), 0o640)
+			_ = os.Remove(filepath.Join(dir, "AGENT.md"))
 		}
 	}
 
