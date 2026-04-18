@@ -1,6 +1,7 @@
 package trace_test
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -301,6 +302,101 @@ func TestIsValidID(t *testing.T) {
 	for _, id := range invalid {
 		if trace.IsValidID(id) {
 			t.Errorf("IsValidID(%q) = true, want false", id)
+		}
+	}
+}
+
+// ---- Validate ----
+
+// TestValidate_Accepts covers the happy-path: a fully-populated Trace
+// with all required fields and a valid type passes without error.
+func TestValidate_Accepts(t *testing.T) {
+	good := &trace.Trace{
+		Frontmatter: trace.Frontmatter{
+			ID:      "20260418-example",
+			Title:   "Example",
+			Type:    "note",
+			Created: "2026-04-18T00:00:00Z",
+			Updated: "2026-04-18T00:00:00Z",
+		},
+		Body: "body",
+	}
+	if err := trace.Validate(good); err != nil {
+		t.Errorf("Validate(good) = %v, want nil", err)
+	}
+}
+
+// TestValidate_Rejects covers every required-field and enum failure mode.
+// Each case mutates one field away from a known-good baseline so the
+// assertion points at exactly one cause of failure.
+func TestValidate_Rejects(t *testing.T) {
+	baseline := func() *trace.Trace {
+		return &trace.Trace{
+			Frontmatter: trace.Frontmatter{
+				ID:      "20260418-example",
+				Title:   "Example",
+				Type:    "note",
+				Created: "2026-04-18T00:00:00Z",
+				Updated: "2026-04-18T00:00:00Z",
+			},
+			Body: "body",
+		}
+	}
+
+	cases := []struct {
+		name       string
+		mutate     func(*trace.Trace)
+		wantSubstr string
+	}{
+		{"nil", func(_ *trace.Trace) {}, "nil"}, // special: see note below
+		{"empty id", func(t *trace.Trace) { t.ID = "" }, "id"},
+		{"invalid id format", func(t *trace.Trace) { t.ID = "not-a-valid-id" }, "id"},
+		{"id uppercase", func(t *trace.Trace) { t.ID = "20260418-UPPER" }, "id"},
+		{"empty title", func(t *trace.Trace) { t.Title = "" }, "title"},
+		{"empty type", func(t *trace.Trace) { t.Type = "" }, "type"},
+		{"typo'd type", func(t *trace.Trace) { t.Type = "decsion" }, "type"},
+		{"unknown type", func(t *trace.Trace) { t.Type = "idea" }, "type"},
+		{"empty created", func(t *trace.Trace) { t.Created = "" }, "created"},
+		{"empty updated", func(t *trace.Trace) { t.Updated = "" }, "updated"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var tr *trace.Trace
+			if tc.name != "nil" {
+				tr = baseline()
+				tc.mutate(tr)
+			}
+			err := trace.Validate(tr)
+			if err == nil {
+				t.Fatalf("Validate(%s) = nil, want error", tc.name)
+			}
+			if !errors.Is(err, trace.ErrInvalidFrontmatter) {
+				t.Errorf("Validate(%s): error is not ErrInvalidFrontmatter, got %v", tc.name, err)
+			}
+			if !strings.Contains(err.Error(), tc.wantSubstr) {
+				t.Errorf("Validate(%s): error %q does not mention %q", tc.name, err.Error(), tc.wantSubstr)
+			}
+		})
+	}
+}
+
+// TestValidate_AcceptsAllRecognizedTypes guards against a drift between
+// ValidTypes and what Validate accepts — if someone adds a type but
+// forgets to refresh the enum check, this test fails loudly.
+func TestValidate_AcceptsAllRecognizedTypes(t *testing.T) {
+	for _, ty := range trace.ValidTypes {
+		tr := &trace.Trace{
+			Frontmatter: trace.Frontmatter{
+				ID:      "20260418-example",
+				Title:   "Example",
+				Type:    string(ty),
+				Created: "2026-04-18T00:00:00Z",
+				Updated: "2026-04-18T00:00:00Z",
+			},
+		}
+		if err := trace.Validate(tr); err != nil {
+			t.Errorf("Validate accepting recognized type %q failed: %v", ty, err)
 		}
 	}
 }

@@ -110,6 +110,10 @@ func (w *Watcher) reconcileExisting(path, id string, dir traceDir, row *cortex.R
 		log.Printf("[watch] skipping %s: frontmatter id %q does not match filename", path, t.ID)
 		return nil
 	}
+	if err := trace.Validate(t); err != nil {
+		log.Printf("[watch] skipping %s: %v", path, err)
+		return nil
+	}
 	bodyHash := trace.ContentHash(t.Body)
 
 	if !inDB {
