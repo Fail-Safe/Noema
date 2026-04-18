@@ -67,6 +67,47 @@ func IsValidType(t string) bool {
 	return false
 }
 
+// ErrInvalidFrontmatter is returned by Validate when a Trace's frontmatter
+// fails a required-field or enum check. The specific failure is wrapped
+// underneath so callers can log it or branch on it.
+var ErrInvalidFrontmatter = errors.New("invalid trace frontmatter")
+
+// Validate checks that a parsed Trace satisfies the required-field and
+// enum constraints the DB can't enforce on its own. The traces table
+// declares id/title/type/created/updated as NOT NULL, but SQLite treats
+// empty strings as satisfying NOT NULL, so YAML-missing fields would
+// slip through as junk rows. Validate closes that gap for ingest paths
+// that parse files written by external tools (the filesystem watcher,
+// primarily — Cortex.Add and CLI flows build Traces via trace.New,
+// which always fills these fields with sensible values).
+//
+// All errors wrap ErrInvalidFrontmatter so callers can use errors.Is
+// to detect validation failures as a category.
+func Validate(t *Trace) error {
+	if t == nil {
+		return fmt.Errorf("%w: nil trace", ErrInvalidFrontmatter)
+	}
+	if !IsValidID(t.ID) {
+		return fmt.Errorf("%w: id %q does not match YYYYMMDD-slug format", ErrInvalidFrontmatter, t.ID)
+	}
+	if t.Title == "" {
+		return fmt.Errorf("%w: title is required", ErrInvalidFrontmatter)
+	}
+	if t.Type == "" {
+		return fmt.Errorf("%w: type is required", ErrInvalidFrontmatter)
+	}
+	if !IsValidType(t.Type) {
+		return fmt.Errorf("%w: type %q is not one of the recognized types (fact, decision, preference, context, skill, intent, observation, note, divergence)", ErrInvalidFrontmatter, t.Type)
+	}
+	if t.Created == "" {
+		return fmt.Errorf("%w: created timestamp is required", ErrInvalidFrontmatter)
+	}
+	if t.Updated == "" {
+		return fmt.Errorf("%w: updated timestamp is required", ErrInvalidFrontmatter)
+	}
+	return nil
+}
+
 type Frontmatter struct {
 	ID          string   `yaml:"id"`
 	Title       string   `yaml:"title"`
