@@ -188,6 +188,99 @@ func TestMalformedFileIsSkipped(t *testing.T) {
 	}
 }
 
+// TestInvalidFrontmatterSkipped covers the tier-3 validation: frontmatter
+// that parses as valid YAML but violates a required-field or enum check.
+// These files would previously have produced junk DB rows (empty title,
+// typo'd type) because SQLite treats empty strings as satisfying NOT NULL
+// and the ingest path had no type-enum check. trace.Validate closes the
+// gap; this test proves it actually runs on the watcher path.
+func TestInvalidFrontmatterSkipped(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "typo'd type",
+			body: "---\nid: 20260418-typo-type\ntitle: Example\ntype: decsion\ncreated: 2026-04-18T00:00:00Z\nupdated: 2026-04-18T00:00:00Z\n---\n\nbody\n",
+		},
+		{
+			name: "unknown type",
+			body: "---\nid: 20260418-unknown-type\ntitle: Example\ntype: idea\ncreated: 2026-04-18T00:00:00Z\nupdated: 2026-04-18T00:00:00Z\n---\n\nbody\n",
+		},
+		{
+			name: "empty title",
+			body: "---\nid: 20260418-no-title\ntitle: \"\"\ntype: note\ncreated: 2026-04-18T00:00:00Z\nupdated: 2026-04-18T00:00:00Z\n---\n\nbody\n",
+		},
+		{
+			name: "missing title field",
+			body: "---\nid: 20260418-bare\ntype: note\ncreated: 2026-04-18T00:00:00Z\nupdated: 2026-04-18T00:00:00Z\n---\n\nbody\n",
+		},
+		{
+			name: "missing type field",
+			body: "---\nid: 20260418-no-type\ntitle: Example\ncreated: 2026-04-18T00:00:00Z\nupdated: 2026-04-18T00:00:00Z\n---\n\nbody\n",
+		},
+		{
+			name: "missing created",
+			body: "---\nid: 20260418-no-created\ntitle: Example\ntype: note\nupdated: 2026-04-18T00:00:00Z\n---\n\nbody\n",
+		},
+		{
+			name: "missing updated",
+			body: "---\nid: 20260418-no-updated\ntitle: Example\ntype: note\ncreated: 2026-04-18T00:00:00Z\n---\n\nbody\n",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cx, _, _ := setupWatcher(t)
+			// Pull the id from the first line of frontmatter so the
+			// filename matches. Each case uses a distinct id so
+			// nothing collides across subtests.
+			var id string
+			for _, line := range []string{tc.body} {
+				_ = line
+			}
+			// Parse id field directly from the body to avoid a full parse.
+			for _, line := range splitLines(tc.body) {
+				const prefix = "id: "
+				if len(line) > len(prefix) && line[:len(prefix)] == prefix {
+					id = line[len(prefix):]
+					break
+				}
+			}
+			if id == "" {
+				t.Fatalf("test setup: could not extract id from body")
+			}
+			path := cx.TraceFile(id, false)
+			if err := os.WriteFile(path, []byte(tc.body), 0o640); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+
+			time.Sleep(settleTime)
+
+			if _, err := cx.Get(id); err == nil {
+				t.Errorf("invalid frontmatter (%s) must not create a DB row", tc.name)
+			}
+		})
+	}
+}
+
+// splitLines is a tiny helper so the test doesn't need to import strings
+// just for Split. Kept local to avoid polluting the package namespace.
+func splitLines(s string) []string {
+	var lines []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			lines = append(lines, s[start:i])
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		lines = append(lines, s[start:])
+	}
+	return lines
+}
+
 // TestSourceLockedSkipsExternalEdit sets source_locked=true with a
 // foreign origin and asserts an external edit is ignored.
 func TestSourceLockedSkipsExternalEdit(t *testing.T) {
