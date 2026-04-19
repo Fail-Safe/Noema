@@ -320,6 +320,35 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 		return mcp.NewToolResultText(fmt.Sprintf("Trace %s updated.", id)), nil
 	}))
 
+	s.AddTool(mcp.NewTool("vote_trace",
+		mcp.WithDescription("Cast a tier-preference vote on a trace. Use sparingly: only when the user has clearly indicated preference (\"this really matters\", \"forget this one\"). 'up' nudges the consolidation agent toward promoting the trace to a higher memory tier; 'down' nudges toward demoting or keeping it low. Votes accumulate across calls and are preferences, not overrides — the consolidation agent still makes the final decision."),
+		mcp.WithString("id", mcp.Description("Trace ID to vote on"), mcp.Required()),
+		mcp.WithString("direction", mcp.Description("'up' for promotion preference, 'down' for demotion preference"), mcp.Required(),
+			mcp.Enum("up", "down")),
+	), readOnlyGuard(func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id, err := req.RequireString("id")
+		if err != nil {
+			return nil, err
+		}
+		direction, err := req.RequireString("direction")
+		if err != nil {
+			return nil, err
+		}
+		delta := 0
+		switch direction {
+		case "up":
+			delta = 1
+		case "down":
+			delta = -1
+		default:
+			return nil, fmt.Errorf("direction must be 'up' or 'down', got %q", direction)
+		}
+		if err := cx.Vote(id, delta, cortex.ActorAgent); err != nil {
+			return nil, err
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("Vote recorded: %s %s.", direction, id)), nil
+	}))
+
 	s.AddTool(mcp.NewTool("append_trace",
 		mcp.WithDescription("Append content to an existing trace's body without reading the full trace first. Ideal for fire-and-forget logging, running journals, or any case where an agent needs to add to a trace without consuming its current content."),
 		mcp.WithString("id", mcp.Description("Trace ID"), mcp.Required()),
