@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Fail-Safe/Noema/internal/config"
+	"github.com/Fail-Safe/Noema/internal/consolidation"
 	"github.com/Fail-Safe/Noema/internal/cortex"
 	"github.com/Fail-Safe/Noema/internal/federation"
 	mcpserver "github.com/Fail-Safe/Noema/internal/mcp"
@@ -95,6 +96,7 @@ func serveCmd() *cobra.Command {
 
 			var syncer *federation.Syncer
 			var watcher *watch.Watcher
+			var consolidator *consolidation.Agent
 
 			// Filesystem watcher: on by default so external edits
 			// (Obsidian, VS Code, Finder, iCloud sync, another agent on
@@ -107,6 +109,16 @@ func serveCmd() *cobra.Command {
 			// cortex.md.
 			if manifestErr == nil && m.Watch.WatchEnabled() {
 				watcher = startWatcher(cx, m.Watch)
+			}
+
+			// Consolidation agent: opt-in; drives memory-tier
+			// promotions on cron/idle/threshold triggers. Runs under
+			// both stdio and http so an agent connected via either
+			// transport sees the same tier state. Phase 7 ships the
+			// scheduling loop with a no-op pass — Phase 8+ populate
+			// the pass with candidate selection and LLM distillation.
+			if manifestErr == nil && m.Consolidation != nil && m.Consolidation.Enabled {
+				consolidator = startConsolidator(cx, m.Consolidation)
 			}
 
 			switch transport {
@@ -246,6 +258,9 @@ func serveCmd() *cobra.Command {
 			if watcher != nil {
 				watcher.Stop()
 			}
+			if consolidator != nil {
+				consolidator.Stop()
+			}
 			return err
 		},
 	}
@@ -275,6 +290,34 @@ func startWatcher(cx *cortex.Cortex, cfg *cortex.WatchConfig) *watch.Watcher {
 		return nil
 	}
 	return w
+}
+
+// startConsolidator wires the manifest's consolidation config into a
+// running scheduling agent. The PassFn is nil for now — Phase 7 is the
+// scheduling infrastructure only; Phases 8 and 9 populate the pass
+// function with candidate selection and LLM distillation. The agent
+// logs when passes fire even with a no-op pass so operators can verify
+// the cadence is behaving.
+func startConsolidator(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig) *consolidation.Agent {
+	if cfg == nil || !cfg.Enabled {
+		return nil
+	}
+	if cfg.Cron == "" && cfg.IdleMinutes == 0 && cfg.ThresholdShort == 0 {
+		fmt.Fprintf(os.Stderr, "[consolidation] enabled but no triggers configured (cron/idle_minutes/threshold_short); agent will not run\n")
+		return nil
+	}
+	logger := func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
+	}
+	a := consolidation.New(cx, consolidation.Config{
+		Cron:           cfg.Cron,
+		IdleMinutes:    cfg.IdleMinutes,
+		ThresholdShort: cfg.ThresholdShort,
+	}, nil, logger)
+	a.Start()
+	fmt.Fprintf(os.Stderr, "[consolidation] agent started (cron=%q idle=%dm threshold=%d)\n",
+		cfg.Cron, cfg.IdleMinutes, cfg.ThresholdShort)
+	return a
 }
 
 // startSyncer converts the manifest's federation config into a running

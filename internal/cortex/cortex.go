@@ -27,15 +27,16 @@ const ManifestVersion = 2
 
 // Manifest is the cortex.md file at the root of each Cortex.
 type Manifest struct {
-	ID         string            `yaml:"id,omitempty"`
-	Name       string            `yaml:"name"`
-	Purpose    string            `yaml:"purpose,omitempty"`
-	Owner      string            `yaml:"owner,omitempty"`
-	Created    string            `yaml:"created"`
-	Version    int               `yaml:"version"`
-	Access     *AccessConfig     `yaml:"access,omitempty"`
-	Federation *FederationConfig `yaml:"federation,omitempty"`
-	Watch      *WatchConfig      `yaml:"watch,omitempty"`
+	ID            string               `yaml:"id,omitempty"`
+	Name          string               `yaml:"name"`
+	Purpose       string               `yaml:"purpose,omitempty"`
+	Owner         string               `yaml:"owner,omitempty"`
+	Created       string               `yaml:"created"`
+	Version       int                  `yaml:"version"`
+	Access        *AccessConfig        `yaml:"access,omitempty"`
+	Federation    *FederationConfig    `yaml:"federation,omitempty"`
+	Watch         *WatchConfig         `yaml:"watch,omitempty"`
+	Consolidation *ConsolidationConfig `yaml:"consolidation,omitempty"`
 }
 
 // AccessConfig holds MCP endpoint authentication settings for cortex.md.
@@ -144,6 +145,49 @@ func (wc *WatchConfig) EffectiveDebounce() time.Duration {
 		return defaultDebounce
 	}
 	return time.Duration(wc.DebounceMs) * time.Millisecond
+}
+
+// ConsolidationConfig controls the background memory-consolidation agent.
+// All three triggers (cron, idle, threshold) are composable — set any
+// combination, the agent fires on whichever triggers first. Leaving all
+// three empty disables the agent even when Enabled is true.
+//
+// See docs/plans/consolidation-plan.md §4 in the Noema-design repo for
+// the cadence design. Model-tier and local-LLM fields are deferred to
+// later phases; this config block only covers scheduling for now.
+type ConsolidationConfig struct {
+	// Enabled is the master opt-in. The feature ships off by default so
+	// existing cortexes are unaffected until users explicitly turn it on.
+	Enabled bool `yaml:"enabled,omitempty"`
+
+	// Cron is the nightly trigger time in "HH:MM" local-clock format
+	// (e.g. "03:00"). Empty means no cron trigger.
+	Cron string `yaml:"cron,omitempty"`
+
+	// IdleMinutes fires a pass after N minutes of no trace mutations.
+	// Zero disables the idle trigger. Cooldown equal to IdleMinutes is
+	// enforced so a quiet cortex doesn't consolidate on every tick.
+	IdleMinutes int `yaml:"idle_minutes,omitempty"`
+
+	// ThresholdShort fires a pass when the short-term tier count
+	// exceeds this many active traces. Zero disables the trigger.
+	// Hysteresis: once tripped, re-arms only when the count drops
+	// back below 0.8 * ThresholdShort so a cortex hovering near the
+	// threshold doesn't thrash.
+	ThresholdShort int `yaml:"threshold_short,omitempty"`
+
+	// WindowHours bounds the candidate pool for a pass to traces
+	// created within the last N hours. Zero defaults to 24.
+	WindowHours int `yaml:"window_hours,omitempty"`
+}
+
+// EffectiveWindowHours returns the window duration with the 24h default
+// applied when unset.
+func (cc *ConsolidationConfig) EffectiveWindowHours() time.Duration {
+	if cc == nil || cc.WindowHours <= 0 {
+		return 24 * time.Hour
+	}
+	return time.Duration(cc.WindowHours) * time.Hour
 }
 
 // ErrSourceLocked is returned when a mutation is attempted on a

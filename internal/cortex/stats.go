@@ -1,5 +1,11 @@
 package cortex
 
+import (
+	"database/sql"
+	"errors"
+	"time"
+)
+
 // TierStats reports how many traces sit in each memory tier plus the
 // count of purged (tombstoned) rows. Phase 6 MVP data source for the
 // `noema memory stats` CLI; later phases expand the dashboard with
@@ -54,4 +60,36 @@ func (c *Cortex) TierStats() (TierStats, error) {
 		return s, err
 	}
 	return s, nil
+}
+
+// ShortTierCount returns the number of active (not archived, trashed,
+// or purged) short-term traces. Used by the consolidation agent's
+// threshold trigger.
+func (c *Cortex) ShortTierCount() (int, error) {
+	var n int
+	err := c.DB.QueryRow(
+		`SELECT COUNT(*) FROM traces
+		 WHERE tier = 'short'
+		   AND archived_at IS NULL
+		   AND trashed_at IS NULL
+		   AND purged_at IS NULL`,
+	).Scan(&n)
+	return n, err
+}
+
+// LastMutationTime returns the timestamp of the most recent event in
+// the local log. Used by the consolidation agent's idle trigger to
+// decide whether the cortex has been quiet long enough to consolidate.
+// Returns zero time (not an error) on an empty log so a cortex with
+// no history yet reads as "idle since beginning of time".
+func (c *Cortex) LastMutationTime() (time.Time, error) {
+	var ts sql.NullString
+	err := c.DB.QueryRow(`SELECT MAX(timestamp) FROM events`).Scan(&ts)
+	if err != nil || !ts.Valid {
+		if errors.Is(err, sql.ErrNoRows) || !ts.Valid {
+			return time.Time{}, nil
+		}
+		return time.Time{}, err
+	}
+	return time.Parse(time.RFC3339, ts.String)
 }
