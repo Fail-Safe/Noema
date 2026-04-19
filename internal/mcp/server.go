@@ -91,7 +91,7 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 		if err != nil {
 			return nil, err
 		}
-		row, err := cx.Get(id)
+		row, err := cx.GetAs(id, cortex.ActorAgent)
 		if err != nil {
 			return nil, fmt.Errorf("trace %q not found", id)
 		}
@@ -314,7 +314,7 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 		if err := t.Write(path); err != nil {
 			return nil, err
 		}
-		if err := cx.Update(id); err != nil {
+		if err := cx.UpdateAs(id, cortex.ActorAgent); err != nil {
 			return nil, err
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("Trace %s updated.", id)), nil
