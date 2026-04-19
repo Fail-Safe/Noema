@@ -95,3 +95,119 @@ func TestOpen_CreatesDBDirectory(t *testing.T) {
 		t.Errorf("noema.db not created at expected path: %v", err)
 	}
 }
+
+// ---- Migration 008: memory tiering ----
+
+func TestMigration008_TierColumnExistsAndDefaults(t *testing.T) {
+	conn, err := db.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer conn.Close()
+
+	rows, err := conn.Query(`PRAGMA table_info(traces)`)
+	if err != nil {
+		t.Fatalf("PRAGMA table_info: %v", err)
+	}
+	defer rows.Close()
+	cols := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt *string
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		cols[name] = true
+	}
+	for _, col := range []string{"tier", "read_count", "modify_count", "last_read_at", "tier_votes"} {
+		if !cols[col] {
+			t.Errorf("traces.%s missing after migration 008", col)
+		}
+	}
+}
+
+func TestMigration008_CheckConstraintRejectsBadTier(t *testing.T) {
+	conn, err := db.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer conn.Close()
+
+	_, err = conn.Exec(
+		`INSERT INTO traces (id, title, type, tier, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		"20260419-bad", "bad tier", "note", "archived", "2026-04-19T00:00:00Z", "2026-04-19T00:00:00Z",
+	)
+	if err == nil {
+		t.Fatal("CHECK constraint let 'archived' through")
+	}
+}
+
+func TestMigration008_LongTermImmutableOnUpdate(t *testing.T) {
+	conn, err := db.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Exec(
+		`INSERT INTO traces (id, title, type, tier, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		"20260419-stone", "immutable", "fact", "long", "2026-04-19T00:00:00Z", "2026-04-19T00:00:00Z",
+	); err != nil {
+		t.Fatalf("seed long-term row: %v", err)
+	}
+
+	_, err = conn.Exec(`UPDATE traces SET title = ? WHERE id = ?`, "edited", "20260419-stone")
+	if err == nil {
+		t.Fatal("trigger did not block UPDATE on tier='long' row")
+	}
+
+	// Demotion escape hatch: UPDATE that changes NEW.tier away from 'long'
+	// must be allowed so admin recovery paths can move a trace out of
+	// long-term without first dropping the trigger.
+	if _, err := conn.Exec(`UPDATE traces SET tier = ? WHERE id = ?`, "short", "20260419-stone"); err != nil {
+		t.Errorf("demotion from long to short blocked: %v", err)
+	}
+}
+
+func TestMigration008_LongTermImmutableOnDelete(t *testing.T) {
+	conn, err := db.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Exec(
+		`INSERT INTO traces (id, title, type, tier, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		"20260419-deep", "no-delete", "fact", "long", "2026-04-19T00:00:00Z", "2026-04-19T00:00:00Z",
+	); err != nil {
+		t.Fatalf("seed long-term row: %v", err)
+	}
+
+	_, err = conn.Exec(`DELETE FROM traces WHERE id = ?`, "20260419-deep")
+	if err == nil {
+		t.Fatal("trigger did not block DELETE on tier='long' row")
+	}
+}
+
+func TestMigration008_ShortTermUnaffected(t *testing.T) {
+	conn, err := db.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Exec(
+		`INSERT INTO traces (id, title, type, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
+		"20260419-flex", "routine", "note", "2026-04-19T00:00:00Z", "2026-04-19T00:00:00Z",
+	); err != nil {
+		t.Fatalf("seed short row: %v", err)
+	}
+	if _, err := conn.Exec(`UPDATE traces SET title = ? WHERE id = ?`, "renamed", "20260419-flex"); err != nil {
+		t.Errorf("UPDATE on default-tier row blocked: %v", err)
+	}
+	if _, err := conn.Exec(`DELETE FROM traces WHERE id = ?`, "20260419-flex"); err != nil {
+		t.Errorf("DELETE on default-tier row blocked: %v", err)
+	}
+}

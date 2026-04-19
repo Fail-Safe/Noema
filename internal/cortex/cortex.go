@@ -712,6 +712,9 @@ func (c *Cortex) Add(t *trace.Trace) error {
 	if t.Origin == "" {
 		t.Origin = c.Name
 	}
+	if t.Tier == "" {
+		t.Tier = trace.TierShort
+	}
 	t.ContentHash = trace.ContentHash(t.Body)
 	path := c.TraceFile(t.ID, false)
 	if err := t.Write(path); err != nil {
@@ -731,9 +734,13 @@ func (c *Cortex) insertDB(t *trace.Trace) error {
 	}
 	defer tx.Rollback()
 
+	tier := t.Tier
+	if tier == "" {
+		tier = trace.TierShort
+	}
 	_, err = tx.Exec(
-		`INSERT INTO traces (id, title, type, author, origin, cortex_id, created_at, updated_at, content_hash, source_locked, source_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.Title, t.Type, t.Author, t.Origin, c.ID, t.Created, t.Updated, t.ContentHash, boolToInt(t.SourceLocked), nullIfEmpty(t.SourceHash),
+		`INSERT INTO traces (id, title, type, tier, author, origin, cortex_id, created_at, updated_at, content_hash, source_locked, source_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.Title, t.Type, tier, t.Author, t.Origin, c.ID, t.Created, t.Updated, t.ContentHash, boolToInt(t.SourceLocked), nullIfEmpty(t.SourceHash),
 	)
 	if err != nil {
 		return err
@@ -762,6 +769,7 @@ type Row struct {
 	ID           string
 	Title        string
 	Type         string
+	Tier         string
 	Author       string
 	Origin       string
 	Tags         []string
@@ -786,7 +794,7 @@ type ListOptions struct {
 }
 
 func (c *Cortex) List(opts ListOptions) ([]Row, error) {
-	q := `SELECT id, title, type, author, origin, archived_at, trashed_at, created_at, updated_at, content_hash, source_locked, source_hash FROM traces WHERE 1=1`
+	q := `SELECT id, title, type, tier, author, origin, archived_at, trashed_at, created_at, updated_at, content_hash, source_locked, source_hash FROM traces WHERE 1=1`
 	var args []any
 
 	switch {
@@ -831,7 +839,7 @@ func (c *Cortex) Search(query string, opts ListOptions) ([]Row, error) {
 	}
 	ftsQuery := SanitizeFTS5Query(query)
 	q := `
-		SELECT t.id, t.title, t.type, t.author, t.origin, t.archived_at, t.trashed_at, t.created_at, t.updated_at, t.content_hash, t.source_locked, t.source_hash
+		SELECT t.id, t.title, t.type, t.tier, t.author, t.origin, t.archived_at, t.trashed_at, t.created_at, t.updated_at, t.content_hash, t.source_locked, t.source_hash
 		FROM traces t
 		WHERE t.id IN (SELECT id FROM traces_fts WHERE traces_fts MATCH ?)`
 	args := []any{ftsQuery}
@@ -873,8 +881,8 @@ func (c *Cortex) Get(id string) (*Row, error) {
 	var archivedAt, trashedAt, contentHash, sourceHash *string
 	var sourceLocked int
 	err := c.DB.QueryRow(
-		`SELECT id, title, type, author, origin, archived_at, trashed_at, created_at, updated_at, content_hash, source_locked, source_hash FROM traces WHERE id = ?`, id,
-	).Scan(&r.ID, &r.Title, &r.Type, &r.Author, &r.Origin, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt, &contentHash, &sourceLocked, &sourceHash)
+		`SELECT id, title, type, tier, author, origin, archived_at, trashed_at, created_at, updated_at, content_hash, source_locked, source_hash FROM traces WHERE id = ?`, id,
+	).Scan(&r.ID, &r.Title, &r.Type, &r.Tier, &r.Author, &r.Origin, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt, &contentHash, &sourceLocked, &sourceHash)
 	if err != nil {
 		return nil, err
 	}
@@ -1339,8 +1347,11 @@ func (c *Cortex) Update(id string) error {
 
 	// Stamp the update time authoritatively rather than trusting whatever the
 	// editor left in the frontmatter — and write it back to the file so disk,
-	// DB, and emitted event all agree.
+	// DB, and emitted event all agree. Tier is DB-managed after creation: if
+	// the on-disk frontmatter drifted (manual edit), authoritative value lives
+	// in the DB row and gets stamped back to the file here.
 	t.Updated = time.Now().UTC().Format(time.RFC3339)
+	t.Tier = r.Tier
 	t.ContentHash = trace.ContentHash(t.Body)
 	if err := t.Write(path); err != nil {
 		return fmt.Errorf("rewriting trace file with updated timestamp: %w", err)
@@ -1443,7 +1454,7 @@ func (c *Cortex) scanRows(rows *sql.Rows) ([]Row, error) { //nolint:govet
 		var r Row
 		var archivedAt, trashedAt, contentHash, sourceHash *string
 		var sourceLocked int
-		if err := rows.Scan(&r.ID, &r.Title, &r.Type, &r.Author, &r.Origin, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt, &contentHash, &sourceLocked, &sourceHash); err != nil {
+		if err := rows.Scan(&r.ID, &r.Title, &r.Type, &r.Tier, &r.Author, &r.Origin, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt, &contentHash, &sourceLocked, &sourceHash); err != nil {
 			return nil, err
 		}
 		if archivedAt != nil {
