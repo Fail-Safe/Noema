@@ -293,11 +293,11 @@ func startWatcher(cx *cortex.Cortex, cfg *cortex.WatchConfig) *watch.Watcher {
 }
 
 // startConsolidator wires the manifest's consolidation config into a
-// running scheduling agent. The PassFn is nil for now — Phase 7 is the
-// scheduling infrastructure only; Phases 8 and 9 populate the pass
-// function with candidate selection and LLM distillation. The agent
-// logs when passes fire even with a no-op pass so operators can verify
-// the cadence is behaving.
+// running scheduling agent. Phase 8 injects the heuristic pass as the
+// default PassFn so triggers actually move memory (short -> mid based
+// on a blended score of reads, modifies, lineage, and votes). Phase 9
+// will wrap this with LLM distillation; heuristic 1:1 promotion
+// remains the fallback when LLMs aren't configured.
 func startConsolidator(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig) *consolidation.Agent {
 	if cfg == nil || !cfg.Enabled {
 		return nil
@@ -309,14 +309,17 @@ func startConsolidator(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig) *cons
 	logger := func(format string, args ...any) {
 		fmt.Fprintf(os.Stderr, format+"\n", args...)
 	}
+	pass := consolidation.HeuristicPass(cx, consolidation.PassConfig{
+		Window: cfg.EffectiveWindowHours(),
+	}, logger)
 	a := consolidation.New(cx, consolidation.Config{
 		Cron:           cfg.Cron,
 		IdleMinutes:    cfg.IdleMinutes,
 		ThresholdShort: cfg.ThresholdShort,
-	}, nil, logger)
+	}, pass, logger)
 	a.Start()
-	fmt.Fprintf(os.Stderr, "[consolidation] agent started (cron=%q idle=%dm threshold=%d)\n",
-		cfg.Cron, cfg.IdleMinutes, cfg.ThresholdShort)
+	fmt.Fprintf(os.Stderr, "[consolidation] agent started (cron=%q idle=%dm threshold=%d window=%s)\n",
+		cfg.Cron, cfg.IdleMinutes, cfg.ThresholdShort, cfg.EffectiveWindowHours())
 	return a
 }
 
