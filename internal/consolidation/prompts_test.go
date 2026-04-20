@@ -205,6 +205,41 @@ func TestParseTemplate_MissingBody(t *testing.T) {
 	}
 }
 
+func TestNormalizeTags(t *testing.T) {
+	cases := []struct {
+		in   []string
+		want []string
+	}{
+		// Common LLM-generated shapes from the real cortex run.
+		{[]string{"MCP Server"}, []string{"mcp-server"}},
+		{[]string{"AI SME", "career goals"}, []string{"ai-sme", "career-goals"}},
+		{[]string{"Hugging Face"}, []string{"hugging-face"}},
+		{[]string{"memory consolidation"}, []string{"memory-consolidation"}},
+		// Already-clean input passes through unchanged.
+		{[]string{"mcp-server", "noema"}, []string{"mcp-server", "noema"}},
+		// Deduplication across differing-case variants.
+		{[]string{"Noema", "noema", "NOEMA"}, []string{"noema"}},
+		// Separator characters collapse to a single hyphen.
+		{[]string{"foo/bar", "a.b.c"}, []string{"foo-bar", "a-b-c"}},
+		// Empty / too-short / all-noise input is dropped.
+		{[]string{"", " ", "a", "!!!"}, nil},
+		// Leading/trailing whitespace and separators are trimmed.
+		{[]string{"  trim-me  ", "leading-hyphen-"}, []string{"trim-me", "leading-hyphen"}},
+	}
+	for _, tc := range cases {
+		got := normalizeTags(tc.in)
+		if len(got) != len(tc.want) {
+			t.Errorf("normalizeTags(%v) = %v, want %v", tc.in, got, tc.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("normalizeTags(%v)[%d] = %q, want %q", tc.in, i, got[i], tc.want[i])
+			}
+		}
+	}
+}
+
 func TestGetProfile_UnknownFallsBackToLarge(t *testing.T) {
 	if GetProfile("bogus").Name() != "large" {
 		t.Errorf("unknown profile should fall back to large, got %q", GetProfile("bogus").Name())

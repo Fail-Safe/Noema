@@ -334,6 +334,11 @@ func submit(cx LLMCortex, cfg PipelineConfig, d Distillation, chunk []cortex.Pro
 	for _, pc := range chunk {
 		sources = append(sources, pc.ID)
 	}
+	// Normalize tags defensively — local models emit human-readable
+	// phrases ("MCP Server", "AI SME", "career goals") and the cortex
+	// expects kebab-case. Prompt tuning alone is not a guarantee;
+	// belt-and-braces here prevents garbage tags from landing in the DB.
+	d.Tags = normalizeTags(d.Tags)
 	if cfg.DryRun {
 		log("[consolidate] DRY-RUN would distill %d sources -> %q (%d tags, %d body chars, confidence=%.2f)",
 			len(sources), d.Title, len(d.Tags), len(d.Body), d.Confidence)

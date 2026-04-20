@@ -220,8 +220,10 @@ Grounding rules:
 Fill in each field exactly. Do not add other fields, do not omit any:
 
 Title: <one line, <=100 chars, no date prefix>
-Tags: <comma-separated list, 1-8 tags>
-Body: <1-3 paragraphs distilling the cluster>`, len(cluster.Traces), body)
+Tags: <comma-separated list, 1-8 tags, each tag lowercase-kebab-case>
+Body: <1-3 paragraphs distilling the cluster>
+
+Tag format rules: each tag must be a single token in lowercase-kebab-case. Good: "mcp-server", "career-goals", "multi-agent", "fastmail-api". Bad: "MCP Server", "AI SME", "Hugging Face", "Memory Consolidation". If a concept naturally has spaces, join the words with hyphens and lowercase them. Never use spaces inside a tag.`, len(cluster.Traces), body)
 
 	raw, err := llm.Complete(ctx, CompletionRequest{
 		Model:           model,
@@ -286,6 +288,56 @@ Answer in exactly this format, nothing else:
 		return 0, err
 	}
 	return parseConfidenceInt(raw), nil
+}
+
+// normalizeTags coerces LLM-generated tag strings into the kebab-case
+// shape the cortex expects. Local models ignore "use hyphens" even
+// when the prompt says so, emitting phrases like "MCP Server" or
+// "career goals"; without this, those phrases land in the DB as-is
+// and render struck-through in Obsidian's tag pane. Rules:
+//   - lowercase
+//   - whitespace runs collapse to a single hyphen
+//   - drop any character that isn't [a-z0-9-_]
+//   - trim leading/trailing hyphens
+//   - drop empty or single-character results (defensive)
+//   - deduplicate, preserving the first occurrence
+func normalizeTags(tags []string) []string {
+	if len(tags) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(tags))
+	seen := make(map[string]struct{}, len(tags))
+	for _, raw := range tags {
+		norm := normalizeTag(raw)
+		if len(norm) < 2 {
+			continue
+		}
+		if _, ok := seen[norm]; ok {
+			continue
+		}
+		seen[norm] = struct{}{}
+		out = append(out, norm)
+	}
+	return out
+}
+
+func normalizeTag(raw string) string {
+	var sb strings.Builder
+	sb.Grow(len(raw))
+	lastWasHyphen := false
+	for _, r := range strings.ToLower(strings.TrimSpace(raw)) {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_':
+			sb.WriteRune(r)
+			lastWasHyphen = false
+		case r == '-' || r == ' ' || r == '\t' || r == '/' || r == '.' || r == ',':
+			if !lastWasHyphen && sb.Len() > 0 {
+				sb.WriteRune('-')
+				lastWasHyphen = true
+			}
+		}
+	}
+	return strings.TrimRight(sb.String(), "-")
 }
 
 // ---- parsers ----
