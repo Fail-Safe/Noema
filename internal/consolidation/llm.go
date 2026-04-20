@@ -33,11 +33,19 @@ type Message struct {
 // constructs. The HTTP client serializes it to the OpenAI
 // chat-completions body; model-tier profiles vary the Temperature
 // and MaxTokens but the envelope stays the same.
+//
+// DisableThinking asks reasoning-capable local models (Qwen3, etc.)
+// to skip their <think> block and answer directly. On llama.cpp's
+// OpenAI-compatible server this sets chat_template_kwargs.enable_thinking=false;
+// providers that don't recognize the field silently ignore it.
+// Cohesion / template / confidence steps use this because thinking
+// consumes the MaxTokens budget before any answer reaches the wire.
 type CompletionRequest struct {
-	Model       string
-	Messages    []Message
-	Temperature float64
-	MaxTokens   int
+	Model           string
+	Messages        []Message
+	Temperature     float64
+	MaxTokens       int
+	DisableThinking bool
 }
 
 // HTTPLLMClient posts chat-completion requests to an OpenAI-
@@ -71,16 +79,28 @@ func NewHTTPLLMClient(endpoint, apiKeyEnv string) (*HTTPLLMClient, error) {
 }
 
 type openAIRequestBody struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Temperature float64   `json:"temperature,omitempty"`
-	MaxTokens   int       `json:"max_tokens,omitempty"`
-	Stream      bool      `json:"stream"`
+	Model              string         `json:"model"`
+	Messages           []Message      `json:"messages"`
+	Temperature        float64        `json:"temperature,omitempty"`
+	MaxTokens          int            `json:"max_tokens,omitempty"`
+	Stream             bool           `json:"stream"`
+	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs,omitempty"`
+}
+
+// openAIResponseMessage accepts both the standard `content` and
+// llama.cpp's extended `reasoning_content` so a response from a
+// reasoning model is diagnosable even when thinking wasn't disabled
+// (content empty, reasoning truncated at MaxTokens).
+type openAIResponseMessage struct {
+	Role             string `json:"role"`
+	Content          string `json:"content"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 type openAIResponseBody struct {
 	Choices []struct {
-		Message Message `json:"message"`
+		Message      openAIResponseMessage `json:"message"`
+		FinishReason string                `json:"finish_reason,omitempty"`
 	} `json:"choices"`
 	Error *struct {
 		Message string `json:"message"`
@@ -92,13 +112,17 @@ type openAIResponseBody struct {
 // choice's content. Non-streaming by design — the pipeline needs the
 // full response to validate and parse before deciding what to do.
 func (c *HTTPLLMClient) Complete(ctx context.Context, req CompletionRequest) (string, error) {
-	body, err := json.Marshal(openAIRequestBody{
+	reqBody := openAIRequestBody{
 		Model:       req.Model,
 		Messages:    req.Messages,
 		Temperature: req.Temperature,
 		MaxTokens:   req.MaxTokens,
 		Stream:      false,
-	})
+	}
+	if req.DisableThinking {
+		reqBody.ChatTemplateKwargs = map[string]any{"enable_thinking": false}
+	}
+	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", fmt.Errorf("encoding llm request: %w", err)
 	}
@@ -153,5 +177,19 @@ func (c *HTTPLLMClient) Complete(ctx context.Context, req CompletionRequest) (st
 	if len(parsed.Choices) == 0 {
 		return "", errors.New("llm response has no choices")
 	}
-	return parsed.Choices[0].Message.Content, nil
+	choice := parsed.Choices[0]
+	if choice.Message.Content == "" {
+		// Reasoning models (Qwen3, DeepSeek-R1, etc.) can emit a
+		// <think> block into reasoning_content and leave content
+		// empty when MaxTokens cuts them off mid-thought. Surface
+		// this clearly — a silent empty string would look like a
+		// confident "no" to the cohesion parser.
+		if choice.Message.ReasoningContent != "" {
+			return "", fmt.Errorf("llm produced reasoning only (%d chars, finish=%q); set DisableThinking or raise MaxTokens", len(choice.Message.ReasoningContent), choice.FinishReason)
+		}
+		if choice.FinishReason == "length" {
+			return "", fmt.Errorf("llm response truncated at MaxTokens with empty content (finish=length)")
+		}
+	}
+	return choice.Message.Content, nil
 }

@@ -161,10 +161,11 @@ Respond with a JSON object and nothing else:
 If "cohesive" is false, the other fields may be null or omitted.`, len(cluster.Traces), body)
 
 	raw, err := llm.Complete(ctx, CompletionRequest{
-		Model:       model,
-		Messages:    []Message{{Role: "user", Content: user}},
-		Temperature: 0.2,
-		MaxTokens:   1200,
+		Model:           model,
+		Messages:        []Message{{Role: "user", Content: user}},
+		Temperature:     0.2,
+		MaxTokens:       1200,
+		DisableThinking: true,
 	})
 	if err != nil {
 		return Distillation{}, err
@@ -183,10 +184,11 @@ func runCohesionStep(ctx context.Context, llm LLMClient, model string, cluster C
 Answer with a single word on one line, with no other text: yes or no.`, len(cluster.Traces), body)
 
 	raw, err := llm.Complete(ctx, CompletionRequest{
-		Model:       model,
-		Messages:    []Message{{Role: "user", Content: user}},
-		Temperature: 0.0,
-		MaxTokens:   16,
+		Model:           model,
+		Messages:        []Message{{Role: "user", Content: user}},
+		Temperature:     0.0,
+		MaxTokens:       16,
+		DisableThinking: true,
 	})
 	if err != nil {
 		return false, err
@@ -207,10 +209,11 @@ Tags: <comma-separated list, 1-8 tags>
 Body: <1-3 paragraphs distilling the cluster>`, len(cluster.Traces), body)
 
 	raw, err := llm.Complete(ctx, CompletionRequest{
-		Model:       model,
-		Messages:    []Message{{Role: "user", Content: user}},
-		Temperature: 0.2,
-		MaxTokens:   800,
+		Model:           model,
+		Messages:        []Message{{Role: "user", Content: user}},
+		Temperature:     0.2,
+		MaxTokens:       800,
+		DisableThinking: true,
 	})
 	if err != nil {
 		return Distillation{}, err
@@ -224,10 +227,11 @@ func runConfidenceStep(ctx context.Context, llm LLMClient, model string, cluster
 Answer with a single integer on one line, with no other text.`
 
 	raw, err := llm.Complete(ctx, CompletionRequest{
-		Model:       model,
-		Messages:    []Message{{Role: "user", Content: user}},
-		Temperature: 0.0,
-		MaxTokens:   8,
+		Model:           model,
+		Messages:        []Message{{Role: "user", Content: user}},
+		Temperature:     0.0,
+		MaxTokens:       8,
+		DisableThinking: true,
 	})
 	if err != nil {
 		return 0, err
