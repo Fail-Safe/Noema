@@ -63,7 +63,7 @@ func loadedModel(t *testing.T, cx *cortex.Cortex) model {
 	m.width = 120
 	m.height = 30
 
-	msg := loadRows(cx, "", false, false)()
+	msg := loadRows(cx, "", false, false, nil)()
 	result, _ := m.Update(msg)
 	return result.(model)
 }
@@ -365,7 +365,7 @@ func TestConfirm_Purge_Yes(t *testing.T) {
 	// Load model in trash view
 	m := loadedModel(t, cx)
 	m.showTrashed = true
-	msg := loadRows(cx, "", false, true)()
+	msg := loadRows(cx, "", false, true, nil)()
 	result, _ := m.Update(msg)
 	m = result.(model)
 
@@ -394,7 +394,7 @@ func TestRecover(t *testing.T) {
 
 	m := loadedModel(t, cx)
 	m.showTrashed = true
-	msg := loadRows(cx, "", false, true)()
+	msg := loadRows(cx, "", false, true, nil)()
 	result, _ := m.Update(msg)
 	m = result.(model)
 
@@ -731,7 +731,7 @@ func TestStickyCursor_PreservesSelectionWhenNewRowArrivesAtTop(t *testing.T) {
 	_ = c
 	_ = b
 
-	msg := loadRows(cx, "", false, false)()
+	msg := loadRows(cx, "", false, false, nil)()
 	result, _ := m.Update(msg)
 	m2 := result.(model)
 
@@ -764,7 +764,7 @@ func TestStickyCursor_ClampsWhenSelectedRowDisappears(t *testing.T) {
 		t.Fatalf("Archive: %v", err)
 	}
 
-	msg := loadRows(cx, "", false, false)()
+	msg := loadRows(cx, "", false, false, nil)()
 	result, _ := m.Update(msg)
 	m2 := result.(model)
 
@@ -794,7 +794,7 @@ func TestNewRowHighlight_MarksArrivalsOnRefresh(t *testing.T) {
 	// flagged, but the pre-existing one should not.
 	second := addTrace(t, cx, "second", "note")
 
-	msg := loadRows(cx, "", false, false)()
+	msg := loadRows(cx, "", false, false, nil)()
 	result, _ := m.Update(msg)
 	m2 := result.(model)
 
@@ -815,7 +815,7 @@ func TestNewRowHighlight_FadesAcrossConsecutiveRefreshes(t *testing.T) {
 
 	// Add a new trace — refresh #1 flags it with a fresh TTL.
 	fresh := addTrace(t, cx, "fresh", "note")
-	msg := loadRows(cx, "", false, false)()
+	msg := loadRows(cx, "", false, false, nil)()
 	result, _ := m.Update(msg)
 	m1 := result.(model)
 
@@ -825,7 +825,7 @@ func TestNewRowHighlight_FadesAcrossConsecutiveRefreshes(t *testing.T) {
 	}
 
 	// Refresh #2 — no new arrivals, existing TTL should decrement.
-	msg = loadRows(cx, "", false, false)()
+	msg = loadRows(cx, "", false, false, nil)()
 	result, _ = m1.Update(msg)
 	m2 := result.(model)
 
@@ -835,7 +835,7 @@ func TestNewRowHighlight_FadesAcrossConsecutiveRefreshes(t *testing.T) {
 	}
 
 	// Refresh #3 — TTL expires and the row is removed from the map.
-	msg = loadRows(cx, "", false, false)()
+	msg = loadRows(cx, "", false, false, nil)()
 	result, _ = m2.Update(msg)
 	m3 := result.(model)
 
@@ -851,7 +851,7 @@ func TestNewRowHighlight_ContextChangeWipesHighlights(t *testing.T) {
 
 	// Create a highlighted state by adding a trace and refreshing.
 	added := addTrace(t, cx, "added", "note")
-	msg := loadRows(cx, "", false, false)()
+	msg := loadRows(cx, "", false, false, nil)()
 	result, _ := m.Update(msg)
 	m1 := result.(model)
 
@@ -863,7 +863,7 @@ func TestNewRowHighlight_ContextChangeWipesHighlights(t *testing.T) {
 	// rowsLoadedMsg should wipe the old highlight map, not pretend the
 	// toggled-in rows are "new arrivals".
 	m1.showAll = true
-	msg = loadRows(cx, "", true, false)()
+	msg = loadRows(cx, "", true, false, nil)()
 	result, _ = m1.Update(msg)
 	m2 := result.(model)
 

@@ -114,6 +114,55 @@ func TestPromotionCandidates_SignalsSurfaced(t *testing.T) {
 	}
 }
 
+func TestListOptions_TiersFilter(t *testing.T) {
+	cx := setup(t)
+	seed(t, cx, "short one", trace.TierShort)
+	seed(t, cx, "mid one", trace.TierMid)
+	seed(t, cx, "long one", trace.TierLong)
+
+	// Single tier: only short returned.
+	rows, err := cx.List(cortex.ListOptions{Tiers: []string{trace.TierShort}})
+	if err != nil {
+		t.Fatalf("List short: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Tier != trace.TierShort {
+		t.Errorf("filter to short failed: got %+v", rows)
+	}
+
+	// Multi-tier: short + mid, no long.
+	rows, err = cx.List(cortex.ListOptions{Tiers: []string{trace.TierShort, trace.TierMid}})
+	if err != nil {
+		t.Fatalf("List short+mid: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Errorf("filter to short+mid returned %d rows, want 2", len(rows))
+	}
+	for _, r := range rows {
+		if r.Tier == trace.TierLong {
+			t.Errorf("long row leaked through filter: %s", r.ID)
+		}
+	}
+
+	// Empty slice means no filter — all three return.
+	rows, err = cx.List(cortex.ListOptions{})
+	if err != nil {
+		t.Fatalf("List all: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Errorf("empty Tiers filter should return all, got %d", len(rows))
+	}
+
+	// Search path also honors the filter so FTS queries respect
+	// the current TUI tier visibility.
+	rows, err = cx.Search("one", cortex.ListOptions{Tiers: []string{trace.TierLong}})
+	if err != nil {
+		t.Fatalf("Search with tier filter: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Tier != trace.TierLong {
+		t.Errorf("search filter to long failed: got %+v", rows)
+	}
+}
+
 func TestPromotionCandidates_WindowBound(t *testing.T) {
 	// A trace created before the rolling window's cutoff must not
 	// appear as a candidate. RFC3339 only has second precision so

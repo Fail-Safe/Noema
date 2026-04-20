@@ -832,9 +832,10 @@ type ListOptions struct {
 	Author   string
 	Tag      string
 	Origin   string
-	Archived bool // only archived (excludes trashed)
-	Trashed  bool // only trashed
-	All      bool // active + archived (excludes trashed)
+	Tiers    []string // restrict to these memory tiers; empty means no tier filter
+	Archived bool     // only archived (excludes trashed)
+	Trashed  bool     // only trashed
+	All      bool     // active + archived (excludes trashed)
 }
 
 func (c *Cortex) List(opts ListOptions) ([]Row, error) {
@@ -866,6 +867,14 @@ func (c *Cortex) List(opts ListOptions) ([]Row, error) {
 	if opts.Origin != "" {
 		q += ` AND origin = ?`
 		args = append(args, opts.Origin)
+	}
+	if len(opts.Tiers) > 0 {
+		placeholders := strings.Repeat("?,", len(opts.Tiers))
+		placeholders = placeholders[:len(placeholders)-1]
+		q += ` AND tier IN (` + placeholders + `)`
+		for _, t := range opts.Tiers {
+			args = append(args, t)
+		}
 	}
 	q += ` ORDER BY created_at DESC, rowid DESC`
 
@@ -909,6 +918,14 @@ func (c *Cortex) Search(query string, opts ListOptions) ([]Row, error) {
 	if opts.Tag != "" {
 		q += ` AND t.id IN (SELECT trace_id FROM trace_tags WHERE tag = ?)`
 		args = append(args, opts.Tag)
+	}
+	if len(opts.Tiers) > 0 {
+		placeholders := strings.Repeat("?,", len(opts.Tiers))
+		placeholders = placeholders[:len(placeholders)-1]
+		q += ` AND t.tier IN (` + placeholders + `)`
+		for _, t := range opts.Tiers {
+			args = append(args, t)
+		}
 	}
 	q += ` ORDER BY t.created_at DESC`
 
