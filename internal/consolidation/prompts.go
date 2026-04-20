@@ -177,7 +177,9 @@ If "cohesive" is false, the other fields may be null or omitted.`, len(cluster.T
 
 func runCohesionStep(ctx context.Context, llm LLMClient, model string, cluster ClusterInput, bodyLimit int) (bool, error) {
 	body := formatTraces(cluster, bodyLimit)
-	user := fmt.Sprintf(`Below are %d short-term memories from a Noema cortex. Are they cohesive enough — same topic, decision, ongoing work — to consolidate into one memory?
+	user := fmt.Sprintf(`Below are %d short-term memories from a Noema cortex.
+
+Would a single consolidated summary of these be more useful than keeping them as separate short-term memories? Answer yes if they share a common thread — same topic, same project, same agent session, same recurring activity, or same line of investigation. Answer no if the only way to summarize them together would be a vague umbrella like "various activities" or "general updates".
 
 %s
 
