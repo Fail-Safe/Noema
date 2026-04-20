@@ -179,6 +179,42 @@ type ConsolidationConfig struct {
 	// WindowHours bounds the candidate pool for a pass to traces
 	// created within the last N hours. Zero defaults to 24.
 	WindowHours int `yaml:"window_hours,omitempty"`
+
+	// LLMEnabled opts into the LLM-driven distillation path used by
+	// `noema consolidate`. When false (default), the in-process agent
+	// runs pure-heuristic 1:1 promotion only. When true, operators are
+	// expected to run `noema consolidate` periodically (or wire the
+	// subcommand up to cron / launchd) so clusters get distilled into
+	// mid-tier memories instead of promoted one-to-one.
+	LLMEnabled bool `yaml:"llm_enabled,omitempty"`
+
+	// ModelTier is the prompt-style profile the consolidation pipeline
+	// uses when calling the LLM: "small" (7B-13B, multi-step template),
+	// "large" (30B-70B, same plus confidence step), or "frontier"
+	// (single-shot JSON). See docs/plans/consolidation-plan.md §6 in
+	// the Noema-design repo for the full profile matrix.
+	ModelTier string `yaml:"model_tier,omitempty"`
+
+	// LocalLLMEndpoint is the OpenAI-compatible base URL to post
+	// chat-completion requests to. Covers Ollama (/v1), LMStudio,
+	// llama.cpp server, vLLM, and OpenAI itself. Empty disables the
+	// LLM path even when LLMEnabled is true; `noema consolidate` exits
+	// with a clear error rather than trying to guess a default.
+	LocalLLMEndpoint string `yaml:"local_llm_endpoint,omitempty"`
+
+	// ModelName is the model identifier passed in the `model` field of
+	// the chat-completion request body (e.g. "llama3.1:70b",
+	// "claude-opus-4-7", "gpt-4o"). Must match what the endpoint
+	// recognizes — no translation layer here.
+	ModelName string `yaml:"model_name,omitempty"`
+
+	// APIKeyEnv names an environment variable whose value is attached
+	// as a Bearer token to outgoing requests. Empty means no auth
+	// header — correct for local runners like Ollama that don't care.
+	// The key itself never lives in cortex.md; this is a pointer to
+	// where the operator keeps it, matching the access.shared_key_file
+	// pattern for the MCP server.
+	APIKeyEnv string `yaml:"api_key_env,omitempty"`
 }
 
 // EffectiveWindowHours returns the window duration with the 24h default
@@ -188,6 +224,17 @@ func (cc *ConsolidationConfig) EffectiveWindowHours() time.Duration {
 		return 24 * time.Hour
 	}
 	return time.Duration(cc.WindowHours) * time.Hour
+}
+
+// EffectiveModelTier returns the configured model-tier profile or
+// "large" as the default. Large is the conservative middle ground —
+// it works well on local 30B-70B models and stays safe on frontier
+// models that would also accept tighter prompts.
+func (cc *ConsolidationConfig) EffectiveModelTier() string {
+	if cc == nil || cc.ModelTier == "" {
+		return "large"
+	}
+	return cc.ModelTier
 }
 
 // ErrSourceLocked is returned when a mutation is attempted on a
