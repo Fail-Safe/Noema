@@ -145,6 +145,7 @@ func federationStatusCmd() *cobra.Command {
 			fmt.Println()
 
 			state := federation.NewState(cx.DB.DB)
+			localVersion := version()
 			for _, p := range m.Federation.Peers {
 				ps, err := state.GetPeerState(p.Name, p.Endpoint)
 				if err != nil {
@@ -160,8 +161,12 @@ func federationStatusCmd() *cobra.Command {
 					lastEvent = ps.LastEvent
 				}
 				peerMode := p.EffectiveMode()
-				fmt.Printf("  %s\n    endpoint:   %s\n    mode:       %s\n    last_seen:  %s\n    last_event: %s\n",
-					p.Name, p.Endpoint, peerMode, lastSeen, lastEvent)
+				fmt.Printf("  %s\n    endpoint:   %s\n    mode:       %s\n",
+					p.Name, p.Endpoint, peerMode)
+				renderPeerVersion(cmd.OutOrStdout(), ps.Health, localVersion)
+				fmt.Fprintf(cmd.OutOrStdout(), "    last_seen:  %s\n    last_event: %s\n",
+					lastSeen, lastEvent)
+				renderPeerHealth(cmd.OutOrStdout(), ps.Health)
 			}
 
 			vc, err := cx.GetClock()
@@ -579,4 +584,124 @@ func federationAddPeerCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// renderPeerVersion prints the peer's last-observed binary version,
+// and a short "⚠ differs from local" annotation when the major/minor
+// segments of the two versions don't line up. Exact-match checks
+// would flag every commit-tagged dev build as a warning, which is
+// noise; comparing the leading `vX.Y` is accurate enough to catch
+// skew that actually produces schema-widening bugs.
+func renderPeerVersion(w io.Writer, h federation.PeerHealth, localVersion string) {
+	if h.Version == "" {
+		fmt.Fprintf(w, "    version:    (not yet observed)\n")
+		return
+	}
+	out := h.Version
+	if !versionSeriesMatches(h.Version, localVersion) {
+		out += fmt.Sprintf("    ⚠ differs from local %s", localVersion)
+	}
+	fmt.Fprintf(w, "    version:    %s\n", out)
+}
+
+// renderPeerHealth prints a multi-line "health:" block whenever the
+// peer is in a degraded state. Silent when everything is green so
+// healthy peers stay compact in the listing.
+func renderPeerHealth(w io.Writer, h federation.PeerHealth) {
+	if h.LastError == nil && h.ConsecutiveFailures == 0 {
+		return
+	}
+	fmt.Fprintf(w, "    health:     ⚠ %d consecutive failures since last success\n", h.ConsecutiveFailures)
+	if h.LastError != nil {
+		fmt.Fprintf(w, "                reason: %s\n", h.LastError.Reason)
+		if h.LastError.EventID != "" {
+			fmt.Fprintf(w, "                event:  %s\n", h.LastError.EventID)
+		}
+		if h.LastError.TraceID != "" {
+			fmt.Fprintf(w, "                trace:  %s\n", h.LastError.TraceID)
+		}
+		if hint := healthHint(h.LastError.Reason); hint != "" {
+			fmt.Fprintf(w, "                %s\n", hint)
+		}
+	}
+}
+
+// healthHint turns a machine-readable reason into a one-line human
+// hint pointing at the likely cause. Lives here rather than on
+// PeerError itself because the mapping is a UI concern — the on-disk
+// enum stays stable while display text can evolve.
+func healthHint(reason string) string {
+	switch reason {
+	case federation.ReasonInvalidTraceID,
+		federation.ReasonUnknownAction,
+		federation.ReasonUnknownType:
+		return "likely cause: peer binary predates schema changes elsewhere on the ring; upgrade the peer"
+	case federation.ReasonInvalidFrontmatter:
+		return "likely cause: peer received an event whose trace shape it doesn't recognise"
+	case federation.ReasonNetworkRefused:
+		return "likely cause: nothing listening on the peer's endpoint; is `noema serve` running?"
+	case federation.ReasonNetworkTimeout:
+		return "likely cause: peer unreachable on the network"
+	case federation.ReasonNetworkDNS:
+		return "likely cause: hostname resolution failed"
+	case federation.ReasonNetworkTLS:
+		return "likely cause: TLS handshake failed — check cert validity and CA trust"
+	case federation.ReasonAuth:
+		return "likely cause: shared-key mismatch between local and peer"
+	case federation.ReasonIdentityMismatch:
+		return "likely cause: peer cortex id changed — `noema federation reset-peer` after verifying"
+	case federation.ReasonIdentityMissing:
+		return "likely cause: peer predates cortex-id federation handshake; upgrade the peer"
+	}
+	return ""
+}
+
+// versionSeriesMatches compares the major/minor prefix of two Noema
+// version strings. Returns true when both strings lead with the same
+// `vX.Y` prefix, or when either side is unparseable (e.g. "dev" or a
+// commit-tagged build without a stable semver prefix) — skipping the
+// warning for unparseable versions avoids shouting at every dev
+// build.
+func versionSeriesMatches(a, b string) bool {
+	ap, aok := semverSeries(a)
+	bp, bok := semverSeries(b)
+	if !aok || !bok {
+		return true
+	}
+	return ap == bp
+}
+
+// semverSeries returns the `vX.Y` prefix of a version string when
+// present. Tolerates an optional leading `v` and a trailing suffix
+// (patch segment, commit hash, -dirty marker). Returns ok=false for
+// inputs that don't lead with two dot-separated numeric segments.
+func semverSeries(v string) (string, bool) {
+	s := strings.TrimPrefix(v, "v")
+	if s == "" {
+		return "", false
+	}
+	dot1 := strings.IndexByte(s, '.')
+	if dot1 <= 0 {
+		return "", false
+	}
+	rest := s[dot1+1:]
+	dot2 := strings.IndexAny(rest, ".-")
+	minor := rest
+	if dot2 >= 0 {
+		minor = rest[:dot2]
+	}
+	if minor == "" {
+		return "", false
+	}
+	for _, r := range s[:dot1] {
+		if r < '0' || r > '9' {
+			return "", false
+		}
+	}
+	for _, r := range minor {
+		if r < '0' || r > '9' {
+			return "", false
+		}
+	}
+	return s[:dot1] + "." + minor, true
 }

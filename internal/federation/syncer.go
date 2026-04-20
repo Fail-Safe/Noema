@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -79,7 +80,8 @@ func (s *Syncer) syncLoop(peer PeerConfig) {
 		default:
 		}
 
-		err := s.syncPeer(peer)
+		version, err := s.syncPeer(peer)
+		s.recordPollOutcome(peer, version, err)
 		if err != nil {
 			category := categorizeError(err)
 			backoff = min(backoff*2, 5*time.Minute)
@@ -102,6 +104,68 @@ func (s *Syncer) syncLoop(peer PeerConfig) {
 			return
 		case <-time.After(backoff):
 		}
+	}
+}
+
+// recordPollOutcome writes the structured health snapshot for a peer
+// after every poll iteration. Reads the previous snapshot so success
+// preserves the most-recent version (blank version would overwrite
+// the known-good value on a transient network failure) and failures
+// carry the right consecutive-failure count. Treats persistence errors
+// as advisory — a health-write failure should not derail the next
+// poll.
+func (s *Syncer) recordPollOutcome(peer PeerConfig, version string, err error) {
+	prev, loadErr := s.state.GetPeerHealth(peer.Name)
+	if loadErr != nil {
+		log.Printf("[federation] peer %q: could not load prior health: %v", peer.Name, loadErr)
+	}
+	next := prev
+
+	if version != "" {
+		next.Version = version
+		next.VersionObservedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+
+	if err == nil {
+		next.LastSuccess = time.Now().UTC().Format(time.RFC3339)
+		next.ConsecutiveFailures = 0
+		next.LastError = nil
+	} else {
+		next.ConsecutiveFailures = prev.ConsecutiveFailures + 1
+		next.LastError = classifyPollError(err)
+	}
+
+	if saveErr := s.state.SetPeerHealth(peer.Name, next); saveErr != nil {
+		log.Printf("[federation] peer %q: could not persist health: %v", peer.Name, saveErr)
+	}
+}
+
+// classifyPollError maps any error from syncPeer into the structured
+// PeerError recorded in health. Replay failures surfaced through
+// PollError carry their own classification and event/trace refs;
+// everything else is treated as a network-or-initialize failure
+// classified by ClassifyNetworkError.
+func classifyPollError(err error) *PeerError {
+	if err == nil {
+		return nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	var pe *PollError
+	if errors.As(err, &pe) {
+		reason := pe.Reason
+		if reason == "" {
+			reason = ReasonOther
+		}
+		return &PeerError{
+			Reason:     reason,
+			EventID:    pe.EventID,
+			TraceID:    pe.TraceID,
+			ObservedAt: now,
+		}
+	}
+	return &PeerError{
+		Reason:     ClassifyNetworkError(err),
+		ObservedAt: now,
 	}
 }
 
@@ -187,11 +251,11 @@ func briefPeerError(peer PeerConfig, category string, backoff time.Duration) str
 	return fmt.Sprintf("[federation] peer %q still unreachable (%s); next retry in %s", peer.Name, category, backoff)
 }
 
-func (s *Syncer) syncPeer(peer PeerConfig) error {
+func (s *Syncer) syncPeer(peer PeerConfig) (string, error) {
 	// Load cursor for this peer.
 	cursor, err := s.state.Get(PeerCursorKey(peer.Name))
 	if err != nil {
-		return fmt.Errorf("loading cursor: %w", err)
+		return "", fmt.Errorf("loading cursor: %w", err)
 	}
 
 	// Connect to remote MCP server. Noema speaks Streamable HTTP (the
@@ -202,7 +266,7 @@ func (s *Syncer) syncPeer(peer PeerConfig) error {
 	if peer.CA != "" {
 		httpClient, err := tlsClientWithCA(peer.CA)
 		if err != nil {
-			return fmt.Errorf("loading CA for peer %s: %w", peer.Name, err)
+			return "", fmt.Errorf("loading CA for peer %s: %w", peer.Name, err)
 		}
 		clientOpts = append(clientOpts, transport.WithHTTPBasicClient(httpClient))
 	}
@@ -217,15 +281,15 @@ func (s *Syncer) syncPeer(peer PeerConfig) error {
 	}
 	mcpClient, err := client.NewStreamableHttpClient(mcpURL, clientOpts...)
 	if err != nil {
-		return fmt.Errorf("creating Streamable HTTP client: %w", err)
+		return "", fmt.Errorf("creating Streamable HTTP client: %w", err)
 	}
 	defer mcpClient.Close()
 
 	if err := mcpClient.Start(s.ctx); err != nil {
-		return fmt.Errorf("starting Streamable HTTP connection: %w", err)
+		return "", fmt.Errorf("starting Streamable HTTP connection: %w", err)
 	}
 
-	_, err = mcpClient.Initialize(s.ctx, mcp.InitializeRequest{
+	initResult, err := mcpClient.Initialize(s.ctx, mcp.InitializeRequest{
 		Params: mcp.InitializeParams{
 			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
 			ClientInfo: mcp.Implementation{
@@ -235,15 +299,16 @@ func (s *Syncer) syncPeer(peer PeerConfig) error {
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("MCP initialize: %w", err)
+		return "", fmt.Errorf("MCP initialize: %w", err)
 	}
+	peerVersion := initResult.ServerInfo.Version
 
 	// Verify the remote peer's identity before exchanging any events. On the
 	// first successful handshake, the peer's ULID is pinned in federation_state.
 	// Every subsequent sync re-checks the advertised ID against the pinned one
 	// and refuses to proceed on a mismatch — see docs/design/cortex-uuid-plan.md.
 	if err := s.verifyPeerIdentity(mcpClient, peer); err != nil {
-		return err
+		return peerVersion, &PollError{Reason: classifyIdentityError(err), Err: err}
 	}
 
 	// Call sync_events on the remote peer.
@@ -259,7 +324,7 @@ func (s *Syncer) syncPeer(peer PeerConfig) error {
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("calling sync_events: %w", err)
+		return peerVersion, fmt.Errorf("calling sync_events: %w", err)
 	}
 
 	// Parse the JSON response.
@@ -274,28 +339,50 @@ func (s *Syncer) syncPeer(peer PeerConfig) error {
 		// No new events.
 		now := time.Now().UTC().Format(time.RFC3339)
 		s.state.SetPeerSeen(peer.Name, now)
-		return nil
+		return peerVersion, nil
 	}
 
 	// Guard against a hostile peer returning an oversized payload.
 	// 100 events * 1 MB body each = 100 MB is a generous upper bound.
 	const maxSyncResponseBytes = 100 * 1024 * 1024 // 100 MiB
 	if len(text) > maxSyncResponseBytes {
-		return fmt.Errorf("sync_events response too large (%d bytes, max %d)", len(text), maxSyncResponseBytes)
+		return peerVersion, fmt.Errorf("sync_events response too large (%d bytes, max %d)", len(text), maxSyncResponseBytes)
 	}
 
 	var events []event.Event
 	if err := json.Unmarshal([]byte(text), &events); err != nil {
-		return fmt.Errorf("parsing sync_events response: %w", err)
+		return peerVersion, fmt.Errorf("parsing sync_events response: %w", err)
 	}
 
 	if err := s.replayBatch(peer.Name, events); err != nil {
-		return err
+		return peerVersion, err
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	s.state.SetPeerSeen(peer.Name, now)
-	return nil
+	return peerVersion, nil
+}
+
+// classifyIdentityError maps errors returned from verifyPeerIdentity
+// into the structured reason set. Pattern-matches on the substrings
+// the verifyPeerIdentity callsites use when constructing the wrapped
+// error (kept here rather than on the error type itself to avoid
+// adding a new package-scoped sentinel for every condition).
+func classifyIdentityError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "identity mismatch"):
+		return ReasonIdentityMismatch
+	case strings.Contains(msg, "no cortex id"),
+		strings.Contains(msg, "pre-dates the cortex-id"):
+		return ReasonIdentityMissing
+	case strings.Contains(msg, "schema version"):
+		return ReasonInvalidFrontmatter
+	}
+	return ReasonOther
 }
 
 // replayBatch replays a batch of events received from a peer, advancing
@@ -320,7 +407,18 @@ func (s *Syncer) replayBatch(peerName string, events []event.Event) error {
 			)
 			now := time.Now().UTC().Format(time.RFC3339)
 			s.state.SetPeerSeen(peerName, now)
-			return nil
+			// Return a structured error so the outer loop can
+			// record event_id / trace_id / reason in peer health
+			// without re-parsing the error text. The log line
+			// above already carries the full error for operators
+			// tailing journalctl; health storage is the stripped-
+			// down, safe-for-persistence version.
+			return &PollError{
+				Reason:  ClassifyReplayError(err),
+				EventID: e.ID,
+				TraceID: e.TraceID,
+				Err:     fmt.Errorf("replay event %s: %w", e.ID, err),
+			}
 		}
 
 		// Merge the remote vector clock.
