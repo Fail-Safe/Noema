@@ -222,15 +222,3 @@ func TestTierStats_CountsActiveTracesByTier(t *testing.T) {
 	}
 }
 
-// itoa avoids importing strconv just for two-test formatting.
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	var s string
-	for i > 0 {
-		s = string(rune('0'+i%10)) + s
-		i /= 10
-	}
-	return s
-}
