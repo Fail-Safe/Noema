@@ -204,6 +204,11 @@ func runTemplateStep(ctx context.Context, llm LLMClient, model string, cluster C
 
 %s
 
+Grounding rules:
+- Only reference entities, projects, tools, people, or topics that actually appear in the memories above. Do not invent, add, or infer topics that are not explicitly present.
+- The title must describe what the memories are actually about, not what they might relate to. If the cluster is about one thing (e.g. all "hermes" sessions), the title should name that one thing — do not add unrelated subjects to make the title sound broader.
+- Tags should come from the source memories' tags or from terms that appear literally in the bodies.
+
 Fill in each field exactly. Do not add other fields, do not omit any:
 
 Title: <one line, <=100 chars, no date prefix>
