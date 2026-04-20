@@ -148,10 +148,16 @@ func TestCreateDistilledTrace_RejectsEmptyTitleOrBody(t *testing.T) {
 	}
 }
 
-func TestCreateDistilledTrace_SourcesUntouched(t *testing.T) {
-	// Phase 9 policy: sources stay in short-term. Distillation is
-	// additive; archiving sources is a follow-up concern users opt
-	// into via the normal archive path.
+func TestCreateDistilledTrace_PromotesSourcesToMid(t *testing.T) {
+	// v1 policy: once a distillation lands, every short-tier source
+	// is promoted to mid. This keeps both representations available
+	// (distillation as the summary, sources as full-detail backing
+	// store reachable via derived_from) and takes the sources out of
+	// the PromotionCandidates pool so the next pass doesn't
+	// re-consolidate them into a duplicate distillation.
+	//
+	// v2+ will likely replace this with archival-after-grace-period
+	// (see the doc-comment on CreateDistilledTrace).
 	cx := setup(t)
 	src1 := trace.New("s1", "note", "", nil, "b1")
 	src2 := trace.New("s2", "note", "", nil, "b2")
@@ -171,8 +177,8 @@ func TestCreateDistilledTrace_SourcesUntouched(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Get source: %v", err)
 		}
-		if row.Tier != trace.TierShort {
-			t.Errorf("source %s tier = %q, want short (sources stay short-term)", id, row.Tier)
+		if row.Tier != trace.TierMid {
+			t.Errorf("source %s tier = %q, want mid (sources promoted on distillation)", id, row.Tier)
 		}
 	}
 }

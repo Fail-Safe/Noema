@@ -90,13 +90,26 @@ func TestRecordConsolidationResult_CreatesMidTrace(t *testing.T) {
 		t.Errorf("response missing confirmation: %s", text)
 	}
 
-	// Verify something mid-tier exists with the right title.
+	// Under the v1 "net-add with source promotion" policy, mid-tier
+	// contains the distilled trace PLUS the two promoted sources, so
+	// the expected count is 3 and the check is "distilled title is
+	// present" rather than "list has exactly one row".
 	rows, err := cx.List(cortex.ListOptions{Tiers: []string{trace.TierMid}})
 	if err != nil {
 		t.Fatalf("List mid: %v", err)
 	}
-	if len(rows) != 1 || rows[0].Title != "Auth strategy — distilled" {
-		t.Errorf("mid tier contents = %+v, want one distilled trace", rows)
+	if len(rows) != 3 {
+		t.Fatalf("mid tier rows = %d, want 3 (1 distilled + 2 promoted sources): %+v", len(rows), rows)
+	}
+	var foundDistilled bool
+	for _, r := range rows {
+		if r.Title == "Auth strategy — distilled" {
+			foundDistilled = true
+			break
+		}
+	}
+	if !foundDistilled {
+		t.Errorf("distilled title %q not found among mid-tier rows: %+v", "Auth strategy — distilled", rows)
 	}
 }
 

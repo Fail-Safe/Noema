@@ -46,9 +46,26 @@ type DistilledTraceSpec struct {
 // which model produced it / how confident" as separate, replayable
 // records.
 //
-// Source short-term traces are left untouched — the distillation is
-// additive. Operators (or later phases) can archive sources via the
-// normal archive path once the distilled memory is trusted.
+// Source handling (v1 — "net-add with source promotion"): every
+// short-tier source is promoted to mid once the distillation lands.
+// The distilled trace is the retrievable summary; sources remain
+// individually addressable at mid so agents can pull the full
+// detail via derived_from when the distillation's compression is
+// lossy. This also prevents the next consolidation pass from
+// re-clustering the same sources into a duplicate distillation —
+// the candidate query filters to tier='short', so promoted sources
+// drop out of the candidate pool.
+//
+// FUTURE (v2+): "source archival" — instead of promoting sources
+// to mid, move them to archived once the distillation is trusted
+// (confidence threshold + retention window). That keeps mid-tier
+// curated and closer to the biological metaphor where the detailed
+// memory fades as the distillation takes its place. Not v1 because
+// the grace-period machinery adds a new daemon and needs a
+// confidence-calibration pass first. The current design's derived_from
+// lineage already supports the retrieval path that option 2 would
+// need, so the switch is local to this function + a new archival
+// sweep — no schema changes.
 func (c *Cortex) CreateDistilledTrace(spec DistilledTraceSpec) (string, error) {
 	if spec.Title == "" {
 		return "", fmt.Errorf("distilled trace: title is required")
@@ -110,5 +127,36 @@ func (c *Cortex) CreateDistilledTrace(spec DistilledTraceSpec) (string, error) {
 	if err := tx.Commit(); err != nil {
 		return t.ID, fmt.Errorf("committing consolidate event: %w", err)
 	}
+
+	// Promote each source from short to mid. Best-effort per source —
+	// the distillation itself has already landed, so a partial
+	// promotion failure doesn't invalidate anything, it just leaves
+	// one or more sources at short. They'd surface again in the next
+	// consolidation pass, which is suboptimal but self-correcting.
+	// Sources that are not at 'short' are skipped quietly: they may
+	// already have been promoted by a previous run (re-consolidation
+	// after a crash), or they're at a tier this function shouldn't
+	// touch (mid/long — isValidPromotion would reject anyway).
+	for _, sid := range spec.SourceIDs {
+		srow, err := c.Get(sid)
+		if err != nil {
+			// Source vanished between the earlier existence check and
+			// now — log and skip rather than abort the whole operation.
+			// The distilled trace is already committed; lineage is
+			// intact.
+			continue
+		}
+		if srow.Tier != trace.TierShort {
+			continue
+		}
+		if err := c.Promote(sid, trace.TierMid); err != nil {
+			// Non-fatal per the "best-effort" contract. The ActionPromote
+			// event is what keeps federation peers consistent; if this
+			// fails here it fails everywhere, and the next run will
+			// retry.
+			continue
+		}
+	}
+
 	return t.ID, nil
 }

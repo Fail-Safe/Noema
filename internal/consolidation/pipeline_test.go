@@ -113,20 +113,30 @@ func TestRunLLMPass_HappyPath_Frontier(t *testing.T) {
 	}
 
 	// Verify a mid-tier trace now exists with derived_from linking
-	// to all three sources.
+	// to all three sources. Under the v1 "net-add with source
+	// promotion" policy, mid also contains the three promoted
+	// sources, so the expected count is 4 (1 distillation + 3
+	// sources). The distillation is the one with derived_from set.
 	rows, err := cx.List(cortex.ListOptions{Tiers: []string{trace.TierMid}})
 	if err != nil {
 		t.Fatalf("List mid: %v", err)
 	}
-	if len(rows) != 1 {
-		t.Fatalf("mid tier rows = %d, want 1", len(rows))
+	if len(rows) != 4 {
+		t.Fatalf("mid tier rows = %d, want 4 (1 distilled + 3 promoted sources)", len(rows))
 	}
-	if rows[0].Title != "Auth strategy — distilled" {
-		t.Errorf("mid title = %q", rows[0].Title)
+	var distilledID string
+	for _, r := range rows {
+		if r.Title == "Auth strategy — distilled" {
+			distilledID = r.ID
+			break
+		}
+	}
+	if distilledID == "" {
+		t.Fatalf("no mid-tier row titled %q among %d mid rows", "Auth strategy — distilled", len(rows))
 	}
 	// List doesn't populate DerivedFrom (that's a separate lineage
 	// query); fetch via Get to verify the derived_from links.
-	full, err := cx.Get(rows[0].ID)
+	full, err := cx.Get(distilledID)
 	if err != nil {
 		t.Fatalf("Get distilled: %v", err)
 	}
