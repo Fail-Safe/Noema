@@ -73,8 +73,16 @@ func TestReplayBatch_PinsCursorOnFailure(t *testing.T) {
 	fr := &fakeReplayer{failOn: "01EVENT0000000000000000003"}
 	s := newSyncerForTest(t, fr)
 
-	if err := s.replayBatch(peerName, events); err != nil {
-		t.Fatalf("replayBatch returned error (should swallow per-event failures): %v", err)
+	err := s.replayBatch(peerName, events)
+	var pe *PollError
+	if !errors.As(err, &pe) {
+		t.Fatalf("replayBatch should return *PollError on replay failure; got %T: %v", err, err)
+	}
+	if pe.EventID != "01EVENT0000000000000000003" {
+		t.Errorf("PollError.EventID = %q, want the failing event's ID", pe.EventID)
+	}
+	if pe.TraceID != "20260407-c" {
+		t.Errorf("PollError.TraceID = %q, want the failing event's trace", pe.TraceID)
 	}
 
 	// Only the events strictly before the failure should have been
@@ -187,8 +195,10 @@ func TestReplayBatch_FirstEventFailure_LeavesCursorUnset(t *testing.T) {
 	fr := &fakeReplayer{failOn: "01FIRSTFAIL0000000000000001"}
 	s := newSyncerForTest(t, fr)
 
-	if err := s.replayBatch(peerName, events); err != nil {
-		t.Fatalf("replayBatch: %v", err)
+	err := s.replayBatch(peerName, events)
+	var pe *PollError
+	if !errors.As(err, &pe) {
+		t.Fatalf("replayBatch should return *PollError on replay failure; got %T: %v", err, err)
 	}
 	if len(fr.replayed) != 0 {
 		t.Errorf("replayed = %v, want empty (first event failed)", fr.replayed)
