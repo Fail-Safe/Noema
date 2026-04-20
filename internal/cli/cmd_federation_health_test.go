@@ -8,14 +8,23 @@ func TestVersionSeriesMatches(t *testing.T) {
 		a, b string
 		want bool
 	}{
-		{"same series", "v0.4.1-19-g1cc3be6", "v0.4.1-20-gabcd123", true},
-		{"different minor", "v0.4.1", "v0.5.0", false},
-		{"different major", "v1.0.0", "v0.9.0", false},
-		{"without v prefix", "0.4.1", "v0.4.2", true},
-		{"dev build on one side — don't warn", "dev", "v0.4.1", true},
-		{"commit hash on one side — don't warn", "1cc3be6-dirty", "v0.4.1", true},
-		{"both dev — don't warn", "dev", "dev", true},
-		{"both empty — don't warn", "", "", true},
+		// --- same baseline, no warning ---
+		{"exact tagged match", "v0.9.2", "v0.9.2", true},
+		{"dev commits on same baseline", "v0.9.2-10-g2473442", "v0.9.2-5-gabcd123", true},
+		{"tag vs dev build on same baseline", "v0.9.2", "v0.9.2-10-g2473442", true},
+		{"without v prefix on one side", "0.9.2", "v0.9.2", true},
+
+		// --- different baseline, warn ---
+		{"patch drift (the bug this test file is pinning)", "v0.9.1", "v0.9.2", false},
+		{"patch drift with dev suffix on local", "v0.9.1", "v0.9.2-10-g2473442", false},
+		{"minor drift", "v0.9.0", "v0.10.0", false},
+		{"major drift", "v0.9.0", "v1.0.0", false},
+
+		// --- unparseable on either side, skip warning ---
+		{"dev on one side — no warning", "dev", "v0.9.1", true},
+		{"commit hash on one side — no warning", "1cc3be6-dirty", "v0.9.1", true},
+		{"both dev — no warning", "dev", "dev", true},
+		{"both empty — no warning", "", "", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -26,26 +35,35 @@ func TestVersionSeriesMatches(t *testing.T) {
 	}
 }
 
-func TestSemverSeries(t *testing.T) {
+func TestSemverBaseline(t *testing.T) {
 	cases := []struct {
-		in     string
-		prefix string
-		ok     bool
+		in       string
+		baseline string
+		ok       bool
 	}{
-		{"v0.4.1", "0.4", true},
-		{"0.5.0-rc1", "0.5", true},
-		{"v1.2", "1.2", true},
-		{"v0.4.1-19-g1cc3be6", "0.4", true},
-		{"v0.4.1-dirty", "0.4", true},
+		// --- clean tagged versions ---
+		{"v0.9.2", "0.9.2", true},
+		{"v0.9.1", "0.9.1", true},
+		{"0.9.0", "0.9.0", true},
+		{"v1.2", "1.2", true}, // allows major.minor only
+
+		// --- dev builds: strip the -N-gSHA suffix ---
+		{"v0.9.2-10-g2473442", "0.9.2", true},
+		{"v0.9.2-10-g2473442-dirty", "0.9.2", true},
+		{"v0.9.2-dirty", "0.9.2", true},
+
+		// --- unparseable ---
 		{"dev", "", false},
 		{"", "", false},
 		{"abc", "", false},
+		{"v", "", false},
 		{"v.1", "", false},
+		{"1", "", false},
 	}
 	for _, tc := range cases {
-		got, ok := semverSeries(tc.in)
-		if got != tc.prefix || ok != tc.ok {
-			t.Errorf("semverSeries(%q) = (%q, %v), want (%q, %v)", tc.in, got, ok, tc.prefix, tc.ok)
+		got, ok := semverBaseline(tc.in)
+		if got != tc.baseline || ok != tc.ok {
+			t.Errorf("semverBaseline(%q) = (%q, %v), want (%q, %v)", tc.in, got, ok, tc.baseline, tc.ok)
 		}
 	}
 }
