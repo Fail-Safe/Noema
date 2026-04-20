@@ -70,7 +70,7 @@ func RunLLMPass(ctx context.Context, cx LLMCortex, llm LLMClient, cfg PipelineCo
 	profile := GetProfile(cfg.ModelTier)
 	maxCluster := profile.MaxClusterSize()
 
-	groups := groupByLineage(candidates)
+	groups := groupCandidates(candidates)
 	for _, g := range groups {
 		if ctx.Err() != nil {
 			return result, ctx.Err()
@@ -101,8 +101,18 @@ func RunLLMPass(ctx context.Context, cx LLMCortex, llm LLMClient, cfg PipelineCo
 			d, runErr := runWithRetry(ctx, llm, profile, cfg.ModelName, cluster, cfg.MaxRetries)
 			switch {
 			case runErr != nil:
-				log("[consolidate] cluster failed after retries: %v; falling back to heuristic promotion", runErr)
-				result.FallbackPromotions += heuristicFallback(cx, chunk, log)
+				if cfg.DryRun {
+					// In dry-run mode the fallback path must not
+					// write to the cortex — the whole point of
+					// --dry-run is zero side effects, and a user
+					// Ctrl-Cing a dry-run shouldn't silently mutate
+					// tier state as a consolation prize.
+					log("[consolidate] cluster failed after retries: %v; dry-run suppressed fallback promotion", runErr)
+					result.Skipped++
+				} else {
+					log("[consolidate] cluster failed after retries: %v; falling back to heuristic promotion", runErr)
+					result.FallbackPromotions += heuristicFallback(cx, chunk, log)
+				}
 			case !d.Cohesive:
 				log("[consolidate] cluster rejected as incohesive (ids=%s)", idsOf(chunk))
 				result.Rejected++
@@ -123,23 +133,78 @@ func RunLLMPass(ctx context.Context, cx LLMCortex, llm LLMClient, cfg PipelineCo
 	return result, nil
 }
 
-// groupByLineage clusters candidates by their first derived_from
-// ancestor (if any), else by orphan pool. Simple heuristic: the
-// pipeline never calls this without candidates, and the stable
-// ordering matters for test reproducibility.
-func groupByLineage(candidates []cortex.PromotionCandidate) [][]cortex.PromotionCandidate {
-	// Phase 8 already has a similar grouping elsewhere, but the LLM
-	// pass needs its own ordering that respects the profile's
-	// max-cluster ceiling. For now the heuristic is "orphans go into
-	// one catch-all bucket in original order". Later phases can
-	// refine with tag-overlap / FTS5-similarity secondary grouping.
+// groupCandidates buckets candidates by (type, day-of-creation) so a
+// cluster handed to the LLM is more likely to be actually cohesive.
+// The prior implementation returned a single orphan pool and chunked
+// by cluster-size — that produced arbitrary groupings that a 9B
+// reasoning model quite correctly rejected as incohesive. Grouping
+// by type handles the common case where a cortex has families of
+// similar traces (all hermes-session, all session-summary, all
+// weekly-news, etc.) that want to be consolidated within their
+// family. Grouping by day adds a temporal cohesion signal —
+// "yesterday's observations" is a reasonable unit.
+//
+// Groups are returned in deterministic order (sorted by key) so
+// test reproducibility is trivial. Within a group, original order
+// (created_at DESC from the candidate query) is preserved.
+//
+// Skips candidates with empty IDs as a defensive measure against
+// any stray row in the traces table — the pipeline's buildCluster
+// would fail on them anyway, but filtering here means the count
+// summary at the end of the pass is accurate rather than inflated.
+func groupCandidates(candidates []cortex.PromotionCandidate) [][]cortex.PromotionCandidate {
 	if len(candidates) == 0 {
 		return nil
 	}
-	// Single orphan pool keeps the logic simple and testable. The
-	// per-profile max-cluster chunker in RunLLMPass splits the pool
-	// into right-sized slices.
-	return [][]cortex.PromotionCandidate{candidates}
+	buckets := make(map[string][]cortex.PromotionCandidate)
+	var keys []string
+	for _, pc := range candidates {
+		if pc.ID == "" {
+			continue
+		}
+		key := groupKey(pc)
+		if _, seen := buckets[key]; !seen {
+			keys = append(keys, key)
+		}
+		buckets[key] = append(buckets[key], pc)
+	}
+	// Deterministic order: sort keys alphabetically so two runs on
+	// the same input produce the same group ordering (useful for
+	// tests and for operator sanity when comparing consecutive
+	// pass outputs).
+	sortStrings(keys)
+	out := make([][]cortex.PromotionCandidate, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, buckets[k])
+	}
+	return out
+}
+
+// groupKey returns the bucket identifier for a candidate. Day is
+// extracted from the ISO-8601 created_at prefix (YYYY-MM-DD). Empty
+// type defaults to "none" so the bucket still forms a valid key.
+func groupKey(pc cortex.PromotionCandidate) string {
+	day := pc.CreatedAt
+	if len(day) >= 10 {
+		day = day[:10]
+	}
+	typ := pc.Type
+	if typ == "" {
+		typ = "none"
+	}
+	return typ + "|" + day
+}
+
+// sortStrings is a tiny helper that avoids pulling in the sort
+// package at the top of this file — all we need is an in-place
+// lexical sort of a string slice, and this stays allocation-free
+// even with dozens of buckets.
+func sortStrings(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j-1] > s[j]; j-- {
+			s[j-1], s[j] = s[j], s[j-1]
+		}
+	}
 }
 
 func buildCluster(cx LLMCortex, chunk []cortex.PromotionCandidate) (ClusterInput, error) {

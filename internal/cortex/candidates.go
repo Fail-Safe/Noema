@@ -12,6 +12,7 @@ import (
 type PromotionCandidate struct {
 	ID               string
 	Tier             string
+	Type             string
 	ReadCount        int
 	ModifyCount      int
 	TierVotes        int
@@ -35,6 +36,7 @@ func (c *Cortex) PromotionCandidates(tier string, window time.Duration) ([]Promo
 		SELECT
 			t.id,
 			t.tier,
+			t.type,
 			t.read_count,
 			t.modify_count,
 			t.tier_votes,
@@ -47,6 +49,7 @@ func (c *Cortex) PromotionCandidates(tier string, window time.Duration) ([]Promo
 		  AND t.trashed_at IS NULL
 		  AND t.purged_at IS NULL
 		  AND t.created_at >= ?
+		  AND t.id != ''
 		ORDER BY t.created_at DESC
 	`
 	rows, err := c.DB.Query(q, tier, cutoff)
@@ -59,7 +62,7 @@ func (c *Cortex) PromotionCandidates(tier string, window time.Duration) ([]Promo
 	for rows.Next() {
 		var pc PromotionCandidate
 		if err := rows.Scan(
-			&pc.ID, &pc.Tier, &pc.ReadCount, &pc.ModifyCount,
+			&pc.ID, &pc.Tier, &pc.Type, &pc.ReadCount, &pc.ModifyCount,
 			&pc.TierVotes, &pc.DerivedFromCount, &pc.CreatedAt,
 		); err != nil {
 			return nil, err
