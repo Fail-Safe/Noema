@@ -616,6 +616,19 @@ func Open(name, dir string) (*Cortex, error) {
 		}
 	}
 
+	// Auto-rebuild the FTS5 index when it's smaller than the traces
+	// table. This is the recovery path after migration 008, which
+	// dropped and recreated traces_fts with a new tags column but
+	// couldn't repopulate body (body lives in the markdown files, not
+	// SQL). The first serve after upgrade does the full filesystem
+	// walk; subsequent opens are no-ops because counts match.
+	// Best-effort: a rebuild failure logs but doesn't block Open —
+	// searches will return fewer results until the next successful
+	// rebuild, but the cortex still opens for normal writes.
+	if err := cx.RebuildFTSIfStale(); err != nil {
+		fmt.Fprintf(os.Stderr, "[cortex] FTS5 reindex warning: %v\n", err)
+	}
+
 	return cx, nil
 }
 
@@ -735,8 +748,7 @@ func (c *Cortex) insertDB(t *trace.Trace) error {
 			return err
 		}
 	}
-	_, err = tx.Exec(`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`, t.ID, t.Title, t.Body)
-	if err != nil {
+	if err := insertFTS(tx, t.ID, t.Title, t.Body, t.Tags); err != nil {
 		return err
 	}
 	if err := c.emitEvent(tx, event.ActionCreate, t.ID, t.Created, marshalTraceData(t)); err != nil {
@@ -1363,10 +1375,7 @@ func (c *Cortex) Update(id string) error {
 			return err
 		}
 	}
-	if _, err := tx.Exec(`DELETE FROM traces_fts WHERE id = ?`, id); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`, id, t.Title, t.Body); err != nil {
+	if err := upsertFTS(tx, id, t.Title, t.Body, t.Tags); err != nil {
 		return err
 	}
 	if err := c.emitEvent(tx, event.ActionUpdate, id, t.Updated, marshalTraceData(t)); err != nil {
@@ -1419,10 +1428,7 @@ func (c *Cortex) Append(id, content string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM traces_fts WHERE id = ?`, id); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`, id, t.Title, t.Body); err != nil {
+	if err := upsertFTS(tx, id, t.Title, t.Body, t.Tags); err != nil {
 		return err
 	}
 	if err := c.emitEvent(tx, event.ActionUpdate, id, t.Updated, marshalTraceData(t)); err != nil {
@@ -1616,11 +1622,7 @@ func (c *Cortex) SyncWithOptions(opts SyncOptions) (SyncResult, error) {
 				return result, err
 			}
 		}
-		if _, err := tx.Exec(`DELETE FROM traces_fts WHERE id = ?`, t.ID); err != nil {
-			tx.Rollback()
-			return result, err
-		}
-		if _, err := tx.Exec(`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`, t.ID, t.Title, t.Body); err != nil {
+		if err := upsertFTS(tx, t.ID, t.Title, t.Body, t.Tags); err != nil {
 			tx.Rollback()
 			return result, err
 		}
@@ -2220,7 +2222,7 @@ func (c *Cortex) replayCreate(e event.Event) error {
 			return err
 		}
 	}
-	if _, err := tx.Exec(`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`, t.ID, t.Title, t.Body); err != nil {
+	if err := insertFTS(tx, t.ID, t.Title, t.Body, t.Tags); err != nil {
 		cleanupFile(err)
 		return err
 	}
@@ -2336,10 +2338,7 @@ func (c *Cortex) replayUpdate(e event.Event) error {
 			return err
 		}
 	}
-	if _, err := tx.Exec(`DELETE FROM traces_fts WHERE id = ?`, e.TraceID); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`, e.TraceID, t.Title, t.Body); err != nil {
+	if err := upsertFTS(tx, e.TraceID, t.Title, t.Body, t.Tags); err != nil {
 		return err
 	}
 	if err := event.Append(tx, &e); err != nil {
@@ -2468,7 +2467,7 @@ func (c *Cortex) createDivergence(
 			return err
 		}
 	}
-	if _, err := tx.Exec(`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`, divID, divTrace.Title, body); err != nil {
+	if err := insertFTS(tx, divID, divTrace.Title, body, divTrace.Tags); err != nil {
 		os.Remove(divPath)
 		return err
 	}
@@ -2814,6 +2813,143 @@ func marshalTraceData(t *trace.Trace) json.RawMessage {
 	}
 	data, _ := json.Marshal(payload)
 	return data
+}
+
+// ftsTagText joins a trace's tags into one space-delimited string for
+// FTS5 indexing. The porter/ascii tokenizer splits on whitespace and
+// indexes each tag as an independent token, so tagging a trace with
+// e.g. `{"auth", "session", "oauth"}` makes each value findable via
+// search_traces even when none of them appear in the title or body.
+func ftsTagText(tags []string) string {
+	return strings.Join(tags, " ")
+}
+
+// insertFTS writes a row into traces_fts. Used for fresh creates where
+// no existing row for the id is possible. Inserting on top of a stale
+// row would create duplicates (FTS5 does not treat id as a key), which
+// is why the update paths use upsertFTS instead.
+func insertFTS(tx *sql.Tx, id, title, body string, tags []string) error {
+	_, err := tx.Exec(
+		`INSERT INTO traces_fts (id, title, body, tags) VALUES (?, ?, ?, ?)`,
+		id, title, body, ftsTagText(tags),
+	)
+	return err
+}
+
+// upsertFTS removes any existing row for id and re-inserts with the
+// current content. Used from every path that may be running against
+// a trace already in the index (updates, appends, federation replays,
+// and the Sync reindex loop).
+func upsertFTS(tx *sql.Tx, id, title, body string, tags []string) error {
+	if _, err := tx.Exec(`DELETE FROM traces_fts WHERE id = ?`, id); err != nil {
+		return err
+	}
+	return insertFTS(tx, id, title, body, tags)
+}
+
+// RebuildFTSIfStale repopulates traces_fts when it contains fewer rows
+// than the traces table (including trashed, archived, and active rows
+// — everything that should be searchable). The mismatch is expected
+// exactly once per cortex, immediately after migration 008 runs and
+// replaces the virtual table. On fresh cortexes and subsequent opens
+// the counts match and this is a no-op.
+//
+// The rebuild walks every row in the traces table, reads the trace's
+// body from disk (since body is not in SQL), and re-inserts all four
+// FTS columns. Rows whose files are missing on disk are inserted with
+// empty body so at least their title and tags remain searchable —
+// operators can fix those with `noema sync` later.
+//
+// Runs outside any caller's transaction because it iterates many
+// traces and couldn't share a short-lived transaction with them
+// cleanly. Each row is reinserted in its own tx so a mid-rebuild
+// failure leaves the index partially populated rather than empty.
+func (c *Cortex) RebuildFTSIfStale() error {
+	var tracesCount, ftsCount int
+	if err := c.DB.QueryRow(`SELECT COUNT(*) FROM traces`).Scan(&tracesCount); err != nil {
+		return fmt.Errorf("counting traces: %w", err)
+	}
+	if err := c.DB.QueryRow(`SELECT COUNT(*) FROM traces_fts`).Scan(&ftsCount); err != nil {
+		return fmt.Errorf("counting traces_fts: %w", err)
+	}
+	if ftsCount >= tracesCount {
+		return nil
+	}
+
+	rows, err := c.DB.Query(
+		`SELECT id, title, archived_at, trashed_at FROM traces`,
+	)
+	if err != nil {
+		return fmt.Errorf("selecting traces for reindex: %w", err)
+	}
+	defer rows.Close()
+
+	type rebuildEntry struct {
+		id, title   string
+		archivedAt  string
+		trashedAt   string
+	}
+	var entries []rebuildEntry
+	for rows.Next() {
+		var e rebuildEntry
+		var archived, trashed *string
+		if err := rows.Scan(&e.id, &e.title, &archived, &trashed); err != nil {
+			return err
+		}
+		if archived != nil {
+			e.archivedAt = *archived
+		}
+		if trashed != nil {
+			e.trashedAt = *trashed
+		}
+		entries = append(entries, e)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stderr,
+		"[cortex] reindexing FTS5 for %d traces (first boot after upgrade; this runs once)\n",
+		len(entries),
+	)
+
+	for _, e := range entries {
+		var path string
+		switch {
+		case e.trashedAt != "":
+			path = c.TrashFile(e.id)
+		case e.archivedAt != "":
+			path = c.TraceFile(e.id, true)
+		default:
+			path = c.TraceFile(e.id, false)
+		}
+
+		var body string
+		tags, err := c.tagsFor(e.id)
+		if err != nil {
+			return fmt.Errorf("loading tags for %s: %w", e.id, err)
+		}
+		if t, err := trace.ParseFile(path); err == nil {
+			body = t.Body
+		}
+		// Parse failures leave body empty — the file may have been
+		// deleted out of band. Title and tags are still indexed so
+		// the trace is partially searchable until `noema sync`
+		// rebuilds from source.
+
+		tx, err := c.DB.Begin()
+		if err != nil {
+			return fmt.Errorf("opening reindex tx for %s: %w", e.id, err)
+		}
+		if err := upsertFTS(tx, e.id, e.title, body, tags); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("reindexing %s: %w", e.id, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("committing reindex for %s: %w", e.id, err)
+		}
+	}
+	return nil
 }
 
 func boolToInt(b bool) int {
