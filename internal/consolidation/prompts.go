@@ -179,7 +179,14 @@ func runCohesionStep(ctx context.Context, llm LLMClient, model string, cluster C
 	body := formatTraces(cluster, bodyLimit)
 	user := fmt.Sprintf(`Below are %d short-term memories from a Noema cortex.
 
-Would a single consolidated summary of these be more useful than keeping them as separate short-term memories? Answer yes if they share a common thread — same topic, same project, same agent session, same recurring activity, or same line of investigation. Answer no if the only way to summarize them together would be a vague umbrella like "various activities" or "general updates".
+Would a single consolidated summary of these be more useful than keeping them as separate short-term memories?
+
+Answer yes if they share a specific common thread. Each of these counts:
+- same topic, project, agent session, or line of investigation
+- same recurring activity across time (multiple session summaries, multiple heartbeat checks, multiple cron logs, multiple daily status reports) — a time-series of the same activity is cohesive even when individual entries are thin
+- same debugging or troubleshooting effort (even across multiple steps)
+
+Answer no if the memories are about different subjects, even if they share superficial features like the same day, the same author, or the same tag. A cluster containing "movie notes", "architecture docs", and "shopping list" is not cohesive even if they were all created on the same Tuesday. If you'd have to write an umbrella like "various activities", "mixed updates", or "general work" to summarize them together, the answer is no.
 
 %s
 
@@ -206,6 +213,7 @@ func runTemplateStep(ctx context.Context, llm LLMClient, model string, cluster C
 
 Grounding rules:
 - Only reference entities, projects, tools, people, or topics that actually appear in the memories above. Do not invent, add, or infer topics that are not explicitly present.
+- Preserve specific named entities verbatim: skill names, tool names, identifiers, file paths, error strings, bug references, proper nouns. If a source mentions "smartthings-integration-token-expiration" or "*.vpost.net_ecc SSL glob bug" or "ssh-key-troubleshooting skill", the body should name those specifics rather than flattening them to generic prose like "various skills" or "network issues". The mid-term memory loses all its value if the concrete artifacts disappear.
 - The title must describe what the memories are actually about, not what they might relate to. If the cluster is about one thing (e.g. all "hermes" sessions), the title should name that one thing — do not add unrelated subjects to make the title sound broader.
 - Tags should come from the source memories' tags or from terms that appear literally in the bodies.
 
