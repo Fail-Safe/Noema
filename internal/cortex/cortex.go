@@ -707,6 +707,18 @@ func Open(name, dir string) (*Cortex, error) {
 		}
 	}
 
+	// Self-heal the FTS5 schema if a prior-branch migration collision
+	// left traces_fts without the tags column. This happens when an
+	// earlier draft of a feature branch occupied a migration version
+	// number that a later patch release also took: the old migration
+	// stamps schema_migrations with that version, and the new
+	// migration then silently skips on the next open because the
+	// version is already marked applied. Detect the shape mismatch
+	// and rebuild the virtual table before the rest of Open proceeds.
+	if err := cx.ensureFTSSchema(); err != nil {
+		fmt.Fprintf(os.Stderr, "[cortex] FTS5 schema repair warning: %v\n", err)
+	}
+
 	// Auto-rebuild the FTS5 index when it's smaller than the traces
 	// table. This is the recovery path after migration 008, which
 	// dropped and recreated traces_fts with a new tags column but
@@ -2964,6 +2976,42 @@ func upsertFTS(tx *sql.Tx, id, title, body string, tags []string) error {
 		return err
 	}
 	return insertFTS(tx, id, title, body, tags)
+}
+
+// ensureFTSSchema checks that traces_fts has the four expected columns
+// (id, title, body, tags) and rebuilds the virtual table if the tags
+// column is missing. Intended for pre-v1 cortexes that were opened by
+// a draft feature branch which claimed a migration version number
+// that a later patch release reused for a different migration — the
+// claim is persisted in schema_migrations, so the new migration
+// silently skips and the on-disk schema diverges from what code
+// expects. A fresh DROP + CREATE here restores the expected shape;
+// RebuildFTSIfStale runs next and repopulates rows from traces +
+// markdown bodies. No-op on correctly-migrated cortexes.
+func (c *Cortex) ensureFTSSchema() error {
+	var sql string
+	err := c.DB.QueryRow(
+		`SELECT sql FROM sqlite_master WHERE type='table' AND name='traces_fts'`,
+	).Scan(&sql)
+	if err != nil {
+		return fmt.Errorf("introspecting traces_fts: %w", err)
+	}
+	if strings.Contains(sql, "tags") {
+		return nil
+	}
+	if _, err := c.DB.Exec(`DROP TABLE IF EXISTS traces_fts`); err != nil {
+		return fmt.Errorf("dropping stale traces_fts: %w", err)
+	}
+	if _, err := c.DB.Exec(`CREATE VIRTUAL TABLE traces_fts USING fts5(
+		id      UNINDEXED,
+		title,
+		body,
+		tags,
+		tokenize = 'porter ascii'
+	)`); err != nil {
+		return fmt.Errorf("recreating traces_fts: %w", err)
+	}
+	return nil
 }
 
 // RebuildFTSIfStale repopulates traces_fts when it contains fewer rows
