@@ -349,6 +349,101 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 		return mcp.NewToolResultText(fmt.Sprintf("Vote recorded: %s %s.", direction, id)), nil
 	}))
 
+	// ---- Memory consolidation tools (internal-only) --------------------
+	//
+	// Two tools that together support an LLM-driven consolidation
+	// flow: list_consolidation_candidates surfaces short-term traces
+	// with their usage signals, and record_consolidation_result
+	// materialises a distilled mid-tier trace linked via derived_from
+	// to the sources it consolidates.
+	//
+	// Internal-only per the pattern in docs/plans/hermes-plugin-plan.md:74:
+	// these are not exposed to the Hermes agent surface (or equivalents)
+	// — they're called by whatever component is designated as the
+	// consolidator (an LLM via `noema consolidate`, or a custom agent
+	// told via get_instructions that it's the consolidator for the
+	// current cortex).
+
+	s.AddTool(mcp.NewTool("list_consolidation_candidates",
+		mcp.WithDescription("Internal tool. Returns short-term traces within the rolling consolidation window along with their usage signals (read_count, modify_count, tier_votes, derived_from_count). Consumer scores these and submits distilled mid-tier traces via record_consolidation_result."),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		m, err := cortex.ReadManifest(cx.Dir)
+		if err != nil {
+			return nil, fmt.Errorf("reading manifest for window config: %w", err)
+		}
+		window := m.Consolidation.EffectiveWindowHours()
+		cands, err := cx.PromotionCandidates(trace.TierShort, window)
+		if err != nil {
+			return nil, err
+		}
+		out := struct {
+			WindowHours int                         `json:"window_hours"`
+			Candidates  []cortex.PromotionCandidate `json:"candidates"`
+		}{
+			WindowHours: int(window.Hours()),
+			Candidates:  cands,
+		}
+		buf, _ := json.MarshalIndent(out, "", "  ")
+		return mcp.NewToolResultText(string(buf)), nil
+	})
+
+	s.AddTool(mcp.NewTool("record_consolidation_result",
+		mcp.WithDescription("Internal tool. Materialises a distilled mid-tier trace from a set of short-term sources. Validates the source IDs exist (>=2 required), creates the new trace with derived_from lineage pointing at the sources, and emits an ActionConsolidate event carrying model/profile/confidence telemetry for the quality dashboard."),
+		mcp.WithString("title", mcp.Description("Title for the distilled trace"), mcp.Required()),
+		mcp.WithString("body", mcp.Description("Body of the distilled trace — the consolidated memory"), mcp.Required()),
+		mcp.WithString("source_ids", mcp.Description("Comma-separated source trace IDs (at least 2)"), mcp.Required()),
+		mcp.WithString("tags", mcp.Description("Comma-separated tags (optional)")),
+		mcp.WithString("author", mcp.Description("Author identifier for the distilled trace (optional)")),
+		mcp.WithString("model_name", mcp.Description("Model that produced the distillation (optional; e.g. claude-opus-4-7)")),
+		mcp.WithString("model_tier_profile", mcp.Description("Prompt profile used (optional)"),
+			mcp.Enum("small", "large", "frontier")),
+		mcp.WithNumber("cohesion_confidence", mcp.Description("Confidence 0.0-1.0 that the cluster was cohesive (optional)")),
+	), readOnlyGuard(func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		title, err := req.RequireString("title")
+		if err != nil {
+			return nil, err
+		}
+		body, err := req.RequireString("body")
+		if err != nil {
+			return nil, err
+		}
+		sourcesRaw, err := req.RequireString("source_ids")
+		if err != nil {
+			return nil, err
+		}
+		var sources []string
+		for _, id := range strings.Split(sourcesRaw, ",") {
+			if id := strings.TrimSpace(id); id != "" {
+				sources = append(sources, id)
+			}
+		}
+
+		var tags []string
+		if raw := req.GetString("tags", ""); raw != "" {
+			for _, t := range strings.Split(raw, ",") {
+				if tag := strings.TrimSpace(t); tag != "" {
+					tags = append(tags, tag)
+				}
+			}
+		}
+
+		spec := cortex.DistilledTraceSpec{
+			Title:              title,
+			Body:               body,
+			Tags:               tags,
+			Author:             req.GetString("author", ""),
+			SourceIDs:          sources,
+			ModelName:          req.GetString("model_name", ""),
+			ModelTierProfile:   req.GetString("model_tier_profile", ""),
+			CohesionConfidence: req.GetFloat("cohesion_confidence", 0),
+		}
+		id, err := cx.CreateDistilledTrace(spec)
+		if err != nil {
+			return nil, err
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("Distilled trace created: %s (from %d sources)", id, len(sources))), nil
+	}))
+
 	s.AddTool(mcp.NewTool("append_trace",
 		mcp.WithDescription("Append content to an existing trace's body without reading the full trace first. Ideal for fire-and-forget logging, running journals, or any case where an agent needs to add to a trace without consuming its current content."),
 		mcp.WithString("id", mcp.Description("Trace ID"), mcp.Required()),

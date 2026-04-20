@@ -347,6 +347,7 @@ func TestPublishMode_BlocksMutatingTools(t *testing.T) {
 		{"unarchive_trace", map[string]any{"id": "nonexistent"}},
 		{"resolve_divergence", map[string]any{"id": "nonexistent"}},
 		{"vote_trace", map[string]any{"id": "nonexistent", "direction": "up"}},
+		{"record_consolidation_result", map[string]any{"title": "x", "body": "y", "source_ids": "a,b"}},
 	}
 
 	for _, tc := range mutating {
