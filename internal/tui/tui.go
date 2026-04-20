@@ -72,6 +72,15 @@ type palette struct {
 	live     lipgloss.TerminalColor // live-mode badge
 	errorFg  lipgloss.TerminalColor // footer error text
 	statusFg lipgloss.TerminalColor // footer status text
+
+	// Tier glyphs render as a heat chart: short is warm (volatile,
+	// just-arrived), long is cold (frozen, archival). Mid sits between
+	// as an amber/gold transition. "?" (unknown tier, a migration bug
+	// signal) reuses the dim color so it reads as an anomaly, not a
+	// fourth legitimate tier.
+	tierShort lipgloss.TerminalColor // short-term: warm orange
+	tierMid   lipgloss.TerminalColor // mid-term: amber/gold
+	tierLong  lipgloss.TerminalColor // long-term: cool blue
 }
 
 // darkPalette is the primary brand surface: near-black background,
@@ -96,6 +105,13 @@ func darkPalette() palette {
 		live:     lipgloss.Color("71"),
 		errorFg:  lipgloss.Color("196"),
 		statusFg: lipgloss.Color("71"),
+		// Heat-chart tier glyphs on a near-black surface: bright
+		// orange for short (volatile), warm gold for mid, sky blue
+		// for long (archival). All three are bright enough to pop
+		// from the 250-grey body without competing with brandRed.
+		tierShort: lipgloss.Color("208"),
+		tierMid:   lipgloss.Color("221"),
+		tierLong:  lipgloss.Color("39"),
 	}
 }
 
@@ -123,6 +139,14 @@ func lightPalette() palette {
 		live:     lipgloss.Color("22"),
 		errorFg:  lipgloss.Color("124"),
 		statusFg: lipgloss.Color("22"),
+		// Heat-chart tiers on a near-white surface need darker
+		// variants of the same progression — bright 208 reads as
+		// pastel against white. Terracotta (166) keeps the "warm"
+		// feel with enough contrast; amber 136 is the gold mid;
+		// steel blue 25 is the cool/frozen endpoint.
+		tierShort: lipgloss.Color("166"),
+		tierMid:   lipgloss.Color("136"),
+		tierLong:  lipgloss.Color("25"),
 	}
 }
 
@@ -172,6 +196,13 @@ var (
 	// implicit fill behind the list/detail/divider block so the
 	// whole TUI reads as one brand surface.
 	styleSurface lipgloss.Style
+
+	// Heat-chart tier glyphs: short/mid/long get warm→cold colors
+	// so a scan of the list reads the tier distribution the same
+	// way the eye reads a heatmap. Used by tierBadge.
+	styleTierShort lipgloss.Style
+	styleTierMid   lipgloss.Style
+	styleTierLong  lipgloss.Style
 )
 
 func init() {
@@ -264,6 +295,15 @@ func loadPalette(theme string) {
 	styleNewRowDim = lipgloss.NewStyle().
 		Background(p.bg).
 		Foreground(p.newDim)
+
+	// Tier glyphs are bold so the heat color registers at a glance
+	// even at the 1-character width. Background isn't set here — the
+	// outer row style (styleSurface/styleSelected/styleRowDim) paints
+	// the row background underneath, and lipgloss preserves the
+	// inner foreground when rendering a nested pre-styled substring.
+	styleTierShort = lipgloss.NewStyle().Foreground(p.tierShort).Bold(true)
+	styleTierMid = lipgloss.NewStyle().Foreground(p.tierMid).Bold(true)
+	styleTierLong = lipgloss.NewStyle().Foreground(p.tierLong).Bold(true)
 }
 
 // resolveTheme picks a concrete theme ("dark" or "light") from an
@@ -416,6 +456,26 @@ func tierBadge(tier string) string {
 		return "L"
 	default:
 		return "?"
+	}
+}
+
+// renderTierGlyph returns the tier badge pre-styled with its heat-chart
+// color (warm orange → amber → cool blue for short → mid → long). The
+// result embeds ANSI escape sequences; the outer row style re-paints
+// the background around them but leaves the inner foreground intact.
+// Unknown tiers render without color to keep the "?" reading as a
+// migration-anomaly signal rather than a fourth tier.
+func renderTierGlyph(tier string) string {
+	glyph := tierBadge(tier)
+	switch tier {
+	case trace.TierShort:
+		return styleTierShort.Render(glyph)
+	case trace.TierMid:
+		return styleTierMid.Render(glyph)
+	case trace.TierLong:
+		return styleTierLong.Render(glyph)
+	default:
+		return glyph
 	}
 }
 
@@ -1207,7 +1267,7 @@ func (m model) renderList(width, height int) string {
 		// badge is at most 14 chars (longest type: "observation"=11 + 2 = 13)
 		badgeW := 14
 		dateW := 10
-		tierGlyph := tierBadge(r.Tier)
+		tierGlyph := renderTierGlyph(r.Tier)
 		// 1 cursor + 1 space + tier(1) + 1 space + title + 1 space +
 		// badge(14) + 1 space + date(10)
 		titleW := width - 2 - 2 - badgeW - 1 - dateW - 1
