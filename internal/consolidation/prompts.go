@@ -124,7 +124,7 @@ func (p largeProfile) Run(ctx context.Context, llm LLMClient, model string, clus
 	if err != nil {
 		return Distillation{}, err
 	}
-	conf, err := runConfidenceStep(ctx, llm, model, cluster)
+	conf, err := runConfidenceStep(ctx, llm, model, cluster, d)
 	if err != nil {
 		// Confidence is optional — proceed with zero confidence on
 		// parse failures rather than bailing the whole pass.
@@ -228,16 +228,50 @@ Body: <1-3 paragraphs distilling the cluster>`, len(cluster.Traces), body)
 	return parseTemplate(raw)
 }
 
-func runConfidenceStep(ctx context.Context, llm LLMClient, model string, cluster ClusterInput) (float64, error) {
-	user := `On a scale of 1 to 10, how confident are you that the consolidation you just wrote preserves the essential information from the source memories?
+func runConfidenceStep(ctx context.Context, llm LLMClient, model string, cluster ClusterInput, d Distillation) (float64, error) {
+	// Each profile step is a fresh completion with no conversation
+	// history, so the confidence step has to be shown both the source
+	// cluster and the distillation it's being asked to rate —
+	// otherwise the model is evaluating thin air and returns
+	// arbitrary low numbers.
+	//
+	// Calibrated scale with anchors because models otherwise default
+	// to "10" on every judgment. The anchors force the model to
+	// distinguish between "all key information preserved" (a strong
+	// distillation) and "most but some fidelity lost" (typical) and
+	// "umbrella summary only" (weak). The ask for a one-sentence
+	// justification before the number is a well-known anti-anchoring
+	// trick — a model that has to justify "10" usually notices it's
+	// not warranted and writes "7" instead.
+	sources := formatTraces(cluster, 300)
+	user := fmt.Sprintf(`You just wrote this consolidation:
 
-Answer with a single integer on one line, with no other text.`
+Title: %s
+Tags: %s
+Body: %s
+
+From these source memories:
+
+%s
+
+Rate how well the consolidation preserves the source information on this calibrated scale:
+
+  10 = every specific fact, name, and detail from every source is preserved
+  7-9 = all key points preserved, minor details omitted
+  4-6 = general theme preserved, specific facts lost
+  1-3 = only a vague umbrella description
+
+Be strict. Most summaries fall in the 4-8 range.
+
+Answer in exactly this format, nothing else:
+<one-sentence justification>
+<integer 1-10>`, d.Title, strings.Join(d.Tags, ", "), d.Body, sources)
 
 	raw, err := llm.Complete(ctx, CompletionRequest{
 		Model:           model,
 		Messages:        []Message{{Role: "user", Content: user}},
 		Temperature:     0.0,
-		MaxTokens:       8,
+		MaxTokens:       120,
 		DisableThinking: true,
 	})
 	if err != nil {
@@ -256,17 +290,19 @@ func parseCohesion(raw string) bool {
 }
 
 func parseConfidenceInt(raw string) float64 {
-	m := intRE.FindStringSubmatch(raw)
-	if m == nil {
+	// With the calibrated-scale prompt the model writes a
+	// justification sentence before the integer, so the score is the
+	// LAST integer in the response, not the first. FindAllStringSubmatch
+	// gives us every match in order; we take the final one.
+	all := intRE.FindAllStringSubmatch(raw, -1)
+	if len(all) == 0 {
 		return 0
 	}
-	switch m[1] {
-	case "10":
+	last := all[len(all)-1][1]
+	if last == "10" {
 		return 1.0
-	default:
-		// "0".."9" — map "10" separately above
-		return float64(int(m[1][0]-'0')) / 10.0
 	}
+	return float64(int(last[0]-'0')) / 10.0
 }
 
 func parseTemplate(raw string) (Distillation, error) {
