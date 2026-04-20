@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -22,6 +23,7 @@ func consolidateCmd() *cobra.Command {
 		dryRunFlag    bool
 		windowFlag    int
 		retriesFlag   int
+		emitJSONFlag  string
 	)
 
 	cmd := &cobra.Command{
@@ -130,6 +132,36 @@ override per-invocation.`,
 				result.DistillationsCreated, result.Rejected,
 				result.FallbackPromotions, result.Skipped,
 			)
+
+			if emitJSONFlag != "" {
+				// Pipeline already populated ClusterResults; this
+				// just serializes them alongside the run-level
+				// summary fields to the requested path. A judge
+				// subagent or downstream scorer can read this file
+				// directly.
+				payload := struct {
+					Endpoint  string                      `json:"endpoint"`
+					Model     string                      `json:"model"`
+					Profile   string                      `json:"profile"`
+					Window    string                      `json:"window"`
+					DryRun    bool                        `json:"dry_run"`
+					Timestamp time.Time                   `json:"timestamp"`
+					Summary   consolidation.PipelineResult `json:"summary"`
+				}{
+					Endpoint: endpoint, Model: modelName, Profile: modelTier,
+					Window: window.String(), DryRun: dryRunFlag,
+					Timestamp: time.Now().UTC(),
+					Summary:   result,
+				}
+				data, err := json.MarshalIndent(payload, "", "  ")
+				if err != nil {
+					return fmt.Errorf("marshalling emit-json: %w", err)
+				}
+				if err := os.WriteFile(emitJSONFlag, data, 0o644); err != nil {
+					return fmt.Errorf("writing emit-json to %s: %w", emitJSONFlag, err)
+				}
+				logger("[consolidate] emitted per-cluster JSON to %s", emitJSONFlag)
+			}
 			return nil
 		},
 	}
@@ -141,5 +173,6 @@ override per-invocation.`,
 	cmd.Flags().BoolVar(&dryRunFlag, "dry-run", false, "format prompts and parse responses but skip record_consolidation_result")
 	cmd.Flags().IntVar(&windowFlag, "window", 0, "override consolidation.window_hours")
 	cmd.Flags().IntVar(&retriesFlag, "retries", 1, "retry budget per cluster before heuristic fallback")
+	cmd.Flags().StringVar(&emitJSONFlag, "emit-json", "", "write per-cluster results to a JSON file for downstream scoring / judging")
 	return cmd
 }

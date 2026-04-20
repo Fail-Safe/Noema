@@ -40,6 +40,38 @@ type PipelineResult struct {
 	FallbackPromotions   int
 	Rejected             int
 	Skipped              int
+
+	// ClusterResults is the per-cluster breakdown. Populated for every
+	// cluster the pipeline considered — distilled, rejected, skipped,
+	// or fallback-promoted. Used by --emit-json for prompt-tuning
+	// evaluation (a frontier model can score each distillation against
+	// its sources to turn vibes into numbers).
+	ClusterResults []ClusterResult `json:"cluster_results,omitempty"`
+}
+
+// ClusterResult is the per-cluster record for one pass. Marshals to
+// JSON for --emit-json consumption.
+type ClusterResult struct {
+	IDs         []string      `json:"ids"`
+	Bucket      string        `json:"bucket"` // groupKey() output, e.g. "note|2026-04-13"
+	Profile     string        `json:"profile"`
+	Outcome     string        `json:"outcome"` // distilled | rejected | skipped | fallback | error
+	Title       string        `json:"title,omitempty"`
+	Tags        []string      `json:"tags,omitempty"`
+	Body        string        `json:"body,omitempty"`
+	Confidence  float64       `json:"confidence,omitempty"`
+	Reason      string        `json:"reason,omitempty"`
+	Sources     []SourceTrace `json:"sources,omitempty"` // only populated on --emit-json
+}
+
+// SourceTrace mirrors TraceInput but is the JSON-serialization shape.
+// Kept separate so the internal pipeline type can evolve without
+// changing the emit-json schema.
+type SourceTrace struct {
+	ID    string   `json:"id"`
+	Title string   `json:"title"`
+	Tags  []string `json:"tags,omitempty"`
+	Body  string   `json:"body,omitempty"`
 }
 
 // RunLLMPass reads candidates from the cortex, groups them into
@@ -71,7 +103,7 @@ func RunLLMPass(ctx context.Context, cx LLMCortex, llm LLMClient, cfg PipelineCo
 	maxCluster := profile.MaxClusterSize()
 
 	groups := groupCandidates(candidates)
-	for _, g := range groups {
+	for gi, g := range groups {
 		if ctx.Err() != nil {
 			return result, ctx.Err()
 		}
@@ -79,14 +111,26 @@ func RunLLMPass(ctx context.Context, cx LLMCortex, llm LLMClient, cfg PipelineCo
 		// model-tier ceiling isn't violated. Heuristic: preserve
 		// lineage groupings even when chunked; the order is
 		// stable so the same input produces the same chunks.
+		bucket := ""
+		if len(g) > 0 {
+			bucket = groupKey(g[0])
+		}
 		for i := 0; i < len(g); i += maxCluster {
 			end := i + maxCluster
 			if end > len(g) {
 				end = len(g)
 			}
 			chunk := g[i:end]
+			cr := ClusterResult{
+				IDs:     idSlice(chunk),
+				Bucket:  bucket,
+				Profile: profile.Name(),
+			}
 			if len(chunk) < 2 {
 				result.Skipped++
+				cr.Outcome = "skipped"
+				cr.Reason = "singleton chunk after bucketing"
+				result.ClusterResults = append(result.ClusterResults, cr)
 				continue
 			}
 			result.ClustersAttempted++
@@ -95,8 +139,12 @@ func RunLLMPass(ctx context.Context, cx LLMCortex, llm LLMClient, cfg PipelineCo
 			if err != nil {
 				log("[consolidate] build cluster failed: %v", err)
 				result.Skipped++
+				cr.Outcome = "error"
+				cr.Reason = fmt.Sprintf("build cluster: %v", err)
+				result.ClusterResults = append(result.ClusterResults, cr)
 				continue
 			}
+			cr.Sources = sourceSnapshot(cluster)
 
 			d, runErr := runWithRetry(ctx, llm, profile, cfg.ModelName, cluster, cfg.MaxRetries)
 			switch {
@@ -109,22 +157,38 @@ func RunLLMPass(ctx context.Context, cx LLMCortex, llm LLMClient, cfg PipelineCo
 					// tier state as a consolation prize.
 					log("[consolidate] cluster failed after retries: %v; dry-run suppressed fallback promotion", runErr)
 					result.Skipped++
+					cr.Outcome = "skipped"
+					cr.Reason = fmt.Sprintf("llm error (dry-run fallback suppressed): %v", runErr)
 				} else {
 					log("[consolidate] cluster failed after retries: %v; falling back to heuristic promotion", runErr)
-					result.FallbackPromotions += heuristicFallback(cx, chunk, log)
+					n := heuristicFallback(cx, chunk, log)
+					result.FallbackPromotions += n
+					cr.Outcome = "fallback"
+					cr.Reason = fmt.Sprintf("llm error, heuristic-promoted %d: %v", n, runErr)
 				}
 			case !d.Cohesive:
 				log("[consolidate] cluster rejected as incohesive (ids=%s)", idsOf(chunk))
 				result.Rejected++
+				cr.Outcome = "rejected"
+				cr.Reason = "cohesion gate returned no"
 			default:
 				if err := submit(cx, cfg, d, chunk, profile.Name(), log); err != nil {
 					log("[consolidate] submit failed (ids=%s): %v", idsOf(chunk), err)
 					result.Skipped++
-					continue
+					cr.Outcome = "error"
+					cr.Reason = fmt.Sprintf("submit: %v", err)
+				} else {
+					result.DistillationsCreated++
+					cr.Outcome = "distilled"
+					cr.Title = d.Title
+					cr.Tags = d.Tags
+					cr.Body = d.Body
+					cr.Confidence = d.Confidence
 				}
-				result.DistillationsCreated++
 			}
+			result.ClusterResults = append(result.ClusterResults, cr)
 		}
+		_ = gi
 	}
 
 	log("[consolidate] pass complete: considered=%d attempted=%d distilled=%d rejected=%d fallback-promoted=%d skipped=%d",
@@ -289,6 +353,28 @@ func submit(cx LLMCortex, cfg PipelineConfig, d Distillation, chunk []cortex.Pro
 	}
 	log("[consolidate] distilled %d sources -> %s (%q)", len(sources), id, d.Title)
 	return nil
+}
+
+// idSlice returns just the IDs from a candidate chunk — used to
+// populate ClusterResult.IDs for JSON emission.
+func idSlice(chunk []cortex.PromotionCandidate) []string {
+	out := make([]string, len(chunk))
+	for i, pc := range chunk {
+		out[i] = pc.ID
+	}
+	return out
+}
+
+// sourceSnapshot captures the TraceInput data as SourceTrace records
+// for JSON emission. A judge needs the source bodies to assess
+// whether a distillation faithfully represents them; without this
+// the JSON is empty scaffolding.
+func sourceSnapshot(c ClusterInput) []SourceTrace {
+	out := make([]SourceTrace, len(c.Traces))
+	for i, t := range c.Traces {
+		out[i] = SourceTrace{ID: t.ID, Title: t.Title, Tags: t.Tags, Body: t.Body}
+	}
+	return out
 }
 
 func idsOf(chunk []cortex.PromotionCandidate) string {
