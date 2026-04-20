@@ -656,52 +656,62 @@ func healthHint(reason string) string {
 	return ""
 }
 
-// versionSeriesMatches compares the major/minor prefix of two Noema
-// version strings. Returns true when both strings lead with the same
-// `vX.Y` prefix, or when either side is unparseable (e.g. "dev" or a
-// commit-tagged build without a stable semver prefix) — skipping the
-// warning for unparseable versions avoids shouting at every dev
-// build.
+// versionSeriesMatches compares the released-version baseline of two
+// Noema version strings. Returns true when both describe builds
+// against the same released tag — i.e. they share a `vX.Y.Z` prefix,
+// ignoring any `-N-gSHA[-dirty]` dev-build suffix that git describe
+// appends.
+//
+// Returns true when either side is unparseable ("dev", a bare commit
+// hash, ad-hoc build strings) so the warning doesn't fire on builds
+// that don't carry a meaningful baseline. The goal is to flag peer-
+// vs-local skew that operators can act on — a dev build is already
+// a known unknown.
+//
+// Earlier implementation compared only `vX.Y`, which let patch-level
+// drift slip through silently. A peer on v0.9.1 while the local
+// binary is v0.9.2-based is exactly the scenario this diagnostic
+// exists to surface, so the comparison now runs at the full patch
+// level.
 func versionSeriesMatches(a, b string) bool {
-	ap, aok := semverSeries(a)
-	bp, bok := semverSeries(b)
+	ap, aok := semverBaseline(a)
+	bp, bok := semverBaseline(b)
 	if !aok || !bok {
 		return true
 	}
 	return ap == bp
 }
 
-// semverSeries returns the `vX.Y` prefix of a version string when
-// present. Tolerates an optional leading `v` and a trailing suffix
-// (patch segment, commit hash, -dirty marker). Returns ok=false for
-// inputs that don't lead with two dot-separated numeric segments.
-func semverSeries(v string) (string, bool) {
+// semverBaseline returns the `X.Y.Z` (or `X.Y`) released-version
+// prefix of a version string. Everything past the first `-` is
+// stripped because `git describe --tags` formats dev builds as
+// `vX.Y.Z-N-gSHA[-dirty]` and that suffix identifies the dev commit,
+// not the released baseline the build descends from.
+//
+// Returns ok=false for strings that don't lead with at least two
+// dot-separated all-numeric segments (so "dev", "v", "1", and
+// arbitrary branch names don't pass as parseable versions).
+func semverBaseline(v string) (string, bool) {
 	s := strings.TrimPrefix(v, "v")
 	if s == "" {
 		return "", false
 	}
-	dot1 := strings.IndexByte(s, '.')
-	if dot1 <= 0 {
+	if dash := strings.IndexByte(s, '-'); dash >= 0 {
+		s = s[:dash]
+	}
+	parts := strings.Split(s, ".")
+	if len(parts) < 2 {
 		return "", false
 	}
-	rest := s[dot1+1:]
-	dot2 := strings.IndexAny(rest, ".-")
-	minor := rest
-	if dot2 >= 0 {
-		minor = rest[:dot2]
-	}
-	if minor == "" {
-		return "", false
-	}
-	for _, r := range s[:dot1] {
-		if r < '0' || r > '9' {
+	for _, p := range parts {
+		if p == "" {
 			return "", false
 		}
-	}
-	for _, r := range minor {
-		if r < '0' || r > '9' {
-			return "", false
+		for _, r := range p {
+			if r < '0' || r > '9' {
+				return "", false
+			}
 		}
 	}
-	return s[:dot1] + "." + minor, true
+	return s, true
 }
