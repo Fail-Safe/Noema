@@ -105,6 +105,15 @@ type WatchConfig struct {
 	// DebounceMs is the per-path debounce window in milliseconds.
 	// Zero means use the default (300ms).
 	DebounceMs int `yaml:"debounce_ms,omitempty"`
+	// AutoOnboard controls what happens when a new file is dropped into
+	// traces/ without conforming frontmatter (no id, empty id, invalid
+	// id format, or filename mismatch). Nil / unset defaults to true:
+	// the watcher rescues the file by synthesizing valid frontmatter,
+	// generating an ID from the title or filename, and renaming the
+	// file to match. Makes Obsidian Web Clipper, Drafts, and shortcut
+	// macros work without teaching users Noema's filename-ID rules.
+	// Set to false to restore the prior skip-and-log behaviour.
+	AutoOnboard *bool `yaml:"auto_onboard,omitempty"`
 }
 
 // WatchEnabled reports whether the watcher should run given the parsed
@@ -114,6 +123,17 @@ func (wc *WatchConfig) WatchEnabled() bool {
 		return true
 	}
 	return *wc.Enabled
+}
+
+// AutoOnboardEnabled reports whether the watcher should rescue non-
+// conforming files dropped into traces/. Nil manifest or nil
+// AutoOnboard pointer both mean "on" so users get the graceful
+// behaviour by default.
+func (wc *WatchConfig) AutoOnboardEnabled() bool {
+	if wc == nil || wc.AutoOnboard == nil {
+		return true
+	}
+	return *wc.AutoOnboard
 }
 
 // EffectiveDebounce returns the configured debounce duration, defaulting
