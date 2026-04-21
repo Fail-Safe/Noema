@@ -26,6 +26,14 @@ const (
 	ActionVote                Action = "vote"
 	ActionPurgeLongTerm       Action = "purge_long_term"
 	ActionPurgeHard           Action = "purge_hard"
+
+	// Multi-peer consolidation coordination. See consolidation-plan.md §14.
+	// Ship alongside the rank-advertisement foundation so federation event
+	// replay doesn't encounter unknown actions once later phases start
+	// emitting them.
+	ActionConsolidationClaim   Action = "consolidation_claim"
+	ActionConsolidationSuccess Action = "consolidation_success"
+	ActionConsolidationFail    Action = "consolidation_fail"
 )
 
 // Event is an immutable record of a mutation to a Trace.
