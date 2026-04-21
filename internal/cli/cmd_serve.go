@@ -97,6 +97,7 @@ func serveCmd() *cobra.Command {
 			var syncer *federation.Syncer
 			var watcher *watch.Watcher
 			var consolidator *consolidation.Agent
+			var eligibility *consolidation.EligibilityLoop
 
 			// Filesystem watcher: on by default so external edits
 			// (Obsidian, VS Code, Finder, iCloud sync, another agent on
@@ -119,6 +120,18 @@ func serveCmd() *cobra.Command {
 			// the pass with candidate selection and LLM distillation.
 			if manifestErr == nil && m.Consolidation != nil && m.Consolidation.Enabled {
 				consolidator = startConsolidator(cx, m.Consolidation)
+			}
+
+			// Eligibility loop: advertises this cortex's consolidation
+			// rank in federation_state so federated peers can observe
+			// whether and how strongly we want to run the next
+			// consolidation window (see consolidation-plan.md §14).
+			// Phase 2 lands the advertisement; Phase 3 wires the
+			// election itself. Runs whenever consolidation.enabled is
+			// true — harmless on a single-node cortex (rank just sits
+			// in local kv) and ready-to-go the moment peers are added.
+			if manifestErr == nil && m.Consolidation != nil && m.Consolidation.Enabled {
+				eligibility = startEligibility(cx, m.Consolidation)
 			}
 
 			switch transport {
@@ -261,6 +274,9 @@ func serveCmd() *cobra.Command {
 			if consolidator != nil {
 				consolidator.Stop()
 			}
+			if eligibility != nil {
+				eligibility.Stop()
+			}
 			return err
 		},
 	}
@@ -321,6 +337,32 @@ func startConsolidator(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig) *cons
 	fmt.Fprintf(os.Stderr, "[consolidation] agent started (cron=%q idle=%dm threshold=%d window=%s)\n",
 		cfg.Cron, cfg.IdleMinutes, cfg.ThresholdShort, cfg.EffectiveWindowHours())
 	return a
+}
+
+// startEligibility launches the rank-advertisement loop for federation-
+// aware consolidation coordination (plan §14). Always safe to call when
+// cfg.Enabled is true: on a single-node cortex the loop writes a local
+// kv row nothing reads, at negligible cost; in a federation it seeds
+// the state remote peers pull on every cortex_identity round-trip.
+func startEligibility(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig) *consolidation.EligibilityLoop {
+	if cfg == nil || !cfg.Enabled {
+		return nil
+	}
+	logger := func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
+	}
+	loop := consolidation.NewEligibilityLoop(consolidation.EligibilityConfig{
+		Enabled:    cfg.Enabled,
+		LLMEnabled: cfg.LLMEnabled,
+		Endpoint:   cfg.LocalLLMEndpoint,
+		CortexID:   cx.ID,
+		State:      federation.NewState(cx.DB.DB),
+		Log:        logger,
+	})
+	loop.Start()
+	fmt.Fprintf(os.Stderr, "[consolidation] eligibility loop started (llm_enabled=%t endpoint=%q)\n",
+		cfg.LLMEnabled, cfg.LocalLLMEndpoint)
+	return loop
 }
 
 // startSyncer converts the manifest's federation config into a running

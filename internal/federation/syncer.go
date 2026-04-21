@@ -470,12 +470,31 @@ func (s *Syncer) verifyPeerIdentity(mcpClient *client.Client, peer PeerConfig) e
 	}
 
 	var identity struct {
-		ID      string `json:"id"`
-		Name    string `json:"name"`
-		Version int    `json:"version"`
+		ID      string     `json:"id"`
+		Name    string     `json:"name"`
+		Version int        `json:"version"`
+		Rank    *RankEntry `json:"rank,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(text), &identity); err != nil {
 		return fmt.Errorf("parsing cortex_identity response from peer %q: %w", peer.Name, err)
+	}
+
+	// Persist the peer's advertised consolidation rank if they reported
+	// one. Rank is advisory — a failure here logs but doesn't abort the
+	// sync. The CortexID we store is the authoritative identity.ID from
+	// this same response, not the nested rank.CortexID, so a peer that
+	// reports an inconsistent rank.CortexID can't confuse us about who
+	// we're talking to. Peers on older binaries simply omit the field
+	// and are left with whatever rank (if any) we last saw.
+	if identity.Rank != nil {
+		entry := RankEntry{
+			CortexID:   identity.ID,
+			Rank:       identity.Rank.Rank,
+			ObservedAt: identity.Rank.ObservedAt,
+		}
+		if err := s.state.SetPeerRank(peer.Name, entry); err != nil {
+			log.Printf("[federation] peer %q rank persist failed: %v", peer.Name, err)
+		}
 	}
 
 	if identity.Version < minPeerManifestVersion {

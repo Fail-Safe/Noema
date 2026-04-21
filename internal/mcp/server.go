@@ -556,6 +556,17 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 			"version": m.Version,
 			"mode":    m.Federation.EffectiveMode(),
 		}
+		// Piggyback the current consolidation rank on the identity
+		// response so federated peers can observe eligibility without a
+		// separate round-trip. Missing state (feature off, eligibility
+		// loop not yet running, malformed kv row) is surfaced as
+		// rank=0 — the coordination layer treats zero as "not
+		// participating". Older peers that don't know about the field
+		// simply ignore it.
+		state := federation.NewState(cx.DB.DB)
+		if rank, rerr := state.GetLocalRank(); rerr == nil && rank.CortexID != "" {
+			payload["rank"] = rank
+		}
 		data, err := json.Marshal(payload)
 		if err != nil {
 			return nil, fmt.Errorf("marshaling identity: %w", err)
