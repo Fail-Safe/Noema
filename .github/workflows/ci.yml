@@ -63,6 +63,17 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Staticcheck
+        # honnef.co/go/tools picks up bugs, stylistic issues, and
+        # performance problems that go vet doesn't cover. Pinned to a
+        # dated release tag so CI output is reproducible — bump the
+        # version below when you want the newer checks. Installed via
+        # go install so the only third-party surface is the upstream
+        # module itself; no GitHub Action in the middle.
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@2026.1
+          "$(go env GOPATH)/bin/staticcheck" ./...
+
       - name: Test with race detector
         # -race catches data races that pure unit tests miss. Noema
         # has a federation syncer, a background SQLite connection, and

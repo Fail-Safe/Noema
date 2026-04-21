@@ -262,7 +262,7 @@ func serveCmd() *cobra.Command {
 				err = fmt.Errorf(
 					"the legacy `sse` transport was removed in this release: noema now speaks Streamable HTTP (MCP 2025-03-26).\n" +
 						"  Re-run with --transport http (default endpoint /mcp) and regenerate any\n" +
-						"  systemd unit, launchd plist, or .mcp.json that pinned --transport sse.")
+						"  systemd unit, launchd plist, or .mcp.json that pinned --transport sse")
 			default:
 				err = fmt.Errorf("unknown transport %q: use stdio or http", transport)
 			}
@@ -475,7 +475,7 @@ func requireTLSForKeyedMode(access cortex.AccessKey, useTLS bool) error {
 	return fmt.Errorf(
 		"refusing to serve MCP auth over plaintext HTTP: access.shared_key_file is set (source=%s) but --tls-cert/--tls-key are not configured.\n"+
 			"  A bearer token sent without TLS is stolen by the first adversary on the network path.\n"+
-			"  Provide --tls-cert and --tls-key, or remove access.shared_key_file from cortex.md to run in open mode.",
+			"  Provide --tls-cert and --tls-key, or remove access.shared_key_file from cortex.md to run in open mode",
 		access.Source,
 	)
 }
@@ -518,7 +518,7 @@ func guardStdioFlags(hostSet, portSet, tlsCertSet, tlsKeySet bool) error {
 		"%s %s only meaningful with --transport http.\n"+
 			"  noema serve defaults to stdio, which reads JSON-RPC from stdin\n"+
 			"  and has no network endpoint to bind. Re-run with --transport http,\n"+
-			"  or remove the flag(s).",
+			"  or remove the flag(s)",
 		strings.Join(flags, ", "),
 		verb,
 	)

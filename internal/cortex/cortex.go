@@ -731,7 +731,7 @@ func Open(name, dir string) (*Cortex, error) {
 			return nil, fmt.Errorf(
 				"cortex %q is at manifest version %d but this binary requires version %d.\n"+
 					"Run `noema migrate cortex-id --cortex %s` to upgrade.\n"+
-					"See docs/design/cortex-uuid-plan.md for what this changes.",
+					"See docs/design/cortex-uuid-plan.md for what this changes",
 				name, m.Version, ManifestVersion, name,
 			)
 		}
@@ -842,7 +842,7 @@ func (c *Cortex) detectCopiedDirectory() error {
 			"clobbered. To make this directory a distinct Cortex, run:\n"+
 			"    noema migrate cortex-id --cortex %s --reset\n"+
 			"That will assign a fresh id and re-key the local event log. If this is not a\n"+
-			"copy and you expected the events to be present, restore from backup instead.",
+			"copy and you expected the events to be present, restore from backup instead",
 		c.Name, c.Dir, c.ID, distinctIDs, c.Name,
 	)
 }
@@ -2136,28 +2136,6 @@ func matchVersionLabel(accept, name, cortexID string) bool {
 		return true
 	}
 	return false
-}
-
-// extractVersionBody returns the body content of the `### Version from <label>`
-// section in a divergence trace, stripping the `**Vector clock:**` metadata
-// line that follows the header. `accept` may be a display name, a full ULID,
-// or the 8-char id prefix shown in the header.
-func extractVersionBody(divID, path, accept string) (string, error) {
-	t, err := trace.ParseFile(path)
-	if err != nil {
-		return "", fmt.Errorf("reading divergence trace: %w", err)
-	}
-
-	sections, err := splitDivergenceSections(t.Body)
-	if err != nil {
-		return "", fmt.Errorf("parsing divergence trace %q: %w", divID, err)
-	}
-	for _, sec := range sections {
-		if matchVersionLabel(accept, sec.name, sec.cortexID) {
-			return strings.TrimSpace(sec.body), nil
-		}
-	}
-	return "", fmt.Errorf("divergence trace %q has no version matching %q", divID, accept)
 }
 
 // divergenceSection is one parsed `### Version from <label>` block.
