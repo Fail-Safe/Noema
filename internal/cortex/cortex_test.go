@@ -1,13 +1,13 @@
 package cortex_test
 
 import (
+	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-
-	"encoding/json"
 
 	"github.com/Fail-Safe/Noema/internal/cortex"
 	"github.com/Fail-Safe/Noema/internal/event"
@@ -2370,6 +2370,252 @@ func TestValidateFederation_NilFederation(t *testing.T) {
 }
 
 // ---- Security: path traversal ----
+
+func TestReplayEvent_Promote(t *testing.T) {
+	// Promote events must replicate across peers so tier state
+	// converges. Before this handler existed, federation replay hit
+	// the default "unknown event action" error and pinned the cursor
+	// on the first Promote — fatal to any federated cortex with
+	// consolidation active.
+	cx := setup(t)
+
+	tr := trace.New("Target", "note", "local", nil, "body")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	promoteData, _ := json.Marshal(map[string]any{"from": "short", "to": "mid"})
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionPromote,
+		TraceID:   tr.ID,
+		CortexID:  "01REMOTEABCDEF",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-04-21T14:00:00Z",
+		Data:      promoteData,
+	}
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent promote: %v", err)
+	}
+
+	row, _ := cx.Get(tr.ID)
+	if row.Tier != trace.TierMid {
+		t.Errorf("tier = %q, want %q", row.Tier, trace.TierMid)
+	}
+}
+
+func TestReplayEvent_Demote(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Target", "note", "local", nil, "body")
+	tr.Tier = trace.TierMid
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	demoteData, _ := json.Marshal(map[string]any{"from": "mid", "to": "short"})
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionDemote,
+		TraceID:   tr.ID,
+		CortexID:  "01REMOTEABCDEF",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-04-21T14:00:00Z",
+		Data:      demoteData,
+	}
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent demote: %v", err)
+	}
+
+	row, _ := cx.Get(tr.ID)
+	if row.Tier != trace.TierShort {
+		t.Errorf("tier = %q, want %q", row.Tier, trace.TierShort)
+	}
+}
+
+func TestReplayEvent_Promote_MissingTrace_StoresOnly(t *testing.T) {
+	// A Promote for a trace we haven't received a Create for yet is
+	// stored in the event log but skips the tier UPDATE — matches the
+	// existing soft-handling posture of replayArchive/Trash/etc.
+	cx := setup(t)
+
+	promoteData, _ := json.Marshal(map[string]any{"from": "short", "to": "mid"})
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionPromote,
+		TraceID:   "20260421-not-here-yet",
+		CortexID:  "01REMOTEABCDEF",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-04-21T14:00:00Z",
+		Data:      promoteData,
+	}
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent: %v", err)
+	}
+
+	events, _ := cx.Events("20260421-not-here-yet")
+	if len(events) != 1 || events[0].ID != e.ID {
+		t.Errorf("event not stored for missing trace: %v", events)
+	}
+}
+
+func TestReplayEvent_Vote(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Vote target", "note", "local", nil, "body")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	voteData, _ := json.Marshal(map[string]any{"delta": 1, "actor": "human"})
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionVote,
+		TraceID:   tr.ID,
+		CortexID:  "01REMOTEABCDEF",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-04-21T14:00:00Z",
+		Data:      voteData,
+	}
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent vote: %v", err)
+	}
+
+	var votes int
+	if err := cx.DB.QueryRow(`SELECT tier_votes FROM traces WHERE id = ?`, tr.ID).Scan(&votes); err != nil {
+		t.Fatalf("reading tier_votes: %v", err)
+	}
+	if votes != 1 {
+		t.Errorf("tier_votes = %d, want 1", votes)
+	}
+
+	// Replaying the same event must be idempotent.
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("idempotent replay: %v", err)
+	}
+	_ = cx.DB.QueryRow(`SELECT tier_votes FROM traces WHERE id = ?`, tr.ID).Scan(&votes)
+	if votes != 1 {
+		t.Errorf("idempotent replay double-counted: tier_votes = %d, want 1", votes)
+	}
+}
+
+func TestReplayEvent_Consolidate_StoresTelemetryOnly(t *testing.T) {
+	// ActionConsolidate is telemetry about a distillation that already
+	// arrived via its own ActionCreate. Replay must NOT double-create
+	// the trace; it should only append the event to the log.
+	cx := setup(t)
+
+	telemetry, _ := json.Marshal(map[string]any{
+		"source_ids":          []string{"20260421-source-a"},
+		"distilled_id":        "20260421-distilled",
+		"model_name":          "claude-opus-4-7",
+		"cohesion_confidence": 0.87,
+	})
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionConsolidate,
+		TraceID:   "20260421-distilled",
+		CortexID:  "01REMOTEABCDEF",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-04-21T14:00:00Z",
+		Data:      telemetry,
+	}
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent consolidate: %v", err)
+	}
+
+	events, _ := cx.Events("20260421-distilled")
+	if len(events) != 1 || events[0].ID != e.ID {
+		t.Errorf("telemetry event not stored: %v", events)
+	}
+
+	// Must NOT have created a trace row — consolidate is telemetry,
+	// create rides a separate ActionCreate.
+	if _, err := cx.Get("20260421-distilled"); err == nil {
+		t.Error("consolidate replay created a trace row (it shouldn't)")
+	}
+}
+
+func TestReplayEvent_PurgeLongTerm(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("To purge", "note", "local", nil, "body")
+	tr.Tier = trace.TierLong
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	purgeData, _ := json.Marshal(map[string]any{
+		"reason": "remote operator purged",
+		"tier":   "long",
+		"actor":  "human",
+	})
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionPurgeLongTerm,
+		TraceID:   tr.ID,
+		CortexID:  "01REMOTEABCDEF",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-04-21T14:00:00Z",
+		Data:      purgeData,
+	}
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent purge_long_term: %v", err)
+	}
+
+	var purgedAt sql.NullString
+	if err := cx.DB.QueryRow(
+		`SELECT purged_at FROM traces WHERE id = ?`, tr.ID,
+	).Scan(&purgedAt); err != nil {
+		t.Fatalf("reading purged_at: %v", err)
+	}
+	if !purgedAt.Valid || purgedAt.String == "" {
+		t.Error("expected purged_at to be set on long-tier trace after replay")
+	}
+}
+
+func TestReplayEvent_PurgeHard(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("To hard-purge", "note", "local", nil, "body")
+	tr.Tier = trace.TierLong
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	purgeData, _ := json.Marshal(map[string]any{
+		"reason": "gdpr request",
+		"tier":   "long",
+		"actor":  "human",
+		"hard":   true,
+	})
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionPurgeHard,
+		TraceID:   tr.ID,
+		CortexID:  "01REMOTEABCDEF",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-04-21T14:00:00Z",
+		Data:      purgeData,
+	}
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent purge_hard: %v", err)
+	}
+
+	// Hard purge removes the row entirely.
+	var n int
+	_ = cx.DB.QueryRow(`SELECT COUNT(*) FROM traces WHERE id = ?`, tr.ID).Scan(&n)
+	if n != 0 {
+		t.Errorf("hard-purged trace still in traces table: count=%d", n)
+	}
+}
 
 func TestReplayEvent_CoordinationActionsBypassTraceIDGate(t *testing.T) {
 	// Consolidation coordination events (Claim/Success/Fail) use a

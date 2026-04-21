@@ -2307,6 +2307,24 @@ func (c *Cortex) ReplayEvent(e event.Event) error {
 		replayErr = c.replayRecover(e)
 	case event.ActionPurge:
 		replayErr = c.replayPurge(e)
+	case event.ActionPromote, event.ActionDemote:
+		// Both emit the same {from, to} payload via applyTierChange;
+		// the replay handler doesn't need to distinguish them since
+		// the DB-level effect is identical (UPDATE tier column).
+		replayErr = c.replayTierChange(e)
+	case event.ActionVote:
+		replayErr = c.replayVote(e)
+	case event.ActionConsolidate,
+		event.ActionConsolidateFallback,
+		event.ActionDivergenceLongTerm:
+		// Telemetry-only events — the trace-level state change (new
+		// distilled trace, divergence trace) rides a separate
+		// ActionCreate. Just store the event for audit trail.
+		replayErr = c.storeRemoteEvent(e)
+	case event.ActionPurgeLongTerm:
+		replayErr = c.replayPurgeLongTerm(e)
+	case event.ActionPurgeHard:
+		replayErr = c.replayPurgeHard(e)
 	default:
 		return fmt.Errorf("unknown event action: %s", e.Action)
 	}
@@ -2813,6 +2831,220 @@ func (c *Cortex) replayPurge(e event.Event) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// replayTierChange applies a remote Promote or Demote event to the local
+// trace. Both actions carry a {from, to} payload — the handler doesn't
+// distinguish them because the DB-level effect is a single UPDATE of
+// the tier column. Missing-trace case stores the event only, matching
+// replayArchive's soft-handling posture.
+func (c *Cortex) replayTierChange(e event.Event) error {
+	var data struct {
+		From string `json:"from"`
+		To   string `json:"to"`
+	}
+	if err := json.Unmarshal(e.Data, &data); err != nil {
+		return fmt.Errorf("parsing tier-change event data: %w", err)
+	}
+	if data.To == "" {
+		return fmt.Errorf("tier-change event %s missing 'to' field", e.ID)
+	}
+	if _, err := c.Get(e.TraceID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.storeRemoteEvent(e)
+		}
+		return err
+	}
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE traces SET tier = ? WHERE id = ?`, data.To, e.TraceID); err != nil {
+		return err
+	}
+	if err := event.Append(tx, &e); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// replayVote applies a remote Vote event to the local trace's
+// tier_votes counter. The counter converges across peers because the
+// delta (+1 / -1) is the authoritative payload — replaying the same
+// event twice is blocked by the existing idempotency guard in
+// ReplayEvent (event ID dedup).
+func (c *Cortex) replayVote(e event.Event) error {
+	var data struct {
+		Delta int `json:"delta"`
+	}
+	if err := json.Unmarshal(e.Data, &data); err != nil {
+		return fmt.Errorf("parsing vote event data: %w", err)
+	}
+	if _, err := c.Get(e.TraceID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.storeRemoteEvent(e)
+		}
+		return err
+	}
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE traces SET tier_votes = tier_votes + ? WHERE id = ?`, data.Delta, e.TraceID); err != nil {
+		return err
+	}
+	if err := event.Append(tx, &e); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// replayPurgeLongTerm applies a remote soft-purge of a tier='long'
+// trace. Mirrors the trigger-suspension dance in Purge() because the
+// migration-010 immutability trigger otherwise blocks the purged_at /
+// purge_reason update. The suspended-trigger DROP/re-CREATE stays
+// inside the transaction so a mid-operation failure is reverted on
+// rollback — the trigger definition cannot be lost.
+func (c *Cortex) replayPurgeLongTerm(e event.Event) error {
+	if _, err := c.Get(e.TraceID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.storeRemoteEvent(e)
+		}
+		return err
+	}
+
+	var data struct {
+		Reason string `json:"reason"`
+	}
+	_ = json.Unmarshal(e.Data, &data)
+	if data.Reason == "" {
+		data.Reason = "remote purge"
+	}
+
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var updateTriggerSQL string
+	if err := tx.QueryRow(
+		`SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_long_term_immutable'`,
+	).Scan(&updateTriggerSQL); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("reading trg_long_term_immutable: %w", err)
+	}
+	if _, err := tx.Exec(`DROP TRIGGER IF EXISTS trg_long_term_immutable`); err != nil {
+		return fmt.Errorf("suspending immutability trigger: %w", err)
+	}
+
+	tombstone := fmt.Sprintf("[purged: %s]", data.Reason)
+	if _, err := tx.Exec(
+		`UPDATE traces SET purged_at = ?, purge_reason = ?, updated_at = ? WHERE id = ?`,
+		e.Timestamp, data.Reason, e.Timestamp, e.TraceID,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM trace_tags WHERE trace_id = ?`, e.TraceID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM traces_fts WHERE id = ?`, e.TraceID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`,
+		e.TraceID, "", tombstone,
+	); err != nil {
+		return err
+	}
+
+	if updateTriggerSQL != "" {
+		if _, err := tx.Exec(updateTriggerSQL); err != nil {
+			return fmt.Errorf("restoring immutability trigger: %w", err)
+		}
+	}
+
+	if err := event.Append(tx, &e); err != nil {
+		return err
+	}
+	// File cleanup: try both the active path and the archive path since
+	// we don't track the pre-purge location in the event payload.
+	_ = os.Remove(c.TraceFile(e.TraceID, false))
+	_ = os.Remove(c.TraceFile(e.TraceID, true))
+	return tx.Commit()
+}
+
+// replayPurgeHard applies a remote hard-delete. Both immutability and
+// delete triggers are suspended for the duration so tier='long' rows
+// can be removed; lineage edges on both sides of the trace are deleted
+// to match Purge() semantics.
+func (c *Cortex) replayPurgeHard(e event.Event) error {
+	if _, err := c.Get(e.TraceID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.storeRemoteEvent(e)
+		}
+		return err
+	}
+
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var updateTriggerSQL, deleteTriggerSQL string
+	if err := tx.QueryRow(
+		`SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_long_term_immutable'`,
+	).Scan(&updateTriggerSQL); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("reading trg_long_term_immutable: %w", err)
+	}
+	if err := tx.QueryRow(
+		`SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_long_term_no_delete'`,
+	).Scan(&deleteTriggerSQL); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("reading trg_long_term_no_delete: %w", err)
+	}
+	if _, err := tx.Exec(`DROP TRIGGER IF EXISTS trg_long_term_immutable`); err != nil {
+		return fmt.Errorf("suspending immutability trigger: %w", err)
+	}
+	if _, err := tx.Exec(`DROP TRIGGER IF EXISTS trg_long_term_no_delete`); err != nil {
+		return fmt.Errorf("suspending delete trigger: %w", err)
+	}
+
+	for _, stmt := range []string{
+		`DELETE FROM trace_lineage WHERE trace_id = ?`,
+		`DELETE FROM trace_lineage WHERE derived_from = ?`,
+		`DELETE FROM trace_tags WHERE trace_id = ?`,
+		`DELETE FROM traces_fts WHERE id = ?`,
+		`DELETE FROM traces WHERE id = ?`,
+	} {
+		if _, err := tx.Exec(stmt, e.TraceID); err != nil {
+			return err
+		}
+	}
+
+	if updateTriggerSQL != "" {
+		if _, err := tx.Exec(updateTriggerSQL); err != nil {
+			return fmt.Errorf("restoring immutability trigger: %w", err)
+		}
+	}
+	if deleteTriggerSQL != "" {
+		if _, err := tx.Exec(deleteTriggerSQL); err != nil {
+			return fmt.Errorf("restoring delete trigger: %w", err)
+		}
+	}
+
+	if err := event.Append(tx, &e); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	_ = os.Remove(c.TraceFile(e.TraceID, false))
+	_ = os.Remove(c.TraceFile(e.TraceID, true))
+	_ = os.Remove(c.TrashFile(e.TraceID))
+	return nil
 }
 
 // storeRemoteEvent stores a remote event without any state change (trace already in expected state).
