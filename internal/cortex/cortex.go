@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -2933,6 +2934,17 @@ func (c *Cortex) replayVote(e event.Event) error {
 	if err := json.Unmarshal(e.Data, &data); err != nil {
 		return fmt.Errorf("parsing vote event data: %w", err)
 	}
+	// Clamp replayed deltas to ±1 to match the local Vote() contract.
+	// The emit path refuses anything else, but a malicious or buggy
+	// peer could in principle ship an inflated delta — clamping here
+	// keeps the tier_votes counter in the range the scorer expects
+	// without blocking replay.
+	switch {
+	case data.Delta > 0:
+		data.Delta = 1
+	case data.Delta < 0:
+		data.Delta = -1
+	}
 	if _, err := c.Get(e.TraceID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return c.storeRemoteEvent(e)
@@ -2970,7 +2982,13 @@ func (c *Cortex) replayPurgeLongTerm(e event.Event) error {
 	var data struct {
 		Reason string `json:"reason"`
 	}
-	_ = json.Unmarshal(e.Data, &data)
+	if err := json.Unmarshal(e.Data, &data); err != nil {
+		// Malformed data is not fatal — purge events replicate for
+		// audit and content-wipe side effects, not for the reason
+		// string. Log so a real emitter bug is diagnosable, fall
+		// back to a placeholder reason, and continue.
+		log.Printf("[federation] purge-long-term replay: malformed data for event %s: %v", e.ID, err)
+	}
 	if data.Reason == "" {
 		data.Reason = "remote purge"
 	}

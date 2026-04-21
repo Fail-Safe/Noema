@@ -342,9 +342,9 @@ func startConsolidator(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig, fed *
 	// fire evaluates both transitions in order.
 	if cfg.Graduation.EffectiveEnabled() {
 		graduate := consolidation.GraduatePass(cx, consolidation.GraduationConfig{
-			MinAge:            cfg.Graduation.EffectiveMinAge(),
-			MinReadCount:      cfg.Graduation.EffectiveMinReadCount(),
-			RequireUnmodified: cfg.Graduation.EffectiveRequireUnmodified(),
+			MinAge:        cfg.Graduation.EffectiveMinAge(),
+			MinReadCount:  cfg.Graduation.EffectiveMinReadCount(),
+			AllowModified: !cfg.Graduation.EffectiveRequireUnmodified(),
 		}, logger)
 		pass = consolidation.ChainPasses(pass, graduate)
 		fmt.Fprintf(os.Stderr, "[consolidation] graduation enabled (min_age=%s min_reads=%d require_unmodified=%t)\n",

@@ -38,7 +38,7 @@ func TestGraduatePass_AllCriteriaMet(t *testing.T) {
 		},
 	}
 	pass := consolidation.GraduatePass(provider, consolidation.GraduationConfig{
-		MinAge: 14 * 24 * time.Hour, MinReadCount: 3, RequireUnmodified: true,
+		MinAge: 14 * 24 * time.Hour, MinReadCount: 3, AllowModified: false,
 	}, nil)
 
 	if err := pass(context.Background(), "cron"); err != nil {
@@ -56,7 +56,7 @@ func TestGraduatePass_InsufficientReads(t *testing.T) {
 		},
 	}
 	pass := consolidation.GraduatePass(provider, consolidation.GraduationConfig{
-		MinReadCount: 3, RequireUnmodified: true,
+		MinReadCount: 3, AllowModified: false,
 	}, nil)
 	_ = pass(context.Background(), "cron")
 	if len(provider.promoted) != 0 {
@@ -73,7 +73,7 @@ func TestGraduatePass_ModifiedTraceBlocked(t *testing.T) {
 		},
 	}
 	pass := consolidation.GraduatePass(provider, consolidation.GraduationConfig{
-		MinReadCount: 3, RequireUnmodified: true,
+		MinReadCount: 3, AllowModified: false,
 	}, nil)
 	_ = pass(context.Background(), "cron")
 	if len(provider.promoted) != 0 {
@@ -82,14 +82,14 @@ func TestGraduatePass_ModifiedTraceBlocked(t *testing.T) {
 }
 
 func TestGraduatePass_ModifiedTraceAllowedWhenNotRequired(t *testing.T) {
-	// Inverse: if RequireUnmodified is off, modify_count doesn't gate.
+	// Inverse: when AllowModified is true, modify_count doesn't gate.
 	provider := &fakeGraduationProvider{
 		candidates: []cortex.PromotionCandidate{
 			{ID: "a", Tier: "mid", ReadCount: 5, ModifyCount: 3, TierVotes: 0},
 		},
 	}
 	pass := consolidation.GraduatePass(provider, consolidation.GraduationConfig{
-		MinReadCount: 3, RequireUnmodified: false,
+		MinReadCount: 3, AllowModified: true,
 	}, nil)
 	_ = pass(context.Background(), "cron")
 	if len(provider.promoted) != 1 {
@@ -106,7 +106,7 @@ func TestGraduatePass_NegativeVotesBlock(t *testing.T) {
 		},
 	}
 	pass := consolidation.GraduatePass(provider, consolidation.GraduationConfig{
-		MinReadCount: 3, RequireUnmodified: true,
+		MinReadCount: 3, AllowModified: false,
 	}, nil)
 	_ = pass(context.Background(), "cron")
 	if len(provider.promoted) != 0 {
@@ -126,7 +126,7 @@ func TestGraduatePass_PromoteErrorCountsAsSkip(t *testing.T) {
 		promoteErr: errors.New("simulated failure"),
 	}
 	pass := consolidation.GraduatePass(provider, consolidation.GraduationConfig{
-		MinReadCount: 3, RequireUnmodified: true,
+		MinReadCount: 3, AllowModified: false,
 	}, nil)
 	if err := pass(context.Background(), "cron"); err != nil {
 		t.Fatalf("pass error leaked despite per-candidate swallowing: %v", err)

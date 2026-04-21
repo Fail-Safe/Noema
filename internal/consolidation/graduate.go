@@ -23,10 +23,19 @@ type GraduationConfig struct {
 	// defaults to 3.
 	MinReadCount int
 
-	// RequireUnmodified gates on modify_count == 0. True is the
-	// default; set to false when edits are routine in the cortex and
-	// shouldn't block graduation.
-	RequireUnmodified bool
+	// AllowModified opts OUT of the stability gate. Zero value is
+	// false, which matches the plan's "base truths are unmodified
+	// since creation" default — so a caller who forgets to set this
+	// field still gets the strict behavior. Flip to true in cortexes
+	// where edits are routine and shouldn't block graduation.
+	//
+	// Inverted from the originally-proposed RequireUnmodified to make
+	// the zero-value safe: the runtime type is consumed by an
+	// internal caller (cmd_serve.go) that translates from the YAML-
+	// facing cortex.GraduationConfig, but shipping a struct where
+	// the safe default requires an explicit assignment is a
+	// maintenance trap.
+	AllowModified bool
 }
 
 func (c GraduationConfig) resolved() GraduationConfig {
@@ -36,9 +45,6 @@ func (c GraduationConfig) resolved() GraduationConfig {
 	if c.MinReadCount <= 0 {
 		c.MinReadCount = 3
 	}
-	// RequireUnmodified is a bool; the zero-value is false. Callers
-	// explicitly set it via cortex.GraduationConfig.EffectiveRequire-
-	// Unmodified() which preserves the "default true" semantics.
 	return c
 }
 
@@ -103,7 +109,7 @@ func shouldGraduate(pc cortex.PromotionCandidate, cfg GraduationConfig) bool {
 	if pc.ReadCount < cfg.MinReadCount {
 		return false
 	}
-	if cfg.RequireUnmodified && pc.ModifyCount > 0 {
+	if !cfg.AllowModified && pc.ModifyCount > 0 {
 		return false
 	}
 	if pc.TierVotes < 0 {
