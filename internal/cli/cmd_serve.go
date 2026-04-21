@@ -119,7 +119,7 @@ func serveCmd() *cobra.Command {
 			// scheduling loop with a no-op pass — Phase 8+ populate
 			// the pass with candidate selection and LLM distillation.
 			if manifestErr == nil && m.Consolidation != nil && m.Consolidation.Enabled {
-				consolidator = startConsolidator(cx, m.Consolidation)
+				consolidator = startConsolidator(cx, m.Consolidation, m.Federation)
 			}
 
 			// Eligibility loop: advertises this cortex's consolidation
@@ -314,7 +314,13 @@ func startWatcher(cx *cortex.Cortex, cfg *cortex.WatchConfig) *watch.Watcher {
 // on a blended score of reads, modifies, lineage, and votes). Phase 9
 // will wrap this with LLM distillation; heuristic 1:1 promotion
 // remains the fallback when LLMs aren't configured.
-func startConsolidator(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig) *consolidation.Agent {
+//
+// When federation peers are configured, the pass is wrapped with the
+// election gate from consolidation-plan.md §14 so only the elected peer
+// actually runs a cycle. Single-node cortexes skip the wrapper — the
+// gate would work there too, but it would emit a Claim+Success pair on
+// every pass for a degenerate election with a single participant.
+func startConsolidator(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig, fed *cortex.FederationConfig) *consolidation.Agent {
 	if cfg == nil || !cfg.Enabled {
 		return nil
 	}
@@ -328,6 +334,35 @@ func startConsolidator(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig) *cons
 	pass := consolidation.HeuristicPass(cx, consolidation.PassConfig{
 		Window: cfg.EffectiveWindowHours(),
 	}, logger)
+
+	if fed != nil && len(fed.Peers) > 0 {
+		peerNames := make([]string, 0, len(fed.Peers))
+		for _, p := range fed.Peers {
+			peerNames = append(peerNames, p.Name)
+		}
+		// Quiet period tracks federation sync cadence so a peer's
+		// rank is only trusted once the ring has had a chance to
+		// observe it. Default to 60s (2 × the 30s federation default)
+		// when the manifest leaves Interval unset or unparseable.
+		interval := 30 * time.Second
+		if fed.Interval != "" {
+			if parsed, err := time.ParseDuration(fed.Interval); err == nil && parsed > 0 {
+				interval = parsed
+			}
+		}
+		election := consolidation.NewElection(consolidation.ElectionConfig{
+			CortexID:    cx.ID,
+			PeerNames:   peerNames,
+			QuietPeriod: 2 * interval,
+			State:       federation.NewState(cx.DB.DB),
+			Emitter:     cx,
+			Log:         logger,
+		})
+		pass = consolidation.WithElection(pass, election, logger)
+		fmt.Fprintf(os.Stderr, "[consolidation] election gate enabled (peers=%d quiet=%s)\n",
+			len(peerNames), 2*interval)
+	}
+
 	a := consolidation.New(cx, consolidation.Config{
 		Cron:           cfg.Cron,
 		IdleMinutes:    cfg.IdleMinutes,

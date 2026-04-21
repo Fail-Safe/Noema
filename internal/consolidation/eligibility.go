@@ -58,15 +58,15 @@ type EligibilityConfig struct {
 
 // EligibilityLoop refreshes this peer's consolidation rank on a cadence.
 // One loop per cortex, lifecycle parallel to Agent. Writes the
-// advertised RankEntry into federation_state every cycle so observers
-// see a fresh ObservedAt even when the rank value doesn't change.
+// advertised RankEntry into federation_state every cycle.
 //
-// The loop preserves the current Rank across ticks while the peer stays
-// eligible; a fresh random bid is rolled only on transitions into
-// eligibility (Rank 0 → N). This gives a stable value for within-window
-// elections without tracking window boundaries explicitly — Phase 3
-// will reset rank on ActionConsolidationSuccess replay so leadership
-// rotates across windows.
+// The loop re-rolls the Rank value on every refresh while the peer is
+// eligible — matches consolidation-plan.md §14 step 5 (eligibility check
+// unconditionally sets rank to a fresh random 1..99). Stability within
+// an election is provided by the quiet-period filter in ElectWinner,
+// not by preserving ranks across ticks; re-rolling every cycle gives
+// leadership rotation across windows for free without a separate
+// "reset on Success event" handler.
 type EligibilityLoop struct {
 	cfg EligibilityConfig
 
@@ -155,22 +155,15 @@ func (e *EligibilityLoop) refresh() {
 		newEntry.Rank = RankIneligible
 		e.cfg.Log("[consolidation] endpoint probe failed; rank=0")
 	default:
-		// Endpoint alive. Preserve the existing rank so the bid is
-		// stable within a window; re-roll only on the 0 → N transition.
-		prev, err := e.cfg.State.GetLocalRank()
-		if err != nil {
-			e.cfg.Log("[consolidation] loading prior rank failed: %v", err)
-		}
-		if err == nil && prev.Rank > RankIneligible {
-			newEntry.Rank = prev.Rank
+		// Endpoint alive. Roll a fresh bid on every refresh — the plan
+		// spec is unconditional re-roll, and election correctness is
+		// provided by the quiet-period filter, not by rank stability.
+		r, gerr := GenerateRank()
+		if gerr != nil {
+			e.cfg.Log("[consolidation] generate rank failed: %v", gerr)
+			newEntry.Rank = RankIneligible
 		} else {
-			r, gerr := GenerateRank()
-			if gerr != nil {
-				e.cfg.Log("[consolidation] generate rank failed: %v", gerr)
-				newEntry.Rank = RankIneligible
-			} else {
-				newEntry.Rank = r
-			}
+			newEntry.Rank = r
 		}
 	}
 

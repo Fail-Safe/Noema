@@ -119,10 +119,15 @@ func TestEligibility_AliveAndEnabled_RollsRank(t *testing.T) {
 	}
 }
 
-func TestEligibility_PreservesRankAcrossRefresh(t *testing.T) {
-	// Rank is stable within a window; re-rolling every tick would mean
-	// two peers with staggered check cadences see each other flipping
-	// values, defeating deterministic election.
+func TestEligibility_ReRollsEveryRefresh(t *testing.T) {
+	// Plan §14 step 5: every eligibility check sets rank to a fresh
+	// random 1..99. Within-window election stability is provided by
+	// the quiet-period filter in ElectWinner, not by preserving rank
+	// across ticks. Re-rolling gives leadership rotation for free.
+	//
+	// Collisions across two rolls are ~1/99, so a single refresh pair
+	// would be flaky; instead, check that across many refreshes we see
+	// at least two distinct values.
 	loop, state := buildLoop(t, consolidation.EligibilityConfig{
 		Enabled:    true,
 		LLMEnabled: true,
@@ -130,28 +135,24 @@ func TestEligibility_PreservesRankAcrossRefresh(t *testing.T) {
 		Probe:      func(context.Context, string) bool { return true },
 	})
 
-	loop.Refresh()
-	first, err := state.GetLocalRank()
-	if err != nil {
-		t.Fatalf("first GetLocalRank: %v", err)
+	seen := map[int]bool{}
+	for range 20 {
+		loop.Refresh()
+		r, err := state.GetLocalRank()
+		if err != nil {
+			t.Fatalf("GetLocalRank: %v", err)
+		}
+		seen[r.Rank] = true
 	}
-
-	loop.Refresh()
-	second, err := state.GetLocalRank()
-	if err != nil {
-		t.Fatalf("second GetLocalRank: %v", err)
-	}
-
-	if second.Rank != first.Rank {
-		t.Errorf("rank changed across refresh: %d -> %d (want stable)",
-			first.Rank, second.Rank)
+	if len(seen) < 2 {
+		t.Errorf("expected >=2 distinct ranks across 20 refreshes, got %d (values: %v)",
+			len(seen), seen)
 	}
 }
 
-func TestEligibility_ReRollsAfterIneligibilityTransition(t *testing.T) {
-	// When the endpoint goes down then comes back, the peer must roll a
-	// fresh bid rather than reusing a stale one from before the outage.
-	// This is the "0 -> N" transition path.
+func TestEligibility_RollsFreshAfterOutageRecovery(t *testing.T) {
+	// The 0 -> N transition path: endpoint down, rank=0, endpoint back
+	// up, rank must land in [1..99] on the next refresh.
 	var alive bool
 	loop, state := buildLoop(t, consolidation.EligibilityConfig{
 		Enabled:    true,
@@ -175,10 +176,6 @@ func TestEligibility_ReRollsAfterIneligibilityTransition(t *testing.T) {
 	}
 
 	alive = true
-	// Re-roll must happen here. The new rank may legitimately collide
-	// with the first one (1/99 odds), so retry the entire test up to 5
-	// times if that happens — we care about the re-roll path firing,
-	// not about distinct values from a 99-element sample space.
 	loop.Refresh()
 	r3, _ := state.GetLocalRank()
 	if r3.Rank == 0 {
@@ -187,9 +184,10 @@ func TestEligibility_ReRollsAfterIneligibilityTransition(t *testing.T) {
 }
 
 func TestEligibility_ObservedAtAdvances(t *testing.T) {
-	// Every refresh must bump ObservedAt even when the rank value is
-	// unchanged, so remote peers have a fresh staleness signal to feed
-	// into the quiet-period guard.
+	// Every refresh bumps ObservedAt so remote peers have a fresh
+	// staleness signal for the quiet-period guard. Rank value is
+	// expected to change too (re-roll every tick) but the assertion
+	// here is about ObservedAt movement specifically.
 	clock := time.Date(2026, 4, 21, 12, 0, 0, 0, time.UTC)
 	loop, state := buildLoop(t, consolidation.EligibilityConfig{
 		Enabled:    true,
@@ -208,8 +206,5 @@ func TestEligibility_ObservedAtAdvances(t *testing.T) {
 
 	if second.ObservedAt == first.ObservedAt {
 		t.Errorf("ObservedAt unchanged across refresh: %q", first.ObservedAt)
-	}
-	if second.Rank != first.Rank {
-		t.Errorf("rank changed unexpectedly: %d -> %d", first.Rank, second.Rank)
 	}
 }

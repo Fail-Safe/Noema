@@ -2166,6 +2166,38 @@ func parseVersionLabel(label string) (name, cortexID string) {
 // incrementing the local vector clock. All reads/writes go through the tx
 // to avoid SQLite lock contention. Vector clocks are keyed on the cortex
 // ID (a stable ULID), not the cortex name — see docs/design/cortex-uuid-plan.md.
+// EmitCoordinationEvent emits an event that isn't tied to a specific
+// trace mutation — used by the consolidation election protocol for
+// Claim / Success / Fail events (see consolidation-plan.md §14). The
+// windowID serves as trace_id in the events table (the column is
+// NOT NULL but doesn't enforce a foreign key on traces — coordination
+// events use a synthetic ID scoped to the election window).
+//
+// Data is JSON-marshaled by the caller's choice of struct; pass nil to
+// emit an event with an empty payload.
+func (c *Cortex) EmitCoordinationEvent(action event.Action, windowID string, data any) error {
+	var blob json.RawMessage
+	if data != nil {
+		b, err := json.Marshal(data)
+		if err != nil {
+			return fmt.Errorf("marshaling coordination event data: %w", err)
+		}
+		blob = b
+	}
+
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := c.emitEvent(tx, action, windowID, now, blob); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (c *Cortex) emitEvent(tx *sql.Tx, action event.Action, traceID, timestamp string, data json.RawMessage) error {
 	// Read clock from federation_state within the transaction.
 	vc, err := getClockTx(tx)
