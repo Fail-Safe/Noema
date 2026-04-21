@@ -20,6 +20,55 @@ type PromotionCandidate struct {
 	CreatedAt        string
 }
 
+// GraduationCandidates returns every active tier='mid' trace older
+// than minAge. The mirror of PromotionCandidates — that one narrows
+// to the rolling short-term pool for short→mid evaluation;
+// graduation evaluates mid→long on traces that have had time to
+// prove durability, so the inequality flips (`created_at <= cutoff`)
+// and the lower bound is open. Archived/trashed/purged rows are
+// excluded for the same reason as PromotionCandidates.
+func (c *Cortex) GraduationCandidates(minAge time.Duration) ([]PromotionCandidate, error) {
+	cutoff := time.Now().UTC().Add(-minAge).Format(time.RFC3339)
+	q := `
+		SELECT
+			t.id,
+			t.tier,
+			t.type,
+			t.read_count,
+			t.modify_count,
+			t.tier_votes,
+			COALESCE(v.n, 0) AS derived_from_count,
+			t.created_at
+		FROM traces t
+		LEFT JOIN v_derived_from_count v ON v.trace_id = t.id
+		WHERE t.tier = 'mid'
+		  AND t.archived_at IS NULL
+		  AND t.trashed_at IS NULL
+		  AND t.purged_at IS NULL
+		  AND t.created_at <= ?
+		  AND t.id != ''
+		ORDER BY t.created_at ASC
+	`
+	rows, err := c.DB.Query(q, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("selecting graduation candidates: %w", err)
+	}
+	defer rows.Close()
+
+	var out []PromotionCandidate
+	for rows.Next() {
+		var pc PromotionCandidate
+		if err := rows.Scan(
+			&pc.ID, &pc.Tier, &pc.Type, &pc.ReadCount, &pc.ModifyCount,
+			&pc.TierVotes, &pc.DerivedFromCount, &pc.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, pc)
+	}
+	return out, rows.Err()
+}
+
 // PromotionCandidates returns every active trace in the given tier
 // whose created_at falls within the rolling window. The caller does
 // the scoring; this method is only responsible for narrowing to the

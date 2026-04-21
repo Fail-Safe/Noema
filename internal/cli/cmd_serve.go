@@ -337,6 +337,22 @@ func startConsolidator(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig, fed *
 		Window: cfg.EffectiveWindowHours(),
 	}, logger)
 
+	// Phase 15: mid→long graduation runs on the same trigger cadence
+	// alongside short→mid promotion. Chain the two so each scheduler
+	// fire evaluates both transitions in order.
+	if cfg.Graduation.EffectiveEnabled() {
+		graduate := consolidation.GraduatePass(cx, consolidation.GraduationConfig{
+			MinAge:            cfg.Graduation.EffectiveMinAge(),
+			MinReadCount:      cfg.Graduation.EffectiveMinReadCount(),
+			RequireUnmodified: cfg.Graduation.EffectiveRequireUnmodified(),
+		}, logger)
+		pass = consolidation.ChainPasses(pass, graduate)
+		fmt.Fprintf(os.Stderr, "[consolidation] graduation enabled (min_age=%s min_reads=%d require_unmodified=%t)\n",
+			cfg.Graduation.EffectiveMinAge(),
+			cfg.Graduation.EffectiveMinReadCount(),
+			cfg.Graduation.EffectiveRequireUnmodified())
+	}
+
 	if fed != nil && len(fed.Peers) > 0 {
 		peerNames := make([]string, 0, len(fed.Peers))
 		for _, p := range fed.Peers {

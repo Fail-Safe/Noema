@@ -30,7 +30,119 @@ the audit trail intact.
 ` + "`noema memory stats`" + ` reports tier counts so you can see how memory
 is distributed across the cortex without opening the DB.`,
 	}
-	cmd.AddCommand(memoryPurgeCmd(), memoryStatsCmd())
+	cmd.AddCommand(
+		memoryPurgeCmd(),
+		memoryStatsCmd(),
+		memoryPromoteCmd(),
+		memoryDemoteCmd(),
+	)
+	return cmd
+}
+
+// memoryPromoteCmd surfaces Cortex.Promote as an operator-facing CLI
+// verb. The underlying Go function has always supported short→mid and
+// mid→long; this command closes the gap where only automatic pathways
+// (heuristic promoter, LLM distillation, Phase 15 graduation) could
+// reach the long tier. Useful for explicit curation: "this trace is a
+// base truth, lock it now" without waiting for the stability bar.
+func memoryPromoteCmd() *cobra.Command {
+	var toFlag string
+	cmd := &cobra.Command{
+		Use:   "promote <trace-id>",
+		Short: "Advance a trace one tier (short→mid or mid→long)",
+		Long: `Promotes the referenced trace to the next memory tier. With no
+--to flag, advances by one: short→mid if currently short, mid→long if
+currently mid. Pass --to explicitly to assert the target tier as a
+safety check.
+
+Emits ActionPromote, which propagates through federation so peers
+reach the same tier state on their next sync.
+
+This is the explicit curation path. The automatic path (scheduler's
+graduation pass) waits for the stability criteria configured under
+` + "`consolidation.graduation`" + ` in cortex.md; use the CLI when you're
+confident a trace should be a base truth today.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cx, err := resolveCortex()
+			if err != nil {
+				return err
+			}
+			defer cx.Close()
+
+			row, err := cx.Get(args[0])
+			if err != nil {
+				return err
+			}
+
+			target := toFlag
+			if target == "" {
+				switch row.Tier {
+				case trace.TierShort:
+					target = trace.TierMid
+				case trace.TierMid:
+					target = trace.TierLong
+				case trace.TierLong:
+					return fmt.Errorf("trace %s is already at long tier (terminal)", args[0])
+				default:
+					return fmt.Errorf("trace %s is at unknown tier %q", args[0], row.Tier)
+				}
+			}
+			if !trace.IsValidTier(target) {
+				return fmt.Errorf("--to must be one of short, mid, long")
+			}
+
+			if err := cx.Promote(args[0], target); err != nil {
+				return err
+			}
+			fmt.Printf("Trace %s promoted %s → %s.\n", args[0], row.Tier, target)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&toFlag, "to", "", "target tier (mid or long); default = next tier up")
+	return cmd
+}
+
+// memoryDemoteCmd surfaces Cortex.Demote. Only mid → short is allowed
+// in routine operation — long-term demotion is the admin-purge path
+// (`noema memory purge`) because undoing a base truth should carry the
+// same friction as destroying it.
+func memoryDemoteCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "demote <trace-id>",
+		Short: "Step a trace back a tier (mid→short only)",
+		Long: `Demotes the referenced trace from mid back to short. Long-tier
+demotion is deliberately not a CLI verb: once a trace is etched into
+the base-truths layer, removing it goes through ` + "`noema memory purge`" + `
+so the admin-purge ceremony produces the same audit trail a destructive
+change deserves.
+
+Emits ActionDemote, which propagates through federation.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cx, err := resolveCortex()
+			if err != nil {
+				return err
+			}
+			defer cx.Close()
+
+			row, err := cx.Get(args[0])
+			if err != nil {
+				return err
+			}
+			if row.Tier == trace.TierLong {
+				return fmt.Errorf(
+					"trace %s is at long tier — long-term demotion goes through `noema memory purge` (with --hard if you want full removal)",
+					args[0],
+				)
+			}
+			if err := cx.Demote(args[0], trace.TierShort); err != nil {
+				return err
+			}
+			fmt.Printf("Trace %s demoted %s → %s.\n", args[0], row.Tier, trace.TierShort)
+			return nil
+		},
+	}
 	return cmd
 }
 

@@ -939,6 +939,26 @@ the rest of the ring. A paused peer keeps its cursor and identity pin intact.
 cortex_identity reports the active mode. federation_status shows both the cortex mode
 and per-peer modes.
 
+## Tier Graduation (short → mid → long)
+The long tier accumulates base truths — traces that have proven durable via stable,
+repeat usage. An automatic graduation pass runs on the consolidation schedule and
+promotes every mid-tier trace that clears four AND-gated criteria:
+
+  - age >= 14 days (configurable via consolidation.graduation.min_age_days)
+  - read_count >= 3 (configurable via consolidation.graduation.min_read_count)
+  - modify_count == 0 (unless require_unmodified is false)
+  - tier_votes >= 0 (no active downvotes)
+
+Traces at the long tier are DB-level immutable: content / identity fields are
+frozen, tier cannot change except via the admin-purge ceremony, and routine
+Update/Delete is refused. Archive / trash / vote still work — visibility and
+preference signals remain mutable.
+
+Operators promote manually via 'noema memory promote <id>' / 'demote <id>'.
+Agents don't directly promote — vote_trace is the signal to influence the
+automatic pass. The ceremony for removing a long trace is 'noema memory
+purge --tier long' (add '--hard' for full deletion; default tombstones).
+
 ## Consolidation Coordination
 When multiple federated peers have consolidation.enabled + consolidation.llm_enabled
 with a reachable local_llm_endpoint, exactly one peer runs each consolidation cycle:

@@ -215,6 +215,80 @@ type ConsolidationConfig struct {
 	// where the operator keeps it, matching the access.shared_key_file
 	// pattern for the MCP server.
 	APIKeyEnv string `yaml:"api_key_env,omitempty"`
+
+	// Graduation controls the mid→long promotion heuristic (Phase 15).
+	// Leaving the block unset uses the defaults. Setting
+	// Graduation.Enabled=false on an existing cortex keeps mid as the
+	// terminal tier for automatic promotion — useful for operators who
+	// want to curate the long tier by hand via `noema memory promote`.
+	Graduation *GraduationConfig `yaml:"graduation,omitempty"`
+}
+
+// GraduationConfig controls the mid→long promotion heuristic. A
+// trace graduates when every criterion is simultaneously true — a
+// simple AND-gate rather than a blended score because the long tier
+// is meant to be slow-moving and auditable. Bumping any threshold
+// makes graduation stricter; lowering any makes it looser.
+type GraduationConfig struct {
+	// Enabled defaults to true when the parent consolidation block is
+	// enabled. Set to false to pause automatic mid→long graduation
+	// while leaving the short→mid promoter and LLM distillation
+	// pipeline running.
+	Enabled *bool `yaml:"enabled,omitempty"`
+
+	// MinAgeDays is the minimum age (in days) before a mid-tier trace
+	// can graduate. Zero defaults to 14 — two weeks of stability
+	// signals the trace hasn't been a transient idea.
+	MinAgeDays int `yaml:"min_age_days,omitempty"`
+
+	// MinReadCount is the minimum read_count required for graduation.
+	// Zero defaults to 3 — at least a few deliberate reads to prove
+	// the trace carries ongoing value.
+	MinReadCount int `yaml:"min_read_count,omitempty"`
+
+	// RequireUnmodified defaults to true. When true, a trace graduates
+	// only if modify_count == 0 since creation; any edit resets the
+	// stability clock. Flip to false in cortexes where edits are
+	// routine and don't indicate churn.
+	RequireUnmodified *bool `yaml:"require_unmodified,omitempty"`
+}
+
+// EffectiveEnabled returns true when graduation should run. Defaults
+// to true on a nil config so a cortex that enables consolidation
+// without an explicit graduation block gets the tier model completed.
+func (gc *GraduationConfig) EffectiveEnabled() bool {
+	if gc == nil || gc.Enabled == nil {
+		return true
+	}
+	return *gc.Enabled
+}
+
+// EffectiveMinAge returns the configured minimum age, defaulting to 14
+// days. The return type is time.Duration for direct use in candidate
+// queries; the YAML knob is days for human readability.
+func (gc *GraduationConfig) EffectiveMinAge() time.Duration {
+	days := 14
+	if gc != nil && gc.MinAgeDays > 0 {
+		days = gc.MinAgeDays
+	}
+	return time.Duration(days) * 24 * time.Hour
+}
+
+// EffectiveMinReadCount returns the configured floor, defaulting to 3.
+func (gc *GraduationConfig) EffectiveMinReadCount() int {
+	if gc == nil || gc.MinReadCount <= 0 {
+		return 3
+	}
+	return gc.MinReadCount
+}
+
+// EffectiveRequireUnmodified returns the stability-gate flag,
+// defaulting to true on a nil config.
+func (gc *GraduationConfig) EffectiveRequireUnmodified() bool {
+	if gc == nil || gc.RequireUnmodified == nil {
+		return true
+	}
+	return *gc.RequireUnmodified
 }
 
 // EffectiveWindowHours returns the window duration with the 24h default
