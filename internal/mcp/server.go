@@ -635,9 +635,17 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 			if m.Federation.Interval != "" {
 				sb.WriteString(fmt.Sprintf("Interval: %s\n", m.Federation.Interval))
 			}
-			sb.WriteByte('\n')
 
 			state := federation.NewState(cx.DB.DB)
+			// Surface the local consolidation rank (plan §14). A missing
+			// entry or Rank=0 is rendered plainly as "(ineligible)" so
+			// operators can see at a glance whether coordination is
+			// armed for this cortex.
+			if localRank, rerr := state.GetLocalRank(); rerr == nil {
+				sb.WriteString(fmt.Sprintf("Consolidation Rank: %s\n", formatRank(localRank)))
+			}
+			sb.WriteByte('\n')
+
 			for _, p := range m.Federation.Peers {
 				ps, err := state.GetPeerState(p.Name, p.Endpoint)
 				if err != nil {
@@ -657,8 +665,12 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 					cortexID = ps.CortexID
 				}
 				peerMode := p.EffectiveMode()
-				sb.WriteString(fmt.Sprintf("  %s\n    endpoint:   %s\n    mode:       %s\n    cortex_id:  %s\n    last_seen:  %s\n    last_event: %s\n",
-					p.Name, p.Endpoint, peerMode, cortexID, lastSeen, lastEvent))
+				peerRank := "(none)"
+				if pr, perr := state.GetPeerRank(p.Name); perr == nil && pr.ObservedAt != "" {
+					peerRank = formatRank(pr)
+				}
+				sb.WriteString(fmt.Sprintf("  %s\n    endpoint:   %s\n    mode:       %s\n    cortex_id:  %s\n    rank:       %s\n    last_seen:  %s\n    last_event: %s\n",
+					p.Name, p.Endpoint, peerMode, cortexID, peerRank, lastSeen, lastEvent))
 			}
 		}
 
@@ -759,6 +771,17 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 	})
 
 	return s
+}
+
+// formatRank renders a federation.RankEntry for federation_status
+// output. Empty / ineligible entries become "(ineligible)"; live
+// entries show the numeric rank plus the observation timestamp so
+// operators can see whether the advertisement is fresh.
+func formatRank(r federation.RankEntry) string {
+	if r.Rank == 0 || r.ObservedAt == "" {
+		return "(ineligible)"
+	}
+	return fmt.Sprintf("%d (observed %s)", r.Rank, r.ObservedAt)
 }
 
 // renderInstructions builds the agent reference guide returned by the
@@ -915,6 +938,21 @@ the rest of the ring. A paused peer keeps its cursor and identity pin intact.
 
 cortex_identity reports the active mode. federation_status shows both the cortex mode
 and per-peer modes.
+
+## Consolidation Coordination
+When multiple federated peers have consolidation.enabled + consolidation.llm_enabled
+with a reachable local_llm_endpoint, exactly one peer runs each consolidation cycle:
+
+  - Every peer advertises a random rank (1..99) via cortex_identity on each sync.
+  - At trigger time, the peer with the highest rank (cortex_id breaks ties) runs
+    the pass; the rest silently skip. Subscribe-mode cortexes advertise rank=0
+    and never win.
+  - The winner emits consolidation_claim → runs → consolidation_success|fail
+    events that replicate through the standard event log.
+
+federation_status displays each peer's current rank. No configuration required
+beyond the existing consolidation block — coordination is automatic when peers
+are present.
 
 ## Source-Locking
 Traces can be source-locked by setting source_locked=true on creation. A source-locked

@@ -28,6 +28,13 @@ type EligibilityConfig struct {
 	// run distillation passes and so cannot legitimately win a round.
 	LLMEnabled bool
 
+	// FederationMode is the effective federation mode of this cortex
+	// (sync / publish / subscribe). When "subscribe", the loop forces
+	// Rank=0 because a read-only mirror cannot legitimately run a
+	// consolidation pass — matches the §14 mode table in the plan.
+	// Empty string is treated as "sync" (the EffectiveMode default).
+	FederationMode string
+
 	// Endpoint is the OpenAI-compatible base URL probed on every tick.
 	// Empty endpoint is treated as unreachable.
 	Endpoint string
@@ -149,6 +156,12 @@ func (e *EligibilityLoop) refresh() {
 	case !e.cfg.Enabled, !e.cfg.LLMEnabled:
 		// Feature disabled by config. Advertise ineligibility so peers
 		// know this cortex is deliberately not participating.
+		newEntry.Rank = RankIneligible
+	case e.cfg.FederationMode == "subscribe":
+		// Read-only mirror mode (plan §14 table). A subscribe-mode
+		// cortex pulls events from others but cannot serve them; by
+		// extension it should not author distillations either. Force
+		// Rank=0 regardless of probe outcome.
 		newEntry.Rank = RankIneligible
 	case !e.cfg.Probe(e.ctx, e.cfg.Endpoint):
 		// Endpoint unreachable; demote to ineligible until it recovers.

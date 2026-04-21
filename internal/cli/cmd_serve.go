@@ -131,7 +131,7 @@ func serveCmd() *cobra.Command {
 			// true — harmless on a single-node cortex (rank just sits
 			// in local kv) and ready-to-go the moment peers are added.
 			if manifestErr == nil && m.Consolidation != nil && m.Consolidation.Enabled {
-				eligibility = startEligibility(cx, m.Consolidation)
+				eligibility = startEligibility(cx, m.Consolidation, m.Federation)
 			}
 
 			switch transport {
@@ -379,24 +379,33 @@ func startConsolidator(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig, fed *
 // cfg.Enabled is true: on a single-node cortex the loop writes a local
 // kv row nothing reads, at negligible cost; in a federation it seeds
 // the state remote peers pull on every cortex_identity round-trip.
-func startEligibility(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig) *consolidation.EligibilityLoop {
+//
+// fed is consulted for the cortex-wide federation mode: a subscribe-mode
+// cortex forces Rank=0 so it can never win an election, matching the
+// "read-only mirror" semantics in plan §14 and federation-plan.md.
+func startEligibility(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig, fed *cortex.FederationConfig) *consolidation.EligibilityLoop {
 	if cfg == nil || !cfg.Enabled {
 		return nil
 	}
 	logger := func(format string, args ...any) {
 		fmt.Fprintf(os.Stderr, format+"\n", args...)
 	}
+	mode := cortex.FederationModeSync
+	if fed != nil {
+		mode = fed.EffectiveMode()
+	}
 	loop := consolidation.NewEligibilityLoop(consolidation.EligibilityConfig{
-		Enabled:    cfg.Enabled,
-		LLMEnabled: cfg.LLMEnabled,
-		Endpoint:   cfg.LocalLLMEndpoint,
-		CortexID:   cx.ID,
-		State:      federation.NewState(cx.DB.DB),
-		Log:        logger,
+		Enabled:        cfg.Enabled,
+		LLMEnabled:     cfg.LLMEnabled,
+		FederationMode: mode,
+		Endpoint:       cfg.LocalLLMEndpoint,
+		CortexID:       cx.ID,
+		State:          federation.NewState(cx.DB.DB),
+		Log:            logger,
 	})
 	loop.Start()
-	fmt.Fprintf(os.Stderr, "[consolidation] eligibility loop started (llm_enabled=%t endpoint=%q)\n",
-		cfg.LLMEnabled, cfg.LocalLLMEndpoint)
+	fmt.Fprintf(os.Stderr, "[consolidation] eligibility loop started (llm_enabled=%t mode=%s endpoint=%q)\n",
+		cfg.LLMEnabled, mode, cfg.LocalLLMEndpoint)
 	return loop
 }
 

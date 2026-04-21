@@ -62,6 +62,50 @@ func TestEligibility_DisabledConfig_AdvertisesZero(t *testing.T) {
 	}
 }
 
+func TestEligibility_SubscribeMode_AdvertisesZero(t *testing.T) {
+	// A subscribe-mode cortex is a read-only mirror. It must advertise
+	// Rank=0 even when the feature is enabled and the endpoint is alive
+	// — matches the §14 mode-compatibility table.
+	loop, state := buildLoop(t, consolidation.EligibilityConfig{
+		Enabled:        true,
+		LLMEnabled:     true,
+		FederationMode: "subscribe",
+		Endpoint:       "http://example.invalid",
+		Probe:          func(context.Context, string) bool { return true },
+	})
+	loop.Refresh()
+
+	got, err := state.GetLocalRank()
+	if err != nil {
+		t.Fatalf("GetLocalRank: %v", err)
+	}
+	if got.Rank != consolidation.RankIneligible {
+		t.Errorf("subscribe mode: got rank %d, want 0", got.Rank)
+	}
+}
+
+func TestEligibility_SyncMode_AdvertisesRank(t *testing.T) {
+	// Regression guard: the subscribe-mode branch must not accidentally
+	// blacklist sync-mode cortexes.
+	loop, state := buildLoop(t, consolidation.EligibilityConfig{
+		Enabled:        true,
+		LLMEnabled:     true,
+		FederationMode: "sync",
+		Endpoint:       "http://example.invalid",
+		Probe:          func(context.Context, string) bool { return true },
+	})
+	loop.Refresh()
+
+	got, err := state.GetLocalRank()
+	if err != nil {
+		t.Fatalf("GetLocalRank: %v", err)
+	}
+	if got.Rank < consolidation.RankMin || got.Rank > consolidation.RankMax {
+		t.Errorf("sync mode: got rank %d, want in [%d, %d]",
+			got.Rank, consolidation.RankMin, consolidation.RankMax)
+	}
+}
+
 func TestEligibility_LLMDisabled_AdvertisesZero(t *testing.T) {
 	// Master flag on, LLM off → rank stays 0. Heuristic-only cortexes
 	// cannot do distillation so they should not participate in election.

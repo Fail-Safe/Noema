@@ -507,6 +507,10 @@ noema federation set-mode subscribe      # switch cortex mode
 
 Changes take effect on the next `noema serve` restart.
 
+### Consolidation coordination in a federation
+
+When multiple peers have `consolidation.enabled`, `consolidation.llm_enabled`, and a reachable `local_llm_endpoint`, only one peer runs each consolidation cycle — without any additional configuration. Each peer advertises a random rank (1..99) on the `cortex_identity` heartbeat; the highest-ranked eligible peer wins (cortex ID breaks ties), runs the pass, and emits `consolidation_success`/`fail` events that replicate through the standard event log. `subscribe`-mode cortexes advertise rank 0 and can never win; `paused` peers naturally drop out via staleness. `federation_status` shows each peer's current rank.
+
 ### Content hashing and source-locking
 
 Every trace carries a `content_hash` (SHA-256 of the body, recomputed on every write). This enables integrity verification and federation sync optimization.
