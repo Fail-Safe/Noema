@@ -573,6 +573,11 @@ func tlsClientWithCA(caPath string) (*http.Client, error) {
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
 				RootCAs: pool,
+				// Explicit floor per gosec G402 — stdlib default has
+				// drifted upward over Go releases but pinning keeps
+				// the ring from silently negotiating TLS 1.0/1.1 on
+				// older peers with misconfigured OpenSSL-style stacks.
+				MinVersion: tls.VersionTLS12,
 			},
 		},
 	}, nil
