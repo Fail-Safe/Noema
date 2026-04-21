@@ -2252,6 +2252,29 @@ func setClockTx(tx *sql.Tx, vc federation.VClock) error {
 // ReplayEvent materializes a remote event locally without emitting a new event.
 // The remote event is stored in the local log with its original ID and origin.
 func (c *Cortex) ReplayEvent(e event.Event) error {
+	// Coordination events (consolidation Claim/Success/Fail) carry a
+	// synthetic window ID as trace_id, not a real trace ID. They only
+	// need to land in the event log — no trace-table side effect, no
+	// filesystem write, no path-escape risk. Handle them before the
+	// IsValidID gate that applies to content-mutating actions.
+	switch e.Action {
+	case event.ActionConsolidationClaim,
+		event.ActionConsolidationSuccess,
+		event.ActionConsolidationFail:
+		// Idempotency via event ID, not trace ID — multiple coord
+		// events share the same window ID but must each land once.
+		existing, err := event.ForTrace(c.DB.DB, e.TraceID)
+		if err != nil {
+			return err
+		}
+		for _, ex := range existing {
+			if ex.ID == e.ID {
+				return nil
+			}
+		}
+		return c.storeRemoteEvent(e)
+	}
+
 	// Guard: reject trace IDs that could escape the cortex directory.
 	if !trace.IsValidID(e.TraceID) {
 		return fmt.Errorf("rejecting remote event %s: %w: %q", e.ID, trace.ErrInvalidTraceID, e.TraceID)

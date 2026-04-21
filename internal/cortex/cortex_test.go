@@ -2371,6 +2371,75 @@ func TestValidateFederation_NilFederation(t *testing.T) {
 
 // ---- Security: path traversal ----
 
+func TestReplayEvent_CoordinationActionsBypassTraceIDGate(t *testing.T) {
+	// Consolidation coordination events (Claim/Success/Fail) use a
+	// synthetic window ULID as trace_id rather than a real trace ID.
+	// The IsValidID gate for path-traversal safety only applies to
+	// content-mutating replays — coord events must replay into the
+	// local log verbatim so peers converge on election history.
+	cx := setup(t)
+
+	windowID := event.NewULID()
+	claim, _ := json.Marshal(map[string]any{
+		"window_id": windowID,
+		"cortex_id": "01KPR5X75NFJ5703T7VZTCC8TF",
+	})
+
+	claimEvent := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionConsolidationClaim,
+		TraceID:   windowID,
+		CortexID:  "01KPR5X75NFJ5703T7VZTCC8TF",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-04-21T14:16:36Z",
+		Data:      claim,
+	}
+	if err := cx.ReplayEvent(claimEvent); err != nil {
+		t.Fatalf("ReplayEvent claim: %v", err)
+	}
+
+	success, _ := json.Marshal(map[string]any{
+		"window_id": windowID,
+		"cortex_id": "01KPR5X75NFJ5703T7VZTCC8TF",
+	})
+	successEvent := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionConsolidationSuccess,
+		TraceID:   windowID,
+		CortexID:  "01KPR5X75NFJ5703T7VZTCC8TF",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-04-21T14:16:46Z",
+		Data:      success,
+	}
+	if err := cx.ReplayEvent(successEvent); err != nil {
+		t.Fatalf("ReplayEvent success: %v", err)
+	}
+
+	// Both events should be in the log under the window ID.
+	events, err := cx.Events(windowID)
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if len(events) != 2 {
+		t.Errorf("got %d events, want 2", len(events))
+	}
+
+	// Idempotent replay of the same event must be a no-op.
+	if err := cx.ReplayEvent(claimEvent); err != nil {
+		t.Fatalf("second replay of claim: %v", err)
+	}
+	events, _ = cx.Events(windowID)
+	if len(events) != 2 {
+		t.Errorf("after idempotent replay, got %d events, want 2", len(events))
+	}
+
+	// No trace row or file should have been created for the synthetic
+	// window ID.
+	if _, err := cx.Get(windowID); err == nil {
+		t.Error("expected no trace row for coordination window ID")
+	}
+}
+
 func TestReplayEvent_RejectsPathTraversal(t *testing.T) {
 	cx := setup(t)
 
