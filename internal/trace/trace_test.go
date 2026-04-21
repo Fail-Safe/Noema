@@ -2,6 +2,7 @@ package trace_test
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -398,5 +399,66 @@ func TestValidate_AcceptsAllRecognizedTypes(t *testing.T) {
 		if err := trace.Validate(tr); err != nil {
 			t.Errorf("Validate accepting recognized type %q failed: %v", ty, err)
 		}
+	}
+}
+
+// ---- Tier ----
+
+func TestIsValidTier(t *testing.T) {
+	valid := []string{trace.TierShort, trace.TierMid, trace.TierLong}
+	for _, tier := range valid {
+		if !trace.IsValidTier(tier) {
+			t.Errorf("IsValidTier(%q) = false, want true", tier)
+		}
+	}
+	invalid := []string{"", "SHORT", "short ", "archived", "longterm", "unknown"}
+	for _, tier := range invalid {
+		if trace.IsValidTier(tier) {
+			t.Errorf("IsValidTier(%q) = true, want false", tier)
+		}
+	}
+}
+
+func TestTier_FrontmatterRoundtrip(t *testing.T) {
+	input := "---\nid: 20260419-consolidated-session\ntitle: Consolidated session memory\ntype: observation\ntier: mid\ncreated: 2026-04-19T12:00:00Z\nupdated: 2026-04-19T12:00:00Z\n---\n\nDistilled body.\n"
+	tr, err := trace.Parse([]byte(input))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if tr.Tier != trace.TierMid {
+		t.Errorf("Tier after Parse = %q, want %q", tr.Tier, trace.TierMid)
+	}
+
+	path := filepath.Join(t.TempDir(), tr.ID+".md")
+	if err := tr.Write(path); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	restored, err := trace.ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if restored.Tier != trace.TierMid {
+		t.Errorf("Tier after roundtrip = %q, want %q", restored.Tier, trace.TierMid)
+	}
+}
+
+func TestTier_EmptyOmittedFromFile(t *testing.T) {
+	// trace.New does not set Tier — cortex.Add stamps the default. This test
+	// pins the contract that Write omits an empty tier from YAML (keeping
+	// short-term trace files uncluttered).
+	tr := trace.New("Empty tier test", "note", "", nil, "body")
+	if tr.Tier != "" {
+		t.Errorf("trace.New set Tier = %q, want empty", tr.Tier)
+	}
+	path := filepath.Join(t.TempDir(), tr.ID+".md")
+	if err := tr.Write(path); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if strings.Contains(string(data), "tier:") {
+		t.Errorf("empty tier leaked into file: %s", data)
 	}
 }

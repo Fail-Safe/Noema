@@ -91,7 +91,7 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 		if err != nil {
 			return nil, err
 		}
-		row, err := cx.Get(id)
+		row, err := cx.GetAs(id, cortex.ActorAgent)
 		if err != nil {
 			return nil, fmt.Errorf("trace %q not found", id)
 		}
@@ -314,10 +314,134 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 		if err := t.Write(path); err != nil {
 			return nil, err
 		}
-		if err := cx.Update(id); err != nil {
+		if err := cx.UpdateAs(id, cortex.ActorAgent); err != nil {
 			return nil, err
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("Trace %s updated.", id)), nil
+	}))
+
+	s.AddTool(mcp.NewTool("vote_trace",
+		mcp.WithDescription("Cast a tier-preference vote on a trace. Use sparingly: only when the user has clearly indicated preference (\"this really matters\", \"forget this one\"). 'up' nudges the consolidation agent toward promoting the trace to a higher memory tier; 'down' nudges toward demoting or keeping it low. Votes accumulate across calls and are preferences, not overrides — the consolidation agent still makes the final decision."),
+		mcp.WithString("id", mcp.Description("Trace ID to vote on"), mcp.Required()),
+		mcp.WithString("direction", mcp.Description("'up' for promotion preference, 'down' for demotion preference"), mcp.Required(),
+			mcp.Enum("up", "down")),
+	), readOnlyGuard(func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id, err := req.RequireString("id")
+		if err != nil {
+			return nil, err
+		}
+		direction, err := req.RequireString("direction")
+		if err != nil {
+			return nil, err
+		}
+		delta := 0
+		switch direction {
+		case "up":
+			delta = 1
+		case "down":
+			delta = -1
+		default:
+			return nil, fmt.Errorf("direction must be 'up' or 'down', got %q", direction)
+		}
+		if err := cx.Vote(id, delta, cortex.ActorAgent); err != nil {
+			return nil, err
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("Vote recorded: %s %s.", direction, id)), nil
+	}))
+
+	// ---- Memory consolidation tools (internal-only) --------------------
+	//
+	// Two tools that together support an LLM-driven consolidation
+	// flow: list_consolidation_candidates surfaces short-term traces
+	// with their usage signals, and record_consolidation_result
+	// materialises a distilled mid-tier trace linked via derived_from
+	// to the sources it consolidates.
+	//
+	// Internal-only per the pattern in docs/plans/hermes-plugin-plan.md:74:
+	// these are not exposed to the Hermes agent surface (or equivalents)
+	// — they're called by whatever component is designated as the
+	// consolidator (an LLM via `noema consolidate`, or a custom agent
+	// told via get_instructions that it's the consolidator for the
+	// current cortex).
+
+	s.AddTool(mcp.NewTool("list_consolidation_candidates",
+		mcp.WithDescription("Internal tool. Returns short-term traces within the rolling consolidation window along with their usage signals (read_count, modify_count, tier_votes, derived_from_count). Consumer scores these and submits distilled mid-tier traces via record_consolidation_result."),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		m, err := cortex.ReadManifest(cx.Dir)
+		if err != nil {
+			return nil, fmt.Errorf("reading manifest for window config: %w", err)
+		}
+		window := m.Consolidation.EffectiveWindowHours()
+		cands, err := cx.PromotionCandidates(trace.TierShort, window)
+		if err != nil {
+			return nil, err
+		}
+		out := struct {
+			WindowHours int                         `json:"window_hours"`
+			Candidates  []cortex.PromotionCandidate `json:"candidates"`
+		}{
+			WindowHours: int(window.Hours()),
+			Candidates:  cands,
+		}
+		buf, _ := json.MarshalIndent(out, "", "  ")
+		return mcp.NewToolResultText(string(buf)), nil
+	})
+
+	s.AddTool(mcp.NewTool("record_consolidation_result",
+		mcp.WithDescription("Internal tool. Materialises a distilled mid-tier trace from a set of short-term sources. Validates the source IDs exist (>=2 required), creates the new trace with derived_from lineage pointing at the sources, and emits an ActionConsolidate event carrying model/profile/confidence telemetry for the quality dashboard."),
+		mcp.WithString("title", mcp.Description("Title for the distilled trace"), mcp.Required()),
+		mcp.WithString("body", mcp.Description("Body of the distilled trace — the consolidated memory"), mcp.Required()),
+		mcp.WithString("source_ids", mcp.Description("Comma-separated source trace IDs (at least 2)"), mcp.Required()),
+		mcp.WithString("tags", mcp.Description("Comma-separated tags (optional)")),
+		mcp.WithString("author", mcp.Description("Author identifier for the distilled trace (optional)")),
+		mcp.WithString("model_name", mcp.Description("Model that produced the distillation (optional; e.g. claude-opus-4-7)")),
+		mcp.WithString("model_tier_profile", mcp.Description("Prompt profile used (optional)"),
+			mcp.Enum("small", "large", "frontier")),
+		mcp.WithNumber("cohesion_confidence", mcp.Description("Confidence 0.0-1.0 that the cluster was cohesive (optional)")),
+	), readOnlyGuard(func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		title, err := req.RequireString("title")
+		if err != nil {
+			return nil, err
+		}
+		body, err := req.RequireString("body")
+		if err != nil {
+			return nil, err
+		}
+		sourcesRaw, err := req.RequireString("source_ids")
+		if err != nil {
+			return nil, err
+		}
+		var sources []string
+		for _, id := range strings.Split(sourcesRaw, ",") {
+			if id := strings.TrimSpace(id); id != "" {
+				sources = append(sources, id)
+			}
+		}
+
+		var tags []string
+		if raw := req.GetString("tags", ""); raw != "" {
+			for _, t := range strings.Split(raw, ",") {
+				if tag := strings.TrimSpace(t); tag != "" {
+					tags = append(tags, tag)
+				}
+			}
+		}
+
+		spec := cortex.DistilledTraceSpec{
+			Title:              title,
+			Body:               body,
+			Tags:               tags,
+			Author:             req.GetString("author", ""),
+			SourceIDs:          sources,
+			ModelName:          req.GetString("model_name", ""),
+			ModelTierProfile:   req.GetString("model_tier_profile", ""),
+			CohesionConfidence: req.GetFloat("cohesion_confidence", 0),
+		}
+		id, err := cx.CreateDistilledTrace(spec)
+		if err != nil {
+			return nil, err
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("Distilled trace created: %s (from %d sources)", id, len(sources))), nil
 	}))
 
 	s.AddTool(mcp.NewTool("append_trace",
@@ -432,6 +556,17 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 			"version": m.Version,
 			"mode":    m.Federation.EffectiveMode(),
 		}
+		// Piggyback the current consolidation rank on the identity
+		// response so federated peers can observe eligibility without a
+		// separate round-trip. Missing state (feature off, eligibility
+		// loop not yet running, malformed kv row) is surfaced as
+		// rank=0 — the coordination layer treats zero as "not
+		// participating". Older peers that don't know about the field
+		// simply ignore it.
+		state := federation.NewState(cx.DB.DB)
+		if rank, rerr := state.GetLocalRank(); rerr == nil && rank.CortexID != "" {
+			payload["rank"] = rank
+		}
 		data, err := json.Marshal(payload)
 		if err != nil {
 			return nil, fmt.Errorf("marshaling identity: %w", err)
@@ -500,9 +635,17 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 			if m.Federation.Interval != "" {
 				sb.WriteString(fmt.Sprintf("Interval: %s\n", m.Federation.Interval))
 			}
-			sb.WriteByte('\n')
 
 			state := federation.NewState(cx.DB.DB)
+			// Surface the local consolidation rank (plan §14). A missing
+			// entry or Rank=0 is rendered plainly as "(ineligible)" so
+			// operators can see at a glance whether coordination is
+			// armed for this cortex.
+			if localRank, rerr := state.GetLocalRank(); rerr == nil {
+				sb.WriteString(fmt.Sprintf("Consolidation Rank: %s\n", formatRank(localRank)))
+			}
+			sb.WriteByte('\n')
+
 			for _, p := range m.Federation.Peers {
 				ps, err := state.GetPeerState(p.Name, p.Endpoint)
 				if err != nil {
@@ -522,8 +665,12 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 					cortexID = ps.CortexID
 				}
 				peerMode := p.EffectiveMode()
-				sb.WriteString(fmt.Sprintf("  %s\n    endpoint:   %s\n    mode:       %s\n    cortex_id:  %s\n    last_seen:  %s\n    last_event: %s\n",
-					p.Name, p.Endpoint, peerMode, cortexID, lastSeen, lastEvent))
+				peerRank := "(none)"
+				if pr, perr := state.GetPeerRank(p.Name); perr == nil && pr.ObservedAt != "" {
+					peerRank = formatRank(pr)
+				}
+				sb.WriteString(fmt.Sprintf("  %s\n    endpoint:   %s\n    mode:       %s\n    cortex_id:  %s\n    rank:       %s\n    last_seen:  %s\n    last_event: %s\n",
+					p.Name, p.Endpoint, peerMode, cortexID, peerRank, lastSeen, lastEvent))
 			}
 		}
 
@@ -624,6 +771,17 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 	})
 
 	return s
+}
+
+// formatRank renders a federation.RankEntry for federation_status
+// output. Empty / ineligible entries become "(ineligible)"; live
+// entries show the numeric rank plus the observation timestamp so
+// operators can see whether the advertisement is fresh.
+func formatRank(r federation.RankEntry) string {
+	if r.Rank == 0 || r.ObservedAt == "" {
+		return "(ineligible)"
+	}
+	return fmt.Sprintf("%d (observed %s)", r.Rank, r.ObservedAt)
 }
 
 // renderInstructions builds the agent reference guide returned by the
@@ -780,6 +938,41 @@ the rest of the ring. A paused peer keeps its cursor and identity pin intact.
 
 cortex_identity reports the active mode. federation_status shows both the cortex mode
 and per-peer modes.
+
+## Tier Graduation (short → mid → long)
+The long tier accumulates base truths — traces that have proven durable via stable,
+repeat usage. An automatic graduation pass runs on the consolidation schedule and
+promotes every mid-tier trace that clears four AND-gated criteria:
+
+  - age >= 14 days (configurable via consolidation.graduation.min_age_days)
+  - read_count >= 3 (configurable via consolidation.graduation.min_read_count)
+  - modify_count == 0 (unless require_unmodified is false)
+  - tier_votes >= 0 (no active downvotes)
+
+Traces at the long tier are DB-level immutable: content / identity fields are
+frozen, tier cannot change except via the admin-purge ceremony, and routine
+Update/Delete is refused. Archive / trash / vote still work — visibility and
+preference signals remain mutable.
+
+Operators promote manually via 'noema memory promote <id>' / 'demote <id>'.
+Agents don't directly promote — vote_trace is the signal to influence the
+automatic pass. The ceremony for removing a long trace is 'noema memory
+purge --tier long' (add '--hard' for full deletion; default tombstones).
+
+## Consolidation Coordination
+When multiple federated peers have consolidation.enabled + consolidation.llm_enabled
+with a reachable local_llm_endpoint, exactly one peer runs each consolidation cycle:
+
+  - Every peer advertises a random rank (1..99) via cortex_identity on each sync.
+  - At trigger time, the peer with the highest rank (cortex_id breaks ties) runs
+    the pass; the rest silently skip. Subscribe-mode cortexes advertise rank=0
+    and never win.
+  - The winner emits consolidation_claim → runs → consolidation_success|fail
+    events that replicate through the standard event log.
+
+federation_status displays each peer's current rank. No configuration required
+beyond the existing consolidation block — coordination is automatic when peers
+are present.
 
 ## Source-Locking
 Traces can be source-locked by setting source_locked=true on creation. A source-locked

@@ -46,4 +46,5 @@ type PeerState struct {
 	LastSeen  string // RFC3339, "" if never reached
 	LastEvent string // ULID of last synced event, "" if never synced
 	CortexID  string // pinned ULID after first successful identity handshake
+	Health    PeerHealth
 }

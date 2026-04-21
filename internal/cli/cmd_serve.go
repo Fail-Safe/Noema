@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Fail-Safe/Noema/internal/config"
+	"github.com/Fail-Safe/Noema/internal/consolidation"
 	"github.com/Fail-Safe/Noema/internal/cortex"
 	"github.com/Fail-Safe/Noema/internal/federation"
 	mcpserver "github.com/Fail-Safe/Noema/internal/mcp"
@@ -95,6 +96,8 @@ func serveCmd() *cobra.Command {
 
 			var syncer *federation.Syncer
 			var watcher *watch.Watcher
+			var consolidator *consolidation.Agent
+			var eligibility *consolidation.EligibilityLoop
 
 			// Filesystem watcher: on by default so external edits
 			// (Obsidian, VS Code, Finder, iCloud sync, another agent on
@@ -107,6 +110,28 @@ func serveCmd() *cobra.Command {
 			// cortex.md.
 			if manifestErr == nil && m.Watch.WatchEnabled() {
 				watcher = startWatcher(cx, m.Watch)
+			}
+
+			// Consolidation agent: opt-in; drives memory-tier
+			// promotions on cron/idle/threshold triggers. Runs under
+			// both stdio and http so an agent connected via either
+			// transport sees the same tier state. Phase 7 ships the
+			// scheduling loop with a no-op pass — Phase 8+ populate
+			// the pass with candidate selection and LLM distillation.
+			if manifestErr == nil && m.Consolidation != nil && m.Consolidation.Enabled {
+				consolidator = startConsolidator(cx, m.Consolidation, m.Federation)
+			}
+
+			// Eligibility loop: advertises this cortex's consolidation
+			// rank in federation_state so federated peers can observe
+			// whether and how strongly we want to run the next
+			// consolidation window (see consolidation-plan.md §14).
+			// Phase 2 lands the advertisement; Phase 3 wires the
+			// election itself. Runs whenever consolidation.enabled is
+			// true — harmless on a single-node cortex (rank just sits
+			// in local kv) and ready-to-go the moment peers are added.
+			if manifestErr == nil && m.Consolidation != nil && m.Consolidation.Enabled {
+				eligibility = startEligibility(cx, m.Consolidation, m.Federation)
 			}
 
 			switch transport {
@@ -143,11 +168,13 @@ func serveCmd() *cobra.Command {
 
 				// Federation only runs over the HTTP transport (peers
 				// need an HTTP endpoint to call sync_events on). Start
-				// the syncer only when the bound cortex actually has
-				// peers configured AND the mode is not "publish" (a
-				// publish-mode cortex serves events but never pulls).
+				// the syncer whenever peers are configured. Publish-mode
+				// cortexes still run the syncer so they can pick up
+				// consolidation ranks from peers via cortex_identity
+				// (plan §14); the sync_events pull is suppressed inside
+				// the syncer loop.
 				fedMode := m.Federation.EffectiveMode()
-				if m.Federation != nil && len(m.Federation.Peers) > 0 && fedMode != cortex.FederationModePublish {
+				if m.Federation != nil && len(m.Federation.Peers) > 0 {
 					syncer = startSyncer(cx, accessKey.Value, m.Federation)
 				}
 				fmt.Fprintf(os.Stderr, "[serve] federation mode: %s\n", fedMode)
@@ -235,7 +262,7 @@ func serveCmd() *cobra.Command {
 				err = fmt.Errorf(
 					"the legacy `sse` transport was removed in this release: noema now speaks Streamable HTTP (MCP 2025-03-26).\n" +
 						"  Re-run with --transport http (default endpoint /mcp) and regenerate any\n" +
-						"  systemd unit, launchd plist, or .mcp.json that pinned --transport sse.")
+						"  systemd unit, launchd plist, or .mcp.json that pinned --transport sse")
 			default:
 				err = fmt.Errorf("unknown transport %q: use stdio or http", transport)
 			}
@@ -245,6 +272,12 @@ func serveCmd() *cobra.Command {
 			}
 			if watcher != nil {
 				watcher.Stop()
+			}
+			if consolidator != nil {
+				consolidator.Stop()
+			}
+			if eligibility != nil {
+				eligibility.Stop()
 			}
 			return err
 		},
@@ -275,6 +308,123 @@ func startWatcher(cx *cortex.Cortex, cfg *cortex.WatchConfig) *watch.Watcher {
 		return nil
 	}
 	return w
+}
+
+// startConsolidator wires the manifest's consolidation config into a
+// running scheduling agent. Phase 8 injects the heuristic pass as the
+// default PassFn so triggers actually move memory (short -> mid based
+// on a blended score of reads, modifies, lineage, and votes). Phase 9
+// will wrap this with LLM distillation; heuristic 1:1 promotion
+// remains the fallback when LLMs aren't configured.
+//
+// When federation peers are configured, the pass is wrapped with the
+// election gate from consolidation-plan.md §14 so only the elected peer
+// actually runs a cycle. Single-node cortexes skip the wrapper — the
+// gate would work there too, but it would emit a Claim+Success pair on
+// every pass for a degenerate election with a single participant.
+func startConsolidator(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig, fed *cortex.FederationConfig) *consolidation.Agent {
+	if cfg == nil || !cfg.Enabled {
+		return nil
+	}
+	if cfg.Cron == "" && cfg.IdleMinutes == 0 && cfg.ThresholdShort == 0 {
+		fmt.Fprintf(os.Stderr, "[consolidation] enabled but no triggers configured (cron/idle_minutes/threshold_short); agent will not run\n")
+		return nil
+	}
+	logger := func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
+	}
+	pass := consolidation.HeuristicPass(cx, consolidation.PassConfig{
+		Window: cfg.EffectiveWindowHours(),
+	}, logger)
+
+	// Phase 15: mid→long graduation runs on the same trigger cadence
+	// alongside short→mid promotion. Chain the two so each scheduler
+	// fire evaluates both transitions in order.
+	if cfg.Graduation.EffectiveEnabled() {
+		graduate := consolidation.GraduatePass(cx, consolidation.GraduationConfig{
+			MinAge:        cfg.Graduation.EffectiveMinAge(),
+			MinReadCount:  cfg.Graduation.EffectiveMinReadCount(),
+			AllowModified: !cfg.Graduation.EffectiveRequireUnmodified(),
+		}, logger)
+		pass = consolidation.ChainPasses(pass, graduate)
+		fmt.Fprintf(os.Stderr, "[consolidation] graduation enabled (min_age=%s min_reads=%d require_unmodified=%t)\n",
+			cfg.Graduation.EffectiveMinAge(),
+			cfg.Graduation.EffectiveMinReadCount(),
+			cfg.Graduation.EffectiveRequireUnmodified())
+	}
+
+	if fed != nil && len(fed.Peers) > 0 {
+		peerNames := make([]string, 0, len(fed.Peers))
+		for _, p := range fed.Peers {
+			peerNames = append(peerNames, p.Name)
+		}
+		// Quiet period tracks federation sync cadence so a peer's
+		// rank is only trusted once the ring has had a chance to
+		// observe it. Default to 60s (2 × the 30s federation default)
+		// when the manifest leaves Interval unset or unparseable.
+		interval := 30 * time.Second
+		if fed.Interval != "" {
+			if parsed, err := time.ParseDuration(fed.Interval); err == nil && parsed > 0 {
+				interval = parsed
+			}
+		}
+		election := consolidation.NewElection(consolidation.ElectionConfig{
+			CortexID:    cx.ID,
+			PeerNames:   peerNames,
+			QuietPeriod: 2 * interval,
+			State:       federation.NewState(cx.DB.DB),
+			Emitter:     cx,
+			Log:         logger,
+		})
+		pass = consolidation.WithElection(pass, election, logger)
+		fmt.Fprintf(os.Stderr, "[consolidation] election gate enabled (peers=%d quiet=%s)\n",
+			len(peerNames), 2*interval)
+	}
+
+	a := consolidation.New(cx, consolidation.Config{
+		Cron:           cfg.Cron,
+		IdleMinutes:    cfg.IdleMinutes,
+		ThresholdShort: cfg.ThresholdShort,
+	}, pass, logger)
+	a.Start()
+	fmt.Fprintf(os.Stderr, "[consolidation] agent started (cron=%q idle=%dm threshold=%d window=%s)\n",
+		cfg.Cron, cfg.IdleMinutes, cfg.ThresholdShort, cfg.EffectiveWindowHours())
+	return a
+}
+
+// startEligibility launches the rank-advertisement loop for federation-
+// aware consolidation coordination (plan §14). Always safe to call when
+// cfg.Enabled is true: on a single-node cortex the loop writes a local
+// kv row nothing reads, at negligible cost; in a federation it seeds
+// the state remote peers pull on every cortex_identity round-trip.
+//
+// fed is consulted for the cortex-wide federation mode: a subscribe-mode
+// cortex forces Rank=0 so it can never win an election, matching the
+// "read-only mirror" semantics in plan §14 and federation-plan.md.
+func startEligibility(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig, fed *cortex.FederationConfig) *consolidation.EligibilityLoop {
+	if cfg == nil || !cfg.Enabled {
+		return nil
+	}
+	logger := func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
+	}
+	mode := cortex.FederationModeSync
+	if fed != nil {
+		mode = fed.EffectiveMode()
+	}
+	loop := consolidation.NewEligibilityLoop(consolidation.EligibilityConfig{
+		Enabled:        cfg.Enabled,
+		LLMEnabled:     cfg.LLMEnabled,
+		FederationMode: mode,
+		Endpoint:       cfg.LocalLLMEndpoint,
+		CortexID:       cx.ID,
+		State:          federation.NewState(cx.DB.DB),
+		Log:            logger,
+	})
+	loop.Start()
+	fmt.Fprintf(os.Stderr, "[consolidation] eligibility loop started (llm_enabled=%t mode=%s endpoint=%q)\n",
+		cfg.LLMEnabled, mode, cfg.LocalLLMEndpoint)
+	return loop
 }
 
 // startSyncer converts the manifest's federation config into a running
@@ -325,7 +475,7 @@ func requireTLSForKeyedMode(access cortex.AccessKey, useTLS bool) error {
 	return fmt.Errorf(
 		"refusing to serve MCP auth over plaintext HTTP: access.shared_key_file is set (source=%s) but --tls-cert/--tls-key are not configured.\n"+
 			"  A bearer token sent without TLS is stolen by the first adversary on the network path.\n"+
-			"  Provide --tls-cert and --tls-key, or remove access.shared_key_file from cortex.md to run in open mode.",
+			"  Provide --tls-cert and --tls-key, or remove access.shared_key_file from cortex.md to run in open mode",
 		access.Source,
 	)
 }
@@ -368,7 +518,7 @@ func guardStdioFlags(hostSet, portSet, tlsCertSet, tlsKeySet bool) error {
 		"%s %s only meaningful with --transport http.\n"+
 			"  noema serve defaults to stdio, which reads JSON-RPC from stdin\n"+
 			"  and has no network endpoint to bind. Re-run with --transport http,\n"+
-			"  or remove the flag(s).",
+			"  or remove the flag(s)",
 		strings.Join(flags, ", "),
 		verb,
 	)

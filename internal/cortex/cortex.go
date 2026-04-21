@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -27,15 +28,16 @@ const ManifestVersion = 2
 
 // Manifest is the cortex.md file at the root of each Cortex.
 type Manifest struct {
-	ID         string            `yaml:"id,omitempty"`
-	Name       string            `yaml:"name"`
-	Purpose    string            `yaml:"purpose,omitempty"`
-	Owner      string            `yaml:"owner,omitempty"`
-	Created    string            `yaml:"created"`
-	Version    int               `yaml:"version"`
-	Access     *AccessConfig     `yaml:"access,omitempty"`
-	Federation *FederationConfig `yaml:"federation,omitempty"`
-	Watch      *WatchConfig      `yaml:"watch,omitempty"`
+	ID            string               `yaml:"id,omitempty"`
+	Name          string               `yaml:"name"`
+	Purpose       string               `yaml:"purpose,omitempty"`
+	Owner         string               `yaml:"owner,omitempty"`
+	Created       string               `yaml:"created"`
+	Version       int                  `yaml:"version"`
+	Access        *AccessConfig        `yaml:"access,omitempty"`
+	Federation    *FederationConfig    `yaml:"federation,omitempty"`
+	Watch         *WatchConfig         `yaml:"watch,omitempty"`
+	Consolidation *ConsolidationConfig `yaml:"consolidation,omitempty"`
 }
 
 // AccessConfig holds MCP endpoint authentication settings for cortex.md.
@@ -105,6 +107,15 @@ type WatchConfig struct {
 	// DebounceMs is the per-path debounce window in milliseconds.
 	// Zero means use the default (300ms).
 	DebounceMs int `yaml:"debounce_ms,omitempty"`
+	// AutoOnboard controls what happens when a new file is dropped into
+	// traces/ without conforming frontmatter (no id, empty id, invalid
+	// id format, or filename mismatch). Nil / unset defaults to true:
+	// the watcher rescues the file by synthesizing valid frontmatter,
+	// generating an ID from the title or filename, and renaming the
+	// file to match. Makes Obsidian Web Clipper, Drafts, and shortcut
+	// macros work without teaching users Noema's filename-ID rules.
+	// Set to false to restore the prior skip-and-log behaviour.
+	AutoOnboard *bool `yaml:"auto_onboard,omitempty"`
 }
 
 // WatchEnabled reports whether the watcher should run given the parsed
@@ -116,6 +127,17 @@ func (wc *WatchConfig) WatchEnabled() bool {
 	return *wc.Enabled
 }
 
+// AutoOnboardEnabled reports whether the watcher should rescue non-
+// conforming files dropped into traces/. Nil manifest or nil
+// AutoOnboard pointer both mean "on" so users get the graceful
+// behaviour by default.
+func (wc *WatchConfig) AutoOnboardEnabled() bool {
+	if wc == nil || wc.AutoOnboard == nil {
+		return true
+	}
+	return *wc.AutoOnboard
+}
+
 // EffectiveDebounce returns the configured debounce duration, defaulting
 // to 300ms when unset.
 func (wc *WatchConfig) EffectiveDebounce() time.Duration {
@@ -124,6 +146,170 @@ func (wc *WatchConfig) EffectiveDebounce() time.Duration {
 		return defaultDebounce
 	}
 	return time.Duration(wc.DebounceMs) * time.Millisecond
+}
+
+// ConsolidationConfig controls the background memory-consolidation agent.
+// All three triggers (cron, idle, threshold) are composable — set any
+// combination, the agent fires on whichever triggers first. Leaving all
+// three empty disables the agent even when Enabled is true.
+//
+// See docs/plans/consolidation-plan.md §4 in the Noema-design repo for
+// the cadence design. Model-tier and local-LLM fields are deferred to
+// later phases; this config block only covers scheduling for now.
+type ConsolidationConfig struct {
+	// Enabled is the master opt-in. The feature ships off by default so
+	// existing cortexes are unaffected until users explicitly turn it on.
+	Enabled bool `yaml:"enabled,omitempty"`
+
+	// Cron is the nightly trigger time in "HH:MM" local-clock format
+	// (e.g. "03:00"). Empty means no cron trigger.
+	Cron string `yaml:"cron,omitempty"`
+
+	// IdleMinutes fires a pass after N minutes of no trace mutations.
+	// Zero disables the idle trigger. Cooldown equal to IdleMinutes is
+	// enforced so a quiet cortex doesn't consolidate on every tick.
+	IdleMinutes int `yaml:"idle_minutes,omitempty"`
+
+	// ThresholdShort fires a pass when the short-term tier count
+	// exceeds this many active traces. Zero disables the trigger.
+	// Hysteresis: once tripped, re-arms only when the count drops
+	// back below 0.8 * ThresholdShort so a cortex hovering near the
+	// threshold doesn't thrash.
+	ThresholdShort int `yaml:"threshold_short,omitempty"`
+
+	// WindowHours bounds the candidate pool for a pass to traces
+	// created within the last N hours. Zero defaults to 24.
+	WindowHours int `yaml:"window_hours,omitempty"`
+
+	// LLMEnabled opts into the LLM-driven distillation path used by
+	// `noema consolidate`. When false (default), the in-process agent
+	// runs pure-heuristic 1:1 promotion only. When true, operators are
+	// expected to run `noema consolidate` periodically (or wire the
+	// subcommand up to cron / launchd) so clusters get distilled into
+	// mid-tier memories instead of promoted one-to-one.
+	LLMEnabled bool `yaml:"llm_enabled,omitempty"`
+
+	// ModelTier is the prompt-style profile the consolidation pipeline
+	// uses when calling the LLM: "small" (7B-13B, multi-step template),
+	// "large" (30B-70B, same plus confidence step), or "frontier"
+	// (single-shot JSON). See docs/plans/consolidation-plan.md §6 in
+	// the Noema-design repo for the full profile matrix.
+	ModelTier string `yaml:"model_tier,omitempty"`
+
+	// LocalLLMEndpoint is the OpenAI-compatible base URL to post
+	// chat-completion requests to. Covers Ollama (/v1), LMStudio,
+	// llama.cpp server, vLLM, and OpenAI itself. Empty disables the
+	// LLM path even when LLMEnabled is true; `noema consolidate` exits
+	// with a clear error rather than trying to guess a default.
+	LocalLLMEndpoint string `yaml:"local_llm_endpoint,omitempty"`
+
+	// ModelName is the model identifier passed in the `model` field of
+	// the chat-completion request body (e.g. "llama3.1:70b",
+	// "claude-opus-4-7", "gpt-4o"). Must match what the endpoint
+	// recognizes — no translation layer here.
+	ModelName string `yaml:"model_name,omitempty"`
+
+	// APIKeyEnv names an environment variable whose value is attached
+	// as a Bearer token to outgoing requests. Empty means no auth
+	// header — correct for local runners like Ollama that don't care.
+	// The key itself never lives in cortex.md; this is a pointer to
+	// where the operator keeps it, matching the access.shared_key_file
+	// pattern for the MCP server.
+	APIKeyEnv string `yaml:"api_key_env,omitempty"`
+
+	// Graduation controls the mid→long promotion heuristic (Phase 15).
+	// Leaving the block unset uses the defaults. Setting
+	// Graduation.Enabled=false on an existing cortex keeps mid as the
+	// terminal tier for automatic promotion — useful for operators who
+	// want to curate the long tier by hand via `noema memory promote`.
+	Graduation *GraduationConfig `yaml:"graduation,omitempty"`
+}
+
+// GraduationConfig controls the mid→long promotion heuristic. A
+// trace graduates when every criterion is simultaneously true — a
+// simple AND-gate rather than a blended score because the long tier
+// is meant to be slow-moving and auditable. Bumping any threshold
+// makes graduation stricter; lowering any makes it looser.
+type GraduationConfig struct {
+	// Enabled defaults to true when the parent consolidation block is
+	// enabled. Set to false to pause automatic mid→long graduation
+	// while leaving the short→mid promoter and LLM distillation
+	// pipeline running.
+	Enabled *bool `yaml:"enabled,omitempty"`
+
+	// MinAgeDays is the minimum age (in days) before a mid-tier trace
+	// can graduate. Zero defaults to 14 — two weeks of stability
+	// signals the trace hasn't been a transient idea.
+	MinAgeDays int `yaml:"min_age_days,omitempty"`
+
+	// MinReadCount is the minimum read_count required for graduation.
+	// Zero defaults to 3 — at least a few deliberate reads to prove
+	// the trace carries ongoing value.
+	MinReadCount int `yaml:"min_read_count,omitempty"`
+
+	// RequireUnmodified defaults to true. When true, a trace graduates
+	// only if modify_count == 0 since creation; any edit resets the
+	// stability clock. Flip to false in cortexes where edits are
+	// routine and don't indicate churn.
+	RequireUnmodified *bool `yaml:"require_unmodified,omitempty"`
+}
+
+// EffectiveEnabled returns true when graduation should run. Defaults
+// to true on a nil config so a cortex that enables consolidation
+// without an explicit graduation block gets the tier model completed.
+func (gc *GraduationConfig) EffectiveEnabled() bool {
+	if gc == nil || gc.Enabled == nil {
+		return true
+	}
+	return *gc.Enabled
+}
+
+// EffectiveMinAge returns the configured minimum age, defaulting to 14
+// days. The return type is time.Duration for direct use in candidate
+// queries; the YAML knob is days for human readability.
+func (gc *GraduationConfig) EffectiveMinAge() time.Duration {
+	days := 14
+	if gc != nil && gc.MinAgeDays > 0 {
+		days = gc.MinAgeDays
+	}
+	return time.Duration(days) * 24 * time.Hour
+}
+
+// EffectiveMinReadCount returns the configured floor, defaulting to 3.
+func (gc *GraduationConfig) EffectiveMinReadCount() int {
+	if gc == nil || gc.MinReadCount <= 0 {
+		return 3
+	}
+	return gc.MinReadCount
+}
+
+// EffectiveRequireUnmodified returns the stability-gate flag,
+// defaulting to true on a nil config.
+func (gc *GraduationConfig) EffectiveRequireUnmodified() bool {
+	if gc == nil || gc.RequireUnmodified == nil {
+		return true
+	}
+	return *gc.RequireUnmodified
+}
+
+// EffectiveWindowHours returns the window duration with the 24h default
+// applied when unset.
+func (cc *ConsolidationConfig) EffectiveWindowHours() time.Duration {
+	if cc == nil || cc.WindowHours <= 0 {
+		return 24 * time.Hour
+	}
+	return time.Duration(cc.WindowHours) * time.Hour
+}
+
+// EffectiveModelTier returns the configured model-tier profile or
+// "large" as the default. Large is the conservative middle ground —
+// it works well on local 30B-70B models and stays safe on frontier
+// models that would also accept tighter prompts.
+func (cc *ConsolidationConfig) EffectiveModelTier() string {
+	if cc == nil || cc.ModelTier == "" {
+		return "large"
+	}
+	return cc.ModelTier
 }
 
 // ErrSourceLocked is returned when a mutation is attempted on a
@@ -546,7 +732,7 @@ func Open(name, dir string) (*Cortex, error) {
 			return nil, fmt.Errorf(
 				"cortex %q is at manifest version %d but this binary requires version %d.\n"+
 					"Run `noema migrate cortex-id --cortex %s` to upgrade.\n"+
-					"See docs/design/cortex-uuid-plan.md for what this changes.",
+					"See docs/design/cortex-uuid-plan.md for what this changes",
 				name, m.Version, ManifestVersion, name,
 			)
 		}
@@ -596,6 +782,31 @@ func Open(name, dir string) (*Cortex, error) {
 		}
 	}
 
+	// Self-heal the FTS5 schema if a prior-branch migration collision
+	// left traces_fts without the tags column. This happens when an
+	// earlier draft of a feature branch occupied a migration version
+	// number that a later patch release also took: the old migration
+	// stamps schema_migrations with that version, and the new
+	// migration then silently skips on the next open because the
+	// version is already marked applied. Detect the shape mismatch
+	// and rebuild the virtual table before the rest of Open proceeds.
+	if err := cx.ensureFTSSchema(); err != nil {
+		fmt.Fprintf(os.Stderr, "[cortex] FTS5 schema repair warning: %v\n", err)
+	}
+
+	// Auto-rebuild the FTS5 index when it's smaller than the traces
+	// table. This is the recovery path after migration 008, which
+	// dropped and recreated traces_fts with a new tags column but
+	// couldn't repopulate body (body lives in the markdown files, not
+	// SQL). The first serve after upgrade does the full filesystem
+	// walk; subsequent opens are no-ops because counts match.
+	// Best-effort: a rebuild failure logs but doesn't block Open —
+	// searches will return fewer results until the next successful
+	// rebuild, but the cortex still opens for normal writes.
+	if err := cx.RebuildFTSIfStale(); err != nil {
+		fmt.Fprintf(os.Stderr, "[cortex] FTS5 reindex warning: %v\n", err)
+	}
+
 	return cx, nil
 }
 
@@ -632,7 +843,7 @@ func (c *Cortex) detectCopiedDirectory() error {
 			"clobbered. To make this directory a distinct Cortex, run:\n"+
 			"    noema migrate cortex-id --cortex %s --reset\n"+
 			"That will assign a fresh id and re-key the local event log. If this is not a\n"+
-			"copy and you expected the events to be present, restore from backup instead.",
+			"copy and you expected the events to be present, restore from backup instead",
 		c.Name, c.Dir, c.ID, distinctIDs, c.Name,
 	)
 }
@@ -679,6 +890,9 @@ func (c *Cortex) Add(t *trace.Trace) error {
 	if t.Origin == "" {
 		t.Origin = c.Name
 	}
+	if t.Tier == "" {
+		t.Tier = trace.TierShort
+	}
 	t.ContentHash = trace.ContentHash(t.Body)
 	path := c.TraceFile(t.ID, false)
 	if err := t.Write(path); err != nil {
@@ -698,9 +912,13 @@ func (c *Cortex) insertDB(t *trace.Trace) error {
 	}
 	defer tx.Rollback()
 
+	tier := t.Tier
+	if tier == "" {
+		tier = trace.TierShort
+	}
 	_, err = tx.Exec(
-		`INSERT INTO traces (id, title, type, author, origin, cortex_id, created_at, updated_at, content_hash, source_locked, source_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.Title, t.Type, t.Author, t.Origin, c.ID, t.Created, t.Updated, t.ContentHash, boolToInt(t.SourceLocked), nullIfEmpty(t.SourceHash),
+		`INSERT INTO traces (id, title, type, tier, author, origin, cortex_id, created_at, updated_at, content_hash, source_locked, source_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.Title, t.Type, tier, t.Author, t.Origin, c.ID, t.Created, t.Updated, t.ContentHash, boolToInt(t.SourceLocked), nullIfEmpty(t.SourceHash),
 	)
 	if err != nil {
 		return err
@@ -715,8 +933,7 @@ func (c *Cortex) insertDB(t *trace.Trace) error {
 			return err
 		}
 	}
-	_, err = tx.Exec(`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`, t.ID, t.Title, t.Body)
-	if err != nil {
+	if err := insertFTS(tx, t.ID, t.Title, t.Body, t.Tags); err != nil {
 		return err
 	}
 	if err := c.emitEvent(tx, event.ActionCreate, t.ID, t.Created, marshalTraceData(t)); err != nil {
@@ -730,6 +947,7 @@ type Row struct {
 	ID           string
 	Title        string
 	Type         string
+	Tier         string
 	Author       string
 	Origin       string
 	Tags         []string
@@ -748,13 +966,14 @@ type ListOptions struct {
 	Author   string
 	Tag      string
 	Origin   string
-	Archived bool // only archived (excludes trashed)
-	Trashed  bool // only trashed
-	All      bool // active + archived (excludes trashed)
+	Tiers    []string // restrict to these memory tiers; empty means no tier filter
+	Archived bool     // only archived (excludes trashed)
+	Trashed  bool     // only trashed
+	All      bool     // active + archived (excludes trashed)
 }
 
 func (c *Cortex) List(opts ListOptions) ([]Row, error) {
-	q := `SELECT id, title, type, author, origin, archived_at, trashed_at, created_at, updated_at, content_hash, source_locked, source_hash FROM traces WHERE 1=1`
+	q := `SELECT id, title, type, tier, author, origin, archived_at, trashed_at, created_at, updated_at, content_hash, source_locked, source_hash FROM traces WHERE 1=1`
 	var args []any
 
 	switch {
@@ -783,6 +1002,14 @@ func (c *Cortex) List(opts ListOptions) ([]Row, error) {
 		q += ` AND origin = ?`
 		args = append(args, opts.Origin)
 	}
+	if len(opts.Tiers) > 0 {
+		placeholders := strings.Repeat("?,", len(opts.Tiers))
+		placeholders = placeholders[:len(placeholders)-1]
+		q += ` AND tier IN (` + placeholders + `)`
+		for _, t := range opts.Tiers {
+			args = append(args, t)
+		}
+	}
 	q += ` ORDER BY created_at DESC, rowid DESC`
 
 	rows, err := c.DB.Query(q, args...)
@@ -799,7 +1026,7 @@ func (c *Cortex) Search(query string, opts ListOptions) ([]Row, error) {
 	}
 	ftsQuery := SanitizeFTS5Query(query)
 	q := `
-		SELECT t.id, t.title, t.type, t.author, t.origin, t.archived_at, t.trashed_at, t.created_at, t.updated_at, t.content_hash, t.source_locked, t.source_hash
+		SELECT t.id, t.title, t.type, t.tier, t.author, t.origin, t.archived_at, t.trashed_at, t.created_at, t.updated_at, t.content_hash, t.source_locked, t.source_hash
 		FROM traces t
 		WHERE t.id IN (SELECT id FROM traces_fts WHERE traces_fts MATCH ?)`
 	args := []any{ftsQuery}
@@ -826,6 +1053,14 @@ func (c *Cortex) Search(query string, opts ListOptions) ([]Row, error) {
 		q += ` AND t.id IN (SELECT trace_id FROM trace_tags WHERE tag = ?)`
 		args = append(args, opts.Tag)
 	}
+	if len(opts.Tiers) > 0 {
+		placeholders := strings.Repeat("?,", len(opts.Tiers))
+		placeholders = placeholders[:len(placeholders)-1]
+		q += ` AND t.tier IN (` + placeholders + `)`
+		for _, t := range opts.Tiers {
+			args = append(args, t)
+		}
+	}
 	q += ` ORDER BY t.created_at DESC`
 
 	rows, err := c.DB.Query(q, args...)
@@ -841,8 +1076,8 @@ func (c *Cortex) Get(id string) (*Row, error) {
 	var archivedAt, trashedAt, contentHash, sourceHash *string
 	var sourceLocked int
 	err := c.DB.QueryRow(
-		`SELECT id, title, type, author, origin, archived_at, trashed_at, created_at, updated_at, content_hash, source_locked, source_hash FROM traces WHERE id = ?`, id,
-	).Scan(&r.ID, &r.Title, &r.Type, &r.Author, &r.Origin, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt, &contentHash, &sourceLocked, &sourceHash)
+		`SELECT id, title, type, tier, author, origin, archived_at, trashed_at, created_at, updated_at, content_hash, source_locked, source_hash FROM traces WHERE id = ?`, id,
+	).Scan(&r.ID, &r.Title, &r.Type, &r.Tier, &r.Author, &r.Origin, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt, &contentHash, &sourceLocked, &sourceHash)
 	if err != nil {
 		return nil, err
 	}
@@ -1307,8 +1542,11 @@ func (c *Cortex) Update(id string) error {
 
 	// Stamp the update time authoritatively rather than trusting whatever the
 	// editor left in the frontmatter — and write it back to the file so disk,
-	// DB, and emitted event all agree.
+	// DB, and emitted event all agree. Tier is DB-managed after creation: if
+	// the on-disk frontmatter drifted (manual edit), authoritative value lives
+	// in the DB row and gets stamped back to the file here.
 	t.Updated = time.Now().UTC().Format(time.RFC3339)
+	t.Tier = r.Tier
 	t.ContentHash = trace.ContentHash(t.Body)
 	if err := t.Write(path); err != nil {
 		return fmt.Errorf("rewriting trace file with updated timestamp: %w", err)
@@ -1343,10 +1581,7 @@ func (c *Cortex) Update(id string) error {
 			return err
 		}
 	}
-	if _, err := tx.Exec(`DELETE FROM traces_fts WHERE id = ?`, id); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`, id, t.Title, t.Body); err != nil {
+	if err := upsertFTS(tx, id, t.Title, t.Body, t.Tags); err != nil {
 		return err
 	}
 	if err := c.emitEvent(tx, event.ActionUpdate, id, t.Updated, marshalTraceData(t)); err != nil {
@@ -1399,10 +1634,7 @@ func (c *Cortex) Append(id, content string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM traces_fts WHERE id = ?`, id); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`, id, t.Title, t.Body); err != nil {
+	if err := upsertFTS(tx, id, t.Title, t.Body, t.Tags); err != nil {
 		return err
 	}
 	if err := c.emitEvent(tx, event.ActionUpdate, id, t.Updated, marshalTraceData(t)); err != nil {
@@ -1417,7 +1649,7 @@ func (c *Cortex) scanRows(rows *sql.Rows) ([]Row, error) { //nolint:govet
 		var r Row
 		var archivedAt, trashedAt, contentHash, sourceHash *string
 		var sourceLocked int
-		if err := rows.Scan(&r.ID, &r.Title, &r.Type, &r.Author, &r.Origin, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt, &contentHash, &sourceLocked, &sourceHash); err != nil {
+		if err := rows.Scan(&r.ID, &r.Title, &r.Type, &r.Tier, &r.Author, &r.Origin, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt, &contentHash, &sourceLocked, &sourceHash); err != nil {
 			return nil, err
 		}
 		if archivedAt != nil {
@@ -1596,11 +1828,7 @@ func (c *Cortex) SyncWithOptions(opts SyncOptions) (SyncResult, error) {
 				return result, err
 			}
 		}
-		if _, err := tx.Exec(`DELETE FROM traces_fts WHERE id = ?`, t.ID); err != nil {
-			tx.Rollback()
-			return result, err
-		}
-		if _, err := tx.Exec(`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`, t.ID, t.Title, t.Body); err != nil {
+		if err := upsertFTS(tx, t.ID, t.Title, t.Body, t.Tags); err != nil {
 			tx.Rollback()
 			return result, err
 		}
@@ -1911,28 +2139,6 @@ func matchVersionLabel(accept, name, cortexID string) bool {
 	return false
 }
 
-// extractVersionBody returns the body content of the `### Version from <label>`
-// section in a divergence trace, stripping the `**Vector clock:**` metadata
-// line that follows the header. `accept` may be a display name, a full ULID,
-// or the 8-char id prefix shown in the header.
-func extractVersionBody(divID, path, accept string) (string, error) {
-	t, err := trace.ParseFile(path)
-	if err != nil {
-		return "", fmt.Errorf("reading divergence trace: %w", err)
-	}
-
-	sections, err := splitDivergenceSections(t.Body)
-	if err != nil {
-		return "", fmt.Errorf("parsing divergence trace %q: %w", divID, err)
-	}
-	for _, sec := range sections {
-		if matchVersionLabel(accept, sec.name, sec.cortexID) {
-			return strings.TrimSpace(sec.body), nil
-		}
-	}
-	return "", fmt.Errorf("divergence trace %q has no version matching %q", divID, accept)
-}
-
 // divergenceSection is one parsed `### Version from <label>` block.
 type divergenceSection struct {
 	name     string // peer display name
@@ -2013,6 +2219,38 @@ func parseVersionLabel(label string) (name, cortexID string) {
 // incrementing the local vector clock. All reads/writes go through the tx
 // to avoid SQLite lock contention. Vector clocks are keyed on the cortex
 // ID (a stable ULID), not the cortex name — see docs/design/cortex-uuid-plan.md.
+// EmitCoordinationEvent emits an event that isn't tied to a specific
+// trace mutation — used by the consolidation election protocol for
+// Claim / Success / Fail events (see consolidation-plan.md §14). The
+// windowID serves as trace_id in the events table (the column is
+// NOT NULL but doesn't enforce a foreign key on traces — coordination
+// events use a synthetic ID scoped to the election window).
+//
+// Data is JSON-marshaled by the caller's choice of struct; pass nil to
+// emit an event with an empty payload.
+func (c *Cortex) EmitCoordinationEvent(action event.Action, windowID string, data any) error {
+	var blob json.RawMessage
+	if data != nil {
+		b, err := json.Marshal(data)
+		if err != nil {
+			return fmt.Errorf("marshaling coordination event data: %w", err)
+		}
+		blob = b
+	}
+
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := c.emitEvent(tx, action, windowID, now, blob); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (c *Cortex) emitEvent(tx *sql.Tx, action event.Action, traceID, timestamp string, data json.RawMessage) error {
 	// Read clock from federation_state within the transaction.
 	vc, err := getClockTx(tx)
@@ -2067,6 +2305,29 @@ func setClockTx(tx *sql.Tx, vc federation.VClock) error {
 // ReplayEvent materializes a remote event locally without emitting a new event.
 // The remote event is stored in the local log with its original ID and origin.
 func (c *Cortex) ReplayEvent(e event.Event) error {
+	// Coordination events (consolidation Claim/Success/Fail) carry a
+	// synthetic window ID as trace_id, not a real trace ID. They only
+	// need to land in the event log — no trace-table side effect, no
+	// filesystem write, no path-escape risk. Handle them before the
+	// IsValidID gate that applies to content-mutating actions.
+	switch e.Action {
+	case event.ActionConsolidationClaim,
+		event.ActionConsolidationSuccess,
+		event.ActionConsolidationFail:
+		// Idempotency via event ID, not trace ID — multiple coord
+		// events share the same window ID but must each land once.
+		existing, err := event.ForTrace(c.DB.DB, e.TraceID)
+		if err != nil {
+			return err
+		}
+		for _, ex := range existing {
+			if ex.ID == e.ID {
+				return nil
+			}
+		}
+		return c.storeRemoteEvent(e)
+	}
+
 	// Guard: reject trace IDs that could escape the cortex directory.
 	if !trace.IsValidID(e.TraceID) {
 		return fmt.Errorf("rejecting remote event %s: %w: %q", e.ID, trace.ErrInvalidTraceID, e.TraceID)
@@ -2099,6 +2360,24 @@ func (c *Cortex) ReplayEvent(e event.Event) error {
 		replayErr = c.replayRecover(e)
 	case event.ActionPurge:
 		replayErr = c.replayPurge(e)
+	case event.ActionPromote, event.ActionDemote:
+		// Both emit the same {from, to} payload via applyTierChange;
+		// the replay handler doesn't need to distinguish them since
+		// the DB-level effect is identical (UPDATE tier column).
+		replayErr = c.replayTierChange(e)
+	case event.ActionVote:
+		replayErr = c.replayVote(e)
+	case event.ActionConsolidate,
+		event.ActionConsolidateFallback,
+		event.ActionDivergenceLongTerm:
+		// Telemetry-only events — the trace-level state change (new
+		// distilled trace, divergence trace) rides a separate
+		// ActionCreate. Just store the event for audit trail.
+		replayErr = c.storeRemoteEvent(e)
+	case event.ActionPurgeLongTerm:
+		replayErr = c.replayPurgeLongTerm(e)
+	case event.ActionPurgeHard:
+		replayErr = c.replayPurgeHard(e)
 	default:
 		return fmt.Errorf("unknown event action: %s", e.Action)
 	}
@@ -2200,7 +2479,7 @@ func (c *Cortex) replayCreate(e event.Event) error {
 			return err
 		}
 	}
-	if _, err := tx.Exec(`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`, t.ID, t.Title, t.Body); err != nil {
+	if err := insertFTS(tx, t.ID, t.Title, t.Body, t.Tags); err != nil {
 		cleanupFile(err)
 		return err
 	}
@@ -2316,10 +2595,7 @@ func (c *Cortex) replayUpdate(e event.Event) error {
 			return err
 		}
 	}
-	if _, err := tx.Exec(`DELETE FROM traces_fts WHERE id = ?`, e.TraceID); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`, e.TraceID, t.Title, t.Body); err != nil {
+	if err := upsertFTS(tx, e.TraceID, t.Title, t.Body, t.Tags); err != nil {
 		return err
 	}
 	if err := event.Append(tx, &e); err != nil {
@@ -2448,7 +2724,7 @@ func (c *Cortex) createDivergence(
 			return err
 		}
 	}
-	if _, err := tx.Exec(`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`, divID, divTrace.Title, body); err != nil {
+	if err := insertFTS(tx, divID, divTrace.Title, body, divTrace.Tags); err != nil {
 		os.Remove(divPath)
 		return err
 	}
@@ -2608,6 +2884,237 @@ func (c *Cortex) replayPurge(e event.Event) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// replayTierChange applies a remote Promote or Demote event to the local
+// trace. Both actions carry a {from, to} payload — the handler doesn't
+// distinguish them because the DB-level effect is a single UPDATE of
+// the tier column. Missing-trace case stores the event only, matching
+// replayArchive's soft-handling posture.
+func (c *Cortex) replayTierChange(e event.Event) error {
+	var data struct {
+		From string `json:"from"`
+		To   string `json:"to"`
+	}
+	if err := json.Unmarshal(e.Data, &data); err != nil {
+		return fmt.Errorf("parsing tier-change event data: %w", err)
+	}
+	if data.To == "" {
+		return fmt.Errorf("tier-change event %s missing 'to' field", e.ID)
+	}
+	if _, err := c.Get(e.TraceID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.storeRemoteEvent(e)
+		}
+		return err
+	}
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE traces SET tier = ? WHERE id = ?`, data.To, e.TraceID); err != nil {
+		return err
+	}
+	if err := event.Append(tx, &e); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// replayVote applies a remote Vote event to the local trace's
+// tier_votes counter. The counter converges across peers because the
+// delta (+1 / -1) is the authoritative payload — replaying the same
+// event twice is blocked by the existing idempotency guard in
+// ReplayEvent (event ID dedup).
+func (c *Cortex) replayVote(e event.Event) error {
+	var data struct {
+		Delta int `json:"delta"`
+	}
+	if err := json.Unmarshal(e.Data, &data); err != nil {
+		return fmt.Errorf("parsing vote event data: %w", err)
+	}
+	// Clamp replayed deltas to ±1 to match the local Vote() contract.
+	// The emit path refuses anything else, but a malicious or buggy
+	// peer could in principle ship an inflated delta — clamping here
+	// keeps the tier_votes counter in the range the scorer expects
+	// without blocking replay.
+	switch {
+	case data.Delta > 0:
+		data.Delta = 1
+	case data.Delta < 0:
+		data.Delta = -1
+	}
+	if _, err := c.Get(e.TraceID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.storeRemoteEvent(e)
+		}
+		return err
+	}
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE traces SET tier_votes = tier_votes + ? WHERE id = ?`, data.Delta, e.TraceID); err != nil {
+		return err
+	}
+	if err := event.Append(tx, &e); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// replayPurgeLongTerm applies a remote soft-purge of a tier='long'
+// trace. Mirrors the trigger-suspension dance in Purge() because the
+// migration-010 immutability trigger otherwise blocks the purged_at /
+// purge_reason update. The suspended-trigger DROP/re-CREATE stays
+// inside the transaction so a mid-operation failure is reverted on
+// rollback — the trigger definition cannot be lost.
+func (c *Cortex) replayPurgeLongTerm(e event.Event) error {
+	if _, err := c.Get(e.TraceID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.storeRemoteEvent(e)
+		}
+		return err
+	}
+
+	var data struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(e.Data, &data); err != nil {
+		// Malformed data is not fatal — purge events replicate for
+		// audit and content-wipe side effects, not for the reason
+		// string. Log so a real emitter bug is diagnosable, fall
+		// back to a placeholder reason, and continue.
+		log.Printf("[federation] purge-long-term replay: malformed data for event %s: %v", e.ID, err)
+	}
+	if data.Reason == "" {
+		data.Reason = "remote purge"
+	}
+
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var updateTriggerSQL string
+	if err := tx.QueryRow(
+		`SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_long_term_immutable'`,
+	).Scan(&updateTriggerSQL); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("reading trg_long_term_immutable: %w", err)
+	}
+	if _, err := tx.Exec(`DROP TRIGGER IF EXISTS trg_long_term_immutable`); err != nil {
+		return fmt.Errorf("suspending immutability trigger: %w", err)
+	}
+
+	tombstone := fmt.Sprintf("[purged: %s]", data.Reason)
+	if _, err := tx.Exec(
+		`UPDATE traces SET purged_at = ?, purge_reason = ?, updated_at = ? WHERE id = ?`,
+		e.Timestamp, data.Reason, e.Timestamp, e.TraceID,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM trace_tags WHERE trace_id = ?`, e.TraceID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM traces_fts WHERE id = ?`, e.TraceID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO traces_fts (id, title, body) VALUES (?, ?, ?)`,
+		e.TraceID, "", tombstone,
+	); err != nil {
+		return err
+	}
+
+	if updateTriggerSQL != "" {
+		if _, err := tx.Exec(updateTriggerSQL); err != nil {
+			return fmt.Errorf("restoring immutability trigger: %w", err)
+		}
+	}
+
+	if err := event.Append(tx, &e); err != nil {
+		return err
+	}
+	// File cleanup: try both the active path and the archive path since
+	// we don't track the pre-purge location in the event payload.
+	_ = os.Remove(c.TraceFile(e.TraceID, false))
+	_ = os.Remove(c.TraceFile(e.TraceID, true))
+	return tx.Commit()
+}
+
+// replayPurgeHard applies a remote hard-delete. Both immutability and
+// delete triggers are suspended for the duration so tier='long' rows
+// can be removed; lineage edges on both sides of the trace are deleted
+// to match Purge() semantics.
+func (c *Cortex) replayPurgeHard(e event.Event) error {
+	if _, err := c.Get(e.TraceID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.storeRemoteEvent(e)
+		}
+		return err
+	}
+
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var updateTriggerSQL, deleteTriggerSQL string
+	if err := tx.QueryRow(
+		`SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_long_term_immutable'`,
+	).Scan(&updateTriggerSQL); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("reading trg_long_term_immutable: %w", err)
+	}
+	if err := tx.QueryRow(
+		`SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_long_term_no_delete'`,
+	).Scan(&deleteTriggerSQL); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("reading trg_long_term_no_delete: %w", err)
+	}
+	if _, err := tx.Exec(`DROP TRIGGER IF EXISTS trg_long_term_immutable`); err != nil {
+		return fmt.Errorf("suspending immutability trigger: %w", err)
+	}
+	if _, err := tx.Exec(`DROP TRIGGER IF EXISTS trg_long_term_no_delete`); err != nil {
+		return fmt.Errorf("suspending delete trigger: %w", err)
+	}
+
+	for _, stmt := range []string{
+		`DELETE FROM trace_lineage WHERE trace_id = ?`,
+		`DELETE FROM trace_lineage WHERE derived_from = ?`,
+		`DELETE FROM trace_tags WHERE trace_id = ?`,
+		`DELETE FROM traces_fts WHERE id = ?`,
+		`DELETE FROM traces WHERE id = ?`,
+	} {
+		if _, err := tx.Exec(stmt, e.TraceID); err != nil {
+			return err
+		}
+	}
+
+	if updateTriggerSQL != "" {
+		if _, err := tx.Exec(updateTriggerSQL); err != nil {
+			return fmt.Errorf("restoring immutability trigger: %w", err)
+		}
+	}
+	if deleteTriggerSQL != "" {
+		if _, err := tx.Exec(deleteTriggerSQL); err != nil {
+			return fmt.Errorf("restoring delete trigger: %w", err)
+		}
+	}
+
+	if err := event.Append(tx, &e); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	_ = os.Remove(c.TraceFile(e.TraceID, false))
+	_ = os.Remove(c.TraceFile(e.TraceID, true))
+	_ = os.Remove(c.TrashFile(e.TraceID))
+	return nil
 }
 
 // storeRemoteEvent stores a remote event without any state change (trace already in expected state).
@@ -2794,6 +3301,179 @@ func marshalTraceData(t *trace.Trace) json.RawMessage {
 	}
 	data, _ := json.Marshal(payload)
 	return data
+}
+
+// ftsTagText joins a trace's tags into one space-delimited string for
+// FTS5 indexing. The porter/ascii tokenizer splits on whitespace and
+// indexes each tag as an independent token, so tagging a trace with
+// e.g. `{"auth", "session", "oauth"}` makes each value findable via
+// search_traces even when none of them appear in the title or body.
+func ftsTagText(tags []string) string {
+	return strings.Join(tags, " ")
+}
+
+// insertFTS writes a row into traces_fts. Used for fresh creates where
+// no existing row for the id is possible. Inserting on top of a stale
+// row would create duplicates (FTS5 does not treat id as a key), which
+// is why the update paths use upsertFTS instead.
+func insertFTS(tx *sql.Tx, id, title, body string, tags []string) error {
+	_, err := tx.Exec(
+		`INSERT INTO traces_fts (id, title, body, tags) VALUES (?, ?, ?, ?)`,
+		id, title, body, ftsTagText(tags),
+	)
+	return err
+}
+
+// upsertFTS removes any existing row for id and re-inserts with the
+// current content. Used from every path that may be running against
+// a trace already in the index (updates, appends, federation replays,
+// and the Sync reindex loop).
+func upsertFTS(tx *sql.Tx, id, title, body string, tags []string) error {
+	if _, err := tx.Exec(`DELETE FROM traces_fts WHERE id = ?`, id); err != nil {
+		return err
+	}
+	return insertFTS(tx, id, title, body, tags)
+}
+
+// ensureFTSSchema checks that traces_fts has the four expected columns
+// (id, title, body, tags) and rebuilds the virtual table if the tags
+// column is missing. Intended for pre-v1 cortexes that were opened by
+// a draft feature branch which claimed a migration version number
+// that a later patch release reused for a different migration — the
+// claim is persisted in schema_migrations, so the new migration
+// silently skips and the on-disk schema diverges from what code
+// expects. A fresh DROP + CREATE here restores the expected shape;
+// RebuildFTSIfStale runs next and repopulates rows from traces +
+// markdown bodies. No-op on correctly-migrated cortexes.
+func (c *Cortex) ensureFTSSchema() error {
+	var sql string
+	err := c.DB.QueryRow(
+		`SELECT sql FROM sqlite_master WHERE type='table' AND name='traces_fts'`,
+	).Scan(&sql)
+	if err != nil {
+		return fmt.Errorf("introspecting traces_fts: %w", err)
+	}
+	if strings.Contains(sql, "tags") {
+		return nil
+	}
+	if _, err := c.DB.Exec(`DROP TABLE IF EXISTS traces_fts`); err != nil {
+		return fmt.Errorf("dropping stale traces_fts: %w", err)
+	}
+	if _, err := c.DB.Exec(`CREATE VIRTUAL TABLE traces_fts USING fts5(
+		id      UNINDEXED,
+		title,
+		body,
+		tags,
+		tokenize = 'porter ascii'
+	)`); err != nil {
+		return fmt.Errorf("recreating traces_fts: %w", err)
+	}
+	return nil
+}
+
+// RebuildFTSIfStale repopulates traces_fts when it contains fewer rows
+// than the traces table (including trashed, archived, and active rows
+// — everything that should be searchable). The mismatch is expected
+// exactly once per cortex, immediately after migration 008 runs and
+// replaces the virtual table. On fresh cortexes and subsequent opens
+// the counts match and this is a no-op.
+//
+// The rebuild walks every row in the traces table, reads the trace's
+// body from disk (since body is not in SQL), and re-inserts all four
+// FTS columns. Rows whose files are missing on disk are inserted with
+// empty body so at least their title and tags remain searchable —
+// operators can fix those with `noema sync` later.
+//
+// Runs outside any caller's transaction because it iterates many
+// traces and couldn't share a short-lived transaction with them
+// cleanly. Each row is reinserted in its own tx so a mid-rebuild
+// failure leaves the index partially populated rather than empty.
+func (c *Cortex) RebuildFTSIfStale() error {
+	var tracesCount, ftsCount int
+	if err := c.DB.QueryRow(`SELECT COUNT(*) FROM traces`).Scan(&tracesCount); err != nil {
+		return fmt.Errorf("counting traces: %w", err)
+	}
+	if err := c.DB.QueryRow(`SELECT COUNT(*) FROM traces_fts`).Scan(&ftsCount); err != nil {
+		return fmt.Errorf("counting traces_fts: %w", err)
+	}
+	if ftsCount >= tracesCount {
+		return nil
+	}
+
+	rows, err := c.DB.Query(
+		`SELECT id, title, archived_at, trashed_at FROM traces`,
+	)
+	if err != nil {
+		return fmt.Errorf("selecting traces for reindex: %w", err)
+	}
+	defer rows.Close()
+
+	type rebuildEntry struct {
+		id, title   string
+		archivedAt  string
+		trashedAt   string
+	}
+	var entries []rebuildEntry
+	for rows.Next() {
+		var e rebuildEntry
+		var archived, trashed *string
+		if err := rows.Scan(&e.id, &e.title, &archived, &trashed); err != nil {
+			return err
+		}
+		if archived != nil {
+			e.archivedAt = *archived
+		}
+		if trashed != nil {
+			e.trashedAt = *trashed
+		}
+		entries = append(entries, e)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stderr,
+		"[cortex] reindexing FTS5 for %d traces (first boot after upgrade; this runs once)\n",
+		len(entries),
+	)
+
+	for _, e := range entries {
+		var path string
+		switch {
+		case e.trashedAt != "":
+			path = c.TrashFile(e.id)
+		case e.archivedAt != "":
+			path = c.TraceFile(e.id, true)
+		default:
+			path = c.TraceFile(e.id, false)
+		}
+
+		var body string
+		tags, err := c.tagsFor(e.id)
+		if err != nil {
+			return fmt.Errorf("loading tags for %s: %w", e.id, err)
+		}
+		if t, err := trace.ParseFile(path); err == nil {
+			body = t.Body
+		}
+		// Parse failures leave body empty — the file may have been
+		// deleted out of band. Title and tags are still indexed so
+		// the trace is partially searchable until `noema sync`
+		// rebuilds from source.
+
+		tx, err := c.DB.Begin()
+		if err != nil {
+			return fmt.Errorf("opening reindex tx for %s: %w", e.id, err)
+		}
+		if err := upsertFTS(tx, e.id, e.title, body, tags); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("reindexing %s: %w", e.id, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("committing reindex for %s: %w", e.id, err)
+		}
+	}
+	return nil
 }
 
 func boolToInt(b bool) int {

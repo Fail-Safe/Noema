@@ -280,22 +280,30 @@ func callTool(t *testing.T, s *server.MCPServer, toolName string, args map[strin
 	if result == nil {
 		t.Fatalf("HandleMessage returned nil for %s", toolName)
 	}
-	resp, ok := result.(mcp.JSONRPCResponse)
-	if !ok {
-		t.Fatalf("expected JSONRPCResponse for %s, got %T", toolName, result)
-	}
-	data, _ := json.Marshal(resp.Result)
-	var toolResult mcp.CallToolResult
-	if err := json.Unmarshal(data, &toolResult); err != nil {
-		t.Fatalf("unmarshal CallToolResult for %s: %v", toolName, err)
-	}
-	text := ""
-	if len(toolResult.Content) > 0 {
-		if tc, ok := toolResult.Content[0].(mcp.TextContent); ok {
-			text = tc.Text
+	switch r := result.(type) {
+	case mcp.JSONRPCResponse:
+		data, _ := json.Marshal(r.Result)
+		var toolResult mcp.CallToolResult
+		if err := json.Unmarshal(data, &toolResult); err != nil {
+			t.Fatalf("unmarshal CallToolResult for %s: %v", toolName, err)
 		}
+		text := ""
+		if len(toolResult.Content) > 0 {
+			if tc, ok := toolResult.Content[0].(mcp.TextContent); ok {
+				text = tc.Text
+			}
+		}
+		return text, toolResult.IsError
+	case mcp.JSONRPCError:
+		// Handlers that return `nil, err` surface as protocol-level
+		// JSON-RPC errors rather than tool-result errors. Treat both
+		// as error outcomes so tests can assert on failure modes
+		// uniformly regardless of which path the handler took.
+		return r.Error.Message, true
+	default:
+		t.Fatalf("unexpected response type for %s: %T", toolName, result)
+		return "", false
 	}
-	return text, toolResult.IsError
 }
 
 // initServer drives the MCP initialize handshake so tools can be called.
@@ -338,6 +346,8 @@ func TestPublishMode_BlocksMutatingTools(t *testing.T) {
 		{"archive_trace", map[string]any{"id": "nonexistent"}},
 		{"unarchive_trace", map[string]any{"id": "nonexistent"}},
 		{"resolve_divergence", map[string]any{"id": "nonexistent"}},
+		{"vote_trace", map[string]any{"id": "nonexistent", "direction": "up"}},
+		{"record_consolidation_result", map[string]any{"title": "x", "body": "y", "source_ids": "a,b"}},
 	}
 
 	for _, tc := range mutating {

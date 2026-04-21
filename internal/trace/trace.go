@@ -67,6 +67,27 @@ func IsValidType(t string) bool {
 	return false
 }
 
+// Tier names the three memory tiers in the consolidation hierarchy. See
+// docs/plans/consolidation-plan.md (in the Noema-design repo) for the full
+// design. New traces default to TierShort; promotion is short -> mid -> long.
+// Long is terminal from routine operation (DB trigger enforces immutability).
+const (
+	TierShort = "short"
+	TierMid   = "mid"
+	TierLong  = "long"
+)
+
+var validTiers = map[string]struct{}{
+	TierShort: {},
+	TierMid:   {},
+	TierLong:  {},
+}
+
+func IsValidTier(s string) bool {
+	_, ok := validTiers[s]
+	return ok
+}
+
 // ErrInvalidFrontmatter is returned by Validate when a Trace's frontmatter
 // fails a required-field or enum check. The specific failure is wrapped
 // underneath so callers can log it or branch on it.
@@ -109,12 +130,13 @@ func Validate(t *Trace) error {
 }
 
 type Frontmatter struct {
-	ID          string   `yaml:"id"`
-	Title       string   `yaml:"title"`
-	Type        string   `yaml:"type"`
-	Author      string   `yaml:"author,omitempty"`
-	Tags        []string `yaml:"tags,omitempty"`
-	DerivedFrom []string `yaml:"derived_from,omitempty"`
+	ID           string   `yaml:"id"`
+	Title        string   `yaml:"title"`
+	Type         string   `yaml:"type"`
+	Tier         string   `yaml:"tier,omitempty"` // short|mid|long; empty == short, omitted for cleaner files
+	Author       string   `yaml:"author,omitempty"`
+	Tags         []string `yaml:"tags,omitempty"`
+	DerivedFrom  []string `yaml:"derived_from,omitempty"`
 	Origin       string   `yaml:"origin,omitempty"`
 	Created      string   `yaml:"created"`
 	Updated      string   `yaml:"updated"`

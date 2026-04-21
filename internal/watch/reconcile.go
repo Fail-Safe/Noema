@@ -101,17 +101,44 @@ func (w *Watcher) reconcile(path string) error {
 // Covers: brand-new file drops, in-place edits, and cross-directory moves
 // (user dragged a file from traces/ to archive/ in Finder).
 func (w *Watcher) reconcileExisting(path, id string, dir traceDir, row *cortex.Row, inDB bool) error {
-	t, err := trace.ParseFile(path)
-	if err != nil {
-		log.Printf("[watch] skipping %s: %v", path, err)
-		return nil
-	}
-	if t.ID == "" || t.ID != id {
-		log.Printf("[watch] skipping %s: frontmatter id %q does not match filename", path, t.ID)
-		return nil
-	}
-	if err := trace.Validate(t); err != nil {
-		log.Printf("[watch] skipping %s: %v", path, err)
+	t, parseErr := trace.ParseFile(path)
+	malformed := parseErr != nil ||
+		t.ID == "" || t.ID != id ||
+		trace.Validate(t) != nil
+
+	// Rescue path: a malformed file dropped into traces/ that isn't
+	// in the DB yet is almost always a tool (Obsidian Web Clipper,
+	// Drafts, a shortcut) that doesn't know Noema's filename-ID
+	// convention. Synthesise valid frontmatter, rename the file to
+	// match, and ingest. Anything else (malformed file already
+	// tracked, or malformed file in archive/trash) still gets the
+	// skip-and-log treatment; auto-rewriting a tracked trace behind
+	// the operator's back would be surprising.
+	if malformed {
+		if w.autoOnboard && dir == dirActive && !inDB {
+			newPath, onboarded, err := w.onboardFile(path)
+			if err != nil {
+				w.logSkip(path, fmt.Sprintf("auto-onboard failed: %v", err))
+				return nil
+			}
+			if err := w.cx.Add(onboarded); err != nil {
+				return fmt.Errorf("add onboarded: %w", err)
+			}
+			w.forgetSkip(path)
+			log.Printf("[watch] auto-onboarded %s -> %s", filepath.Base(path), onboarded.ID)
+			_ = newPath
+			return nil
+		}
+		// Not eligible for rescue — fall back to the historical
+		// skip-and-log behaviour, now throttled per-path.
+		switch {
+		case parseErr != nil:
+			w.logSkip(path, parseErr.Error())
+		case t.ID == "" || t.ID != id:
+			w.logSkip(path, fmt.Sprintf("frontmatter id %q does not match filename", t.ID))
+		default:
+			w.logSkip(path, trace.Validate(t).Error())
+		}
 		return nil
 	}
 	bodyHash := trace.ContentHash(t.Body)
@@ -119,12 +146,13 @@ func (w *Watcher) reconcileExisting(path, id string, dir traceDir, row *cortex.R
 	if !inDB {
 		// New file dropped into the cortex.
 		if dir != dirActive {
-			log.Printf("[watch] skipping new trace %s in non-active dir", id)
+			w.logSkip(path, "new trace in non-active dir")
 			return nil
 		}
 		if err := w.cx.Add(t); err != nil {
 			return fmt.Errorf("add: %w", err)
 		}
+		w.forgetSkip(path)
 		log.Printf("[watch] ingested external create: %s", id)
 		return nil
 	}

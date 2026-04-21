@@ -396,7 +396,7 @@ func runCortexRestore(out io.Writer, cfg *config.Config, tarballPath, overrideNa
 						"  clone with a fresh identity, restore under a new name with --name,\n"+
 						"  then run `noema migrate cortex-id --reset --cortex <new-name>` to\n"+
 						"  assign a new ULID. To replace the existing entry, remove it first\n"+
-						"  with `noema cortex remove %s --purge`.",
+						"  with `noema cortex remove %s --purge`",
 					m.ID, existingName, existingEntry.Path, existingName,
 				)
 			}

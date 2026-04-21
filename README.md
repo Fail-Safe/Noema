@@ -507,6 +507,29 @@ noema federation set-mode subscribe      # switch cortex mode
 
 Changes take effect on the next `noema serve` restart.
 
+### Consolidation coordination in a federation
+
+When multiple peers have `consolidation.enabled`, `consolidation.llm_enabled`, and a reachable `local_llm_endpoint`, only one peer runs each consolidation cycle — without any additional configuration. Each peer advertises a random rank (1..99) on the `cortex_identity` heartbeat; the highest-ranked eligible peer wins (cortex ID breaks ties), runs the pass, and emits `consolidation_success`/`fail` events that replicate through the standard event log. `subscribe`-mode cortexes advertise rank 0 and can never win; `paused` peers naturally drop out via staleness. `federation_status` shows each peer's current rank.
+
+### Mid → long graduation
+
+The three-tier model (short → mid → long) completes with an automatic mid→long promoter. Alongside the short→mid heuristic pass, the scheduler evaluates every mid-tier trace older than 14 days against a simple AND-gate — minimum read count (default 3), optional "unmodified since creation" stability requirement, and no active downvotes. Traces clearing every threshold graduate to long and are locked by the DB-level immutability trigger. Thresholds live under `consolidation.graduation` in cortex.md:
+
+```yaml
+consolidation:
+  enabled: true
+  llm_enabled: true
+  local_llm_endpoint: http://localhost:11434/v1
+  window_hours: 6
+  graduation:
+    enabled: true
+    min_age_days: 14
+    min_read_count: 3
+    require_unmodified: true
+```
+
+Explicit curation is always available: `noema memory promote <id>` advances a trace one tier (short→mid or mid→long), and `noema memory demote <id>` steps mid→short. Long-term demotion goes through `noema memory purge` because undoing a base truth deserves the same ceremony as destroying it.
+
 ### Content hashing and source-locking
 
 Every trace carries a `content_hash` (SHA-256 of the body, recomputed on every write). This enables integrity verification and federation sync optimization.

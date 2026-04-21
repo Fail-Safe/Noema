@@ -27,8 +27,9 @@ import (
 // federation.Syncer: construct, Start, Stop (cancels context and waits for
 // the goroutine to drain).
 type Watcher struct {
-	cx       *cortex.Cortex
-	debounce time.Duration
+	cx          *cortex.Cortex
+	debounce    time.Duration
+	autoOnboard bool
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -38,6 +39,13 @@ type Watcher struct {
 
 	mu      sync.Mutex
 	pending map[string]*time.Timer
+
+	// lastSkipErr dedupes skip-and-log messages for the same file —
+	// external sync loops (iCloud, Obsidian reload) fire several
+	// watcher events per user action, and logging the identical
+	// error 5-10 times per file is noise. A new error string for
+	// the same path is always logged.
+	lastSkipErr map[string]string
 }
 
 // New creates a Watcher for the given cortex. An empty cfg is equivalent
@@ -50,13 +58,39 @@ func New(cx *cortex.Cortex, cfg *cortex.WatchConfig) (*Watcher, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Watcher{
-		cx:       cx,
-		debounce: cfg.EffectiveDebounce(),
-		ctx:      ctx,
-		cancel:   cancel,
-		fsn:      fsn,
-		pending:  make(map[string]*time.Timer),
+		cx:          cx,
+		debounce:    cfg.EffectiveDebounce(),
+		autoOnboard: cfg.AutoOnboardEnabled(),
+		ctx:         ctx,
+		cancel:      cancel,
+		fsn:         fsn,
+		pending:     make(map[string]*time.Timer),
+		lastSkipErr: make(map[string]string),
 	}, nil
+}
+
+// logSkip records and throttles a skip-and-log event. A file that keeps
+// producing the same error (common with iCloud sync or a Web Clipper
+// re-write loop) is logged once; the next distinct error for the same
+// path is logged afresh. Keeps the skip log honest without flooding.
+func (w *Watcher) logSkip(path, msg string) {
+	w.mu.Lock()
+	prev, seen := w.lastSkipErr[path]
+	w.lastSkipErr[path] = msg
+	w.mu.Unlock()
+	if seen && prev == msg {
+		return
+	}
+	log.Printf("[watch] skipping %s: %s", path, msg)
+}
+
+// forgetSkip drops the throttle entry for path. Call when a path
+// transitions from skipped to successfully handled so the next skip
+// (if any) is logged even if the message matches an older one.
+func (w *Watcher) forgetSkip(path string) {
+	w.mu.Lock()
+	delete(w.lastSkipErr, path)
+	w.mu.Unlock()
 }
 
 // Start registers the three trace directories with fsnotify and spawns the

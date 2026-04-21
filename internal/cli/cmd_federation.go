@@ -142,9 +142,18 @@ func federationStatusCmd() *cobra.Command {
 			if m.Federation.Interval != "" {
 				fmt.Printf("Interval: %s\n", m.Federation.Interval)
 			}
-			fmt.Println()
 
 			state := federation.NewState(cx.DB.DB)
+
+			// Surface the local consolidation rank (plan §14). Empty or
+			// zero entries render as "(ineligible)" so an operator can
+			// see at a glance whether coordination is armed.
+			if localRank, rerr := state.GetLocalRank(); rerr == nil {
+				fmt.Printf("Consolidation Rank: %s\n", formatFederationRank(localRank))
+			}
+			fmt.Println()
+
+			localVersion := version()
 			for _, p := range m.Federation.Peers {
 				ps, err := state.GetPeerState(p.Name, p.Endpoint)
 				if err != nil {
@@ -160,8 +169,16 @@ func federationStatusCmd() *cobra.Command {
 					lastEvent = ps.LastEvent
 				}
 				peerMode := p.EffectiveMode()
-				fmt.Printf("  %s\n    endpoint:   %s\n    mode:       %s\n    last_seen:  %s\n    last_event: %s\n",
-					p.Name, p.Endpoint, peerMode, lastSeen, lastEvent)
+				peerRank := "(none)"
+				if pr, perr := state.GetPeerRank(p.Name); perr == nil && pr.ObservedAt != "" {
+					peerRank = formatFederationRank(pr)
+				}
+				fmt.Printf("  %s\n    endpoint:   %s\n    mode:       %s\n",
+					p.Name, p.Endpoint, peerMode)
+				renderPeerVersion(cmd.OutOrStdout(), ps.Health, localVersion)
+				fmt.Fprintf(cmd.OutOrStdout(), "    rank:       %s\n    last_seen:  %s\n    last_event: %s\n",
+					peerRank, lastSeen, lastEvent)
+				renderPeerHealth(cmd.OutOrStdout(), ps.Health)
 			}
 
 			vc, err := cx.GetClock()
@@ -579,4 +596,145 @@ func federationAddPeerCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// renderPeerVersion prints the peer's last-observed binary version,
+// and a short "⚠ differs from local" annotation when the major/minor
+// segments of the two versions don't line up. Exact-match checks
+// would flag every commit-tagged dev build as a warning, which is
+// noise; comparing the leading `vX.Y` is accurate enough to catch
+// skew that actually produces schema-widening bugs.
+func renderPeerVersion(w io.Writer, h federation.PeerHealth, localVersion string) {
+	if h.Version == "" {
+		fmt.Fprintf(w, "    version:    (not yet observed)\n")
+		return
+	}
+	out := h.Version
+	if !versionSeriesMatches(h.Version, localVersion) {
+		out += fmt.Sprintf("    ⚠ differs from local %s", localVersion)
+	}
+	fmt.Fprintf(w, "    version:    %s\n", out)
+}
+
+// renderPeerHealth prints a multi-line "health:" block whenever the
+// peer is in a degraded state. Silent when everything is green so
+// healthy peers stay compact in the listing.
+func renderPeerHealth(w io.Writer, h federation.PeerHealth) {
+	if h.LastError == nil && h.ConsecutiveFailures == 0 {
+		return
+	}
+	fmt.Fprintf(w, "    health:     ⚠ %d consecutive failures since last success\n", h.ConsecutiveFailures)
+	if h.LastError != nil {
+		fmt.Fprintf(w, "                reason: %s\n", h.LastError.Reason)
+		if h.LastError.EventID != "" {
+			fmt.Fprintf(w, "                event:  %s\n", h.LastError.EventID)
+		}
+		if h.LastError.TraceID != "" {
+			fmt.Fprintf(w, "                trace:  %s\n", h.LastError.TraceID)
+		}
+		if hint := healthHint(h.LastError.Reason); hint != "" {
+			fmt.Fprintf(w, "                %s\n", hint)
+		}
+	}
+}
+
+// healthHint turns a machine-readable reason into a one-line human
+// hint pointing at the likely cause. Lives here rather than on
+// PeerError itself because the mapping is a UI concern — the on-disk
+// enum stays stable while display text can evolve.
+func healthHint(reason string) string {
+	switch reason {
+	case federation.ReasonInvalidTraceID,
+		federation.ReasonUnknownAction,
+		federation.ReasonUnknownType:
+		return "likely cause: peer binary predates schema changes elsewhere on the ring; upgrade the peer"
+	case federation.ReasonInvalidFrontmatter:
+		return "likely cause: peer received an event whose trace shape it doesn't recognise"
+	case federation.ReasonNetworkRefused:
+		return "likely cause: nothing listening on the peer's endpoint; is `noema serve` running?"
+	case federation.ReasonNetworkTimeout:
+		return "likely cause: peer unreachable on the network"
+	case federation.ReasonNetworkDNS:
+		return "likely cause: hostname resolution failed"
+	case federation.ReasonNetworkTLS:
+		return "likely cause: TLS handshake failed — check cert validity and CA trust"
+	case federation.ReasonAuth:
+		return "likely cause: shared-key mismatch between local and peer"
+	case federation.ReasonIdentityMismatch:
+		return "likely cause: peer cortex id changed — `noema federation reset-peer` after verifying"
+	case federation.ReasonIdentityMissing:
+		return "likely cause: peer predates cortex-id federation handshake; upgrade the peer"
+	}
+	return ""
+}
+
+// versionSeriesMatches compares the released-version baseline of two
+// Noema version strings. Returns true when both describe builds
+// against the same released tag — i.e. they share a `vX.Y.Z` prefix,
+// ignoring any `-N-gSHA[-dirty]` dev-build suffix that git describe
+// appends.
+//
+// Returns true when either side is unparseable ("dev", a bare commit
+// hash, ad-hoc build strings) so the warning doesn't fire on builds
+// that don't carry a meaningful baseline. The goal is to flag peer-
+// vs-local skew that operators can act on — a dev build is already
+// a known unknown.
+//
+// Earlier implementation compared only `vX.Y`, which let patch-level
+// drift slip through silently. A peer on v0.9.1 while the local
+// binary is v0.9.2-based is exactly the scenario this diagnostic
+// exists to surface, so the comparison now runs at the full patch
+// level.
+func versionSeriesMatches(a, b string) bool {
+	ap, aok := semverBaseline(a)
+	bp, bok := semverBaseline(b)
+	if !aok || !bok {
+		return true
+	}
+	return ap == bp
+}
+
+// semverBaseline returns the `X.Y.Z` (or `X.Y`) released-version
+// prefix of a version string. Everything past the first `-` is
+// stripped because `git describe --tags` formats dev builds as
+// `vX.Y.Z-N-gSHA[-dirty]` and that suffix identifies the dev commit,
+// not the released baseline the build descends from.
+//
+// Returns ok=false for strings that don't lead with at least two
+// dot-separated all-numeric segments (so "dev", "v", "1", and
+// arbitrary branch names don't pass as parseable versions).
+func semverBaseline(v string) (string, bool) {
+	s := strings.TrimPrefix(v, "v")
+	if s == "" {
+		return "", false
+	}
+	if dash := strings.IndexByte(s, '-'); dash >= 0 {
+		s = s[:dash]
+	}
+	parts := strings.Split(s, ".")
+	if len(parts) < 2 {
+		return "", false
+	}
+	for _, p := range parts {
+		if p == "" {
+			return "", false
+		}
+		for _, r := range p {
+			if r < '0' || r > '9' {
+				return "", false
+			}
+		}
+	}
+	return s, true
+}
+
+// formatFederationRank renders a federation.RankEntry for the CLI
+// `noema federation status` output. Mirrors the formatRank helper in
+// internal/mcp/server.go — the two surfaces are parallel views of the
+// same data, so they render it the same way.
+func formatFederationRank(r federation.RankEntry) string {
+	if r.Rank == 0 || r.ObservedAt == "" {
+		return "(ineligible)"
+	}
+	return fmt.Sprintf("%d (observed %s)", r.Rank, r.ObservedAt)
 }
