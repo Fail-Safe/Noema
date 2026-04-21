@@ -168,11 +168,13 @@ func serveCmd() *cobra.Command {
 
 				// Federation only runs over the HTTP transport (peers
 				// need an HTTP endpoint to call sync_events on). Start
-				// the syncer only when the bound cortex actually has
-				// peers configured AND the mode is not "publish" (a
-				// publish-mode cortex serves events but never pulls).
+				// the syncer whenever peers are configured. Publish-mode
+				// cortexes still run the syncer so they can pick up
+				// consolidation ranks from peers via cortex_identity
+				// (plan §14); the sync_events pull is suppressed inside
+				// the syncer loop.
 				fedMode := m.Federation.EffectiveMode()
-				if m.Federation != nil && len(m.Federation.Peers) > 0 && fedMode != cortex.FederationModePublish {
+				if m.Federation != nil && len(m.Federation.Peers) > 0 {
 					syncer = startSyncer(cx, accessKey.Value, m.Federation)
 				}
 				fmt.Fprintf(os.Stderr, "[serve] federation mode: %s\n", fedMode)

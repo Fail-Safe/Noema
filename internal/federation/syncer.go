@@ -311,6 +311,17 @@ func (s *Syncer) syncPeer(peer PeerConfig) (string, error) {
 		return peerVersion, &PollError{Reason: classifyIdentityError(err), Err: err}
 	}
 
+	// Publish-mode cortexes serve events outward but never pull. The
+	// identity handshake above still captures the peer's advertised
+	// consolidation rank (plan §14) so election decisions on this peer
+	// see the full ring. We just skip the sync_events pull and exit
+	// after stamping last_seen.
+	if s.config.Mode == "publish" {
+		now := time.Now().UTC().Format(time.RFC3339)
+		s.state.SetPeerSeen(peer.Name, now)
+		return peerVersion, nil
+	}
+
 	// Call sync_events on the remote peer.
 	args := map[string]any{"limit": 100}
 	if cursor != "" {
@@ -335,6 +346,16 @@ func (s *Syncer) syncPeer(peer PeerConfig) (string, error) {
 			break
 		}
 	}
+
+	// If the peer returned an error result (e.g. it's in subscribe mode
+	// and refuses to serve sync_events), surface it cleanly rather than
+	// trying to JSON-parse the human-readable error message as an event
+	// array — that produces a confusing "invalid character 'h' in
+	// literal true" rather than the actual reason.
+	if result.IsError {
+		return peerVersion, fmt.Errorf("peer sync_events refused: %s", text)
+	}
+
 	if text == "" || text == "[]" {
 		// No new events.
 		now := time.Now().UTC().Format(time.RFC3339)
@@ -464,6 +485,9 @@ func (s *Syncer) verifyPeerIdentity(mcpClient *client.Client, peer PeerConfig) e
 			text = tc.Text
 			break
 		}
+	}
+	if result.IsError {
+		return fmt.Errorf("peer %q cortex_identity refused: %s", peer.Name, text)
 	}
 	if text == "" {
 		return fmt.Errorf("peer %q returned empty cortex_identity response — likely an older version that pre-dates the cortex-id federation handshake. Upgrade the peer to a binary that exposes cortex_identity", peer.Name)
