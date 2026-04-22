@@ -29,6 +29,7 @@ import (
 type Watcher struct {
 	cx          *cortex.Cortex
 	debounce    time.Duration
+	deleteGrace time.Duration
 	autoOnboard bool
 
 	ctx    context.Context
@@ -57,9 +58,11 @@ func New(cx *cortex.Cortex, cfg *cortex.WatchConfig) (*Watcher, error) {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	debounce := cfg.EffectiveDebounce()
 	return &Watcher{
 		cx:          cx,
-		debounce:    cfg.EffectiveDebounce(),
+		debounce:    debounce,
+		deleteGrace: debounce,
 		autoOnboard: cfg.AutoOnboardEnabled(),
 		ctx:         ctx,
 		cancel:      cancel,
