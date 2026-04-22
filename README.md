@@ -304,6 +304,8 @@ noema serve --print-config
 
 The `--cortex` flag, `NOEMA_CORTEX` env, and config default are all respected, so `--print-config` always reflects the cortex you would actually use.
 
+**Log destination.** In stdio mode, operational logs (watcher events, federation sync status, startup messages) are written to `$XDG_STATE_HOME/noema/<cortex>.log` — defaulting to `~/.local/state/noema/<cortex>.log` — so MCP clients that inherit the spawning terminal's stderr (Claude Code, Copilot, Zed, Cursor, Aider, etc.) don't dump logs into your active terminal. The single `[serve] logs -> <path>` line printed at startup tells you exactly where to `tail -f`. Override the destination with `--log-file <path>`, or force logs back to stderr with `--log-stderr` for interactive triage.
+
 ### Streamable HTTP (remote clients, GitHub Copilot, federation peers)
 
 Noema speaks the **Streamable HTTP** transport from the [MCP 2025-03-26 spec](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http) — a single endpoint at `/mcp` that handles JSON-RPC requests and optional SSE streaming on the same path. This is the transport native MCP clients (Zed, Claude Desktop's HTTP support, GitHub Copilot's MCP integration) speak today; the older two-endpoint legacy SSE transport has been removed.

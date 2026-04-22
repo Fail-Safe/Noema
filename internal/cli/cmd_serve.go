@@ -31,6 +31,8 @@ func serveCmd() *cobra.Command {
 		port              int
 		tlsCert           string
 		tlsKey            string
+		logFile           string
+		logStderr         bool
 		printConfig       bool
 		printSystemdUnit  bool
 		printLaunchdPlist bool
@@ -77,6 +79,27 @@ func serveCmd() *cobra.Command {
 				return err
 			}
 			// Don't defer cx.Close() — server runs until interrupted.
+
+			// Route operational logs. In stdio mode the default is to
+			// redirect to $XDG_STATE_HOME/noema/<cortex>.log so MCP
+			// clients (Claude Code, Copilot, Zed, etc.) that inherit
+			// the spawning tty's stderr don't end up dumping watcher +
+			// federation logs into the user's active terminal. Operators
+			// who want the logs interactive pass --log-stderr; those who
+			// want a specific path pass --log-file. In http mode the
+			// default stays stderr since systemd / launchd capture it.
+			//
+			// Print the destination to stderr BEFORE redirecting so the
+			// user sees exactly one "logs going to X" line in their tty
+			// (stdio case) or in their journald stream (http case).
+			if path, err := setupServeLogging(cx.Name, transport, logFile, logStderr); err != nil {
+				return fmt.Errorf("setting up logging: %w", err)
+			} else if path != "" {
+				fmt.Fprintf(os.Stderr, "[serve] logs -> %s\n", path)
+				if err := redirectStderrToFile(path); err != nil {
+					return fmt.Errorf("redirecting logs: %w", err)
+				}
+			}
 
 			// Surface the bound cortex identity on every serve, so an
 			// operator who started the wrong cortex sees it in the very
@@ -288,6 +311,8 @@ func serveCmd() *cobra.Command {
 	cmd.Flags().IntVar(&port, "port", 3000, "port for HTTP transport")
 	cmd.Flags().StringVar(&tlsCert, "tls-cert", "", "path to TLS certificate file (enables HTTPS)")
 	cmd.Flags().StringVar(&tlsKey, "tls-key", "", "path to TLS private key file")
+	cmd.Flags().StringVar(&logFile, "log-file", "", "write operational logs to this path (default: $XDG_STATE_HOME/noema/<cortex>.log in stdio mode; stderr in http mode)")
+	cmd.Flags().BoolVar(&logStderr, "log-stderr", false, "force logs to stderr even in stdio mode (overrides the default file redirect)")
 	cmd.Flags().BoolVar(&printConfig, "print-config", false, "print MCP client config JSON and exit")
 	cmd.Flags().BoolVar(&printSystemdUnit, "print-systemd-unit", false, "print a systemd service unit for this serve command and exit")
 	cmd.Flags().BoolVar(&printLaunchdPlist, "print-launchd-plist", false, "print a launchd LaunchAgent plist for this serve command and exit")
