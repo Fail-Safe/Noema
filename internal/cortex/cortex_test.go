@@ -536,13 +536,21 @@ func TestSearch_ExcludesArchivedByDefault(t *testing.T) {
 	}
 }
 
-func TestSearch_MalformedQuery(t *testing.T) {
+func TestSearch_StructuralCharsAsLiterals(t *testing.T) {
 	cx := setup(t)
-	// FTS5 rejects certain malformed queries. Verify this surfaces as an error
-	// rather than silently returning empty results.
-	_, err := cx.Search("(unclosed paren", cortex.ListOptions{})
-	if err == nil {
-		t.Error("malformed FTS5 query must return an error")
+	// SanitizeFTS5Query quotes any token containing FTS5 structural
+	// characters so the parser treats them as literals. Queries that
+	// would previously produce "fts5: syntax error" now succeed.
+	cases := []string{
+		"(unclosed paren",
+		"cortex.md manifest format yaml",
+		"path/to/file",
+		"foo(bar)",
+	}
+	for _, q := range cases {
+		if _, err := cx.Search(q, cortex.ListOptions{}); err != nil {
+			t.Errorf("Search(%q) unexpected error: %v", q, err)
+		}
 	}
 }
 
@@ -601,6 +609,14 @@ func TestSanitizeFTS5Query(t *testing.T) {
 		{"\"already quoted\"", "\"already quoted\""},
 		{"", ""},
 		{"no-hyphens-here AND plain", "\"no-hyphens-here\" AND plain"},
+		// Tokens with FTS5 structural characters must be quoted as literals.
+		{"cortex.md manifest format yaml", "\"cortex.md\" manifest format yaml"},
+		{"path/to/file", "\"path/to/file\""},
+		{"foo(bar)", "\"foo(bar)\""},
+		{"a+b", "\"a+b\""},
+		{"foo*bar", "\"foo*bar\""},
+		{"café", "café"},
+		{"*", "\"*\""},
 		// Unbalanced quotes: stripped to prevent FTS5 syntax errors.
 		// Odd quote count → all quotes removed → safe default tokenization.
 		{"\"unterminated", "unterminated"},

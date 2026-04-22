@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 
@@ -320,10 +321,13 @@ var ErrSourceLocked = errors.New("trace is source-locked")
 // denial of service via expensive wildcard or deeply nested expressions.
 const MaxSearchQueryLen = 1000
 
-// SanitizeFTS5Query quotes each whitespace-delimited token so that FTS5
-// treats hyphens, colons, and other operator characters as literals.
-// Tokens that are already quoted or use explicit FTS5 operators (AND, OR,
-// NOT, prefix*) are passed through unchanged to preserve power-user syntax.
+// SanitizeFTS5Query quotes each whitespace-delimited token that contains
+// any FTS5 structural character (., -, :, /, (, ), etc.) so the parser
+// treats it as a literal phrase. Tokens that are already quoted or use
+// explicit FTS5 operators (AND, OR, NOT, prefix*) are passed through
+// unchanged to preserve power-user syntax. A bareword token is anything
+// composed solely of Unicode letters, digits, and underscore, with an
+// optional single trailing '*' for prefix search.
 func SanitizeFTS5Query(q string) string {
 	tokens := strings.Fields(q)
 	if len(tokens) == 0 {
@@ -334,14 +338,12 @@ func SanitizeFTS5Query(q string) string {
 		switch {
 		case t == "AND" || t == "OR" || t == "NOT":
 			out = append(out, t)
-		case strings.HasPrefix(t, "\""):
+		case strings.HasPrefix(t, "\"") || strings.HasSuffix(t, "\""):
 			out = append(out, t) // already quoted (may be part of multi-token phrase)
-		case strings.HasSuffix(t, "*"):
-			out = append(out, t) // prefix search
-		case strings.ContainsAny(t, "-:"):
-			out = append(out, "\""+t+"\"")
-		default:
+		case isBareFTS5Token(t):
 			out = append(out, t)
+		default:
+			out = append(out, "\""+t+"\"")
 		}
 	}
 	result := strings.Join(out, " ")
@@ -356,6 +358,19 @@ func SanitizeFTS5Query(q string) string {
 		result = strings.ReplaceAll(result, "\"", "")
 	}
 	return result
+}
+
+func isBareFTS5Token(t string) bool {
+	t = strings.TrimSuffix(t, "*")
+	if t == "" {
+		return false
+	}
+	for _, r := range t {
+		if !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 type Cortex struct {
