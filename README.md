@@ -198,9 +198,11 @@ noema events backfill [--dry-run] [--yes]
                                           Synthesize create events for active traces missing one (e.g. traces added via `noema sync`)
 noema resolve <divergence-id> --accept <origin> | --custom <body>
                                           Resolve a divergence (concurrent edit conflict)
-noema verify [--backfill]                 Check trace content hashes for integrity; --backfill populates
-                                          hashes for old traces
-noema drift                               Check federated traces for drift from their source hash
+noema verify [--backfill]                 Run integrity checks (alias for `verify traces` for back-compat);
+                                          --backfill populates content_hash for old traces
+noema verify traces [--backfill]          Check trace content hashes against frontmatter content_hash
+noema verify cortex                       Validate manifest, config, db, access posture, and federation
+noema verify drift                        Check federated traces for drift from their source hash
 
 noema federation status                   Show federation config, MCP access posture, peer sync state, and vector clock
 noema federation peers                    List configured federation peers
@@ -558,10 +560,11 @@ source_locked: true
 Source-locked traces refuse `update`, `delete`, and `remove` operations when the local cortex is not the origin. `archive`/`unarchive` remain allowed (non-destructive). Use `--force` on CLI commands to override in emergencies.
 
 ```bash
-noema verify               # check all trace hashes for integrity
-noema verify --backfill     # populate hashes for old traces
-noema drift                 # check federated traces against source hashes
-noema edit <id> --force     # override source-lock
+noema verify traces           # check trace content hashes against frontmatter
+noema verify traces --backfill # populate content_hash for old traces
+noema verify cortex           # validate manifest, config, db, access, federation
+noema verify drift            # check federated traces against source hashes
+noema edit <id> --force       # override source-lock
 ```
 
 ### Authentication
