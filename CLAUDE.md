@@ -111,15 +111,27 @@ Each Cortex is a named directory the user manages. Layout:
 
 Trace filenames follow the pattern `YYYYMMDD-slugified-title.md` (ISO 8601). The markdown files are the source of truth for content; the DB is the index.
 
-**`cortex.md` manifest** (YAML, minimal — not a config file):
+**`cortex.md` manifest** — a markdown file with YAML frontmatter. The
+YAML block holds the manifest (minimal — not a config file); any prose
+below the closing fence is preserved verbatim on write, so users can
+keep free-form notes about the cortex alongside its metadata.
 
-```yaml
+```markdown
+---
+id: 01JQ3Z4XKP8VY6H7B9W2R5T8MN
 name: my-cortex
 purpose: "Primary memory for the research agent cluster"
 owner: mark
 created: 2026-03-29
-version: 1
+version: 2
+---
+
+Optional free-form notes about this cortex.
 ```
+
+For back-compat, `ReadManifest` also accepts legacy bare-YAML files
+(no `---` fences) written by older binaries; the next `WriteManifest`
+silently upgrades them to the framed form.
 
 ### Archiving
 
