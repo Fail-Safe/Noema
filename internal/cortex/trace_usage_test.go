@@ -196,11 +196,13 @@ func TestTraceUsage_AggregateSumsAcrossPeers(t *testing.T) {
 		}
 	}
 
-	// Simulate a remote peer's deltas already synced in.
+	// Simulate a remote peer's deltas already synced in. Far-future
+	// timestamp so "remote is newer than local" holds regardless of
+	// wall-clock drift between local GetAs() bumps and this line.
 	remote := "01REMOTEFEDPEER0000000000"
 	if _, err := cx.DB.Exec(`
 		INSERT INTO trace_usage (trace_id, peer_cortex_id, read_count, modify_count, last_read_at, updated_at)
-		VALUES (?, ?, 5, 0, '2026-04-23T19:00:00Z', '2026-04-23T19:00:00Z')`,
+		VALUES (?, ?, 5, 0, '2099-01-01T00:00:00Z', '2099-01-01T00:00:00Z')`,
 		tr.ID, remote,
 	); err != nil {
 		t.Fatalf("seed remote: %v", err)
@@ -217,7 +219,7 @@ func TestTraceUsage_AggregateSumsAcrossPeers(t *testing.T) {
 	if totalReads != 8 {
 		t.Errorf("aggregate read_count = %d, want 8 (3 local + 5 remote)", totalReads)
 	}
-	if maxLast != "2026-04-23T19:00:00Z" {
-		t.Errorf("aggregate last_read_at = %q, want 2026-04-23T19:00:00Z (remote newer)", maxLast)
+	if maxLast != "2099-01-01T00:00:00Z" {
+		t.Errorf("aggregate last_read_at = %q, want 2099-01-01T00:00:00Z (remote newer)", maxLast)
 	}
 }

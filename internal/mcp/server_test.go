@@ -432,3 +432,28 @@ func TestSyncMode_AllowsEverything(t *testing.T) {
 		t.Errorf("sync_events should work in sync mode, got: %s", text)
 	}
 }
+
+func TestSubscribeMode_BlocksSyncReadSignal(t *testing.T) {
+	cx := newTestCortex(t)
+	s := NewServer(cx, "test", "subscribe")
+	initServer(t, s)
+
+	text, isErr := callTool(t, s, "sync_read_signal", nil)
+	if !isErr {
+		t.Errorf("sync_read_signal should be blocked in subscribe mode, got: %s", text)
+	}
+	if !strings.Contains(text, "subscribe mode") {
+		t.Errorf("error should mention subscribe mode, got: %s", text)
+	}
+}
+
+func TestPublishMode_AllowsSyncReadSignal(t *testing.T) {
+	cx := newTestCortex(t)
+	s := NewServer(cx, "test", "publish")
+	initServer(t, s)
+
+	text, isErr := callTool(t, s, "sync_read_signal", nil)
+	if isErr {
+		t.Errorf("sync_read_signal should be served in publish mode, got error: %s", text)
+	}
+}
