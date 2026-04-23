@@ -36,6 +36,36 @@ func (f *fakeReplayer) MergeRemoteUsage(rows []TraceUsage) error {
 	return nil
 }
 
+// TestIsToolUnknown pins the match surface for "peer does not implement
+// this tool" errors. The syncer treats these as silent skips during
+// mid-upgrade transitions rather than logging ERROR-level noise for
+// every cycle. Covers both raw JSON-RPC (-32601) and the mcp-go
+// wrapped form ("tool not found").
+func TestIsToolUnknown(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil error", nil, false},
+		{"raw -32601", errors.New("JSON-RPC error: -32601 method not found"), true},
+		{"mcp-go tool-not-found (observed in prod)", errors.New("invalid params: tool 'sync_read_signal' not found: tool not found"), true},
+		{"lowercase method not found", errors.New("method not found"), true},
+		{"capitalized Method not found", errors.New("Method not found"), true},
+		{"capitalized Tool not found", errors.New("Tool not found"), true},
+		{"unrelated error must not match", errors.New("connection refused"), false},
+		{"FK constraint error must not match (would swallow real failures)", errors.New("constraint failed: FOREIGN KEY constraint failed (787)"), false},
+		{"timeout must not match", errors.New("context deadline exceeded"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isToolUnknown(tc.err); got != tc.want {
+				t.Errorf("isToolUnknown(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
 // newSyncerForTest spins up a minimal Syncer wired to a real federation
 // State backed by a fresh on-disk DB. The DB is needed because State
 // reads/writes the federation_state table; the fake replayer absorbs the

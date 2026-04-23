@@ -422,13 +422,10 @@ func (s *Syncer) syncReadSignalPhase(peer PeerConfig, mcpClient *client.Client) 
 		},
 	})
 	if err != nil {
-		// JSON-RPC "method not found" surfaces as -32601 in the
-		// error message. Peers on pre-PR-B binaries return this;
-		// treat as a clean no-op (logged once by the caller if it
-		// keeps happening, not here).
-		if strings.Contains(err.Error(), "-32601") ||
-			strings.Contains(err.Error(), "method not found") ||
-			strings.Contains(err.Error(), "Method not found") {
+		// A peer on a pre-PR-B binary doesn't know sync_read_signal
+		// and rejects the call. Treated as a clean no-op — next
+		// cycle retries, ring converges once all peers upgrade.
+		if isToolUnknown(err) {
 			return nil
 		}
 		return fmt.Errorf("calling sync_read_signal: %w", err)
@@ -485,6 +482,31 @@ func (s *Syncer) syncReadSignalPhase(peer PeerConfig, mcpClient *client.Client) 
 // into the structured reason set. Pattern-matches on the substrings
 // the verifyPeerIdentity callsites use when constructing the wrapped
 // error (kept here rather than on the error type itself to avoid
+// isToolUnknown reports whether an MCP CallTool error signals that the
+// remote peer does not implement the requested tool. Two shapes appear
+// in practice:
+//
+//   - Raw JSON-RPC peers surface `-32601` (the spec's "method not found"
+//     code) in the error string.
+//   - The mcp-go library wraps the same condition as
+//     `invalid params: tool '<name>' not found: tool not found`.
+//
+// We match both so the mid-upgrade transitional window (where some
+// peers haven't restarted onto a binary that implements a newly-added
+// tool) stays silent at the syncer level instead of logging ERROR for
+// every cycle until the ring finishes upgrading.
+func isToolUnknown(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "-32601") ||
+		strings.Contains(msg, "tool not found") ||
+		strings.Contains(msg, "Tool not found") ||
+		strings.Contains(msg, "method not found") ||
+		strings.Contains(msg, "Method not found")
+}
+
 // adding a new package-scoped sentinel for every condition).
 func classifyIdentityError(err error) string {
 	if err == nil {
