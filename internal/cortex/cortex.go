@@ -896,7 +896,51 @@ func Open(name, dir string) (*Cortex, error) {
 		fmt.Fprintf(os.Stderr, "[cortex] FTS5 reindex warning: %v\n", err)
 	}
 
+	// One-shot backfill of trace_usage from the legacy traces counters.
+	// Migration 014 creates the table; this backfill populates it from
+	// the per-trace {read_count, modify_count, last_read_at} columns on
+	// the first Open after the migration runs. Gated on "trace_usage is
+	// empty AND traces has rows" so fresh cortexes skip the work and
+	// repeat opens are no-ops. Requires cx.ID to attribute the historical
+	// counters to the local peer.
+	if cx.ID != "" {
+		if err := cx.backfillTraceUsage(); err != nil {
+			fmt.Fprintf(os.Stderr, "[cortex] trace_usage backfill warning: %v\n", err)
+		}
+	}
+
 	return cx, nil
+}
+
+// backfillTraceUsage populates trace_usage from the legacy per-trace
+// counter columns, crediting them to the local cortex ID. Idempotent:
+// skipped when trace_usage already has rows. Safe on fresh cortexes
+// (no traces -> no-op).
+func (c *Cortex) backfillTraceUsage() error {
+	var usageCount, traceCount int
+	if err := c.DB.QueryRow(`SELECT COUNT(*) FROM trace_usage`).Scan(&usageCount); err != nil {
+		return fmt.Errorf("count trace_usage: %w", err)
+	}
+	if usageCount > 0 {
+		return nil
+	}
+	if err := c.DB.QueryRow(`SELECT COUNT(*) FROM traces`).Scan(&traceCount); err != nil {
+		return fmt.Errorf("count traces: %w", err)
+	}
+	if traceCount == 0 {
+		return nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := c.DB.Exec(`
+		INSERT INTO trace_usage (trace_id, peer_cortex_id, read_count, modify_count, last_read_at, updated_at)
+		SELECT id, ?, read_count, modify_count, last_read_at, ?
+		FROM traces`,
+		c.ID, now,
+	)
+	if err != nil {
+		return fmt.Errorf("backfill insert: %w", err)
+	}
+	return nil
 }
 
 // detectCopiedDirectory refuses to start if the events table contains rows

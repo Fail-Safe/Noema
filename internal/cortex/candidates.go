@@ -34,12 +34,19 @@ func (c *Cortex) GraduationCandidates(minAge time.Duration) ([]PromotionCandidat
 			t.id,
 			t.tier,
 			t.type,
-			t.read_count,
-			t.modify_count,
+			COALESCE(u.total_reads, 0)    AS read_count,
+			COALESCE(u.total_modifies, 0) AS modify_count,
 			t.tier_votes,
 			COALESCE(v.n, 0) AS derived_from_count,
 			t.created_at
 		FROM traces t
+		LEFT JOIN (
+			SELECT trace_id,
+			       SUM(read_count)   AS total_reads,
+			       SUM(modify_count) AS total_modifies
+			FROM trace_usage
+			GROUP BY trace_id
+		) u ON u.trace_id = t.id
 		LEFT JOIN v_derived_from_count v ON v.trace_id = t.id
 		WHERE t.tier = 'mid'
 		  AND t.archived_at IS NULL
@@ -86,12 +93,19 @@ func (c *Cortex) PromotionCandidates(tier string, window time.Duration) ([]Promo
 			t.id,
 			t.tier,
 			t.type,
-			t.read_count,
-			t.modify_count,
+			COALESCE(u.total_reads, 0)    AS read_count,
+			COALESCE(u.total_modifies, 0) AS modify_count,
 			t.tier_votes,
 			COALESCE(v.n, 0) AS derived_from_count,
 			t.created_at
 		FROM traces t
+		LEFT JOIN (
+			SELECT trace_id,
+			       SUM(read_count)   AS total_reads,
+			       SUM(modify_count) AS total_modifies
+			FROM trace_usage
+			GROUP BY trace_id
+		) u ON u.trace_id = t.id
 		LEFT JOIN v_derived_from_count v ON v.trace_id = t.id
 		WHERE t.tier = ?
 		  AND t.archived_at IS NULL
