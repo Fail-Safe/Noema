@@ -64,6 +64,16 @@ func (c *Cortex) Demote(id, newTier string) error {
 // tier='long' rows while still blocking content and identity fields.
 // Votes on long-term are a meaningful signal that a base-truth memory
 // is still being referenced.
+// TierVotes returns the current tier_votes count for a trace. Surfaced
+// to UIs (TUI detail pane, future CLI `noema memory votes`) so users
+// voting on a trace can see their vote's effect. A missing trace
+// returns sql.ErrNoRows.
+func (c *Cortex) TierVotes(id string) (int, error) {
+	var votes int
+	err := c.DB.QueryRow(`SELECT tier_votes FROM traces WHERE id = ?`, id).Scan(&votes)
+	return votes, err
+}
+
 func (c *Cortex) Vote(id string, delta int, actor ReadActor) error {
 	if delta != 1 && delta != -1 {
 		return fmt.Errorf("vote delta must be +1 or -1, got %d", delta)

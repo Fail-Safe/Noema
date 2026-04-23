@@ -119,3 +119,46 @@ func TestUpdate_PreservesDBTierAgainstFileDrift(t *testing.T) {
 		t.Errorf("file tier after drifted update = %q, want %q", after.Tier, trace.TierShort)
 	}
 }
+
+// TestTierVotes_ReflectsVoteHistory pins the read path for the TUI's
+// detail-pane vote counter: TierVotes returns the accumulated
+// +1/-1 deltas applied via Vote(). Missing traces surface the
+// underlying sql.ErrNoRows so callers can distinguish "0 votes" from
+// "id doesn't exist."
+func TestTierVotes_ReflectsVoteHistory(t *testing.T) {
+	cx := setup(t)
+	tr := trace.New("vote fixture", "note", "", nil, "body")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	// Fresh trace starts at zero.
+	v, err := cx.TierVotes(tr.ID)
+	if err != nil {
+		t.Fatalf("TierVotes (fresh): %v", err)
+	}
+	if v != 0 {
+		t.Errorf("fresh trace votes = %d, want 0", v)
+	}
+
+	// Two upvotes, one downvote — net +1.
+	for _, d := range []int{1, 1, -1} {
+		if err := cx.Vote(tr.ID, d, cortex.ActorHuman); err != nil {
+			t.Fatalf("Vote(%d): %v", d, err)
+		}
+	}
+	v, err = cx.TierVotes(tr.ID)
+	if err != nil {
+		t.Fatalf("TierVotes (after votes): %v", err)
+	}
+	if v != 1 {
+		t.Errorf("votes after +1+1-1 = %d, want 1", v)
+	}
+
+	// Missing trace returns a non-nil error — TUI callers currently
+	// treat any error as "0" (the detail pane blanks in that case),
+	// but the contract is important for future callers.
+	if _, err := cx.TierVotes("does-not-exist"); err == nil {
+		t.Error("TierVotes on missing id should return an error, got nil")
+	}
+}

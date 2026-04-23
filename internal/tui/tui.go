@@ -379,10 +379,11 @@ type confirmAction struct {
 }
 
 type model struct {
-	cx          *cortex.Cortex
-	rows        []cortex.Row
-	cursor      int
-	current     *trace.Trace // cached detail for selected row
+	cx           *cortex.Cortex
+	rows         []cortex.Row
+	cursor       int
+	current      *trace.Trace // cached detail for selected row
+	currentVotes int          // tier_votes for m.current, refreshed whenever m.current reloads
 	width       int
 	height      int
 	state       viewState
@@ -1022,6 +1023,7 @@ func (m model) handleRowsLoaded(newRows []cortex.Row) model {
 	m.lastQuery = m.searchQuery
 
 	m.current = m.loadCurrent()
+	m.currentVotes = m.loadCurrentVotes()
 
 	// If the refresh landed on a different trace (sticky-cursor
 	// failed because the row was archived/deleted, or context
@@ -1051,6 +1053,21 @@ func (m model) loadCurrent() *trace.Trace {
 	}
 	t, _ := trace.ParseFile(path)
 	return t
+}
+
+// loadCurrentVotes returns the tier_votes count for the row under the
+// cursor. Renders "0" for an empty list or a row that can't be
+// resolved — the detail pane is blanked in those cases anyway, so the
+// value isn't displayed.
+func (m model) loadCurrentVotes() int {
+	if len(m.rows) == 0 {
+		return 0
+	}
+	votes, err := m.cx.TierVotes(m.rows[m.cursor].ID)
+	if err != nil {
+		return 0
+	}
+	return votes
 }
 
 // paneWidths returns the widths of the list pane and the detail pane
@@ -1162,6 +1179,7 @@ func (m model) selectCursor(idx int) model {
 	}
 	m.cursor = idx
 	m.current = m.loadCurrent()
+	m.currentVotes = m.loadCurrentVotes()
 	var newID string
 	if m.current != nil {
 		newID = m.current.ID
@@ -1382,6 +1400,15 @@ func (m model) renderDetail(width, height int) string {
 	lines = append(lines, metaLine("id", t.ID))
 	lines = append(lines, metaLine("title", t.Title))
 	lines = append(lines, chipLine("type", t.Type))
+	// Tier + current vote count. Surfaced together so a user casting a
+	// +/- vote can see both the tier they're influencing and the count
+	// they're incrementing. Tier defaults to "short" when the field is
+	// omitted from frontmatter (matches DB default).
+	tier := t.Tier
+	if tier == "" {
+		tier = "short"
+	}
+	lines = append(lines, metaLine("tier", fmt.Sprintf("%s  (votes: %+d)", tier, m.currentVotes)))
 	if t.Author != "" {
 		lines = append(lines, metaLine("author", t.Author))
 	}
@@ -1502,7 +1529,7 @@ func (m model) renderFooter() string {
 		case m.showTrashed:
 			hint = "j/k:nav  r:recover  D:purge  t:back  /:search  →/tab:body  f:live  R:refresh  q:quit"
 		default:
-			hint = "j/k:nav  n:new  e:edit  d:archive  u:unarchive  D:trash  t:trash-view  a:all  /:search  →/tab:body  f:live  R:refresh  q:quit"
+			hint = "j/k:nav  n:new  e:edit  +/-:vote  d:archive  u:unarchive  D:trash  t:trash-view  a:all  /:search  →/tab:body  f:live  R:refresh  q:quit"
 		}
 		if m.focus == focusList && m.searchQuery != "" {
 			hint = "esc:clear  " + hint
