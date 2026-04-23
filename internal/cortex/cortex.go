@@ -1,6 +1,7 @@
 package cortex
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 
@@ -38,6 +40,12 @@ type Manifest struct {
 	Federation    *FederationConfig    `yaml:"federation,omitempty"`
 	Watch         *WatchConfig         `yaml:"watch,omitempty"`
 	Consolidation *ConsolidationConfig `yaml:"consolidation,omitempty"`
+
+	// Body is the free-form markdown content that follows the YAML
+	// frontmatter in cortex.md. Never serialized through YAML; populated
+	// by ReadManifest and consumed by WriteManifest to preserve any
+	// prose the user keeps below the manifest.
+	Body string `yaml:"-"`
 }
 
 // AccessConfig holds MCP endpoint authentication settings for cortex.md.
@@ -320,10 +328,13 @@ var ErrSourceLocked = errors.New("trace is source-locked")
 // denial of service via expensive wildcard or deeply nested expressions.
 const MaxSearchQueryLen = 1000
 
-// SanitizeFTS5Query quotes each whitespace-delimited token so that FTS5
-// treats hyphens, colons, and other operator characters as literals.
-// Tokens that are already quoted or use explicit FTS5 operators (AND, OR,
-// NOT, prefix*) are passed through unchanged to preserve power-user syntax.
+// SanitizeFTS5Query quotes each whitespace-delimited token that contains
+// any FTS5 structural character (., -, :, /, (, ), etc.) so the parser
+// treats it as a literal phrase. Tokens that are already quoted or use
+// explicit FTS5 operators (AND, OR, NOT, prefix*) are passed through
+// unchanged to preserve power-user syntax. A bareword token is anything
+// composed solely of Unicode letters, digits, and underscore, with an
+// optional single trailing '*' for prefix search.
 func SanitizeFTS5Query(q string) string {
 	tokens := strings.Fields(q)
 	if len(tokens) == 0 {
@@ -334,14 +345,12 @@ func SanitizeFTS5Query(q string) string {
 		switch {
 		case t == "AND" || t == "OR" || t == "NOT":
 			out = append(out, t)
-		case strings.HasPrefix(t, "\""):
+		case strings.HasPrefix(t, "\"") || strings.HasSuffix(t, "\""):
 			out = append(out, t) // already quoted (may be part of multi-token phrase)
-		case strings.HasSuffix(t, "*"):
-			out = append(out, t) // prefix search
-		case strings.ContainsAny(t, "-:"):
-			out = append(out, "\""+t+"\"")
-		default:
+		case isBareFTS5Token(t):
 			out = append(out, t)
+		default:
+			out = append(out, "\""+t+"\"")
 		}
 	}
 	result := strings.Join(out, " ")
@@ -356,6 +365,19 @@ func SanitizeFTS5Query(q string) string {
 		result = strings.ReplaceAll(result, "\"", "")
 	}
 	return result
+}
+
+func isBareFTS5Token(t string) bool {
+	t = strings.TrimSuffix(t, "*")
+	if t == "" {
+		return false
+	}
+	for _, r := range t {
+		if !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 type Cortex struct {
@@ -405,7 +427,7 @@ func Create(name, dir string) (Manifest, error) {
 		Created: time.Now().UTC().Format("2006-01-02"),
 		Version: ManifestVersion,
 	}
-	data, err := yaml.Marshal(manifest)
+	data, err := marshalManifest(manifest)
 	if err != nil {
 		return Manifest{}, err
 	}
@@ -447,14 +469,22 @@ func (m Manifest) ValidateFederation() error {
 }
 
 // ReadManifest parses the cortex.md manifest in the given cortex directory.
+// cortex.md is a markdown file with YAML frontmatter: a `---` fence, the
+// manifest YAML, a closing `---` fence, and an optional free-form body.
+// For back-compat with cortexes written before the framing change, a file
+// that does not begin with `---` is parsed as whole-file YAML.
 func ReadManifest(dir string) (Manifest, error) {
 	data, err := os.ReadFile(filepath.Join(dir, "cortex.md"))
 	if err != nil {
 		return Manifest{}, fmt.Errorf("reading cortex.md: %w", err)
 	}
+	yamlPart, body, framed := splitFrontmatter(data)
 	var m Manifest
-	if err := yaml.Unmarshal(data, &m); err != nil {
+	if err := yaml.Unmarshal(yamlPart, &m); err != nil {
 		return Manifest{}, fmt.Errorf("parsing cortex.md: %w", err)
+	}
+	if framed {
+		m.Body = string(body)
 	}
 	if err := m.ValidateFederation(); err != nil {
 		return Manifest{}, err
@@ -462,13 +492,72 @@ func ReadManifest(dir string) (Manifest, error) {
 	return m, nil
 }
 
-// WriteManifest writes the manifest back to cortex.md in the given directory.
+// WriteManifest writes the manifest back to cortex.md in the given
+// directory. The output is always framed as markdown frontmatter: a
+// `---` fence, the YAML, a closing `---` fence, then m.Body if non-empty.
+// Legacy bare-YAML manifests are silently upgraded to framed form on
+// the first write.
 func WriteManifest(dir string, m Manifest) error {
-	data, err := yaml.Marshal(m)
+	data, err := marshalManifest(m)
 	if err != nil {
-		return fmt.Errorf("marshaling cortex.md: %w", err)
+		return err
 	}
 	return os.WriteFile(filepath.Join(dir, "cortex.md"), data, 0o640)
+}
+
+func marshalManifest(m Manifest) ([]byte, error) {
+	yamlBytes, err := yaml.Marshal(m)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling cortex.md: %w", err)
+	}
+	var buf bytes.Buffer
+	buf.WriteString("---\n")
+	buf.Write(yamlBytes)
+	buf.WriteString("---\n")
+	body := strings.TrimRight(m.Body, "\n")
+	if body != "" {
+		buf.WriteString("\n")
+		buf.WriteString(body)
+		buf.WriteString("\n")
+	}
+	return buf.Bytes(), nil
+}
+
+// splitFrontmatter separates a markdown file's `---`-fenced YAML
+// frontmatter from its body. Returns framed=false when the file does
+// not open with a `---` fence or has no matching close fence — the
+// caller then parses the whole input as YAML (legacy bare-manifest
+// compatibility).
+func splitFrontmatter(data []byte) (yamlPart, body []byte, framed bool) {
+	first, afterFirst, ok := bytes.Cut(data, []byte("\n"))
+	if !ok || !bytes.Equal(bytes.TrimRight(first, "\r"), []byte("---")) {
+		return data, nil, false
+	}
+	// Scan lines of afterFirst for a closing "---" (tolerant of trailing CR).
+	rest := afterFirst
+	for len(rest) > 0 {
+		line, next, hasNext := bytes.Cut(rest, []byte("\n"))
+		if bytes.Equal(bytes.TrimRight(line, "\r"), []byte("---")) {
+			yamlPart = afterFirst[:len(afterFirst)-len(rest)]
+			if hasNext {
+				body = next
+			}
+			// Strip one blank line between fence and body (cosmetic).
+			switch {
+			case bytes.HasPrefix(body, []byte("\n")):
+				body = body[1:]
+			case bytes.HasPrefix(body, []byte("\r\n")):
+				body = body[2:]
+			}
+			return yamlPart, body, true
+		}
+		if !hasNext {
+			break
+		}
+		rest = next
+	}
+	// Opening fence without a matching close — treat as unframed.
+	return data, nil, false
 }
 
 // PeerLabelCollidesWithSelf reports whether the proposed peer label is the

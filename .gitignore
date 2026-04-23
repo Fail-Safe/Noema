@@ -25,5 +25,6 @@
 .vscode/
 
 # Local dev
-.claude/layout.md
+.claude/
+install.sh
 push-binary.sh

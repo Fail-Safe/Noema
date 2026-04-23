@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/Fail-Safe/Noema/internal/cortex"
 	"github.com/Fail-Safe/Noema/internal/trace"
 )
 
@@ -110,6 +111,52 @@ func (w *Watcher) onboardFile(path string) (string, *trace.Trace, error) {
 		}
 	}
 	return newPath, t, nil
+}
+
+// healMalformedFile reconstructs a tracked trace whose frontmatter got
+// wiped — typically because Obsidian (or a script) saved plain text
+// over the file. The DB row carries the authoritative metadata
+// (title, type, tags, lineage, timestamps, etc.); we wrap the file's
+// raw bytes as body and rewrite the file with proper frontmatter,
+// then call cx.Update so the change flows through the event log,
+// FTS, and federation just like any other edit.
+//
+// Returns an error for unrecoverable cases (file unreadable, empty,
+// or update failure); the caller logs and skips on error.
+func (w *Watcher) healMalformedFile(path string, row *cortex.Row) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+	body := string(raw)
+	if strings.TrimSpace(body) == "" {
+		return fmt.Errorf("file is empty")
+	}
+	t := &trace.Trace{
+		Frontmatter: trace.Frontmatter{
+			ID:           row.ID,
+			Title:        row.Title,
+			Type:         row.Type,
+			Tier:         row.Tier,
+			Author:       row.Author,
+			Tags:         row.Tags,
+			DerivedFrom:  row.DerivedFrom,
+			Origin:       row.Origin,
+			Created:      row.CreatedAt,
+			Updated:      row.UpdatedAt, // re-stamped by trace.Write
+			SourceHash:   row.SourceHash,
+			SourceLocked: row.SourceLocked,
+		},
+		Body: body,
+	}
+	t.ContentHash = trace.ContentHash(body)
+	if err := t.Write(path); err != nil {
+		return fmt.Errorf("write healed trace: %w", err)
+	}
+	if err := w.cx.Update(row.ID); err != nil {
+		return fmt.Errorf("update after heal: %w", err)
+	}
+	return nil
 }
 
 // extractH1 returns the first Markdown level-1 heading in body, or ""

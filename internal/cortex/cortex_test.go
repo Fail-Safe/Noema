@@ -1,6 +1,7 @@
 package cortex_test
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"os"
@@ -271,6 +272,104 @@ func TestReadManifest(t *testing.T) {
 	}
 }
 
+// TestManifest_FramedOnCreate verifies that Create writes cortex.md as
+// markdown with `---`-fenced YAML frontmatter, not as bare YAML.
+func TestManifest_FramedOnCreate(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := cortex.Create("framed", dir); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "framed", "cortex.md"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.HasPrefix(data, []byte("---\n")) {
+		t.Errorf("cortex.md must open with a --- fence; got:\n%s", data)
+	}
+	// The YAML block must be followed by a closing --- fence on its own line.
+	if !bytes.Contains(data, []byte("\n---\n")) {
+		t.Errorf("cortex.md must contain a closing --- fence; got:\n%s", data)
+	}
+}
+
+// TestManifest_LegacyBareYAMLParses verifies back-compat: cortex.md files
+// written by earlier binaries (bare YAML, no frontmatter fences) still
+// parse cleanly. This is the pre-framing on-disk format.
+func TestManifest_LegacyBareYAMLParses(t *testing.T) {
+	dir := t.TempDir()
+	legacy := []byte("id: 01J000000000000000000000AA\nname: legacy\nversion: 2\ncreated: 2026-04-22\n")
+	if err := os.WriteFile(filepath.Join(dir, "cortex.md"), legacy, 0o640); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	m, err := cortex.ReadManifest(dir)
+	if err != nil {
+		t.Fatalf("ReadManifest (legacy): %v", err)
+	}
+	if m.Name != "legacy" || m.Version != 2 {
+		t.Errorf("legacy manifest did not parse: got %+v", m)
+	}
+	if m.Body != "" {
+		t.Errorf("legacy manifest has no body; got %q", m.Body)
+	}
+}
+
+// TestManifest_BodyRoundTrip verifies that free-form body text below the
+// frontmatter is preserved across ReadManifest/WriteManifest.
+func TestManifest_BodyRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := cortex.Create("withbody", dir); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	cortexDir := filepath.Join(dir, "withbody")
+
+	m, err := cortex.ReadManifest(cortexDir)
+	if err != nil {
+		t.Fatalf("ReadManifest: %v", err)
+	}
+	m.Body = "# About this cortex\n\nPrimary memory for the research cluster.\n"
+	if err := cortex.WriteManifest(cortexDir, m); err != nil {
+		t.Fatalf("WriteManifest: %v", err)
+	}
+
+	got, err := cortex.ReadManifest(cortexDir)
+	if err != nil {
+		t.Fatalf("ReadManifest (round-trip): %v", err)
+	}
+	wantBody := "# About this cortex\n\nPrimary memory for the research cluster.\n"
+	if got.Body != wantBody {
+		t.Errorf("Body round-trip mismatch\n got: %q\nwant: %q", got.Body, wantBody)
+	}
+	if got.Name != "withbody" || got.ID == "" {
+		t.Errorf("frontmatter corrupted by body round-trip: %+v", got)
+	}
+}
+
+// TestManifest_LegacyPromotesToFramedOnWrite verifies that reading a
+// legacy bare-YAML manifest and then writing it back produces a framed
+// file — existing cortexes silently upgrade on the first mutation.
+func TestManifest_LegacyPromotesToFramedOnWrite(t *testing.T) {
+	dir := t.TempDir()
+	legacy := []byte("id: 01J000000000000000000000BB\nname: upgrade\nversion: 2\ncreated: 2026-04-22\n")
+	path := filepath.Join(dir, "cortex.md")
+	if err := os.WriteFile(path, legacy, 0o640); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	m, err := cortex.ReadManifest(dir)
+	if err != nil {
+		t.Fatalf("ReadManifest: %v", err)
+	}
+	if err := cortex.WriteManifest(dir, m); err != nil {
+		t.Fatalf("WriteManifest: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.HasPrefix(data, []byte("---\n")) {
+		t.Errorf("legacy cortex.md was not upgraded to framed form; got:\n%s", data)
+	}
+}
+
 func TestPeerLabelCollidesWithSelf(t *testing.T) {
 	m := cortex.Manifest{Name: "alpha"}
 
@@ -536,13 +635,21 @@ func TestSearch_ExcludesArchivedByDefault(t *testing.T) {
 	}
 }
 
-func TestSearch_MalformedQuery(t *testing.T) {
+func TestSearch_StructuralCharsAsLiterals(t *testing.T) {
 	cx := setup(t)
-	// FTS5 rejects certain malformed queries. Verify this surfaces as an error
-	// rather than silently returning empty results.
-	_, err := cx.Search("(unclosed paren", cortex.ListOptions{})
-	if err == nil {
-		t.Error("malformed FTS5 query must return an error")
+	// SanitizeFTS5Query quotes any token containing FTS5 structural
+	// characters so the parser treats them as literals. Queries that
+	// would previously produce "fts5: syntax error" now succeed.
+	cases := []string{
+		"(unclosed paren",
+		"cortex.md manifest format yaml",
+		"path/to/file",
+		"foo(bar)",
+	}
+	for _, q := range cases {
+		if _, err := cx.Search(q, cortex.ListOptions{}); err != nil {
+			t.Errorf("Search(%q) unexpected error: %v", q, err)
+		}
 	}
 }
 
@@ -601,6 +708,14 @@ func TestSanitizeFTS5Query(t *testing.T) {
 		{"\"already quoted\"", "\"already quoted\""},
 		{"", ""},
 		{"no-hyphens-here AND plain", "\"no-hyphens-here\" AND plain"},
+		// Tokens with FTS5 structural characters must be quoted as literals.
+		{"cortex.md manifest format yaml", "\"cortex.md\" manifest format yaml"},
+		{"path/to/file", "\"path/to/file\""},
+		{"foo(bar)", "\"foo(bar)\""},
+		{"a+b", "\"a+b\""},
+		{"foo*bar", "\"foo*bar\""},
+		{"café", "café"},
+		{"*", "\"*\""},
 		// Unbalanced quotes: stripped to prevent FTS5 syntax errors.
 		// Odd quote count → all quotes removed → safe default tokenization.
 		{"\"unterminated", "unterminated"},

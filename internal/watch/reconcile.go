@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Fail-Safe/Noema/internal/cortex"
 	"github.com/Fail-Safe/Noema/internal/trace"
@@ -91,6 +92,24 @@ func (w *Watcher) reconcile(path string) error {
 		return fmt.Errorf("db lookup: %w", rowErr)
 	}
 
+	// Atomic-save guard: editors like Obsidian save by deleting then
+	// rewriting the file at the same path. fsnotify fires REMOVE then
+	// CREATE; the debounced reconcile can fire during the gap when
+	// the file is briefly missing. If we're about to treat a known
+	// trace as deleted, wait one grace period and re-stat — if the
+	// file is back, the recreate's own event will route it through
+	// reconcileExisting, so we no-op here.
+	if !fileExists && inDB {
+		select {
+		case <-time.After(w.deleteGrace):
+		case <-w.ctx.Done():
+			return nil
+		}
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		}
+	}
+
 	if fileExists {
 		return w.reconcileExisting(path, id, dir, row, inDB)
 	}
@@ -115,6 +134,27 @@ func (w *Watcher) reconcileExisting(path, id string, dir traceDir, row *cortex.R
 	// skip-and-log treatment; auto-rewriting a tracked trace behind
 	// the operator's back would be surprising.
 	if malformed {
+		// Heal path: a tracked active trace whose frontmatter got
+		// wiped (Obsidian saving plain text over the file, a script
+		// stripping the YAML, etc.) can be reconstructed from the DB
+		// row plus the file's raw content as body. Source-locked
+		// foreign traces are excluded — heal would mutate
+		// authoritative state. Only the "missing frontmatter
+		// delimiter" parse error is healed; other malformations
+		// (broken YAML, mismatched id) may carry user intent and
+		// stay in the skip-and-log path.
+		if parseErr != nil && inDB && dir == dirActive &&
+			strings.Contains(parseErr.Error(), "missing frontmatter delimiter") &&
+			!(row.SourceLocked && row.Origin != w.cx.Name) {
+			if err := w.healMalformedFile(path, row); err != nil {
+				w.logSkip(path, fmt.Sprintf("heal failed: %v", err))
+				return nil
+			}
+			w.forgetSkip(path)
+			log.Printf("[watch] healed frontmatter-wiped trace: %s", id)
+			return nil
+		}
+
 		if w.autoOnboard && dir == dirActive && !inDB {
 			newPath, onboarded, err := w.onboardFile(path)
 			if err != nil {
@@ -129,7 +169,7 @@ func (w *Watcher) reconcileExisting(path, id string, dir traceDir, row *cortex.R
 			_ = newPath
 			return nil
 		}
-		// Not eligible for rescue — fall back to the historical
+		// Not eligible for rescue or heal — fall back to the historical
 		// skip-and-log behaviour, now throttled per-path.
 		switch {
 		case parseErr != nil:
