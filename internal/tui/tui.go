@@ -470,13 +470,21 @@ func tierBadge(tier string) string {
 }
 
 // renderTierGlyph returns the tier badge pre-styled with its heat-chart
-// color (warm orange → amber → cool blue for short → mid → long). The
-// result embeds ANSI escape sequences; the outer row style re-paints
-// the background around them but leaves the inner foreground intact.
-// Unknown tiers render without color to keep the "?" reading as a
-// migration-anomaly signal rather than a fourth tier.
-func renderTierGlyph(tier string) string {
+// color (warm orange → amber → cool blue for short → mid → long) when
+// the pane is in focus. When dim=true (list acting as backdrop while
+// the detail pane has focus), the glyph renders as a plain character
+// so the outer styleRowDim can apply uniform dimming across the whole
+// row — the heat-chart ANSI embeds a reset that would otherwise
+// terminate the outer dim mid-line, leaving the title/badge/date
+// rendered at default terminal color.
+//
+// Unknown tiers render without color in both states to keep the "?"
+// reading as a migration-anomaly signal rather than a fourth tier.
+func renderTierGlyph(tier string, dim bool) string {
 	glyph := tierBadge(tier)
+	if dim {
+		return glyph
+	}
 	switch tier {
 	case trace.TierShort:
 		return styleTierShort.Render(glyph)
@@ -1343,7 +1351,12 @@ func (m model) renderList(width, height int) string {
 		// badge is at most 14 chars (longest type: "observation"=11 + 2 = 13)
 		badgeW := 14
 		dateW := 10
-		tierGlyph := renderTierGlyph(r.Tier)
+		// When the detail pane has focus, the list acts as a dim
+		// backdrop — pass that through so the tier glyph skips its
+		// heat-chart ANSI (whose embedded reset would otherwise
+		// terminate the outer dim style mid-line).
+		dim := m.focus == focusDetail
+		tierGlyph := renderTierGlyph(r.Tier, dim)
 		// 1 cursor + 1 space + tier(1) + 1 space + title + 1 space +
 		// badge(14) + 1 space + date(10)
 		titleW := width - 2 - 2 - badgeW - 1 - dateW - 1
@@ -1380,12 +1393,13 @@ func (m model) renderList(width, height int) string {
 			date,
 		)
 
-		// When the detail pane owns focus, every row in the list is
-		// rendered through a dim palette — the entire pane fades like
-		// a modal backdrop, not just the selected row. The cursor row
-		// still sits one brightness step above the rest so the
-		// selection is findable at a glance when tabbing back.
-		dim := m.focus == focusDetail
+		// dim was computed above (alongside tierGlyph) so the tier
+		// glyph could opt out of its heat-chart ANSI when the pane
+		// is a backdrop; now it gates the row styles too. The entire
+		// pane fades like a modal backdrop, not just the selected
+		// row — the cursor row still sits one brightness step above
+		// the rest so the selection is findable at a glance when
+		// tabbing back.
 		switch {
 		case i == m.cursor:
 			if dim {

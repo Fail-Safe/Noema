@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -112,5 +113,37 @@ func TestFormatVotes(t *testing.T) {
 		if got := formatVotes(tc.n); got != tc.want {
 			t.Errorf("formatVotes(%d) = %q, want %q", tc.n, got, tc.want)
 		}
+	}
+}
+
+// TestRenderTierGlyph_DimDropsANSI pins the pane-dim-backdrop
+// interaction. When the list pane is acting as a dim backdrop (the
+// detail pane owns focus), the tier glyph must render as a plain
+// character without any embedded ANSI color — otherwise the heat-
+// chart styling's reset terminates the outer styleRowDim mid-line
+// and everything after the glyph (title, badge, date) fails to dim.
+// This test pins that contract so a future "let's always colorize the
+// tier glyph" refactor has to reckon with the dim case.
+func TestRenderTierGlyph_DimDropsANSI(t *testing.T) {
+	loadPalette("dark")
+
+	cases := []struct {
+		tier string
+	}{{"short"}, {"mid"}, {"long"}}
+
+	for _, tc := range cases {
+		t.Run(tc.tier, func(t *testing.T) {
+			// Non-dim: ANSI color present so the heat chart reads.
+			colored := renderTierGlyph(tc.tier, false)
+			if !strings.Contains(colored, "\x1b[") {
+				t.Errorf("renderTierGlyph(%q, false) should embed ANSI, got %q", tc.tier, colored)
+			}
+			// Dim: must be a plain character so outer dim style can
+			// wrap the whole row uniformly.
+			plain := renderTierGlyph(tc.tier, true)
+			if strings.Contains(plain, "\x1b[") {
+				t.Errorf("renderTierGlyph(%q, true) leaked ANSI, got %q — outer dim will break at the glyph", tc.tier, plain)
+			}
+		})
 	}
 }
