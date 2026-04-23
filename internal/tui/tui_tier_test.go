@@ -90,3 +90,27 @@ func TestTierBadge(t *testing.T) {
 		}
 	}
 }
+
+// TestFormatVotes pins the three-state display contract for the
+// tier-votes detail-pane line. Zero renders bare rather than as
+// "+0" (the unsigned zero looks wrong, and was an early iteration
+// bug that confused users into thinking they'd voted). Positive
+// values carry an explicit "+" so the sign is always legible at a
+// glance next to the tier name.
+func TestFormatVotes(t *testing.T) {
+	cases := []struct {
+		n    int
+		want string
+	}{
+		{0, "0"},
+		{1, "+1"},
+		{7, "+7"},
+		{-1, "-1"},
+		{-3, "-3"},
+	}
+	for _, tc := range cases {
+		if got := formatVotes(tc.n); got != tc.want {
+			t.Errorf("formatVotes(%d) = %q, want %q", tc.n, got, tc.want)
+		}
+	}
+}
