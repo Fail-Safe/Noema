@@ -137,6 +137,7 @@ func (w *Watcher) healMalformedFile(path string, row *cortex.Row) error {
 			ID:           row.ID,
 			Title:        row.Title,
 			Type:         row.Type,
+			Tier:         row.Tier,
 			Author:       row.Author,
 			Tags:         row.Tags,
 			DerivedFrom:  row.DerivedFrom,

@@ -75,6 +75,8 @@ func TestHealMalformed_PreservesMetadata(t *testing.T) {
 	t.Cleanup(func() { cx.Close() })
 
 	tr := trace.New("Important Note", "decision", "alice", []string{"alpha", "beta"}, "original body\n")
+	// Seed a mid-tier trace so we can also assert tier preservation.
+	tr.Tier = trace.TierMid
 	if err := cx.Add(tr); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
@@ -112,6 +114,10 @@ func TestHealMalformed_PreservesMetadata(t *testing.T) {
 	}
 	if len(healed.Tags) != 2 || healed.Tags[0] != "alpha" || healed.Tags[1] != "beta" {
 		t.Errorf("tags = %v, want [alpha beta]", healed.Tags)
+	}
+	if healed.Tier != trace.TierMid {
+		t.Errorf("tier = %q, want %q — heal must preserve tier or mid→short is a silent regression",
+			healed.Tier, trace.TierMid)
 	}
 	if !strings.Contains(healed.Body, "rewritten body only") {
 		t.Errorf("body does not preserve user content: %q", healed.Body)

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -95,6 +96,7 @@ func runVerifyCortexFor(out io.Writer, cx *cortex.Cortex, cfg *config.Config, cf
 	results = append(results, checkAccess(cx))
 	results = append(results, checkFederationConfig(cx)...)
 	results = append(results, checkWatch(cx))
+	results = append(results, checkConsolidation(cx))
 
 	header := fmt.Sprintf("noema verify cortex — %s (%s)", cx.Name, cx.Dir)
 	fmt.Fprintln(out, header)
@@ -482,5 +484,59 @@ func watchDebounceDisplay(d int) int {
 		return 300
 	}
 	return d
+}
+
+// checkConsolidation validates the consolidation config block. The
+// feature ships off by default — a missing block is OK. When present
+// with LLMEnabled, the LocalLLMEndpoint must parse as a URL and must
+// not be empty. Graduation thresholds, if set, must be non-negative.
+func checkConsolidation(cx *cortex.Cortex) checkResult {
+	m, err := cortex.ReadManifest(cx.Dir)
+	if err != nil {
+		return checkResult{
+			name:    "consolidation",
+			level:   checkFail,
+			summary: fmt.Sprintf("manifest unavailable: %v", err),
+		}
+	}
+	if m.Consolidation == nil {
+		return checkResult{
+			name:    "consolidation",
+			level:   checkOK,
+			summary: "not configured",
+		}
+	}
+	c := m.Consolidation
+	if c.LLMEnabled && c.LocalLLMEndpoint == "" {
+		return checkResult{
+			name:    "consolidation",
+			level:   checkWarn,
+			summary: "llm_enabled but local_llm_endpoint is empty",
+		}
+	}
+	if c.LLMEnabled && c.LocalLLMEndpoint != "" {
+		if _, err := url.Parse(c.LocalLLMEndpoint); err != nil {
+			return checkResult{
+				name:    "consolidation",
+				level:   checkFail,
+				summary: fmt.Sprintf("local_llm_endpoint not a valid URL: %v", err),
+			}
+		}
+	}
+	if c.Graduation != nil {
+		g := c.Graduation
+		if g.MinAgeDays < 0 || g.MinReadCount < 0 {
+			return checkResult{
+				name:    "consolidation",
+				level:   checkFail,
+				summary: "graduation thresholds must be non-negative",
+			}
+		}
+	}
+	return checkResult{
+		name:    "consolidation",
+		level:   checkOK,
+		summary: fmt.Sprintf("enabled=%t, llm_enabled=%t", c.Enabled, c.LLMEnabled),
+	}
 }
 
