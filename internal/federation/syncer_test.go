@@ -12,9 +12,10 @@ import (
 // optionally fails on a specific event ID. Used to drive replayBatch
 // without standing up a real cortex.
 type fakeReplayer struct {
-	failOn   string // ID of the event that should fail; "" means never fail
-	replayed []string
-	merged   []VClock
+	failOn       string // ID of the event that should fail; "" means never fail
+	replayed     []string
+	merged       []VClock
+	usageBatches [][]TraceUsage
 }
 
 func (f *fakeReplayer) ReplayEvent(e event.Event) error {
@@ -27,6 +28,11 @@ func (f *fakeReplayer) ReplayEvent(e event.Event) error {
 
 func (f *fakeReplayer) MergeClock(vc VClock) error {
 	f.merged = append(f.merged, vc)
+	return nil
+}
+
+func (f *fakeReplayer) MergeRemoteUsage(rows []TraceUsage) error {
+	f.usageBatches = append(f.usageBatches, rows)
 	return nil
 }
 

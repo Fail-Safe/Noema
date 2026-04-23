@@ -603,6 +603,31 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 		return mcp.NewToolResultText(string(data)), nil
 	})
 
+	s.AddTool(mcp.NewTool("sync_read_signal",
+		mcp.WithDescription("Returns per-peer tier-usage deltas (read_count, modify_count, last_read_at) for federation sync. Each peer publishes only its own rows — the ring aggregates by SUMing over every peer's contribution, so consolidation decisions operate on a federation-wide signal rather than the local slice. Returns a JSON array of trace_usage rows owned by this cortex with updated_at > since."),
+		mcp.WithString("since", mcp.Description("RFC3339 cursor — return only rows with updated_at > this value. Empty returns everything this peer owns.")),
+		mcp.WithNumber("limit", mcp.Description("Max rows to return (default 100, max 1000)")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if federationMode == cortex.FederationModeSubscribe {
+			return mcp.NewToolResultError(
+				"this cortex is in subscribe mode and does not serve read signal"), nil
+		}
+		since := req.GetString("since", "")
+		limit := req.GetInt("limit", 100)
+		if limit <= 0 || limit > 1000 {
+			limit = 100
+		}
+		rows, err := cx.LocalUsageSince(since, limit)
+		if err != nil {
+			return nil, err
+		}
+		data, err := json.Marshal(rows)
+		if err != nil {
+			return nil, fmt.Errorf("marshaling usage rows: %w", err)
+		}
+		return mcp.NewToolResultText(string(data)), nil
+	})
+
 	s.AddTool(mcp.NewTool("federation_status",
 		mcp.WithDescription("Show federation configuration, peer sync state, and local vector clock."),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
