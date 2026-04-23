@@ -38,11 +38,27 @@ func TestAtomicSaveDoesNotTrash(t *testing.T) {
 	}
 	time.Sleep(settleTime)
 
+	// autoOnboard uses today's UTC date when generating the new ID.
+	// Hardcoding the date prefix (e.g. "20260423") made this test
+	// flake past midnight UTC and break CI runs in UTC-late hours.
+	// Discover the rescued filename from the active traces dir
+	// instead so the test stays date-agnostic.
+	rescued := ""
+	entries, _ := os.ReadDir(cx.TracesDir())
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), "-untitled.md") {
+			rescued = filepath.Join(cx.TracesDir(), e.Name())
+			break
+		}
+	}
+	if rescued == "" {
+		t.Fatalf("autoOnboard didn't produce a *-untitled.md file in %s", cx.TracesDir())
+	}
+
 	// Obsidian's tab now points at the renamed file. Subsequent saves
 	// use macOS's "atomic replace" pattern: remove + recreate. The
 	// watcher must treat that gap as a transient save artifact, not
 	// an external delete.
-	rescued := filepath.Join(cx.TracesDir(), "20260423-untitled.md")
 	if err := os.Remove(rescued); err != nil {
 		t.Fatalf("Remove (atomic-save phase 1): %v", err)
 	}
@@ -61,13 +77,14 @@ func TestAtomicSaveDoesNotTrash(t *testing.T) {
 	}
 
 	// Assertion 2: DB row for the rescued trace stays active (no
-	// trashed_at stamp).
+	// trashed_at stamp). Match against the dynamically-discovered ID.
+	rescuedID := strings.TrimSuffix(filepath.Base(rescued), ".md")
 	rows, err := cx.List(cortex.ListOptions{All: true})
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
 	for _, r := range rows {
-		if r.ID == "20260423-untitled" && r.TrashedAt != "" {
+		if r.ID == rescuedID && r.TrashedAt != "" {
 			t.Errorf("trace %s has trashed_at=%q after atomic save; expected empty",
 				r.ID, r.TrashedAt)
 		}
