@@ -13,12 +13,16 @@ import (
 // contract that only ActorAgent bumps counters — the whole point of the
 // attribution system is to keep the consolidation-scoring signal clean.
 
+// readCountOf returns the aggregate (read_count, last_read_at) across
+// all peers for the given trace — the same view the heuristic and
+// scorer consume. Post-PR-A this reads from trace_usage (the new
+// source of truth) rather than the legacy traces columns.
 func readCountOf(t *testing.T, cx *cortex.Cortex, id string) (int, string) {
 	t.Helper()
 	var count int
 	var lastRead *string
 	err := cx.DB.QueryRow(
-		`SELECT read_count, last_read_at FROM traces WHERE id = ?`, id,
+		`SELECT COALESCE(SUM(read_count), 0), MAX(last_read_at) FROM trace_usage WHERE trace_id = ?`, id,
 	).Scan(&count, &lastRead)
 	if err != nil {
 		t.Fatalf("reading counters: %v", err)
@@ -33,7 +37,9 @@ func readCountOf(t *testing.T, cx *cortex.Cortex, id string) (int, string) {
 func modifyCountOf(t *testing.T, cx *cortex.Cortex, id string) int {
 	t.Helper()
 	var count int
-	if err := cx.DB.QueryRow(`SELECT modify_count FROM traces WHERE id = ?`, id).Scan(&count); err != nil {
+	if err := cx.DB.QueryRow(
+		`SELECT COALESCE(SUM(modify_count), 0) FROM trace_usage WHERE trace_id = ?`, id,
+	).Scan(&count); err != nil {
 		t.Fatalf("reading modify_count: %v", err)
 	}
 	return count

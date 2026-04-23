@@ -41,9 +41,11 @@ const (
 // bumps read_count + last_read_at when the caller is ActorAgent. Other
 // actors (ActorHuman, ActorSystem) short-circuit to plain Get behavior.
 //
-// Counter bumps are skipped on tier='long' rows because the DB trigger
-// blocks all UPDATE statements on long-term traces. Long-term usage
-// signal could be revisited in a later phase if it proves valuable.
+// The bump writes to trace_usage keyed on (trace_id, local cortex ID) —
+// CRDT-style per-peer counters. Federated peers receive each other's
+// counters via sync_read_signal and the heuristic queries the aggregate.
+// Long-tier traces skip the bump because the immutability trigger blocks
+// updates; revisit if long-tier usage signal ever proves useful.
 func (c *Cortex) GetAs(id string, actor ReadActor) (*Row, error) {
 	row, err := c.Get(id)
 	if err != nil {
@@ -52,12 +54,8 @@ func (c *Cortex) GetAs(id string, actor ReadActor) (*Row, error) {
 	if actor != ActorAgent || row.Tier == trace.TierLong {
 		return row, nil
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	if _, err := c.DB.Exec(
-		`UPDATE traces SET read_count = read_count + 1, last_read_at = ? WHERE id = ?`,
-		now, id,
-	); err != nil {
-		return row, fmt.Errorf("bumping read_count: %w", err)
+	if err := c.bumpReadCount(id); err != nil {
+		return row, err
 	}
 	return row, nil
 }
@@ -67,6 +65,7 @@ func (c *Cortex) GetAs(id string, actor ReadActor) (*Row, error) {
 // FTS refresh, etc.) and bumps modify_count when the caller is
 // ActorAgent. A failed Update short-circuits before the bump.
 //
+// The bump writes to trace_usage keyed on (trace_id, local cortex ID).
 // Long-term traces can never reach the bump step: the immutability trigger
 // aborts the inner Update transaction first.
 func (c *Cortex) UpdateAs(id string, actor ReadActor) error {
@@ -76,9 +75,43 @@ func (c *Cortex) UpdateAs(id string, actor ReadActor) error {
 	if actor != ActorAgent {
 		return nil
 	}
-	if _, err := c.DB.Exec(
-		`UPDATE traces SET modify_count = modify_count + 1 WHERE id = ?`, id,
-	); err != nil {
+	return c.bumpModifyCount(id)
+}
+
+// bumpReadCount upserts a read_count+=1 and last_read_at=now on the
+// local peer's trace_usage row. Creates the row if this is the first
+// read (or the peer's cortex ID is new to this trace_id).
+func (c *Cortex) bumpReadCount(traceID string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := c.DB.Exec(`
+		INSERT INTO trace_usage (trace_id, peer_cortex_id, read_count, modify_count, last_read_at, updated_at)
+		VALUES (?, ?, 1, 0, ?, ?)
+		ON CONFLICT(trace_id, peer_cortex_id) DO UPDATE SET
+			read_count   = read_count + 1,
+			last_read_at = excluded.last_read_at,
+			updated_at   = excluded.updated_at`,
+		traceID, c.ID, now, now,
+	)
+	if err != nil {
+		return fmt.Errorf("bumping read_count: %w", err)
+	}
+	return nil
+}
+
+// bumpModifyCount upserts a modify_count+=1 on the local peer's
+// trace_usage row. last_read_at is left untouched — modification is a
+// distinct signal from reading.
+func (c *Cortex) bumpModifyCount(traceID string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := c.DB.Exec(`
+		INSERT INTO trace_usage (trace_id, peer_cortex_id, read_count, modify_count, last_read_at, updated_at)
+		VALUES (?, ?, 0, 1, NULL, ?)
+		ON CONFLICT(trace_id, peer_cortex_id) DO UPDATE SET
+			modify_count = modify_count + 1,
+			updated_at   = excluded.updated_at`,
+		traceID, c.ID, now,
+	)
+	if err != nil {
 		return fmt.Errorf("bumping modify_count: %w", err)
 	}
 	return nil
