@@ -11,7 +11,70 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/Fail-Safe/Noema/internal/cortex"
+	"github.com/Fail-Safe/Noema/internal/trace"
 )
+
+// --------- tier visibility in MCP output ---------
+//
+// Pins the contract that list_traces / search_traces / get_trace must
+// expose the tier of every trace to MCP consumers. Agents reason about
+// immutability and curation based on tier; the TUI and CLI both surface
+// it, so MCP parity is required. A regression here would make agents
+// tier-blind again.
+
+func TestFormatRows_IncludesTierGlyph(t *testing.T) {
+	rows := []cortex.Row{
+		{ID: "20260424-a", Title: "short one", Type: "note", CreatedAt: "2026-04-24T00:00:00Z", Tier: trace.TierShort},
+		{ID: "20260424-b", Title: "mid one", Type: "note", CreatedAt: "2026-04-24T00:00:00Z", Tier: trace.TierMid},
+		{ID: "20260424-c", Title: "long one", Type: "note", CreatedAt: "2026-04-24T00:00:00Z", Tier: trace.TierLong},
+	}
+	out := formatRows(rows)
+	for _, want := range []string{"[s]", "[m]", "[L]"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("formatRows output missing tier glyph %q; got:\n%s", want, out)
+		}
+	}
+}
+
+func TestGetTrace_IncludesTierLine(t *testing.T) {
+	// Integration-level: seed a trace at mid tier through the Cortex,
+	// invoke get_trace over MCP, and assert the output carries a
+	// "Tier: mid" line. Pre-fix this failed because the metadata block
+	// only surfaced ID/Title/Type/Author/Tags/Created/Updated with no
+	// tier slot at all.
+	cx := newTestCortex(t)
+	tr := trace.New("tier-vis", "note", "agent", nil, "body")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := cx.Promote(tr.ID, trace.TierMid); err != nil {
+		t.Fatalf("Promote: %v", err)
+	}
+
+	s := NewServer(cx, "test-version", "")
+	text, isErr := callTool(t, s, "get_trace", map[string]any{"id": tr.ID})
+	if isErr {
+		t.Fatalf("get_trace returned error: %s", text)
+	}
+	if !strings.Contains(text, "Tier: mid") {
+		t.Errorf("get_trace output missing 'Tier: mid' line; got:\n%s", text)
+	}
+}
+
+func TestTierGlyph(t *testing.T) {
+	cases := map[string]string{
+		trace.TierShort: "s",
+		trace.TierMid:   "m",
+		trace.TierLong:  "L",
+		"":              "?",
+		"bogus":         "?",
+	}
+	for in, want := range cases {
+		if got := tierGlyph(in); got != want {
+			t.Errorf("tierGlyph(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
 
 // --------- renderInstructions (pure helper) ---------
 
