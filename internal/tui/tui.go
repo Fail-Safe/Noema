@@ -1385,9 +1385,21 @@ func (m model) renderList(width, height int) string {
 				cursor = "·"
 			}
 		}
-		line := fmt.Sprintf("%s %s %-*s %-*s %s",
-			cursor,
-			tierGlyph,
+
+		// Split the row into prefix | tier glyph | suffix so the row
+		// style can emit its bg both BEFORE and AFTER the tier glyph.
+		// If we render prefix+glyph+suffix as one string wrapped by
+		// a single rowStyle.Render(...), the heat-chart tier glyph's
+		// embedded `\x1b[0m` reset terminates the outer row style
+		// mid-line — everything after the glyph (title, badge, date)
+		// loses the styled bg and falls back to terminal default.
+		// In dark mode that happens to match styleSurface's near-
+		// black, so the bug was invisible; in light mode, the light
+		// row bg turns into terminal-dark-bg and the list looks
+		// broken. Splitting the render lets each styled chunk assert
+		// its own bg independently.
+		prefix := cursor + " "
+		suffix := fmt.Sprintf(" %-*s %-*s %s",
 			titleW, padRunes(title, titleW),
 			badgeW, badge,
 			date,
@@ -1400,26 +1412,35 @@ func (m model) renderList(width, height int) string {
 		// row — the cursor row still sits one brightness step above
 		// the rest so the selection is findable at a glance when
 		// tabbing back.
+		var rowStyle lipgloss.Style
 		switch {
 		case i == m.cursor:
 			if dim {
-				sb.WriteString(styleSelectedDim.Width(width).Render(line))
+				rowStyle = styleSelectedDim
 			} else {
-				sb.WriteString(styleSelected.Width(width).Render(line))
+				rowStyle = styleSelected
 			}
 		case m.newRowTTL[r.ID] > 0:
 			if dim {
-				sb.WriteString(styleNewRowDim.Width(width).Render(line))
+				rowStyle = styleNewRowDim
 			} else {
-				sb.WriteString(styleNewRow.Width(width).Render(line))
+				rowStyle = styleNewRow
 			}
 		default:
 			if dim {
-				sb.WriteString(styleRowDim.Width(width).Render(line))
+				rowStyle = styleRowDim
 			} else {
-				sb.WriteString(styleSurface.Width(width).Render(line))
+				rowStyle = styleSurface
 			}
 		}
+		// Prefix: exactly 2 cols (cursor + space). Glyph: 1 col.
+		// Suffix: pad to fill the rest of the row so the bg
+		// extends cleanly to the divider.
+		sb.WriteString(
+			rowStyle.Render(prefix) +
+				tierGlyph +
+				rowStyle.Width(width-3).Render(suffix),
+		)
 		if i < end-1 {
 			sb.WriteByte('\n')
 		}
