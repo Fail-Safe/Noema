@@ -551,7 +551,9 @@ The three-tier model (short → mid → long) completes with an automatic mid→
 consolidation:
   enabled: true
   llm_enabled: true
+  auto_distillation_enabled: true     # run LLM distillation on every trigger
   local_llm_endpoint: http://localhost:11434/v1
+  model_name: llama3.1:70b
   window_hours: 6
   graduation:
     enabled: true
@@ -561,6 +563,12 @@ consolidation:
 ```
 
 Explicit curation is always available: `noema memory promote <id>` advances a trace one tier (short→mid or mid→long), and `noema memory demote <id>` steps mid→short. Long-term demotion goes through `noema memory purge` because undoing a base truth deserves the same ceremony as destroying it.
+
+### Automatic LLM distillation
+
+By default, `consolidation.llm_enabled: true` wires up the `noema consolidate` CLI but leaves the in-process agent on cheap heuristic-only work — you'd run the CLI from a separate system cron to get clusters distilled. Set `auto_distillation_enabled: true` to fold the LLM pipeline into every scheduled trigger instead, so each cron/idle/threshold fire runs **distillation → heuristic → graduation** in sequence on the elected peer.
+
+Requires `llm_enabled`, `local_llm_endpoint`, and `model_name` to all be set — Noema refuses to start otherwise. If the LLM endpoint is unreachable at trigger time, distillation is logged and skipped; the chained heuristic + graduation passes still run so an offline LLM doesn't block cheap maintenance.
 
 ### Content hashing and source-locking
 

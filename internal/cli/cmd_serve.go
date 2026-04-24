@@ -362,6 +362,24 @@ func startConsolidator(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig, fed *
 		Window: cfg.EffectiveWindowHours(),
 	}, logger)
 
+	// When auto-distillation is opted in, prepend the LLM pipeline so
+	// each trigger runs distillation → heuristic → graduation in order.
+	// DistillationPass swallows endpoint/pipeline errors so the chained
+	// heuristic + graduation passes still fire when the LLM is offline.
+	// ValidateConsolidation has already guaranteed llm_enabled +
+	// local_llm_endpoint + model_name are set by the time we get here.
+	if cfg.AutoDistillationEnabled {
+		distill := consolidation.DistillationPass(cx, consolidation.PipelineConfig{
+			Window:     cfg.EffectiveWindowHours(),
+			ModelTier:  cfg.EffectiveModelTier(),
+			ModelName:  cfg.ModelName,
+			MaxRetries: 1,
+		}, cfg.LocalLLMEndpoint, cfg.APIKeyEnv, logger)
+		pass = consolidation.ChainPasses(distill, pass)
+		fmt.Fprintf(os.Stderr, "[consolidation] auto-distillation enabled (endpoint=%s model=%q tier=%s)\n",
+			cfg.LocalLLMEndpoint, cfg.ModelName, cfg.EffectiveModelTier())
+	}
+
 	// Phase 15: mid→long graduation runs on the same trigger cadence
 	// alongside short→mid promotion. Chain the two so each scheduler
 	// fire evaluates both transitions in order.

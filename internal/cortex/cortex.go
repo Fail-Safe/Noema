@@ -197,6 +197,20 @@ type ConsolidationConfig struct {
 	// mid-tier memories instead of promoted one-to-one.
 	LLMEnabled bool `yaml:"llm_enabled,omitempty"`
 
+	// AutoDistillationEnabled opts the in-process agent into running the
+	// LLM distillation pipeline on every scheduled trigger (cron / idle /
+	// threshold), before the heuristic promotion + graduation passes.
+	// Default false: LLMEnabled alone wires up `noema consolidate` but
+	// leaves the background agent on cheap heuristic-only work, matching
+	// the pre-v0.10.1 behaviour. Requires LLMEnabled, LocalLLMEndpoint,
+	// and ModelName — ValidateConsolidation refuses the config otherwise.
+	//
+	// Failure semantics: if the LLM endpoint is unreachable or the pass
+	// errors, the distillation result is logged and swallowed so the
+	// chained heuristic + graduation passes still fire. An offline LLM
+	// should not block the cheap maintenance work.
+	AutoDistillationEnabled bool `yaml:"auto_distillation_enabled,omitempty"`
+
 	// ModelTier is the prompt-style profile the consolidation pipeline
 	// uses when calling the LLM: "small" (7B-13B, multi-step template),
 	// "large" (30B-70B, same plus confidence step), or "frontier"
@@ -468,6 +482,32 @@ func (m Manifest) ValidateFederation() error {
 	return nil
 }
 
+// ValidateConsolidation checks that the consolidation block is
+// internally consistent. Today's only cross-field rule: when
+// AutoDistillationEnabled is true, LLMEnabled + LocalLLMEndpoint +
+// ModelName must all be set, because the trigger path has no CLI flags
+// to fall back on. Returns nil when consolidation is disabled or the
+// block is absent.
+func (m Manifest) ValidateConsolidation() error {
+	cc := m.Consolidation
+	if cc == nil || !cc.Enabled {
+		return nil
+	}
+	if !cc.AutoDistillationEnabled {
+		return nil
+	}
+	if !cc.LLMEnabled {
+		return fmt.Errorf("consolidation.auto_distillation_enabled requires consolidation.llm_enabled: true")
+	}
+	if cc.LocalLLMEndpoint == "" {
+		return fmt.Errorf("consolidation.auto_distillation_enabled requires consolidation.local_llm_endpoint to be set")
+	}
+	if cc.ModelName == "" {
+		return fmt.Errorf("consolidation.auto_distillation_enabled requires consolidation.model_name to be set")
+	}
+	return nil
+}
+
 // ReadManifest parses the cortex.md manifest in the given cortex directory.
 // cortex.md is a markdown file with YAML frontmatter: a `---` fence, the
 // manifest YAML, a closing `---` fence, and an optional free-form body.
@@ -487,6 +527,9 @@ func ReadManifest(dir string) (Manifest, error) {
 		m.Body = string(body)
 	}
 	if err := m.ValidateFederation(); err != nil {
+		return Manifest{}, err
+	}
+	if err := m.ValidateConsolidation(); err != nil {
 		return Manifest{}, err
 	}
 	return m, nil
