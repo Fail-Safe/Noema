@@ -2484,6 +2484,79 @@ func TestValidateFederation_NilFederation(t *testing.T) {
 	}
 }
 
+// ---- ValidateConsolidation ----
+//
+// Pins the cross-field rule that auto_distillation_enabled requires the
+// LLM block to be fully populated. The trigger path has no CLI flags to
+// fall back on, so a half-filled config would silently no-op on every
+// scheduled pass — surfacing it at load time is the only way operators
+// discover the gap before production.
+
+func TestValidateConsolidation_NilOrDisabled(t *testing.T) {
+	// Nil and Enabled=false should both pass: there is no agent to
+	// validate against.
+	cases := []cortex.Manifest{
+		{},
+		{Consolidation: &cortex.ConsolidationConfig{Enabled: false, AutoDistillationEnabled: true}},
+	}
+	for i, m := range cases {
+		if err := m.ValidateConsolidation(); err != nil {
+			t.Errorf("case %d: expected nil, got %v", i, err)
+		}
+	}
+}
+
+func TestValidateConsolidation_AutoDistillationHappyPath(t *testing.T) {
+	m := cortex.Manifest{
+		Consolidation: &cortex.ConsolidationConfig{
+			Enabled:                 true,
+			AutoDistillationEnabled: true,
+			LLMEnabled:              true,
+			LocalLLMEndpoint:        "http://localhost:11434/v1",
+			ModelName:               "llama3.1:70b",
+		},
+	}
+	if err := m.ValidateConsolidation(); err != nil {
+		t.Errorf("fully configured auto-distillation rejected: %v", err)
+	}
+}
+
+func TestValidateConsolidation_AutoDistillationMissingFields(t *testing.T) {
+	cases := []struct {
+		name    string
+		cfg     cortex.ConsolidationConfig
+		wantSub string
+	}{
+		{
+			name:    "missing llm_enabled",
+			cfg:     cortex.ConsolidationConfig{Enabled: true, AutoDistillationEnabled: true, LocalLLMEndpoint: "x", ModelName: "m"},
+			wantSub: "llm_enabled",
+		},
+		{
+			name:    "missing endpoint",
+			cfg:     cortex.ConsolidationConfig{Enabled: true, AutoDistillationEnabled: true, LLMEnabled: true, ModelName: "m"},
+			wantSub: "local_llm_endpoint",
+		},
+		{
+			name:    "missing model_name",
+			cfg:     cortex.ConsolidationConfig{Enabled: true, AutoDistillationEnabled: true, LLMEnabled: true, LocalLLMEndpoint: "x"},
+			wantSub: "model_name",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := cortex.Manifest{Consolidation: &tc.cfg}
+			err := m.ValidateConsolidation()
+			if err == nil {
+				t.Fatalf("expected error mentioning %q, got nil", tc.wantSub)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("error should mention %q, got: %v", tc.wantSub, err)
+			}
+		})
+	}
+}
+
 // ---- Security: path traversal ----
 
 func TestReplayEvent_Promote(t *testing.T) {

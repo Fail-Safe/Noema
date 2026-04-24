@@ -999,6 +999,11 @@ federation_status displays each peer's current rank. No configuration required
 beyond the existing consolidation block — coordination is automatic when peers
 are present.
 
+Setting consolidation.auto_distillation_enabled=true folds the LLM distillation
+pipeline into every scheduled trigger (distillation → heuristic → graduation on
+the elected peer). Requires llm_enabled + local_llm_endpoint + model_name, and
+degrades to heuristic+graduation when the LLM endpoint is unreachable.
+
 ## Source-Locking
 Traces can be source-locked by setting source_locked=true on creation. A source-locked
 trace refuses update, delete, and remove when the local cortex is not the trace's origin.
