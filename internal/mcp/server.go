@@ -99,8 +99,8 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 		if err != nil {
 			return nil, err
 		}
-		out := fmt.Sprintf("ID: %s\nTitle: %s\nType: %s\nAuthor: %s\nTags: %s\nCreated: %s\nUpdated: %s",
-			row.ID, row.Title, row.Type, row.Author,
+		out := fmt.Sprintf("ID: %s\nTitle: %s\nType: %s\nTier: %s\nAuthor: %s\nTags: %s\nCreated: %s\nUpdated: %s",
+			row.ID, row.Title, row.Type, row.Tier, row.Author,
 			strings.Join(row.Tags, ", "),
 			row.CreatedAt, row.UpdatedAt,
 		)
@@ -1015,6 +1015,9 @@ federation events. source_hash records the origin's content_hash at publish time
 consumers can detect drift.
 
 get_trace shows Source Locked, Source Hash, and Content Hash fields when present.
+Both list_traces and search_traces prefix each row with a tier glyph (s=short,
+m=mid, L=long) so you can see the tier without a second lookup. get_trace surfaces
+the full tier name on a dedicated "Tier:" line in the metadata block.
 
 ## External Filesystem Edits
 Whenever noema serve is running (stdio OR http), a background watcher
@@ -1063,7 +1066,7 @@ func formatRows(rows []cortex.Row) string {
 		if r.Type == string(trace.TypeDivergence) {
 			typeLabel = "DIVERGENCE"
 		}
-		sb.WriteString(fmt.Sprintf("[%s] %s (%s)", typeLabel, r.ID, r.CreatedAt[:10]))
+		sb.WriteString(fmt.Sprintf("[%s] [%s] %s (%s)", tierGlyph(r.Tier), typeLabel, r.ID, r.CreatedAt[:10]))
 		if r.Author != "" {
 			sb.WriteString(fmt.Sprintf(" — %s", r.Author))
 		}
@@ -1074,4 +1077,22 @@ func formatRows(rows []cortex.Row) string {
 		sb.WriteString(fmt.Sprintf("  %s\n", r.Title))
 	}
 	return sb.String()
+}
+
+// tierGlyph returns the one-letter tier indicator used in MCP list/search
+// output, matching the TUI convention (lowercase for short/mid,
+// uppercase L for long to make long-term traces easy to spot). Unknown
+// tiers render as "?" so a missing tier column surfaces visibly rather
+// than blending in.
+func tierGlyph(tier string) string {
+	switch tier {
+	case trace.TierShort:
+		return "s"
+	case trace.TierMid:
+		return "m"
+	case trace.TierLong:
+		return "L"
+	default:
+		return "?"
+	}
 }
