@@ -210,13 +210,39 @@ func TestVote_AccumulatesBothDirections(t *testing.T) {
 func TestVote_RejectsBadDelta(t *testing.T) {
 	cx := setup(t)
 	id := seed(t, cx, "bad delta", trace.TierShort)
-	for _, bad := range []int{0, 2, -2, 10} {
+	// ±1 and ±2 are valid (±2 supports the TUI session-toggle flip
+	// case: going from -1 intent to +1 intent in one keypress). 0
+	// and anything beyond ±2 is rejected so the signal can't be
+	// amplified arbitrarily.
+	for _, bad := range []int{0, 3, -3, 10} {
 		if err := cx.Vote(id, bad, cortex.ActorAgent); err == nil {
 			t.Errorf("Vote with delta %d should have failed", bad)
 		}
 	}
 	if got := voteSumOf(t, cx, id); got != 0 {
 		t.Errorf("tier_votes polluted by rejected votes = %d, want 0", got)
+	}
+}
+
+func TestVote_AcceptsFlipDelta(t *testing.T) {
+	cx := setup(t)
+	id := seed(t, cx, "flip delta", trace.TierShort)
+	// -2 flips a -1 intent straight to +1 (or a +1 to -1) in the
+	// TUI session-toggle handler. The DB accumulator just adds.
+	if err := cx.Vote(id, -1, cortex.ActorHuman); err != nil {
+		t.Fatalf("Vote -1: %v", err)
+	}
+	if err := cx.Vote(id, 2, cortex.ActorHuman); err != nil {
+		t.Fatalf("Vote +2 (flip): %v", err)
+	}
+	if got := voteSumOf(t, cx, id); got != 1 {
+		t.Errorf("tier_votes after -1 then +2 = %d, want 1", got)
+	}
+	if err := cx.Vote(id, -2, cortex.ActorHuman); err != nil {
+		t.Fatalf("Vote -2 (flip): %v", err)
+	}
+	if got := voteSumOf(t, cx, id); got != -1 {
+		t.Errorf("tier_votes after flip back = %d, want -1", got)
 	}
 }
 

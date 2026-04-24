@@ -75,8 +75,13 @@ func (c *Cortex) TierVotes(id string) (int, error) {
 }
 
 func (c *Cortex) Vote(id string, delta int, actor ReadActor) error {
-	if delta != 1 && delta != -1 {
-		return fmt.Errorf("vote delta must be +1 or -1, got %d", delta)
+	// Allow ±1 for a fresh vote and ±2 for a flip (user was at -1 in a
+	// session-toggle UI, pressing the opposite key swings straight to
+	// +1 — one event log entry instead of two). Anything outside that
+	// range is either a bug or an attempt to amplify the signal, which
+	// is what the refactor to session-toggle was meant to prevent.
+	if delta == 0 || delta < -2 || delta > 2 {
+		return fmt.Errorf("vote delta must be ±1 or ±2, got %d", delta)
 	}
 	if actor == ActorSystem {
 		return fmt.Errorf("system actor cannot cast tier-preference votes")

@@ -384,6 +384,14 @@ type model struct {
 	cursor       int
 	current      *trace.Trace // cached detail for selected row
 	currentVotes int          // tier_votes for m.current, refreshed whenever m.current reloads
+
+	// sessionVotes tracks this session's vote intent per trace ID: -1,
+	// 0, or +1. The DB column tier_votes is an accumulator that any
+	// actor can contribute to; this map is the TUI's local "what have
+	// I cast in this session" so a single user can't pile up +6 by
+	// holding the + key. Reddit-style three-state cycle: + on a fresh
+	// trace → +1; + again → 0 (clears); + when at -1 → +1 (flip).
+	sessionVotes map[string]int
 	width       int
 	height      int
 	state       viewState
@@ -437,6 +445,7 @@ func initialModel(cx *cortex.Cortex) model {
 		search:       ti,
 		state:        stateList,
 		newRowTTL:    map[string]int{},
+		sessionVotes: map[string]int{},
 		visibleShort: true,
 		visibleMid:   true,
 		visibleLong:  false,
@@ -794,28 +803,22 @@ func (m model) updateList(msg tea.KeyMsg) (model, tea.Cmd) {
 	case "+", "=":
 		// Accept "=" too so users on layouts where "+" requires Shift
 		// can upvote without the modifier. "-" is unambiguous.
+		//
+		// Three-state cycle per trace per TUI session:
+		//   0 → +1   (cast upvote)
+		//  +1 → 0    (clear my upvote — same key cycles off)
+		//  -1 → +1   (flip downvote to upvote)
+		// sessionVotes tracks the intent; the DB delta is new - prev.
 		if len(m.rows) == 0 {
 			return m, nil
 		}
-		row := m.rows[m.cursor]
-		if err := m.cx.Vote(row.ID, 1, cortex.ActorHuman); err != nil {
-			m.err = err
-			return m, nil
-		}
-		m.status = "▲ " + row.ID
-		return m, m.reload()
+		return m.castVote(m.rows[m.cursor].ID, +1, "▲", "cleared ▲ on")
 
 	case "-":
 		if len(m.rows) == 0 {
 			return m, nil
 		}
-		row := m.rows[m.cursor]
-		if err := m.cx.Vote(row.ID, -1, cortex.ActorHuman); err != nil {
-			m.err = err
-			return m, nil
-		}
-		m.status = "▼ " + row.ID
-		return m, m.reload()
+		return m.castVote(m.rows[m.cursor].ID, -1, "▼", "cleared ▼ on")
 
 	case "/":
 		m.state = stateSearch
@@ -1068,6 +1071,46 @@ func (m model) loadCurrentVotes() int {
 		return 0
 	}
 	return votes
+}
+
+// castVote applies the session-toggle cycle for a ±1 keypress. target
+// is the caller's desired direction (+1 for '+'/'=', -1 for '-').
+// The new session intent is:
+//
+//	prev == target → 0        (same key twice clears the vote)
+//	prev == 0      → target   (fresh cast)
+//	prev == -target → target  (flip)
+//
+// The DB delta sent to cx.Vote is (newIntent - prev) and falls in
+// {-2, -1, 0, 1, 2}. Zero is a no-op (shouldn't happen with the logic
+// above but defended for safety). Any non-zero value hits the
+// accumulator and emits one ActionVote event per keypress.
+//
+// castKind / clearKind are the status-line glyphs shown after the
+// cast depending on whether this was a set or a clear.
+func (m model) castVote(traceID string, target int, castKind, clearKind string) (model, tea.Cmd) {
+	prev := m.sessionVotes[traceID]
+	var newIntent int
+	if prev == target {
+		newIntent = 0
+	} else {
+		newIntent = target
+	}
+	delta := newIntent - prev
+	if delta == 0 {
+		return m, nil
+	}
+	if err := m.cx.Vote(traceID, delta, cortex.ActorHuman); err != nil {
+		m.err = err
+		return m, nil
+	}
+	m.sessionVotes[traceID] = newIntent
+	if newIntent == 0 {
+		m.status = clearKind + " " + traceID
+	} else {
+		m.status = castKind + " " + traceID
+	}
+	return m, m.reload()
 }
 
 // paneWidths returns the widths of the list pane and the detail pane
