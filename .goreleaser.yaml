@@ -194,6 +194,39 @@ brews:
     install: |
       bin.install "noema"
 
+  # Beta channel: a parallel formula that publishes ONLY on prerelease
+  # tags (v*-beta*, v*-rc*, v*-alpha*). Inverts the stable formula's
+  # skip_upload rule — stable uploads when !Prerelease, beta uploads
+  # when Prerelease. Install with:
+  #
+  #   brew install Fail-Safe/tap/noema-beta
+  #
+  # Declares `conflicts_with "noema"` so users can only have one channel
+  # installed at a time — brew surfaces a clear message if they try to
+  # install both, and `brew upgrade` on the beta picks up each new
+  # prerelease automatically.
+  - name: noema-beta
+    repository:
+      owner: Fail-Safe
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/Fail-Safe/Noema"
+    description: "The intentional memory layer for your AI agents (beta channel)"
+    license: "MIT"
+    skip_upload: "{{ if .Prerelease }}false{{ else }}true{{ end }}"
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
+    commit_msg_template: "brews: update {{ .ProjectName }}-beta to {{ .Tag }}"
+    conflicts:
+      - noema
+    test: |
+      system "#{bin}/noema", "version"
+    install: |
+      bin.install "noema"
+
 homebrew_casks:
   - name: noema
     binaries:

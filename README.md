@@ -81,6 +81,28 @@ brew install noema          # formula (macOS + Linux)
 brew install --cask noema   # cask (macOS only)
 ```
 
+#### Beta channel
+
+Prerelease builds (`v*-beta*`, `v*-rc*`, `v*-alpha*`) publish to a
+parallel formula so you can track the edge without the stable channel
+moving under you:
+
+```bash
+brew install Fail-Safe/tap/noema-beta
+```
+
+`noema-beta` installs the same `noema` binary and conflicts with the
+stable formula — Homebrew will refuse to install both at once. To
+switch channels:
+
+```bash
+brew uninstall noema      # (or noema-beta)
+brew install Fail-Safe/tap/noema-beta   # (or noema)
+```
+
+`brew upgrade` on `noema-beta` pulls the newest prerelease; stable tags
+(`v0.10.0` vs `v0.10.0-beta.1`) stay on their respective channels.
+
 ### Download a pre-built binary
 
 Grab the archive for your OS/arch from the
