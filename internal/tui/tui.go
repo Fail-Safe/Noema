@@ -1058,6 +1058,21 @@ func (m model) loadCurrent() *trace.Trace {
 	return t
 }
 
+// formatVotes renders the tier_votes count for the detail pane. Zero
+// is shown bare ("0") rather than "+0" — the signed format %+d stamps
+// a sign on every number including zero, which looks wrong. Positive
+// counts get an explicit + so the sign is always legible at a glance.
+func formatVotes(n int) string {
+	switch {
+	case n > 0:
+		return fmt.Sprintf("+%d", n)
+	case n < 0:
+		return fmt.Sprintf("%d", n) // negative values already carry the sign
+	default:
+		return "0"
+	}
+}
+
 // loadCurrentVotes returns the tier_votes count for the row under the
 // cursor. Renders "0" for an empty list or a row that can't be
 // resolved — the detail pane is blanked in those cases anyway, so the
@@ -1451,7 +1466,7 @@ func (m model) renderDetail(width, height int) string {
 	if tier == "" {
 		tier = "short"
 	}
-	lines = append(lines, metaLine("tier", fmt.Sprintf("%s  (votes: %+d)", tier, m.currentVotes)))
+	lines = append(lines, metaLine("tier", fmt.Sprintf("%s  (votes: %s)", tier, formatVotes(m.currentVotes))))
 	if t.Author != "" {
 		lines = append(lines, metaLine("author", t.Author))
 	}
