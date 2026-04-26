@@ -67,11 +67,12 @@ func TestEligibility_SubscribeMode_AdvertisesZero(t *testing.T) {
 	// Rank=0 even when the feature is enabled and the endpoint is alive
 	// — matches the §14 mode-compatibility table.
 	loop, state := buildLoop(t, consolidation.EligibilityConfig{
-		Enabled:        true,
-		LLMEnabled:     true,
-		FederationMode: "subscribe",
-		Endpoint:       "http://example.invalid",
-		Probe:          func(context.Context, string) bool { return true },
+		Enabled:            true,
+		LLMEnabled:         true,
+		TriggersConfigured: true,
+		FederationMode:     "subscribe",
+		Endpoint:           "http://example.invalid",
+		Probe:              func(context.Context, string) bool { return true },
 	})
 	loop.Refresh()
 
@@ -88,11 +89,12 @@ func TestEligibility_SyncMode_AdvertisesRank(t *testing.T) {
 	// Regression guard: the subscribe-mode branch must not accidentally
 	// blacklist sync-mode cortexes.
 	loop, state := buildLoop(t, consolidation.EligibilityConfig{
-		Enabled:        true,
-		LLMEnabled:     true,
-		FederationMode: "sync",
-		Endpoint:       "http://example.invalid",
-		Probe:          func(context.Context, string) bool { return true },
+		Enabled:            true,
+		LLMEnabled:         true,
+		TriggersConfigured: true,
+		FederationMode:     "sync",
+		Endpoint:           "http://example.invalid",
+		Probe:              func(context.Context, string) bool { return true },
 	})
 	loop.Refresh()
 
@@ -128,10 +130,11 @@ func TestEligibility_LLMDisabled_AdvertisesZero(t *testing.T) {
 
 func TestEligibility_ProbeFails_AdvertisesZero(t *testing.T) {
 	loop, state := buildLoop(t, consolidation.EligibilityConfig{
-		Enabled:    true,
-		LLMEnabled: true,
-		Endpoint:   "http://example.invalid",
-		Probe:      func(context.Context, string) bool { return false },
+		Enabled:            true,
+		LLMEnabled:         true,
+		TriggersConfigured: true,
+		Endpoint:           "http://example.invalid",
+		Probe:              func(context.Context, string) bool { return false },
 	})
 	loop.Refresh()
 
@@ -144,12 +147,38 @@ func TestEligibility_ProbeFails_AdvertisesZero(t *testing.T) {
 	}
 }
 
+func TestEligibility_NoTriggersConfigured_AdvertisesZero(t *testing.T) {
+	// Phantom-winner guard: a peer that opted into consolidation but
+	// configured no scheduling trigger (cron / idle_minutes /
+	// threshold_short) will never run a pass. Advertising a non-zero
+	// rank in that state makes other peers defer to a leader that
+	// never claims a window, stalling the ring. The loop must force
+	// Rank=0 in this case even when LLM and probe are healthy.
+	loop, state := buildLoop(t, consolidation.EligibilityConfig{
+		Enabled:            true,
+		LLMEnabled:         true,
+		TriggersConfigured: false,
+		Endpoint:           "http://example.invalid",
+		Probe:              func(context.Context, string) bool { return true },
+	})
+	loop.Refresh()
+
+	got, err := state.GetLocalRank()
+	if err != nil {
+		t.Fatalf("GetLocalRank: %v", err)
+	}
+	if got.Rank != consolidation.RankIneligible {
+		t.Errorf("no triggers: got rank %d, want 0", got.Rank)
+	}
+}
+
 func TestEligibility_AliveAndEnabled_RollsRank(t *testing.T) {
 	loop, state := buildLoop(t, consolidation.EligibilityConfig{
-		Enabled:    true,
-		LLMEnabled: true,
-		Endpoint:   "http://example.invalid",
-		Probe:      func(context.Context, string) bool { return true },
+		Enabled:            true,
+		LLMEnabled:         true,
+		TriggersConfigured: true,
+		Endpoint:           "http://example.invalid",
+		Probe:              func(context.Context, string) bool { return true },
 	})
 	loop.Refresh()
 
@@ -173,10 +202,11 @@ func TestEligibility_ReRollsEveryRefresh(t *testing.T) {
 	// would be flaky; instead, check that across many refreshes we see
 	// at least two distinct values.
 	loop, state := buildLoop(t, consolidation.EligibilityConfig{
-		Enabled:    true,
-		LLMEnabled: true,
-		Endpoint:   "http://example.invalid",
-		Probe:      func(context.Context, string) bool { return true },
+		Enabled:            true,
+		LLMEnabled:         true,
+		TriggersConfigured: true,
+		Endpoint:           "http://example.invalid",
+		Probe:              func(context.Context, string) bool { return true },
 	})
 
 	seen := map[int]bool{}
@@ -199,10 +229,11 @@ func TestEligibility_RollsFreshAfterOutageRecovery(t *testing.T) {
 	// up, rank must land in [1..99] on the next refresh.
 	var alive bool
 	loop, state := buildLoop(t, consolidation.EligibilityConfig{
-		Enabled:    true,
-		LLMEnabled: true,
-		Endpoint:   "http://example.invalid",
-		Probe:      func(context.Context, string) bool { return alive },
+		Enabled:            true,
+		LLMEnabled:         true,
+		TriggersConfigured: true,
+		Endpoint:           "http://example.invalid",
+		Probe:              func(context.Context, string) bool { return alive },
 	})
 
 	alive = true
@@ -234,11 +265,12 @@ func TestEligibility_ObservedAtAdvances(t *testing.T) {
 	// here is about ObservedAt movement specifically.
 	clock := time.Date(2026, 4, 21, 12, 0, 0, 0, time.UTC)
 	loop, state := buildLoop(t, consolidation.EligibilityConfig{
-		Enabled:    true,
-		LLMEnabled: true,
-		Endpoint:   "http://example.invalid",
-		Probe:      func(context.Context, string) bool { return true },
-		Now:        func() time.Time { return clock },
+		Enabled:            true,
+		LLMEnabled:         true,
+		TriggersConfigured: true,
+		Endpoint:           "http://example.invalid",
+		Probe:              func(context.Context, string) bool { return true },
+		Now:                func() time.Time { return clock },
 	})
 
 	loop.Refresh()

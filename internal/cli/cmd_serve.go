@@ -121,6 +121,7 @@ func serveCmd() *cobra.Command {
 			var watcher *watch.Watcher
 			var consolidator *consolidation.Agent
 			var eligibility *consolidation.EligibilityLoop
+			var watchdog *consolidation.Watchdog
 
 			// Filesystem watcher: on by default so external edits
 			// (Obsidian, VS Code, Finder, iCloud sync, another agent on
@@ -155,6 +156,18 @@ func serveCmd() *cobra.Command {
 			// in local kv) and ready-to-go the moment peers are added.
 			if manifestErr == nil && m.Consolidation != nil && m.Consolidation.Enabled {
 				eligibility = startEligibility(cx, m.Consolidation, m.Federation)
+			}
+
+			// Election watchdog: closes out consolidation_claim events
+			// that never received a matching success/fail (winner crashed,
+			// network-partitioned, hung on the LLM endpoint, etc.) by
+			// emitting a fail with reason=watchdog_expired so the next
+			// election cycle can pick a new leader. Only runs when
+			// federation peers are configured — single-node cortexes
+			// can't have silent winners.
+			if manifestErr == nil && m.Consolidation != nil && m.Consolidation.Enabled &&
+				m.Federation != nil && len(m.Federation.Peers) > 0 {
+				watchdog = startWatchdog(cx)
 			}
 
 			switch transport {
@@ -302,6 +315,9 @@ func serveCmd() *cobra.Command {
 			if eligibility != nil {
 				eligibility.Stop()
 			}
+			if watchdog != nil {
+				watchdog.Stop()
+			}
 			return err
 		},
 	}
@@ -351,7 +367,7 @@ func startConsolidator(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig, fed *
 	if cfg == nil || !cfg.Enabled {
 		return nil
 	}
-	if cfg.Cron == "" && cfg.IdleMinutes == 0 && cfg.ThresholdShort == 0 {
+	if !cfg.HasTrigger() {
 		fmt.Fprintf(os.Stderr, "[consolidation] enabled but no triggers configured (cron/idle_minutes/threshold_short); agent will not run\n")
 		return nil
 	}
@@ -456,18 +472,41 @@ func startEligibility(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig, fed *c
 		mode = fed.EffectiveMode()
 	}
 	loop := consolidation.NewEligibilityLoop(consolidation.EligibilityConfig{
-		Enabled:        cfg.Enabled,
-		LLMEnabled:     cfg.LLMEnabled,
-		FederationMode: mode,
-		Endpoint:       cfg.LocalLLMEndpoint,
-		CortexID:       cx.ID,
-		State:          federation.NewState(cx.DB.DB),
-		Log:            logger,
+		Enabled:            cfg.Enabled,
+		LLMEnabled:         cfg.LLMEnabled,
+		TriggersConfigured: cfg.HasTrigger(),
+		FederationMode:     mode,
+		Endpoint:           cfg.LocalLLMEndpoint,
+		CortexID:           cx.ID,
+		State:              federation.NewState(cx.DB.DB),
+		Log:                logger,
 	})
 	loop.Start()
-	fmt.Fprintf(os.Stderr, "[consolidation] eligibility loop started (llm_enabled=%t mode=%s endpoint=%q)\n",
-		cfg.LLMEnabled, mode, cfg.LocalLLMEndpoint)
+	fmt.Fprintf(os.Stderr, "[consolidation] eligibility loop started (llm_enabled=%t triggers=%t mode=%s endpoint=%q)\n",
+		cfg.LLMEnabled, cfg.HasTrigger(), mode, cfg.LocalLLMEndpoint)
 	return loop
+}
+
+// startWatchdog launches the election watchdog. The caller has already
+// verified that consolidation is enabled AND federation peers are
+// configured — single-node cortexes never have silent winners and skip
+// the watchdog entirely. Defaults are baked into the watchdog package
+// (10-minute claim staleness ceiling, 1-minute sweep cadence); they
+// can be promoted to manifest config in a future change if real
+// deployments need to tune them.
+func startWatchdog(cx *cortex.Cortex) *consolidation.Watchdog {
+	logger := func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
+	}
+	w := consolidation.NewWatchdog(consolidation.WatchdogConfig{
+		DB:            cx.DB.DB,
+		Emitter:       cx,
+		LocalCortexID: cx.ID,
+		Log:           logger,
+	})
+	w.Start()
+	fmt.Fprintf(os.Stderr, "[consolidation] watchdog started\n")
+	return w
 }
 
 // startSyncer converts the manifest's federation config into a running

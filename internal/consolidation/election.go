@@ -155,12 +155,22 @@ type FailData struct {
 // Fail-reason enum, matching the plan's normalized reason strings.
 // Kept as string constants so callers can compose new reasons without
 // a package change.
+//
+// The three "preempted" reasons (PeerOutranked, NoWinnerAtRecheck,
+// ContextCanceled) replace the older catch-all "aborted_by_peer_conflict"
+// reason that was emitted by all three quiet-period exit paths. Telling
+// them apart in the event log lets operators distinguish "ai-3 outranked
+// us during the wait" from "everyone's rank entry expired" from
+// "agent.Stop() interrupted us" — same outcome (no pass), wildly
+// different operational meaning.
 const (
-	FailReasonEndpointDown     = "endpoint_down"
-	FailReasonLLMError         = "llm_error"
-	FailReasonValidationFailed = "validation_failed"
-	FailReasonPreempted        = "aborted_by_peer_conflict"
-	FailReasonWatchdogExpired  = "watchdog_expired"
+	FailReasonEndpointDown      = "endpoint_down"
+	FailReasonLLMError          = "llm_error"
+	FailReasonValidationFailed  = "validation_failed"
+	FailReasonPeerOutranked     = "peer_outranked"
+	FailReasonNoWinnerAtRecheck = "no_winner_at_recheck"
+	FailReasonContextCanceled   = "context_canceled"
+	FailReasonWatchdogExpired   = "watchdog_expired"
 )
 
 // Claim records this peer's intent to run the pass for windowID. Must
