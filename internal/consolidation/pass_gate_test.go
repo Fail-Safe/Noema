@@ -121,8 +121,9 @@ func TestWithElection_EmitsFailOnPassError(t *testing.T) {
 
 func TestWithElection_HonorsContextCancellationDuringQuietPeriod(t *testing.T) {
 	// A context cancelled during the quiet-period sleep should emit
-	// Fail and return ctx.Err so Agent.Stop() drains promptly rather
-	// than blocking on a multi-second sleep.
+	// Fail with the context_canceled reason and return ctx.Err so
+	// Agent.Stop() drains promptly rather than blocking on a multi-
+	// second sleep.
 	state := newElectionState(t)
 	now := time.Date(2026, 4, 21, 12, 0, 0, 0, time.UTC)
 	must(t, state.SetLocalRank(federation.RankEntry{CortexID: "01LOCAL", Rank: 50, ObservedAt: stale(now)}))
@@ -150,6 +151,130 @@ func TestWithElection_HonorsContextCancellationDuringQuietPeriod(t *testing.T) {
 		t.Errorf("pass calls = %d, want 0 (cancelled before run)", inner.calls)
 	}
 	if got := emitter.count(event.ActionConsolidationFail); got != 1 {
-		t.Errorf("fail events = %d, want 1 (preempted)", got)
+		t.Errorf("fail events = %d, want 1 (context canceled)", got)
+	}
+	if reason := failReason(emitter); reason != consolidation.FailReasonContextCanceled {
+		t.Errorf("fail reason = %q, want %q", reason, consolidation.FailReasonContextCanceled)
+	}
+}
+
+// failReason returns the Reason field of the last ActionConsolidationFail
+// event recorded by emitter, or "" if none. Lets the gate tests assert
+// the specific preemption sub-reason now that the wrapper distinguishes
+// peer-outranked vs. no-winner-at-recheck vs. context-canceled.
+func failReason(emitter *fakeEmitter) string {
+	emitter.mu.Lock()
+	defer emitter.mu.Unlock()
+	for i := len(emitter.events) - 1; i >= 0; i-- {
+		if emitter.events[i].Action != event.ActionConsolidationFail {
+			continue
+		}
+		fd, ok := emitter.events[i].Data.(consolidation.FailData)
+		if !ok {
+			return ""
+		}
+		return fd.Reason
+	}
+	return ""
+}
+
+func TestWithElection_EmitsNoWinnerAtRecheck(t *testing.T) {
+	// Recheck-stall guard: if every rank entry expires or gets
+	// filtered between Decide() and the post-quiet recheck, the
+	// gate must surface FailReasonNoWinnerAtRecheck rather than the
+	// peer-outranked reason. Operationally this signals "everyone
+	// dropped out", not "someone else won" — different debugging path.
+	//
+	// Reproduce by handing Decide() a now-time that makes the local
+	// rank fresh enough to count at t=0 but stale enough to be
+	// filtered when the recheck advances the clock past the entry's
+	// validity window. We do this by writing a rank with ObservedAt
+	// well in the past and using a non-zero QuietPeriod such that
+	// recheck filters it out — except the existing minAge check
+	// requires entries to be at least minAge old, not at most.
+	//
+	// Simpler approach: install a hook that flips local rank to 0
+	// between Decide and recheck. We do that by writing the initial
+	// rank, letting the wrapper take its first Decide (we won), then
+	// the test's clock function returns a "now" that drives the
+	// recheck. To make recheck see no eligible peers, overwrite the
+	// rank entry with Rank=0 just before the wrapper resleeps.
+	//
+	// Because the wrapper sleeps real time when QuietPeriod > 0 and
+	// we want no flake, use QuietPeriod = 50ms and overwrite the
+	// rank from the test goroutine after a brief wait.
+	state := newElectionState(t)
+	now := time.Date(2026, 4, 21, 12, 0, 0, 0, time.UTC)
+	must(t, state.SetLocalRank(federation.RankEntry{CortexID: "01LOCAL", Rank: 50, ObservedAt: stale(now)}))
+
+	emitter := &fakeEmitter{}
+	e := consolidation.NewElection(consolidation.ElectionConfig{
+		CortexID:    "01LOCAL",
+		QuietPeriod: 50 * time.Millisecond,
+		Now:         func() time.Time { return now },
+		State:       state,
+		Emitter:     emitter,
+	})
+
+	inner := &callTracker{}
+	wrapped := consolidation.WithElection(inner.pass, e, nil)
+
+	// Demote local rank to 0 partway through the quiet period so the
+	// recheck finds zero eligible peers.
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		_ = state.SetLocalRank(federation.RankEntry{CortexID: "01LOCAL", Rank: 0, ObservedAt: stale(now)})
+	}()
+
+	if err := wrapped(context.Background(), "cron"); err != nil {
+		t.Fatalf("wrapped: %v", err)
+	}
+	if inner.calls != 0 {
+		t.Errorf("pass calls = %d, want 0 (no winner at recheck)", inner.calls)
+	}
+	if got := emitter.count(event.ActionConsolidationFail); got != 1 {
+		t.Errorf("fail events = %d, want 1", got)
+	}
+	if reason := failReason(emitter); reason != consolidation.FailReasonNoWinnerAtRecheck {
+		t.Errorf("fail reason = %q, want %q", reason, consolidation.FailReasonNoWinnerAtRecheck)
+	}
+}
+
+func TestWithElection_EmitsPeerOutrankedAtRecheck(t *testing.T) {
+	// Peer-outranked-at-recheck guard: a peer that wasn't visible at
+	// initial Decide arrives during the quiet period and outranks
+	// us. The wrapper must surface FailReasonPeerOutranked, not the
+	// no-winner reason.
+	state := newElectionState(t)
+	now := time.Date(2026, 4, 21, 12, 0, 0, 0, time.UTC)
+	must(t, state.SetLocalRank(federation.RankEntry{CortexID: "01LOCAL", Rank: 30, ObservedAt: stale(now)}))
+
+	emitter := &fakeEmitter{}
+	e := consolidation.NewElection(consolidation.ElectionConfig{
+		CortexID:    "01LOCAL",
+		PeerNames:   []string{"ai-2"},
+		QuietPeriod: 50 * time.Millisecond,
+		Now:         func() time.Time { return now },
+		State:       state,
+		Emitter:     emitter,
+	})
+
+	inner := &callTracker{}
+	wrapped := consolidation.WithElection(inner.pass, e, nil)
+
+	// Higher-ranked peer surfaces during the quiet wait.
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		_ = state.SetPeerRank("ai-2", federation.RankEntry{CortexID: "01PEER", Rank: 90, ObservedAt: stale(now)})
+	}()
+
+	if err := wrapped(context.Background(), "cron"); err != nil {
+		t.Fatalf("wrapped: %v", err)
+	}
+	if inner.calls != 0 {
+		t.Errorf("pass calls = %d, want 0 (peer outranked us)", inner.calls)
+	}
+	if reason := failReason(emitter); reason != consolidation.FailReasonPeerOutranked {
+		t.Errorf("fail reason = %q, want %q", reason, consolidation.FailReasonPeerOutranked)
 	}
 }

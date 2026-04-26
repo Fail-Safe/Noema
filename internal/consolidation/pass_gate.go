@@ -20,8 +20,13 @@ import (
 //  2. Emit ActionConsolidationClaim with a fresh window ID.
 //  3. Sleep one QuietPeriod so any parallel-starting claimant has time
 //     to surface in federation_state.
-//  4. Re-decide. If we no longer win (a higher-tiebreak peer also
-//     claimed), emit Fail(aborted_by_peer_conflict) and return.
+//  4. Re-decide. If we no longer win, emit Fail with one of the three
+//     preemption reasons and return:
+//     - FailReasonPeerOutranked: a peer with higher rank (or the
+//     tiebreak) won the recheck.
+//     - FailReasonNoWinnerAtRecheck: no peer qualifies anymore (every
+//     entry got filtered as too-fresh or expired during the wait).
+//     - FailReasonContextCanceled: ctx.Done() fired during the sleep.
 //  5. Invoke inner(ctx, trigger). On error, emit Fail(reason=error
 //     message); on success, emit Success.
 //
@@ -55,7 +60,7 @@ func WithElection(inner PassFn, election *Election, log func(format string, args
 		if election.QuietPeriod() > 0 {
 			select {
 			case <-ctx.Done():
-				_ = election.Fail(windowID, FailReasonPreempted)
+				_ = election.Fail(windowID, FailReasonContextCanceled)
 				return ctx.Err()
 			case <-time.After(election.QuietPeriod()):
 			}
@@ -65,7 +70,11 @@ func WithElection(inner PassFn, election *Election, log func(format string, args
 		if !recheck.ShouldRun || recheck.Winner != election.CortexID() {
 			log("[consolidation] preempted during quiet period (trigger=%s): %s",
 				trigger, recheck.Reason)
-			_ = election.Fail(windowID, FailReasonPreempted)
+			reason := FailReasonPeerOutranked
+			if recheck.Winner == "" {
+				reason = FailReasonNoWinnerAtRecheck
+			}
+			_ = election.Fail(windowID, reason)
 			return nil
 		}
 
