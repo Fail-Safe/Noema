@@ -20,6 +20,11 @@ import (
 type Cortex interface {
 	LastMutationTime() (time.Time, error)
 	ShortTierCount() (int, error)
+	// HasConsolidationSuccessAfter is queried by the cron retry path
+	// to detect whether a fired trigger actually resulted in a pass
+	// running (locally or on any peer that replayed a success event
+	// back to us via federation). See checkCronRetry for the protocol.
+	HasConsolidationSuccessAfter(cutoff time.Time) (bool, error)
 }
 
 // PassFn is the consolidation work itself. trigger identifies which
@@ -45,6 +50,22 @@ type Config struct {
 	// minute of the configured time, loose enough that the agent is
 	// effectively free of background cost.
 	PollInterval time.Duration
+	// CronRetryWindow is how long to wait after a cron trigger fires
+	// before checking whether it actually resulted in a consolidation
+	// pass running (locally or on a peer). If no success event has
+	// landed within this window, the trigger re-fires up to
+	// CronMaxRetries times. Zero disables retries entirely — useful for
+	// single-node cortexes whose passes don't emit success events, and
+	// for tests that drive evaluateAndMaybeRun directly. Issue #56:
+	// without this, a staggered-restart election can have every peer
+	// defer to another, nobody runs, and the cron opportunity is burned
+	// until tomorrow.
+	CronRetryWindow time.Duration
+	// CronMaxRetries bounds how many times a single cron fire will
+	// re-attempt before the agent gives up and marks the day as failed.
+	// Zero treated as "no retries", same as CronRetryWindow=0. Defaults
+	// applied in cmd_serve, not here, so tests can probe the zero case.
+	CronMaxRetries int
 }
 
 // Agent runs cadence evaluation and dispatches passes to the PassFn.
@@ -64,9 +85,22 @@ type Agent struct {
 	mu             sync.Mutex
 	lastRun        time.Time // most recent pass fire time (any trigger)
 	thresholdArmed bool      // true while short count > threshold
-	lastCronDay    string    // date of most recent cron fire (YYYY-MM-DD) so
-	// we don't double-fire cron when the clock is near the scheduled time
-	// and the poll ticks more than once within the minute.
+	lastCronDay    string    // date of most recent successfully-completed
+	// cron pass (YYYY-MM-DD). Set after a consolidation_success has been
+	// observed for the trigger fire (or after retries are exhausted, so
+	// we don't loop the same day forever). Until then cron is allowed to
+	// re-fire — this is what closes the issue #56 split-brain hole.
+
+	// Cron retry state. cronAwaiting is true between the moment a cron
+	// trigger fires and the moment we either observe a success event or
+	// give up on retries. cronFireTime is the most recent fire time used
+	// as the cutoff for HasConsolidationSuccessAfter; it advances on
+	// each retry so the success check ignores events older than the
+	// current attempt.
+	cronAwaiting    bool
+	cronFireTime    time.Time
+	cronRetriesLeft int
+	cronTargetDay   string
 }
 
 // New constructs an agent. Call Start to begin the loop. Passing a nil
@@ -117,6 +151,7 @@ func (a *Agent) loop() {
 
 	// Check once on startup so cron / threshold triggers that are
 	// already due don't wait a full poll interval for their first fire.
+	a.checkCronRetry()
 	a.evaluateAndMaybeRun()
 
 	for {
@@ -124,6 +159,7 @@ func (a *Agent) loop() {
 		case <-a.ctx.Done():
 			return
 		case <-ticker.C:
+			a.checkCronRetry()
 			a.evaluateAndMaybeRun()
 		}
 	}
@@ -134,16 +170,109 @@ func (a *Agent) evaluateAndMaybeRun() {
 	if trigger == "" {
 		return
 	}
+	now := a.now()
 	a.mu.Lock()
-	a.lastRun = a.now()
+	a.lastRun = now
 	if trigger == "cron" {
-		a.lastCronDay = a.now().Format("2006-01-02")
+		// Don't mark lastCronDay yet — we'll mark it from
+		// checkCronRetry once a consolidation_success event has
+		// landed (locally or replayed from a peer), or once retries
+		// are exhausted. Until then cron is allowed to re-fire from
+		// checkCronRetry's retry path.
+		if a.cfg.CronRetryWindow > 0 && a.cfg.CronMaxRetries > 0 {
+			a.cronAwaiting = true
+			a.cronFireTime = now
+			a.cronRetriesLeft = a.cfg.CronMaxRetries
+			a.cronTargetDay = now.Format("2006-01-02")
+		} else {
+			// Retry disabled — fall back to the historical
+			// "mark day done immediately" behaviour. Used in
+			// single-node cortexes (whose passes don't emit
+			// success events) and in tests that don't want to
+			// model the retry path.
+			a.lastCronDay = now.Format("2006-01-02")
+		}
 	}
 	a.mu.Unlock()
 
 	a.log("[consolidation] pass firing (trigger=%s)", trigger)
 	if err := a.pass(a.ctx, trigger); err != nil {
 		a.log("[consolidation] pass error (trigger=%s): %v", trigger, err)
+	}
+}
+
+// checkCronRetry runs at the start of every loop tick (after the
+// initial fire on startup). When a cron trigger is awaiting its
+// success event, this method either:
+//
+//   - clears the waiting state if a success has landed (we won, a peer
+//     ran the pass and we replayed it, or an idle/threshold trigger
+//     happened to consolidate the same window before our retry);
+//   - re-fires the cron pass if the retry window has elapsed and we
+//     still have retries left;
+//   - or marks the day as failed (sets lastCronDay so cron sleeps
+//     until tomorrow) if retries are exhausted.
+//
+// All three states converge to "we either succeeded or we'll wait
+// until tomorrow" — bounded retries cap the worst-case noise from a
+// genuinely sick ring.
+//
+// The pass invocation happens outside the agent's mutex (mirrors
+// evaluateAndMaybeRun's pattern) so a long-running pass doesn't
+// block status reads from other goroutines.
+func (a *Agent) checkCronRetry() {
+	a.mu.Lock()
+	if !a.cronAwaiting {
+		a.mu.Unlock()
+		return
+	}
+	now := a.now()
+	if now.Sub(a.cronFireTime) < a.cfg.CronRetryWindow {
+		a.mu.Unlock()
+		return
+	}
+	cutoff := a.cronFireTime
+	targetDay := a.cronTargetDay
+	a.mu.Unlock()
+
+	// HasConsolidationSuccessAfter is the source of truth: any peer's
+	// success event since the last fire counts, since federation
+	// replay surfaces remote successes in our local log. Errors here
+	// are non-fatal — log and treat as "no success yet" so the next
+	// tick retries the check.
+	found, err := a.cx.HasConsolidationSuccessAfter(cutoff)
+	if err != nil {
+		a.log("[consolidation] cron retry check failed for day=%s: %v",
+			targetDay, err)
+		return
+	}
+
+	a.mu.Lock()
+	if found {
+		a.cronAwaiting = false
+		a.lastCronDay = targetDay
+		a.mu.Unlock()
+		a.log("[consolidation] cron pass succeeded for day=%s", targetDay)
+		return
+	}
+	if a.cronRetriesLeft <= 0 {
+		a.cronAwaiting = false
+		a.lastCronDay = targetDay // give up for today
+		a.mu.Unlock()
+		a.log("[consolidation] cron pass exhausted retries for day=%s; giving up until tomorrow",
+			targetDay)
+		return
+	}
+	a.cronRetriesLeft--
+	a.cronFireTime = now
+	a.lastRun = now
+	retriesLeft := a.cronRetriesLeft
+	a.mu.Unlock()
+
+	a.log("[consolidation] cron pass retry firing (retries_left=%d trigger=cron)",
+		retriesLeft)
+	if err := a.pass(a.ctx, "cron"); err != nil {
+		a.log("[consolidation] cron retry pass error: %v", err)
 	}
 }
 
@@ -176,8 +305,14 @@ func (a *Agent) cronTriggered() bool {
 
 	a.mu.Lock()
 	alreadyFiredToday := a.lastCronDay == today
+	awaitingThisDay := a.cronAwaiting && a.cronTargetDay == today
 	a.mu.Unlock()
-	if alreadyFiredToday {
+	if alreadyFiredToday || awaitingThisDay {
+		// Awaiting state means cron has already fired and we're
+		// either watching for the success event or scheduling a
+		// retry via checkCronRetry. The trigger path must stay out
+		// of this window; only checkCronRetry is allowed to re-fire
+		// cron, and only after CronRetryWindow has elapsed.
 		return false
 	}
 	// Fire when the local clock has passed today's scheduled HH:MM.

@@ -440,10 +440,25 @@ func startConsolidator(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig, fed *
 			len(peerNames), 2*interval)
 	}
 
+	// Cron retry-on-idle (issue #56) only makes sense when the
+	// election gate is in play: gated passes can defer (peer won)
+	// without actually running, and retry-on-idle re-fires until a
+	// success event lands. On a single-node cortex the pass always
+	// runs to completion when called, so leaving CronRetryWindow=0
+	// preserves the historical "mark day done immediately" behaviour.
+	cronRetryWindow := time.Duration(0)
+	cronMaxRetries := 0
+	if fed != nil && len(fed.Peers) > 0 {
+		cronRetryWindow = 5 * time.Minute
+		cronMaxRetries = 3
+	}
+
 	a := consolidation.New(cx, consolidation.Config{
-		Cron:           cfg.Cron,
-		IdleMinutes:    cfg.IdleMinutes,
-		ThresholdShort: cfg.ThresholdShort,
+		Cron:            cfg.Cron,
+		IdleMinutes:     cfg.IdleMinutes,
+		ThresholdShort:  cfg.ThresholdShort,
+		CronRetryWindow: cronRetryWindow,
+		CronMaxRetries:  cronMaxRetries,
 	}, pass, logger)
 	a.Start()
 	fmt.Fprintf(os.Stderr, "[consolidation] agent started (cron=%q idle=%dm threshold=%d window=%s)\n",
