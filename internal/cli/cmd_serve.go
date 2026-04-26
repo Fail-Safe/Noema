@@ -351,7 +351,7 @@ func startConsolidator(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig, fed *
 	if cfg == nil || !cfg.Enabled {
 		return nil
 	}
-	if cfg.Cron == "" && cfg.IdleMinutes == 0 && cfg.ThresholdShort == 0 {
+	if !cfg.HasTrigger() {
 		fmt.Fprintf(os.Stderr, "[consolidation] enabled but no triggers configured (cron/idle_minutes/threshold_short); agent will not run\n")
 		return nil
 	}
@@ -456,17 +456,18 @@ func startEligibility(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig, fed *c
 		mode = fed.EffectiveMode()
 	}
 	loop := consolidation.NewEligibilityLoop(consolidation.EligibilityConfig{
-		Enabled:        cfg.Enabled,
-		LLMEnabled:     cfg.LLMEnabled,
-		FederationMode: mode,
-		Endpoint:       cfg.LocalLLMEndpoint,
-		CortexID:       cx.ID,
-		State:          federation.NewState(cx.DB.DB),
-		Log:            logger,
+		Enabled:            cfg.Enabled,
+		LLMEnabled:         cfg.LLMEnabled,
+		TriggersConfigured: cfg.HasTrigger(),
+		FederationMode:     mode,
+		Endpoint:           cfg.LocalLLMEndpoint,
+		CortexID:           cx.ID,
+		State:              federation.NewState(cx.DB.DB),
+		Log:                logger,
 	})
 	loop.Start()
-	fmt.Fprintf(os.Stderr, "[consolidation] eligibility loop started (llm_enabled=%t mode=%s endpoint=%q)\n",
-		cfg.LLMEnabled, mode, cfg.LocalLLMEndpoint)
+	fmt.Fprintf(os.Stderr, "[consolidation] eligibility loop started (llm_enabled=%t triggers=%t mode=%s endpoint=%q)\n",
+		cfg.LLMEnabled, cfg.HasTrigger(), mode, cfg.LocalLLMEndpoint)
 	return loop
 }
 

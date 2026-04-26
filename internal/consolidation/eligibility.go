@@ -28,6 +28,16 @@ type EligibilityConfig struct {
 	// run distillation passes and so cannot legitimately win a round.
 	LLMEnabled bool
 
+	// TriggersConfigured is true when the cortex has at least one
+	// scheduling trigger (cron / idle_minutes / threshold_short) set.
+	// startConsolidator returns nil without starting the agent when no
+	// trigger is configured; if this loop kept advertising a non-zero
+	// rank in that state, the peer would become a "phantom winner" that
+	// other peers defer to forever — the ring would stall because the
+	// elected leader never claims a window. Forcing Rank=0 here is the
+	// signal to the ring that this peer cannot legitimately run a pass.
+	TriggersConfigured bool
+
 	// FederationMode is the effective federation mode of this cortex
 	// (sync / publish / subscribe). When "subscribe", the loop forces
 	// Rank=0 because a read-only mirror cannot legitimately run a
@@ -157,6 +167,12 @@ func (e *EligibilityLoop) refresh() {
 		// Feature disabled by config. Advertise ineligibility so peers
 		// know this cortex is deliberately not participating.
 		newEntry.Rank = RankIneligible
+	case !e.cfg.TriggersConfigured:
+		// Eligibility was opted in but no scheduling trigger is wired
+		// up, so the agent will never fire. Advertising a non-zero
+		// rank in this state turns this peer into a phantom winner.
+		newEntry.Rank = RankIneligible
+		e.cfg.Log("[consolidation] no triggers configured (cron/idle_minutes/threshold_short); rank=0")
 	case e.cfg.FederationMode == "subscribe":
 		// Read-only mirror mode (plan §14 table). A subscribe-mode
 		// cortex pulls events from others but cannot serve them; by

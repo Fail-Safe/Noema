@@ -75,7 +75,7 @@ const (
 
 // FederationConfig holds peer declarations for cortex.md.
 type FederationConfig struct {
-	Mode     string      `yaml:"mode,omitempty"`     // sync | publish | subscribe
+	Mode     string      `yaml:"mode,omitempty"` // sync | publish | subscribe
 	Peers    []PeerEntry `yaml:"peers,omitempty"`
 	Interval string      `yaml:"interval,omitempty"` // e.g. "30s", "1m"
 }
@@ -92,7 +92,7 @@ func (fc *FederationConfig) EffectiveMode() string {
 type PeerEntry struct {
 	Name     string `yaml:"name"`
 	Endpoint string `yaml:"endpoint"`
-	CA       string `yaml:"ca,omitempty"` // path to CA cert for TLS verification
+	CA       string `yaml:"ca,omitempty"`   // path to CA cert for TLS verification
 	Mode     string `yaml:"mode,omitempty"` // sync | paused
 }
 
@@ -332,6 +332,21 @@ func (cc *ConsolidationConfig) EffectiveModelTier() string {
 		return "large"
 	}
 	return cc.ModelTier
+}
+
+// HasTrigger reports whether at least one scheduling trigger
+// (cron / idle_minutes / threshold_short) is configured. Used by
+// startConsolidator to decide whether to spin up the agent and by
+// startEligibility to decide whether this peer should advertise a
+// non-zero rank: a peer that advertises eligibility but never runs is
+// a phantom winner that other peers defer to indefinitely, stalling
+// the ring. Treating "no triggers" the same as "consolidation off"
+// in the rank loop closes that footgun.
+func (cc *ConsolidationConfig) HasTrigger() bool {
+	if cc == nil {
+		return false
+	}
+	return cc.Cron != "" || cc.IdleMinutes != 0 || cc.ThresholdShort != 0
 }
 
 // ErrSourceLocked is returned when a mutation is attempted on a
@@ -3585,9 +3600,9 @@ func (c *Cortex) RebuildFTSIfStale() error {
 	defer rows.Close()
 
 	type rebuildEntry struct {
-		id, title   string
-		archivedAt  string
-		trashedAt   string
+		id, title  string
+		archivedAt string
+		trashedAt  string
 	}
 	var entries []rebuildEntry
 	for rows.Next() {
@@ -3665,4 +3680,3 @@ func nullIfEmpty(s string) *string {
 	}
 	return &s
 }
-
