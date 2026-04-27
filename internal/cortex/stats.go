@@ -93,3 +93,32 @@ func (c *Cortex) LastMutationTime() (time.Time, error) {
 	}
 	return time.Parse(time.RFC3339, ts.String)
 }
+
+// HasConsolidationSuccessAfter reports whether at least one
+// consolidation_success event exists in the local log with timestamp
+// strictly greater than the given cutoff. Used by the consolidation
+// agent's cron retry-on-idle path to decide whether the most recent
+// trigger fire actually resulted in a pass running, locally or on
+// any peer (peer events arrive via federation replay).
+//
+// The cutoff is compared as RFC3339 strings — lexicographic order
+// matches chronological order for that format with consistent UTC
+// suffix, matching how the events table stores timestamps. A LIMIT 1
+// keeps the query cheap; we only care about existence, not count.
+func (c *Cortex) HasConsolidationSuccessAfter(cutoff time.Time) (bool, error) {
+	var marker int
+	err := c.DB.QueryRow(
+		`SELECT 1 FROM events
+		 WHERE action = 'consolidation_success'
+		   AND timestamp > ?
+		 LIMIT 1`,
+		cutoff.UTC().Format(time.RFC3339),
+	).Scan(&marker)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
