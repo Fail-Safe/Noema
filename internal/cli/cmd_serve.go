@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/Fail-Safe/Noema/internal/consolidation"
 	"github.com/Fail-Safe/Noema/internal/cortex"
 	"github.com/Fail-Safe/Noema/internal/federation"
+	"github.com/Fail-Safe/Noema/internal/lock"
 	mcpserver "github.com/Fail-Safe/Noema/internal/mcp"
 	"github.com/Fail-Safe/Noema/internal/watch"
 	mcpgo "github.com/mark3labs/mcp-go/server"
@@ -123,49 +125,70 @@ func serveCmd() *cobra.Command {
 			var eligibility *consolidation.EligibilityLoop
 			var watchdog *consolidation.Watchdog
 
+			// Per-cortex background-work coordination. Concurrent serve
+			// processes on the same cortex (long-lived `--transport http`
+			// systemd service + transient `--transport stdio` subprocesses
+			// spawned by Claude Code, Hermes plugins, etc.) all open the
+			// same DB and previously each ran their own watcher,
+			// consolidator, eligibility loop, and watchdog. The result was
+			// duplicate event emissions, rank churn, and short-lived
+			// processes polluting the consolidation_claim history when
+			// their schedulers fired briefly before the parent killed them.
+			//
+			// An OS-level advisory lock here picks one process per
+			// cortex dir to own the background work (flock on Unix,
+			// LockFileEx on Windows — both with non-blocking
+			// exclusive semantics). Losers fall through to "MCP-only"
+			// mode — they still serve their transport's request
+			// handlers, just without redundant background loops. The
+			// kernel auto-releases the lock on process exit (any
+			// path: clean, SIGTERM, SIGKILL, panic), so a crashed
+			// holder hands off cleanly to the next process.
+			lockPath := filepath.Join(cx.Dir, "db", "background.lock")
+			bgLock, gotLock, lockErr := lock.TryAcquire(lockPath)
+			if lockErr != nil {
+				return fmt.Errorf("acquiring background lock: %w", lockErr)
+			}
+			if !gotLock {
+				fmt.Fprintf(os.Stderr,
+					"[serve] another noema process owns background work for cortex %q; running as MCP-only\n",
+					cx.Name)
+			}
+
 			// Filesystem watcher: on by default so external edits
 			// (Obsidian, VS Code, Finder, iCloud sync, another agent on
-			// the same cortex) emit real mutation events. Runs under
-			// BOTH stdio and http — a stdio serve is not always the
-			// only mutator (the user may be editing in Obsidian while
-			// Claude Code uses stdio; iCloud may be delivering deltas
-			// from another device; another noema process may be writing
-			// via HTTP). Opt out with `watch: { enabled: false }` in
-			// cortex.md.
-			if manifestErr == nil && m.Watch.WatchEnabled() {
+			// the same cortex) emit real mutation events. Gated on the
+			// background-work lock so two processes don't each emit a
+			// trash/update event for the same fsnotify trigger.
+			if gotLock && manifestErr == nil && m.Watch.WatchEnabled() {
 				watcher = startWatcher(cx, m.Watch)
 			}
 
 			// Consolidation agent: opt-in; drives memory-tier
-			// promotions on cron/idle/threshold triggers. Runs under
-			// both stdio and http so an agent connected via either
-			// transport sees the same tier state. Phase 7 ships the
-			// scheduling loop with a no-op pass — Phase 8+ populate
-			// the pass with candidate selection and LLM distillation.
-			if manifestErr == nil && m.Consolidation != nil && m.Consolidation.Enabled {
+			// promotions on cron/idle/threshold triggers. Gated on the
+			// background-work lock so the cron scheduler only fires
+			// once per cortex even when multiple processes are serving
+			// MCP traffic.
+			if gotLock && manifestErr == nil && m.Consolidation != nil && m.Consolidation.Enabled {
 				consolidator = startConsolidator(cx, m.Consolidation, m.Federation)
 			}
 
 			// Eligibility loop: advertises this cortex's consolidation
 			// rank in federation_state so federated peers can observe
 			// whether and how strongly we want to run the next
-			// consolidation window (see consolidation-plan.md §14).
-			// Phase 2 lands the advertisement; Phase 3 wires the
-			// election itself. Runs whenever consolidation.enabled is
-			// true — harmless on a single-node cortex (rank just sits
-			// in local kv) and ready-to-go the moment peers are added.
-			if manifestErr == nil && m.Consolidation != nil && m.Consolidation.Enabled {
+			// consolidation window. Gated on the background-work lock
+			// so the rank entry doesn't churn between concurrent
+			// processes overwriting each other.
+			if gotLock && manifestErr == nil && m.Consolidation != nil && m.Consolidation.Enabled {
 				eligibility = startEligibility(cx, m.Consolidation, m.Federation)
 			}
 
 			// Election watchdog: closes out consolidation_claim events
-			// that never received a matching success/fail (winner crashed,
-			// network-partitioned, hung on the LLM endpoint, etc.) by
-			// emitting a fail with reason=watchdog_expired so the next
-			// election cycle can pick a new leader. Only runs when
-			// federation peers are configured — single-node cortexes
-			// can't have silent winners.
-			if manifestErr == nil && m.Consolidation != nil && m.Consolidation.Enabled &&
+			// that never received a matching success/fail. Gated on the
+			// background-work lock + federation peers; single-node
+			// cortexes can't have silent winners and lock losers don't
+			// need a parallel sweeper.
+			if gotLock && manifestErr == nil && m.Consolidation != nil && m.Consolidation.Enabled &&
 				m.Federation != nil && len(m.Federation.Peers) > 0 {
 				watchdog = startWatchdog(cx)
 			}
@@ -317,6 +340,14 @@ func serveCmd() *cobra.Command {
 			}
 			if watchdog != nil {
 				watchdog.Stop()
+			}
+			// Release the background-work lock last so background
+			// goroutines have already drained — the kernel would
+			// release it on exit anyway, but explicit release lets
+			// a sibling process pick up the lock before this binary
+			// finishes its own teardown.
+			if releaseErr := bgLock.Release(); releaseErr != nil {
+				fmt.Fprintf(os.Stderr, "[serve] releasing background lock: %v\n", releaseErr)
 			}
 			return err
 		},
