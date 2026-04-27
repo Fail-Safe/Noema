@@ -135,12 +135,15 @@ func serveCmd() *cobra.Command {
 			// processes polluting the consolidation_claim history when
 			// their schedulers fired briefly before the parent killed them.
 			//
-			// flock here picks one process per cortex dir to own the
-			// background work. Losers fall through to "MCP-only" mode —
-			// they still serve their transport's request handlers, just
-			// without redundant background loops. Lock auto-releases on
-			// process exit (any path), so a crash or kill -9 of the
-			// holder lets the next process pick up cleanly.
+			// An OS-level advisory lock here picks one process per
+			// cortex dir to own the background work (flock on Unix,
+			// LockFileEx on Windows — both with non-blocking
+			// exclusive semantics). Losers fall through to "MCP-only"
+			// mode — they still serve their transport's request
+			// handlers, just without redundant background loops. The
+			// kernel auto-releases the lock on process exit (any
+			// path: clean, SIGTERM, SIGKILL, panic), so a crashed
+			// holder hands off cleanly to the next process.
 			lockPath := filepath.Join(cx.Dir, "db", "background.lock")
 			bgLock, gotLock, lockErr := lock.TryAcquire(lockPath)
 			if lockErr != nil {
