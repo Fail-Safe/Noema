@@ -103,6 +103,17 @@ func serveCmd() *cobra.Command {
 				}
 			}
 
+			// Build-fingerprint line, ahead of everything else, so an
+			// operator triaging journals can immediately spot a process
+			// running a stale binary (e.g. systemd-managed long-lived
+			// service that wasn't restarted after a deploy, or a
+			// launchd-managed agent inheriting an older binary path).
+			// Falls back gracefully when only Version is set (Makefile
+			// builds) and stays compact when all three fields are
+			// available (GoReleaser builds).
+			fmt.Fprintf(os.Stderr, "[serve] noema %s%s starting\n",
+				version(), buildFingerprint())
+
 			// Surface the bound cortex identity on every serve, so an
 			// operator who started the wrong cortex sees it in the very
 			// first log line instead of finding out via peer drift hours

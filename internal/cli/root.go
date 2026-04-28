@@ -38,6 +38,41 @@ func version() string {
 	return "dev"
 }
 
+// buildFingerprint renders an operator-facing suffix for log lines
+// that want to surface commit + build-date alongside the version.
+// Returns the empty string when neither Commit nor Date is set —
+// Makefile builds inject only Version, so the fallback keeps
+// startup logs uncluttered for those builds. Format:
+//
+//	" (commit abc1234, built 2026-04-28T15:00:00Z)"
+//
+// Includes a leading space so callers can concatenate it directly
+// after the version string without conditional logic at the call site.
+func buildFingerprint() string {
+	if Commit == "" && Date == "" {
+		return ""
+	}
+	switch {
+	case Commit != "" && Date != "":
+		return fmt.Sprintf(" (commit %s, built %s)", shortCommit(Commit), Date)
+	case Commit != "":
+		return fmt.Sprintf(" (commit %s)", shortCommit(Commit))
+	default:
+		return fmt.Sprintf(" (built %s)", Date)
+	}
+}
+
+// shortCommit truncates a full SHA to its leading 7 hex chars (the
+// git default). GoReleaser injects full SHAs; 7 chars is enough to
+// disambiguate in any practical repo and saves horizontal space in
+// startup log lines.
+func shortCommit(c string) string {
+	if len(c) > 7 {
+		return c[:7]
+	}
+	return c
+}
+
 var cortexFlag string
 
 var rootCmd = &cobra.Command{
