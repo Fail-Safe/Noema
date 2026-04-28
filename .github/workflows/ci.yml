@@ -80,3 +80,29 @@ jobs:
         # MCP request concurrency — exactly the kind of surface where
         # races hide until production.
         run: go test -race ./...
+
+      - name: Set up Node
+        # Required by the Obsidian plugin build below. ubuntu-latest
+        # ships Node 20+ already; pinning explicitly keeps CI immune
+        # to runner-image drift and matches the version pinned in
+        # release.yml so plugin behaviour is reproducible across both
+        # workflows.
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: plugins/obsidian/package-lock.json
+
+      - name: Build Obsidian plugin
+        # Catches TypeScript regressions, broken imports, and esbuild
+        # config drift before they hit a release. Runs even on PRs
+        # that don't touch plugins/obsidian/ — cost is ~15s per CI
+        # run, well worth it given the bug we shipped to v0.10.0-beta.5
+        # would have been caught here. We install with npm ci (strict,
+        # respects package-lock) and run the production build to
+        # exercise the same path goreleaser uses on tag pushes.
+        working-directory: plugins/obsidian
+        run: |
+          npm ci --silent
+          npm run build
+          npx tsc --noEmit
