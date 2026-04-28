@@ -3,6 +3,7 @@ import { DEFAULT_SETTINGS, NoemaSettings, NoemaSettingTab } from "./settings";
 import { LineageView, LINEAGE_VIEW_TYPE } from "./lineage-view";
 import { McpClient } from "./mcp-client";
 import { readTraceMetadata, tierGlyph, tierLabel } from "./tier-status";
+import { ImmutableWarning } from "./immutable-warning";
 
 const STATUS_PING_INTERVAL_MS = 30_000;
 
@@ -22,9 +23,13 @@ const STATUS_PING_INTERVAL_MS = 30_000;
 export default class NoemaPlugin extends Plugin {
 	settings: NoemaSettings = DEFAULT_SETTINGS;
 	client: McpClient | null = null;
+	// cortexName is exposed (not private) because immutable-warning
+	// needs it to decide whether a source_locked trace's origin is
+	// "foreign" (warn) or local (don't warn).
+	cortexName = "";
 	private statusBarEl: HTMLElement | null = null;
-	private cortexName = "";
 	private connected = false;
+	private immutableWarning: ImmutableWarning | null = null;
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -58,14 +63,27 @@ export default class NoemaPlugin extends Plugin {
 			},
 		});
 
-		// Re-render the status bar when the active file changes so the
-		// tier glyph follows the user across files.
+		this.immutableWarning = new ImmutableWarning(this.app, this);
+
+		// Re-render the status bar AND immutable-warning banner when
+		// the active file changes (tier glyph follows the user) or
+		// when frontmatter changes (a tier promotion to long would
+		// flip the warning state without an active-leaf-change).
 		this.registerEvent(
-			this.app.workspace.on("active-leaf-change", () => this.renderStatus())
+			this.app.workspace.on("active-leaf-change", () => {
+				this.renderStatus();
+				this.immutableWarning?.refresh();
+			})
 		);
 		this.registerEvent(
-			this.app.metadataCache.on("changed", () => this.renderStatus())
+			this.app.metadataCache.on("changed", () => {
+				this.renderStatus();
+				this.immutableWarning?.refresh();
+			})
 		);
+		// Initial render in case a trace file is already open at
+		// plugin start.
+		this.immutableWarning.refresh();
 
 		// Initial connection probe + periodic ping. We don't block
 		// onload on this — a missing or unreachable endpoint at
@@ -82,6 +100,10 @@ export default class NoemaPlugin extends Plugin {
 		// preserves view state across plugin reloads when the plugin
 		// re-registers the same view type, which is a better UX than
 		// closing the panel on every plugin restart during dev.
+
+		// Clean up any lingering banner DOM so a plugin reload during
+		// active development doesn't leave orphan elements behind.
+		this.immutableWarning?.removeAll();
 	}
 
 	async loadSettings(): Promise<void> {
