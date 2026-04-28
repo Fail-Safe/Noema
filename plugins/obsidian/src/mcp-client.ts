@@ -54,6 +54,35 @@ export interface Lineage {
 	derivedBy: string[];
 }
 
+// TraceType matches the cortex's trace-type enum. Surfaced as a
+// shared constant so the create-trace modal and any future tier-aware
+// UI can populate dropdowns from one source of truth that tracks the
+// server's accepted values.
+export const TRACE_TYPES = [
+	"fact",
+	"decision",
+	"preference",
+	"context",
+	"skill",
+	"intent",
+	"observation",
+	"note",
+] as const;
+export type TraceType = (typeof TRACE_TYPES)[number];
+
+// CreateTraceParams is the input shape for McpClient.createTrace.
+// tags and derivedFrom are arrays at this layer for caller ergonomics;
+// they get joined to the comma-separated wire format the server
+// expects inside createTrace.
+export interface CreateTraceParams {
+	title: string;
+	type: TraceType;
+	body: string;
+	author?: string;
+	tags?: string[];
+	derivedFrom?: string[];
+}
+
 // Streamable-HTTP MCP servers (per the 2025-03-26 spec) bind every
 // JSON-RPC request to a server-allocated session id. The lifecycle is:
 //
@@ -106,6 +135,37 @@ export class McpClient {
 	async traceLineage(traceId: string): Promise<Lineage> {
 		const text = await this.callToolText("trace_lineage", { id: traceId });
 		return parseLineage(text, traceId);
+	}
+
+	// createTrace invokes the create_trace MCP tool. The server
+	// generates the canonical YYYYMMDD-<slug>.md filename, computes
+	// the content_hash, sets origin to the local cortex name, and
+	// emits the create event in the same transaction. Returns the
+	// freshly-allocated trace ID parsed out of the server's
+	// "Trace created: <id>" response.
+	//
+	// body is required by the server schema; pass at least a single
+	// placeholder character if the caller wants to fill content in
+	// the editor afterwards. tags and derivedFrom come in as arrays
+	// for caller ergonomics and get joined into comma-separated
+	// strings (the wire shape the server expects).
+	async createTrace(params: CreateTraceParams): Promise<string> {
+		const args: Record<string, unknown> = {
+			title: params.title,
+			type: params.type,
+			body: params.body,
+		};
+		if (params.author) args.author = params.author;
+		if (params.tags && params.tags.length > 0) args.tags = params.tags.join(",");
+		if (params.derivedFrom && params.derivedFrom.length > 0) {
+			args.derived_from = params.derivedFrom.join(",");
+		}
+		const text = await this.callToolText("create_trace", args);
+		const match = text.match(/Trace created:\s*(\S+)/);
+		if (!match) {
+			throw new Error(`create_trace: unexpected response shape: ${text}`);
+		}
+		return match[1];
 	}
 
 	// callToolText invokes a tool and returns the concatenated text

@@ -206,6 +206,7 @@ noema add [flags]                         Add a Trace (interactive if flags omit
 noema list [flags]                        List Traces
 noema get <id>                            Show a Trace
 noema edit <id>                           Edit a Trace in $EDITOR
+noema append <id> [--content <text>]      Append to a Trace body (pipe-friendly: `echo X | noema append <id>`)
 noema remove <id>                         Move a Trace to trash (--force to hard-delete)
 noema recover <id>                        Restore a Trace from trash
 noema purge [--days N]                    Permanently delete all trashed Traces older than N days

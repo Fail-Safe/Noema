@@ -3,6 +3,7 @@ import { DEFAULT_SETTINGS, NoemaSettings, NoemaSettingTab } from "./settings";
 import { LineageView, LINEAGE_VIEW_TYPE } from "./lineage-view";
 import { McpClient } from "./mcp-client";
 import { readTraceMetadata, tierGlyph, tierLabel } from "./tier-status";
+import { CreateTraceModal } from "./create-modal";
 import { ImmutableWarning } from "./immutable-warning";
 
 const STATUS_PING_INTERVAL_MS = 30_000;
@@ -60,6 +61,14 @@ export default class NoemaPlugin extends Plugin {
 						await view.refreshFromActive();
 					}
 				}
+			},
+		});
+
+		this.addCommand({
+			id: "create-trace",
+			name: "New trace",
+			callback: () => {
+				new CreateTraceModal(this.app, this).open();
 			},
 		});
 

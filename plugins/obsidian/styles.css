@@ -145,6 +145,49 @@
 	padding: 8px 0;
 }
 
+/* ---- Create-trace modal ---- */
+
+.noema-create-modal .noema-create-row {
+	display: grid;
+	grid-template-columns: 120px 1fr;
+	gap: 8px;
+	align-items: center;
+	margin-bottom: 8px;
+}
+
+.noema-create-modal .noema-create-row label {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	text-align: right;
+}
+
+.noema-create-modal .noema-create-row input,
+.noema-create-modal .noema-create-row select {
+	width: 100%;
+}
+
+.noema-create-modal .noema-create-hint {
+	color: var(--text-faint);
+	font-size: var(--font-ui-smaller);
+	margin: -4px 0 8px 128px;
+}
+
+.noema-create-modal .noema-create-error {
+	color: var(--text-error);
+	font-size: var(--font-ui-smaller);
+	margin: 8px 0;
+	padding: 6px 8px;
+	background: var(--background-modifier-error);
+	border-radius: 4px;
+}
+
+.noema-create-modal .noema-create-buttons {
+	display: flex;
+	justify-content: flex-end;
+	gap: 8px;
+	margin-top: 12px;
+}
+
 /* ---- Immutable / source-locked warning ---- */
 
 .noema-immutable-warning {
