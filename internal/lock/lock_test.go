@@ -1,7 +1,9 @@
 package lock_test
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Fail-Safe/Noema/internal/lock"
@@ -133,5 +135,146 @@ func TestTryAcquire_MissingDirectory_Errors(t *testing.T) {
 	if l != nil {
 		t.Errorf("lock = %v, want nil on error path", l)
 		l.Release()
+	}
+}
+
+// ---- RuntimePath ----
+
+func TestRuntimePath_ReturnsValidPath(t *testing.T) {
+	// Point the runtime base at a controlled temp dir for the test —
+	// XDG_RUNTIME_DIR takes precedence over os.TempDir() so this is
+	// a portable way to redirect the resolution. We restore the
+	// environment afterward.
+	dir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+
+	const cid = "01TESTCORTEXIDXXXXXXXXXXXX"
+	path, err := lock.RuntimePath(cid)
+	if err != nil {
+		t.Fatalf("RuntimePath: %v", err)
+	}
+	if !strings.HasPrefix(path, dir) {
+		t.Errorf("path %q does not start with runtime root %q", path, dir)
+	}
+	if !strings.Contains(path, cid) {
+		t.Errorf("path %q does not contain cortex ID %q", path, cid)
+	}
+	if filepath.Base(path) != "background.lock" {
+		t.Errorf("path %q does not end in background.lock", path)
+	}
+
+	// Parent directory must exist after the call — TryAcquire opens
+	// the file with O_CREATE but does not mkdir its parents, so
+	// RuntimePath must create them first.
+	if _, statErr := os.Stat(filepath.Dir(path)); statErr != nil {
+		t.Errorf("parent dir not created: %v", statErr)
+	}
+}
+
+func TestRuntimePath_EmptyCortexIDErrors(t *testing.T) {
+	// Empty cortex ID is a programmer error — we'd rather fail
+	// loudly than create a "noema/" directory at the runtime root
+	// shared across all cortexes (which would be a real footgun on
+	// multi-cortex hosts).
+	_, err := lock.RuntimePath("")
+	if err == nil {
+		t.Errorf("error = nil, want non-nil for empty cortex ID")
+	}
+}
+
+func TestRuntimePath_StableAcrossCalls(t *testing.T) {
+	// Two calls with the same cortex ID must produce the same path,
+	// otherwise the lock-acquire / lock-release lifecycle wouldn't
+	// reuse the same file across restarts.
+	dir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+
+	a, err := lock.RuntimePath("01STABLECORTEXIDXXXXXXXXX1")
+	if err != nil {
+		t.Fatalf("first RuntimePath: %v", err)
+	}
+	b, err := lock.RuntimePath("01STABLECORTEXIDXXXXXXXXX1")
+	if err != nil {
+		t.Fatalf("second RuntimePath: %v", err)
+	}
+	if a != b {
+		t.Errorf("paths differ across calls: %q vs %q", a, b)
+	}
+}
+
+func TestRuntimePath_DistinctIDsCollide(t *testing.T) {
+	// Different cortex IDs must produce different paths so two
+	// cortexes on the same host can each hold their own lock
+	// without any cross-cortex interference.
+	dir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+
+	a, err := lock.RuntimePath("01CORTEXAAAAAAAAAAAAAAAAAA")
+	if err != nil {
+		t.Fatalf("first RuntimePath: %v", err)
+	}
+	b, err := lock.RuntimePath("01CORTEXBBBBBBBBBBBBBBBBBB")
+	if err != nil {
+		t.Fatalf("second RuntimePath: %v", err)
+	}
+	if a == b {
+		t.Errorf("distinct IDs collided to the same path: %q", a)
+	}
+}
+
+func TestRuntimePath_HonoursXDGRuntimeDir(t *testing.T) {
+	// XDG_RUNTIME_DIR is the Linux convention for tmpfs-backed
+	// per-user runtime state. When set, we prefer it over
+	// os.TempDir() so on systemd hosts the lock lives under
+	// /run/user/$UID/noema/<cortex-id>/ rather than /tmp.
+	dir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+
+	path, err := lock.RuntimePath("01XDGCORTEXIDXXXXXXXXXXXX1")
+	if err != nil {
+		t.Fatalf("RuntimePath: %v", err)
+	}
+	if !strings.HasPrefix(path, dir) {
+		t.Errorf("XDG_RUNTIME_DIR not honoured: path %q is not under %q", path, dir)
+	}
+}
+
+func TestRuntimePath_FallsBackToTempDir(t *testing.T) {
+	// With XDG_RUNTIME_DIR explicitly cleared, the fallback path
+	// must come from os.TempDir(). On the test host this is
+	// /var/folders/.../T (macOS), /tmp (Linux), or %TEMP% (Windows)
+	// — anywhere except an iCloud/Dropbox/etc. sync root.
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	tmp := os.TempDir()
+
+	path, err := lock.RuntimePath("01FALLBACKCORTEXIDXXXXXXXX")
+	if err != nil {
+		t.Fatalf("RuntimePath: %v", err)
+	}
+	if !strings.HasPrefix(path, tmp) {
+		t.Errorf("fallback to os.TempDir() not honoured: path %q is not under %q", path, tmp)
+	}
+}
+
+func TestRuntimePath_AcquirableViaTryAcquire(t *testing.T) {
+	// End-to-end: RuntimePath returns a path that TryAcquire can
+	// actually open and flock. This catches mode / permission /
+	// parent-dir bugs that the unit tests above would miss.
+	dir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+
+	path, err := lock.RuntimePath("01ACQUIRECORTEXIDXXXXXXXXX")
+	if err != nil {
+		t.Fatalf("RuntimePath: %v", err)
+	}
+	l, got, err := lock.TryAcquire(path)
+	if err != nil {
+		t.Fatalf("TryAcquire: %v", err)
+	}
+	if !got || l == nil {
+		t.Fatalf("expected to acquire fresh runtime lock, got got=%v lock=%v", got, l)
+	}
+	if err := l.Release(); err != nil {
+		t.Errorf("Release: %v", err)
 	}
 }

@@ -29,8 +29,10 @@
 package lock
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -120,3 +122,57 @@ func (l *Lock) Release() error {
 //       got=false, err!=nil: hard error (unrelated to contention)
 //
 //   - unlock(f) error: drops the lock; nil on success
+
+// RuntimePath returns the per-cortex background-work lock path in a
+// runtime/temp location that user-data sync layers (iCloud Drive,
+// Dropbox, Syncthing, OneDrive) won't replicate. Keyed on the cortex's
+// stable ULID so two cortexes with different IDs but the same display
+// name don't collide on shared hosts.
+//
+// Why not <cortex>/db/background.lock (the previous location): when
+// the cortex directory is inside a sync layer, the lock file gets
+// replicated to other devices where it has no semantic meaning, and
+// the sync layer's "replace on sync" can unlink the inode our flock
+// is bound to and create a fresh inode at the same path — leaving us
+// holding a flock on an orphaned inode while a new noema process
+// successfully acquires its own flock on the new file. Putting the
+// lock outside the cortex dir removes both problems uniformly,
+// regardless of which sync layer the user has configured.
+//
+// Cross-host coordination is intentionally given up: kernel flocks
+// are per-host and never propagated across machines anyway, so two
+// hosts mounting the same cortex via a sync layer were always going
+// to each acquire their own local flock. Federation HTTP is the
+// designed cross-host coordination mechanism, not flock.
+//
+// Path resolution prefers $XDG_RUNTIME_DIR (Linux convention,
+// tmpfs-backed when set), else os.TempDir() (which resolves
+// correctly on macOS and Windows: per-user temp under
+// /var/folders on macOS, %TEMP% on Windows).
+//
+// Creates the parent directory with 0700 permissions if missing.
+func RuntimePath(cortexID string) (string, error) {
+	if cortexID == "" {
+		return "", errors.New("cortex ID required for runtime lock path")
+	}
+	base := filepath.Join(runtimeBase(), "noema", cortexID)
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		return "", fmt.Errorf("creating runtime dir %q: %w", base, err)
+	}
+	return filepath.Join(base, "background.lock"), nil
+}
+
+// runtimeBase resolves the platform-appropriate runtime root. On
+// Linux distributions that set $XDG_RUNTIME_DIR (typical on systemd
+// systems — points at a tmpfs under /run/user/$UID), we use that.
+// Otherwise os.TempDir() picks the right per-user temp on every
+// supported platform: confstr(_CS_DARWIN_USER_TEMP_DIR) on macOS,
+// $TMPDIR or /tmp on Linux without XDG_RUNTIME_DIR, %TEMP% on
+// Windows. None of these locations are inside iCloud Drive or
+// equivalent sync roots by default.
+func runtimeBase() string {
+	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
+		return xdg
+	}
+	return os.TempDir()
+}
