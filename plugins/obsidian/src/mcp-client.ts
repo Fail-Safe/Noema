@@ -137,6 +137,21 @@ export class McpClient {
 		return parseLineage(text, traceId);
 	}
 
+	// appendTrace invokes the append_trace MCP tool, which is the
+	// designed primitive for "add a line or two to an existing
+	// trace" — the cortex reads the current body server-side, appends,
+	// recomputes the content_hash, and emits an update event in a
+	// single transaction. Compared to a full update_trace round-trip
+	// this avoids the read-modify-write window where another process
+	// could race against us, and saves shipping the existing body
+	// over the wire just to re-send it back.
+	async appendTrace(traceId: string, content: string): Promise<void> {
+		await this.callToolText("append_trace", {
+			id: traceId,
+			content: content,
+		});
+	}
+
 	// createTrace invokes the create_trace MCP tool. The server
 	// generates the canonical YYYYMMDD-<slug>.md filename, computes
 	// the content_hash, sets origin to the local cortex name, and

@@ -1,10 +1,11 @@
-import { Plugin, TFile, WorkspaceLeaf } from "obsidian";
+import { Notice, Plugin, TFile, WorkspaceLeaf } from "obsidian";
 import { DEFAULT_SETTINGS, NoemaSettings, NoemaSettingTab } from "./settings";
 import { LineageView, LINEAGE_VIEW_TYPE } from "./lineage-view";
 import { McpClient } from "./mcp-client";
 import { readTraceMetadata, tierGlyph, tierLabel } from "./tier-status";
 import { CreateTraceModal } from "./create-modal";
 import { ImmutableWarning } from "./immutable-warning";
+import { openAppendModalFromActive } from "./append-modal";
 
 const STATUS_PING_INTERVAL_MS = 30_000;
 
@@ -69,6 +70,31 @@ export default class NoemaPlugin extends Plugin {
 			name: "New trace",
 			callback: () => {
 				new CreateTraceModal(this.app, this).open();
+			},
+		});
+
+		// Append-to-trace uses checkCallback so the command is greyed
+		// out in the palette unless the active editor is a trace.
+		// That's the right UX hint: "no trace open" reads as an
+		// absent/disabled command rather than as an error message
+		// after the user pulls the trigger.
+		this.addCommand({
+			id: "append-to-trace",
+			name: "Append to current trace",
+			checkCallback: (checking: boolean) => {
+				const file = this.app.workspace.getActiveFile();
+				if (!file) return false;
+				// Defer the metadata read until we know we'll act on it.
+				if (checking) {
+					// Cheap approximation — let the modal helper do the
+					// authoritative metadata check. We only need to
+					// know "is the active file a candidate?" here.
+					return file.extension === "md";
+				}
+				if (!openAppendModalFromActive(this)) {
+					new Notice("Open a trace first to append to it.");
+				}
+				return true;
 			},
 		});
 

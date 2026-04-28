@@ -212,3 +212,72 @@
 .noema-immutable-warning-text {
 	color: var(--text-normal);
 }
+
+/* ---- Append modal ---- */
+
+.noema-append-modal .noema-append-target {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	padding: 8px 12px;
+	margin-bottom: 12px;
+	border-radius: 6px;
+	background: var(--background-secondary);
+}
+
+.noema-append-modal .noema-append-target-glyph {
+	font-family: var(--font-monospace);
+	font-weight: 600;
+	color: var(--text-accent);
+	flex-shrink: 0;
+}
+
+.noema-append-modal .noema-append-target-title {
+	font-weight: 600;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.noema-append-modal .noema-append-target-id {
+	color: var(--text-faint);
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
+	margin-left: auto;
+	padding-left: 8px;
+}
+
+.noema-append-modal .noema-append-label {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	margin-bottom: 4px;
+}
+
+.noema-append-modal .noema-append-content {
+	width: 100%;
+	font-family: var(--font-text);
+	resize: vertical;
+	min-height: 120px;
+}
+
+.noema-append-modal .noema-append-hint {
+	color: var(--text-faint);
+	font-size: var(--font-ui-smaller);
+	margin-top: 4px;
+}
+
+.noema-append-modal .noema-append-error {
+	color: var(--text-error);
+	font-size: var(--font-ui-smaller);
+	margin: 8px 0;
+	padding: 6px 8px;
+	background: var(--background-modifier-error);
+	border-radius: 4px;
+}
+
+.noema-append-modal .noema-append-buttons {
+	display: flex;
+	justify-content: flex-end;
+	gap: 8px;
+	margin-top: 12px;
+}
