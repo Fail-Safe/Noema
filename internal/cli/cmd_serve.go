@@ -136,7 +136,7 @@ func serveCmd() *cobra.Command {
 			// their schedulers fired briefly before the parent killed them.
 			//
 			// An OS-level advisory lock here picks one process per
-			// cortex dir to own the background work (flock on Unix,
+			// cortex to own the background work (flock on Unix,
 			// LockFileEx on Windows — both with non-blocking
 			// exclusive semantics). Losers fall through to "MCP-only"
 			// mode — they still serve their transport's request
@@ -144,12 +144,48 @@ func serveCmd() *cobra.Command {
 			// kernel auto-releases the lock on process exit (any
 			// path: clean, SIGTERM, SIGKILL, panic), so a crashed
 			// holder hands off cleanly to the next process.
-			lockPath := filepath.Join(cx.Dir, "db", "background.lock")
+			//
+			// The lock file lives in a platform-appropriate runtime
+			// directory keyed by cortex ID, NOT inside the cortex dir
+			// itself. That insulates the lock from sync layers (iCloud
+			// Drive, Dropbox, Syncthing, OneDrive) which would otherwise
+			// replicate the file to other hosts (where it has no
+			// semantic meaning) and could replace the inode underneath
+			// our flock during a sync, leaving us holding a flock on
+			// an orphaned inode. See lock.RuntimePath for details.
+			lockPath, lockPathErr := lock.RuntimePath(cx.ID)
+			if lockPathErr != nil {
+				return fmt.Errorf("resolving lock path: %w", lockPathErr)
+			}
 			bgLock, gotLock, lockErr := lock.TryAcquire(lockPath)
 			if lockErr != nil {
 				return fmt.Errorf("acquiring background lock: %w", lockErr)
 			}
-			if !gotLock {
+			if gotLock {
+				fmt.Fprintf(os.Stderr, "[serve] background lock at %s\n", lockPath)
+				// Best-effort cleanup of the previous-release lock
+				// location. Earlier versions placed background.lock
+				// inside the cortex dir at <cortex>/db/background.lock,
+				// which had the iCloud-replication problem described
+				// above. Now that we hold the new lock, deleting the
+				// old-location file is safe — no other process should
+				// be relying on it (older binaries would have lost the
+				// race for the new location). If removal fails for any
+				// reason, log and move on; an orphaned 0-byte file is
+				// harmless.
+				oldLockPath := filepath.Join(cx.Dir, "db", "background.lock")
+				if _, statErr := os.Stat(oldLockPath); statErr == nil {
+					if rmErr := os.Remove(oldLockPath); rmErr != nil {
+						fmt.Fprintf(os.Stderr,
+							"[serve] could not remove stale lock at %s: %v (harmless, ignore)\n",
+							oldLockPath, rmErr)
+					} else {
+						fmt.Fprintf(os.Stderr,
+							"[serve] removed stale lock from previous location %s\n",
+							oldLockPath)
+					}
+				}
+			} else {
 				fmt.Fprintf(os.Stderr,
 					"[serve] another noema process owns background work for cortex %q; running as MCP-only\n",
 					cx.Name)
