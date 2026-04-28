@@ -187,3 +187,28 @@
 	gap: 8px;
 	margin-top: 12px;
 }
+
+/* ---- Immutable / source-locked warning ---- */
+
+.noema-immutable-warning {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 8px 12px;
+	margin: 8px 12px;
+	border-radius: 6px;
+	background: var(--background-modifier-border-hover);
+	border-left: 3px solid var(--text-warning, var(--text-accent));
+	font-size: var(--font-ui-smaller);
+}
+
+.noema-immutable-warning-glyph {
+	font-family: var(--font-monospace);
+	font-weight: 600;
+	color: var(--text-warning, var(--text-accent));
+	flex-shrink: 0;
+}
+
+.noema-immutable-warning-text {
+	color: var(--text-normal);
+}
