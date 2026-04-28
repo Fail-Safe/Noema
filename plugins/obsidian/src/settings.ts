@@ -5,17 +5,22 @@ export interface NoemaSettings {
 	endpoint: string;
 	bearerKey: string;
 	tracesFolder: string;
+	defaultAuthor: string;
 }
 
 // DEFAULT_SETTINGS deliberately leave endpoint and bearerKey empty so
 // the plugin starts in "disconnected" state on a fresh install rather
 // than blindly trying to reach a localhost URL. tracesFolder defaults
 // to "traces" because that's the cortex layout convention; users with
-// a non-standard layout (rare) can override.
+// a non-standard layout (rare) can override. defaultAuthor is empty
+// by default — the create-trace flow omits the author field entirely
+// when the setting is empty, letting the cortex's own author logic
+// decide what to record.
 export const DEFAULT_SETTINGS: NoemaSettings = {
 	endpoint: "",
 	bearerKey: "",
 	tracesFolder: "traces",
+	defaultAuthor: "",
 };
 
 export class NoemaSettingTab extends PluginSettingTab {
@@ -72,6 +77,21 @@ export class NoemaSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.tracesFolder)
 					.onChange(async (value) => {
 						this.plugin.settings.tracesFolder = value.trim() || "traces";
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Default author")
+			.setDesc(
+				"Stamped on traces created via the 'New trace' command. Leave empty to let the cortex's default apply. Free-form — typical values are a username, agent name, or 'agent/handle'."
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("e.g. alice or agent/researcher-1")
+					.setValue(this.plugin.settings.defaultAuthor)
+					.onChange(async (value) => {
+						this.plugin.settings.defaultAuthor = value.trim();
 						await this.plugin.saveSettings();
 					})
 			);
