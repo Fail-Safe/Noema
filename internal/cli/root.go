@@ -79,7 +79,7 @@ func init() {
 	)
 
 	addGrouped(groupTrace,
-		addCmd(), listCmd(), getCmd(), editCmd(), removeCmd(),
+		addCmd(), listCmd(), getCmd(), editCmd(), appendCmd(), removeCmd(),
 		searchCmd(), archiveCmd(), unarchiveCmd(), recoverCmd(), purgeCmd(), syncCmd(),
 		eventsCmd(), resolveCmd(), memoryCmd(), consolidateCmd(),
 	)
