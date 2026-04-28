@@ -31,6 +31,24 @@ before:
     - go mod tidy
     # Bundle the Hermes memory provider plugin as a release asset.
     - tar -czf noema-hermes-plugin.tar.gz -C plugins hermes
+    # Build and bundle the Obsidian plugin as a release asset. The
+    # tarball contains only the runtime artifacts the user drops into
+    # <vault>/.obsidian/plugins/noema/ — manifest.json, main.js,
+    # styles.css, README — wrapped in a "noema/" directory so end
+    # users can `tar -xzf … -C <vault>/.obsidian/plugins/` and have
+    # the right layout in one step (mirrors the hermes plugin's
+    # directory-rooted convention).
+    #
+    # Why staging dir instead of `tar --transform`: GNU tar supports
+    # --transform but BSD tar (macOS, FreeBSD) does not, and operators
+    # want to be able to `goreleaser release --snapshot` locally on
+    # any platform. The portable path is to copy into a temp dir.
+    #
+    # Node + npm are preinstalled on ubuntu-latest GitHub runners; we
+    # add a setup-node step in release.yml regardless to pin the
+    # version and keep CI immune to runner-image drift.
+    - bash -c "cd plugins/obsidian && npm ci --silent && npm run build"
+    - bash -c "rm -rf .release-obsidian && mkdir -p .release-obsidian/noema && cp plugins/obsidian/manifest.json plugins/obsidian/main.js plugins/obsidian/styles.css plugins/obsidian/README.md .release-obsidian/noema/ && tar -czf noema-obsidian-plugin.tar.gz -C .release-obsidian noema && rm -rf .release-obsidian"
 
 builds:
   - id: noema
@@ -123,6 +141,7 @@ release:
     require a manual step ship with an explicit `noema migrate` command.**
   extra_files:
     - glob: ./noema-hermes-plugin.tar.gz
+    - glob: ./noema-obsidian-plugin.tar.gz
   footer: |
     ---
     **Install:** see [README — Installation](https://github.com/Fail-Safe/Noema#installation).
