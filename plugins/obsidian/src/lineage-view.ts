@@ -135,12 +135,17 @@ export class LineageView extends ItemView {
 
 	private renderSection(label: string, ids: string[]): void {
 		if (!this.bodyEl) return;
-		const section = this.bodyEl.createEl("div", { cls: "noema-lineage-section" });
-		section.createEl("div", { cls: "noema-lineage-section-label", text: label });
+		// Hide empty sections entirely. The earlier behaviour rendered
+		// the label + "(none)" placeholder for symmetry, but in
+		// practice that just took screen space and pulled focus away
+		// from the actual content. Operators told us at a glance
+		// whether a trace had ancestors / descendants by whether the
+		// section appeared at all — make that the default.
 		if (ids.length === 0) {
-			section.createEl("div", { cls: "noema-lineage-section-empty", text: "(none)" });
 			return;
 		}
+		const section = this.bodyEl.createEl("div", { cls: "noema-lineage-section" });
+		section.createEl("div", { cls: "noema-lineage-section-label", text: label });
 		const list = section.createEl("div", { cls: "noema-lineage-section-list" });
 		for (const id of ids) {
 			const file = this.findTraceFile(id);

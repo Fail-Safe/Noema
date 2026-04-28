@@ -93,33 +93,39 @@
 }
 
 /* The current trace is rendered as a centerpiece between ancestors
-   and descendants. Slightly heavier visual treatment than the
-   surrounding lists so it reads as the focus. */
+   and descendants. Heavier visual treatment than the surrounding
+   lists so it reads as the focus — subtle background tint plus a
+   larger tier glyph anchor the reader's eye to "this is the trace
+   you're looking at" without overwhelming the panel. */
 .noema-lineage-current {
 	display: flex;
 	flex-direction: column;
 	align-items: center;
-	gap: 2px;
-	padding: 8px 0;
-	border-top: 1px solid var(--background-modifier-border);
-	border-bottom: 1px solid var(--background-modifier-border);
-	margin: 8px 0;
+	gap: 4px;
+	padding: 12px 8px;
+	border-radius: 6px;
+	background: var(--background-secondary);
+	margin: 12px 0;
 }
 
 .noema-lineage-current-glyph {
 	font-family: var(--font-monospace);
-	font-size: var(--font-ui-medium);
+	font-size: var(--font-ui-large, 1.1em);
+	font-weight: 600;
 	color: var(--text-accent);
 }
 
 .noema-lineage-current-title {
 	font-weight: 600;
+	text-align: center;
 }
 
 .noema-lineage-current-id {
 	color: var(--text-faint);
 	font-family: var(--font-monospace);
 	font-size: var(--font-ui-smaller);
+	text-align: center;
+	word-break: break-all;
 }
 
 .noema-lineage-empty {
