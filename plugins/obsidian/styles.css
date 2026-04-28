@@ -1,0 +1,146 @@
+/* Noema Obsidian plugin styles. Kept minimal — the goal is to fit
+   into Obsidian's native look rather than impose a separate visual
+   identity. We use Obsidian's CSS variables (--text-muted,
+   --background-secondary, etc.) so the plugin tracks user themes
+   automatically without per-theme rules. */
+
+.noema-status-glyph {
+	font-family: var(--font-monospace);
+	font-weight: 600;
+	margin-right: 4px;
+}
+
+.noema-status-divider {
+	color: var(--text-muted);
+	margin-right: 4px;
+}
+
+.noema-status-ok {
+	color: var(--text-success, var(--text-normal));
+}
+
+.noema-status-err {
+	color: var(--text-error, var(--text-muted));
+}
+
+/* ---- Lineage view ---- */
+
+.noema-lineage-view {
+	padding: 8px 12px;
+}
+
+.noema-lineage-header h3 {
+	margin: 0 0 12px 0;
+}
+
+.noema-lineage-section {
+	margin-bottom: 12px;
+}
+
+.noema-lineage-section-label {
+	font-size: var(--font-ui-smaller);
+	text-transform: uppercase;
+	color: var(--text-muted);
+	letter-spacing: 0.05em;
+	margin-bottom: 4px;
+}
+
+.noema-lineage-section-empty {
+	color: var(--text-muted);
+	font-style: italic;
+	padding-left: 4px;
+}
+
+.noema-lineage-section-list {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+
+.noema-lineage-row {
+	display: flex;
+	align-items: baseline;
+	gap: 6px;
+	padding: 2px 4px;
+	border-radius: 4px;
+}
+
+.noema-lineage-row:hover {
+	background: var(--background-modifier-hover);
+}
+
+.noema-lineage-glyph {
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+	min-width: 24px;
+}
+
+.noema-lineage-link {
+	color: var(--text-normal);
+	text-decoration: none;
+	cursor: pointer;
+}
+
+.noema-lineage-link:hover {
+	text-decoration: underline;
+}
+
+.noema-lineage-id {
+	color: var(--text-faint);
+	font-size: var(--font-ui-smaller);
+	font-family: var(--font-monospace);
+}
+
+/* The current trace is rendered as a centerpiece between ancestors
+   and descendants. Heavier visual treatment than the surrounding
+   lists so it reads as the focus — subtle background tint plus a
+   larger tier glyph anchor the reader's eye to "this is the trace
+   you're looking at" without overwhelming the panel. */
+.noema-lineage-current {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 4px;
+	padding: 12px 8px;
+	border-radius: 6px;
+	background: var(--background-secondary);
+	margin: 12px 0;
+}
+
+.noema-lineage-current-glyph {
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-large, 1.1em);
+	font-weight: 600;
+	color: var(--text-accent);
+}
+
+.noema-lineage-current-title {
+	font-weight: 600;
+	text-align: center;
+}
+
+.noema-lineage-current-id {
+	color: var(--text-faint);
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
+	text-align: center;
+	word-break: break-all;
+}
+
+.noema-lineage-empty {
+	color: var(--text-muted);
+	font-style: italic;
+	padding: 8px 0;
+}
+
+.noema-lineage-error {
+	color: var(--text-error);
+	padding: 8px 0;
+}
+
+.noema-lineage-loading {
+	color: var(--text-muted);
+	font-style: italic;
+	padding: 8px 0;
+}
