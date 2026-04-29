@@ -1,13 +1,14 @@
 package cortex_test
 
 import (
+	"bytes"
+	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-
-	"encoding/json"
 
 	"github.com/Fail-Safe/Noema/internal/cortex"
 	"github.com/Fail-Safe/Noema/internal/event"
@@ -78,8 +79,8 @@ func TestCreate_AgentsMDContent(t *testing.T) {
 		"origin",
 		"trace_history",
 		"trace_lineage",
-		"Titles",      // new naming-rules section
-		"under 80",    // title length guidance
+		"Titles",        // new naming-rules section
+		"under 80",      // title length guidance
 		"100 character", // slug cap guidance
 	} {
 		if !strings.Contains(content, want) {
@@ -271,6 +272,104 @@ func TestReadManifest(t *testing.T) {
 	}
 }
 
+// TestManifest_FramedOnCreate verifies that Create writes cortex.md as
+// markdown with `---`-fenced YAML frontmatter, not as bare YAML.
+func TestManifest_FramedOnCreate(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := cortex.Create("framed", dir); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "framed", "cortex.md"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.HasPrefix(data, []byte("---\n")) {
+		t.Errorf("cortex.md must open with a --- fence; got:\n%s", data)
+	}
+	// The YAML block must be followed by a closing --- fence on its own line.
+	if !bytes.Contains(data, []byte("\n---\n")) {
+		t.Errorf("cortex.md must contain a closing --- fence; got:\n%s", data)
+	}
+}
+
+// TestManifest_LegacyBareYAMLParses verifies back-compat: cortex.md files
+// written by earlier binaries (bare YAML, no frontmatter fences) still
+// parse cleanly. This is the pre-framing on-disk format.
+func TestManifest_LegacyBareYAMLParses(t *testing.T) {
+	dir := t.TempDir()
+	legacy := []byte("id: 01J000000000000000000000AA\nname: legacy\nversion: 2\ncreated: 2026-04-22\n")
+	if err := os.WriteFile(filepath.Join(dir, "cortex.md"), legacy, 0o640); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	m, err := cortex.ReadManifest(dir)
+	if err != nil {
+		t.Fatalf("ReadManifest (legacy): %v", err)
+	}
+	if m.Name != "legacy" || m.Version != 2 {
+		t.Errorf("legacy manifest did not parse: got %+v", m)
+	}
+	if m.Body != "" {
+		t.Errorf("legacy manifest has no body; got %q", m.Body)
+	}
+}
+
+// TestManifest_BodyRoundTrip verifies that free-form body text below the
+// frontmatter is preserved across ReadManifest/WriteManifest.
+func TestManifest_BodyRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := cortex.Create("withbody", dir); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	cortexDir := filepath.Join(dir, "withbody")
+
+	m, err := cortex.ReadManifest(cortexDir)
+	if err != nil {
+		t.Fatalf("ReadManifest: %v", err)
+	}
+	m.Body = "# About this cortex\n\nPrimary memory for the research cluster.\n"
+	if err := cortex.WriteManifest(cortexDir, m); err != nil {
+		t.Fatalf("WriteManifest: %v", err)
+	}
+
+	got, err := cortex.ReadManifest(cortexDir)
+	if err != nil {
+		t.Fatalf("ReadManifest (round-trip): %v", err)
+	}
+	wantBody := "# About this cortex\n\nPrimary memory for the research cluster.\n"
+	if got.Body != wantBody {
+		t.Errorf("Body round-trip mismatch\n got: %q\nwant: %q", got.Body, wantBody)
+	}
+	if got.Name != "withbody" || got.ID == "" {
+		t.Errorf("frontmatter corrupted by body round-trip: %+v", got)
+	}
+}
+
+// TestManifest_LegacyPromotesToFramedOnWrite verifies that reading a
+// legacy bare-YAML manifest and then writing it back produces a framed
+// file — existing cortexes silently upgrade on the first mutation.
+func TestManifest_LegacyPromotesToFramedOnWrite(t *testing.T) {
+	dir := t.TempDir()
+	legacy := []byte("id: 01J000000000000000000000BB\nname: upgrade\nversion: 2\ncreated: 2026-04-22\n")
+	path := filepath.Join(dir, "cortex.md")
+	if err := os.WriteFile(path, legacy, 0o640); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	m, err := cortex.ReadManifest(dir)
+	if err != nil {
+		t.Fatalf("ReadManifest: %v", err)
+	}
+	if err := cortex.WriteManifest(dir, m); err != nil {
+		t.Fatalf("WriteManifest: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.HasPrefix(data, []byte("---\n")) {
+		t.Errorf("legacy cortex.md was not upgraded to framed form; got:\n%s", data)
+	}
+}
+
 func TestPeerLabelCollidesWithSelf(t *testing.T) {
 	m := cortex.Manifest{Name: "alpha"}
 
@@ -278,11 +377,11 @@ func TestPeerLabelCollidesWithSelf(t *testing.T) {
 		label string
 		want  bool
 	}{
-		{"alpha", true},      // exact collision
-		{"beta", false},      // distinct
-		{"", false},          // empty is not a collision (other validation handles empty)
-		{"Alpha", false},     // case-sensitive: cortex names are exact strings
-		{"alpha-1", false},   // distinct
+		{"alpha", true},    // exact collision
+		{"beta", false},    // distinct
+		{"", false},        // empty is not a collision (other validation handles empty)
+		{"Alpha", false},   // case-sensitive: cortex names are exact strings
+		{"alpha-1", false}, // distinct
 	}
 	for _, tc := range cases {
 		if got := m.PeerLabelCollidesWithSelf(tc.label); got != tc.want {
@@ -536,13 +635,21 @@ func TestSearch_ExcludesArchivedByDefault(t *testing.T) {
 	}
 }
 
-func TestSearch_MalformedQuery(t *testing.T) {
+func TestSearch_StructuralCharsAsLiterals(t *testing.T) {
 	cx := setup(t)
-	// FTS5 rejects certain malformed queries. Verify this surfaces as an error
-	// rather than silently returning empty results.
-	_, err := cx.Search("(unclosed paren", cortex.ListOptions{})
-	if err == nil {
-		t.Error("malformed FTS5 query must return an error")
+	// SanitizeFTS5Query quotes any token containing FTS5 structural
+	// characters so the parser treats them as literals. Queries that
+	// would previously produce "fts5: syntax error" now succeed.
+	cases := []string{
+		"(unclosed paren",
+		"cortex.md manifest format yaml",
+		"path/to/file",
+		"foo(bar)",
+	}
+	for _, q := range cases {
+		if _, err := cx.Search(q, cortex.ListOptions{}); err != nil {
+			t.Errorf("Search(%q) unexpected error: %v", q, err)
+		}
 	}
 }
 
@@ -601,6 +708,14 @@ func TestSanitizeFTS5Query(t *testing.T) {
 		{"\"already quoted\"", "\"already quoted\""},
 		{"", ""},
 		{"no-hyphens-here AND plain", "\"no-hyphens-here\" AND plain"},
+		// Tokens with FTS5 structural characters must be quoted as literals.
+		{"cortex.md manifest format yaml", "\"cortex.md\" manifest format yaml"},
+		{"path/to/file", "\"path/to/file\""},
+		{"foo(bar)", "\"foo(bar)\""},
+		{"a+b", "\"a+b\""},
+		{"foo*bar", "\"foo*bar\""},
+		{"café", "café"},
+		{"*", "\"*\""},
 		// Unbalanced quotes: stripped to prevent FTS5 syntax errors.
 		// Odd quote count → all quotes removed → safe default tokenization.
 		{"\"unterminated", "unterminated"},
@@ -2369,7 +2484,463 @@ func TestValidateFederation_NilFederation(t *testing.T) {
 	}
 }
 
+// ---- ValidateConsolidation ----
+//
+// Pins the cross-field rule that auto_distillation_enabled requires the
+// LLM block to be fully populated. The trigger path has no CLI flags to
+// fall back on, so a half-filled config would silently no-op on every
+// scheduled pass — surfacing it at load time is the only way operators
+// discover the gap before production.
+
+func TestValidateConsolidation_NilOrDisabled(t *testing.T) {
+	// Nil and Enabled=false should both pass: there is no agent to
+	// validate against.
+	cases := []cortex.Manifest{
+		{},
+		{Consolidation: &cortex.ConsolidationConfig{Enabled: false, AutoDistillationEnabled: true}},
+	}
+	for i, m := range cases {
+		if err := m.ValidateConsolidation(); err != nil {
+			t.Errorf("case %d: expected nil, got %v", i, err)
+		}
+	}
+}
+
+func TestValidateConsolidation_AutoDistillationHappyPath(t *testing.T) {
+	m := cortex.Manifest{
+		Consolidation: &cortex.ConsolidationConfig{
+			Enabled:                 true,
+			AutoDistillationEnabled: true,
+			LLMEnabled:              true,
+			LocalLLMEndpoint:        "http://localhost:11434/v1",
+			ModelName:               "llama3.1:70b",
+		},
+	}
+	if err := m.ValidateConsolidation(); err != nil {
+		t.Errorf("fully configured auto-distillation rejected: %v", err)
+	}
+}
+
+func TestValidateConsolidation_AutoDistillationMissingFields(t *testing.T) {
+	cases := []struct {
+		name    string
+		cfg     cortex.ConsolidationConfig
+		wantSub string
+	}{
+		{
+			name:    "missing llm_enabled",
+			cfg:     cortex.ConsolidationConfig{Enabled: true, AutoDistillationEnabled: true, LocalLLMEndpoint: "x", ModelName: "m"},
+			wantSub: "llm_enabled",
+		},
+		{
+			name:    "missing endpoint",
+			cfg:     cortex.ConsolidationConfig{Enabled: true, AutoDistillationEnabled: true, LLMEnabled: true, ModelName: "m"},
+			wantSub: "local_llm_endpoint",
+		},
+		{
+			name:    "missing model_name",
+			cfg:     cortex.ConsolidationConfig{Enabled: true, AutoDistillationEnabled: true, LLMEnabled: true, LocalLLMEndpoint: "x"},
+			wantSub: "model_name",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := cortex.Manifest{Consolidation: &tc.cfg}
+			err := m.ValidateConsolidation()
+			if err == nil {
+				t.Fatalf("expected error mentioning %q, got nil", tc.wantSub)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("error should mention %q, got: %v", tc.wantSub, err)
+			}
+		})
+	}
+}
+
+func TestEffectiveWatchdogTimeout(t *testing.T) {
+	// Default applies on nil receiver, empty string, malformed
+	// duration, and non-positive duration. Configured value applies
+	// otherwise.
+	cases := []struct {
+		name string
+		cfg  *cortex.ConsolidationConfig
+		want time.Duration
+	}{
+		{"nil receiver", nil, 10 * time.Minute},
+		{"empty string", &cortex.ConsolidationConfig{}, 10 * time.Minute},
+		{"valid 20m", &cortex.ConsolidationConfig{WatchdogTimeout: "20m"}, 20 * time.Minute},
+		{"valid 1h", &cortex.ConsolidationConfig{WatchdogTimeout: "1h"}, time.Hour},
+		{"malformed falls back", &cortex.ConsolidationConfig{WatchdogTimeout: "not-a-duration"}, 10 * time.Minute},
+		{"zero falls back", &cortex.ConsolidationConfig{WatchdogTimeout: "0s"}, 10 * time.Minute},
+		{"negative falls back", &cortex.ConsolidationConfig{WatchdogTimeout: "-5m"}, 10 * time.Minute},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.cfg.EffectiveWatchdogTimeout()
+			if got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateConsolidation_WatchdogTimeout(t *testing.T) {
+	// A typo in watchdog_timeout should produce a clear error at
+	// manifest load time rather than silently falling back to the
+	// default — operators tweaking this knob would otherwise
+	// wonder why their override didn't take effect.
+	cases := []struct {
+		name    string
+		raw     string
+		wantErr bool
+		wantSub string
+	}{
+		{"empty is ok", "", false, ""},
+		{"valid duration", "20m", false, ""},
+		{"valid hour", "1h30m", false, ""},
+		{"unparseable", "twenty minutes", true, "watchdog_timeout"},
+		{"missing unit", "20", true, "watchdog_timeout"},
+		{"zero rejected", "0s", true, "must be positive"},
+		{"negative rejected", "-5m", true, "must be positive"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := cortex.Manifest{
+				Consolidation: &cortex.ConsolidationConfig{
+					Enabled:         true,
+					WatchdogTimeout: tc.raw,
+				},
+			}
+			err := m.ValidateConsolidation()
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected error mentioning %q, got nil", tc.wantSub)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("expected no error, got %v", err)
+			}
+			if tc.wantErr && err != nil && !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("error should mention %q, got: %v", tc.wantSub, err)
+			}
+		})
+	}
+}
+
 // ---- Security: path traversal ----
+
+func TestReplayEvent_Promote(t *testing.T) {
+	// Promote events must replicate across peers so tier state
+	// converges. Before this handler existed, federation replay hit
+	// the default "unknown event action" error and pinned the cursor
+	// on the first Promote — fatal to any federated cortex with
+	// consolidation active.
+	cx := setup(t)
+
+	tr := trace.New("Target", "note", "local", nil, "body")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	promoteData, _ := json.Marshal(map[string]any{"from": "short", "to": "mid"})
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionPromote,
+		TraceID:   tr.ID,
+		CortexID:  "01REMOTEABCDEF",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-04-21T14:00:00Z",
+		Data:      promoteData,
+	}
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent promote: %v", err)
+	}
+
+	row, _ := cx.Get(tr.ID)
+	if row.Tier != trace.TierMid {
+		t.Errorf("tier = %q, want %q", row.Tier, trace.TierMid)
+	}
+}
+
+func TestReplayEvent_Demote(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Target", "note", "local", nil, "body")
+	tr.Tier = trace.TierMid
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	demoteData, _ := json.Marshal(map[string]any{"from": "mid", "to": "short"})
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionDemote,
+		TraceID:   tr.ID,
+		CortexID:  "01REMOTEABCDEF",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-04-21T14:00:00Z",
+		Data:      demoteData,
+	}
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent demote: %v", err)
+	}
+
+	row, _ := cx.Get(tr.ID)
+	if row.Tier != trace.TierShort {
+		t.Errorf("tier = %q, want %q", row.Tier, trace.TierShort)
+	}
+}
+
+func TestReplayEvent_Promote_MissingTrace_StoresOnly(t *testing.T) {
+	// A Promote for a trace we haven't received a Create for yet is
+	// stored in the event log but skips the tier UPDATE — matches the
+	// existing soft-handling posture of replayArchive/Trash/etc.
+	cx := setup(t)
+
+	promoteData, _ := json.Marshal(map[string]any{"from": "short", "to": "mid"})
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionPromote,
+		TraceID:   "20260421-not-here-yet",
+		CortexID:  "01REMOTEABCDEF",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-04-21T14:00:00Z",
+		Data:      promoteData,
+	}
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent: %v", err)
+	}
+
+	events, _ := cx.Events("20260421-not-here-yet")
+	if len(events) != 1 || events[0].ID != e.ID {
+		t.Errorf("event not stored for missing trace: %v", events)
+	}
+}
+
+func TestReplayEvent_Vote(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Vote target", "note", "local", nil, "body")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	voteData, _ := json.Marshal(map[string]any{"delta": 1, "actor": "human"})
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionVote,
+		TraceID:   tr.ID,
+		CortexID:  "01REMOTEABCDEF",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-04-21T14:00:00Z",
+		Data:      voteData,
+	}
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent vote: %v", err)
+	}
+
+	var votes int
+	if err := cx.DB.QueryRow(`SELECT tier_votes FROM traces WHERE id = ?`, tr.ID).Scan(&votes); err != nil {
+		t.Fatalf("reading tier_votes: %v", err)
+	}
+	if votes != 1 {
+		t.Errorf("tier_votes = %d, want 1", votes)
+	}
+
+	// Replaying the same event must be idempotent.
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("idempotent replay: %v", err)
+	}
+	_ = cx.DB.QueryRow(`SELECT tier_votes FROM traces WHERE id = ?`, tr.ID).Scan(&votes)
+	if votes != 1 {
+		t.Errorf("idempotent replay double-counted: tier_votes = %d, want 1", votes)
+	}
+}
+
+func TestReplayEvent_Consolidate_StoresTelemetryOnly(t *testing.T) {
+	// ActionConsolidate is telemetry about a distillation that already
+	// arrived via its own ActionCreate. Replay must NOT double-create
+	// the trace; it should only append the event to the log.
+	cx := setup(t)
+
+	telemetry, _ := json.Marshal(map[string]any{
+		"source_ids":          []string{"20260421-source-a"},
+		"distilled_id":        "20260421-distilled",
+		"model_name":          "claude-opus-4-7",
+		"cohesion_confidence": 0.87,
+	})
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionConsolidate,
+		TraceID:   "20260421-distilled",
+		CortexID:  "01REMOTEABCDEF",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-04-21T14:00:00Z",
+		Data:      telemetry,
+	}
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent consolidate: %v", err)
+	}
+
+	events, _ := cx.Events("20260421-distilled")
+	if len(events) != 1 || events[0].ID != e.ID {
+		t.Errorf("telemetry event not stored: %v", events)
+	}
+
+	// Must NOT have created a trace row — consolidate is telemetry,
+	// create rides a separate ActionCreate.
+	if _, err := cx.Get("20260421-distilled"); err == nil {
+		t.Error("consolidate replay created a trace row (it shouldn't)")
+	}
+}
+
+func TestReplayEvent_PurgeLongTerm(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("To purge", "note", "local", nil, "body")
+	tr.Tier = trace.TierLong
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	purgeData, _ := json.Marshal(map[string]any{
+		"reason": "remote operator purged",
+		"tier":   "long",
+		"actor":  "human",
+	})
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionPurgeLongTerm,
+		TraceID:   tr.ID,
+		CortexID:  "01REMOTEABCDEF",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-04-21T14:00:00Z",
+		Data:      purgeData,
+	}
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent purge_long_term: %v", err)
+	}
+
+	var purgedAt sql.NullString
+	if err := cx.DB.QueryRow(
+		`SELECT purged_at FROM traces WHERE id = ?`, tr.ID,
+	).Scan(&purgedAt); err != nil {
+		t.Fatalf("reading purged_at: %v", err)
+	}
+	if !purgedAt.Valid || purgedAt.String == "" {
+		t.Error("expected purged_at to be set on long-tier trace after replay")
+	}
+}
+
+func TestReplayEvent_PurgeHard(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("To hard-purge", "note", "local", nil, "body")
+	tr.Tier = trace.TierLong
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	purgeData, _ := json.Marshal(map[string]any{
+		"reason": "gdpr request",
+		"tier":   "long",
+		"actor":  "human",
+		"hard":   true,
+	})
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionPurgeHard,
+		TraceID:   tr.ID,
+		CortexID:  "01REMOTEABCDEF",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-04-21T14:00:00Z",
+		Data:      purgeData,
+	}
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent purge_hard: %v", err)
+	}
+
+	// Hard purge removes the row entirely.
+	var n int
+	_ = cx.DB.QueryRow(`SELECT COUNT(*) FROM traces WHERE id = ?`, tr.ID).Scan(&n)
+	if n != 0 {
+		t.Errorf("hard-purged trace still in traces table: count=%d", n)
+	}
+}
+
+func TestReplayEvent_CoordinationActionsBypassTraceIDGate(t *testing.T) {
+	// Consolidation coordination events (Claim/Success/Fail) use a
+	// synthetic window ULID as trace_id rather than a real trace ID.
+	// The IsValidID gate for path-traversal safety only applies to
+	// content-mutating replays — coord events must replay into the
+	// local log verbatim so peers converge on election history.
+	cx := setup(t)
+
+	windowID := event.NewULID()
+	claim, _ := json.Marshal(map[string]any{
+		"window_id": windowID,
+		"cortex_id": "01KPR5X75NFJ5703T7VZTCC8TF",
+	})
+
+	claimEvent := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionConsolidationClaim,
+		TraceID:   windowID,
+		CortexID:  "01KPR5X75NFJ5703T7VZTCC8TF",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-04-21T14:16:36Z",
+		Data:      claim,
+	}
+	if err := cx.ReplayEvent(claimEvent); err != nil {
+		t.Fatalf("ReplayEvent claim: %v", err)
+	}
+
+	success, _ := json.Marshal(map[string]any{
+		"window_id": windowID,
+		"cortex_id": "01KPR5X75NFJ5703T7VZTCC8TF",
+	})
+	successEvent := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionConsolidationSuccess,
+		TraceID:   windowID,
+		CortexID:  "01KPR5X75NFJ5703T7VZTCC8TF",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-04-21T14:16:46Z",
+		Data:      success,
+	}
+	if err := cx.ReplayEvent(successEvent); err != nil {
+		t.Fatalf("ReplayEvent success: %v", err)
+	}
+
+	// Both events should be in the log under the window ID.
+	events, err := cx.Events(windowID)
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if len(events) != 2 {
+		t.Errorf("got %d events, want 2", len(events))
+	}
+
+	// Idempotent replay of the same event must be a no-op.
+	if err := cx.ReplayEvent(claimEvent); err != nil {
+		t.Fatalf("second replay of claim: %v", err)
+	}
+	events, _ = cx.Events(windowID)
+	if len(events) != 2 {
+		t.Errorf("after idempotent replay, got %d events, want 2", len(events))
+	}
+
+	// No trace row or file should have been created for the synthetic
+	// window ID.
+	if _, err := cx.Get(windowID); err == nil {
+		t.Error("expected no trace row for coordination window ID")
+	}
+}
 
 func TestReplayEvent_RejectsPathTraversal(t *testing.T) {
 	cx := setup(t)

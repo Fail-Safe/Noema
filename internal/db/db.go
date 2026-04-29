@@ -114,10 +114,15 @@ func CheckpointWAL(cortexDir string) error {
 }
 
 // splitSQL splits a SQL script into individual statements on semicolons,
-// skipping comment and blank lines.
+// skipping comment and blank lines. Semicolons inside BEGIN...END blocks
+// (trigger bodies) are preserved so the trigger stays intact as one
+// statement — required for migration 008's long-term immutability triggers.
+// Convention: BEGIN and END; each appear on their own line in migration
+// files so the depth tracking can rely on line-level matching.
 func splitSQL(script string) []string {
 	var stmts []string
 	var cur strings.Builder
+	depth := 0
 	for _, line := range strings.Split(script, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "--") || trimmed == "" {
@@ -125,7 +130,14 @@ func splitSQL(script string) []string {
 		}
 		cur.WriteString(line)
 		cur.WriteByte('\n')
-		if strings.HasSuffix(trimmed, ";") {
+		upper := strings.ToUpper(trimmed)
+		switch {
+		case upper == "BEGIN":
+			depth++
+		case upper == "END;" && depth > 0:
+			depth--
+		}
+		if depth == 0 && strings.HasSuffix(trimmed, ";") {
 			stmts = append(stmts, strings.TrimSpace(cur.String()))
 			cur.Reset()
 		}

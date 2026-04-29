@@ -72,6 +72,15 @@ type palette struct {
 	live     lipgloss.TerminalColor // live-mode badge
 	errorFg  lipgloss.TerminalColor // footer error text
 	statusFg lipgloss.TerminalColor // footer status text
+
+	// Tier glyphs render as a heat chart: short is warm (volatile,
+	// just-arrived), long is cold (frozen, archival). Mid sits between
+	// as an amber/gold transition. "?" (unknown tier, a migration bug
+	// signal) reuses the dim color so it reads as an anomaly, not a
+	// fourth legitimate tier.
+	tierShort lipgloss.TerminalColor // short-term: warm orange
+	tierMid   lipgloss.TerminalColor // mid-term: amber/gold
+	tierLong  lipgloss.TerminalColor // long-term: cool blue
 }
 
 // darkPalette is the primary brand surface: near-black background,
@@ -96,6 +105,13 @@ func darkPalette() palette {
 		live:     lipgloss.Color("71"),
 		errorFg:  lipgloss.Color("196"),
 		statusFg: lipgloss.Color("71"),
+		// Heat-chart tier glyphs on a near-black surface: bright
+		// orange for short (volatile), warm gold for mid, sky blue
+		// for long (archival). All three are bright enough to pop
+		// from the 250-grey body without competing with brandRed.
+		tierShort: lipgloss.Color("208"),
+		tierMid:   lipgloss.Color("221"),
+		tierLong:  lipgloss.Color("39"),
 	}
 }
 
@@ -123,6 +139,14 @@ func lightPalette() palette {
 		live:     lipgloss.Color("22"),
 		errorFg:  lipgloss.Color("124"),
 		statusFg: lipgloss.Color("22"),
+		// Heat-chart tiers on a near-white surface need darker
+		// variants of the same progression — bright 208 reads as
+		// pastel against white. Terracotta (166) keeps the "warm"
+		// feel with enough contrast; amber 136 is the gold mid;
+		// steel blue 25 is the cool/frozen endpoint.
+		tierShort: lipgloss.Color("166"),
+		tierMid:   lipgloss.Color("136"),
+		tierLong:  lipgloss.Color("25"),
 	}
 }
 
@@ -172,6 +196,13 @@ var (
 	// implicit fill behind the list/detail/divider block so the
 	// whole TUI reads as one brand surface.
 	styleSurface lipgloss.Style
+
+	// Heat-chart tier glyphs: short/mid/long get warm→cold colors
+	// so a scan of the list reads the tier distribution the same
+	// way the eye reads a heatmap. Used by tierBadge.
+	styleTierShort lipgloss.Style
+	styleTierMid   lipgloss.Style
+	styleTierLong  lipgloss.Style
 )
 
 func init() {
@@ -264,6 +295,15 @@ func loadPalette(theme string) {
 	styleNewRowDim = lipgloss.NewStyle().
 		Background(p.bg).
 		Foreground(p.newDim)
+
+	// Tier glyphs are bold so the heat color registers at a glance
+	// even at the 1-character width. Background isn't set here — the
+	// outer row style (styleSurface/styleSelected/styleRowDim) paints
+	// the row background underneath, and lipgloss preserves the
+	// inner foreground when rendering a nested pre-styled substring.
+	styleTierShort = lipgloss.NewStyle().Foreground(p.tierShort).Bold(true)
+	styleTierMid = lipgloss.NewStyle().Foreground(p.tierMid).Bold(true)
+	styleTierLong = lipgloss.NewStyle().Foreground(p.tierLong).Bold(true)
 }
 
 // resolveTheme picks a concrete theme ("dark" or "light") from an
@@ -339,10 +379,19 @@ type confirmAction struct {
 }
 
 type model struct {
-	cx          *cortex.Cortex
-	rows        []cortex.Row
-	cursor      int
-	current     *trace.Trace // cached detail for selected row
+	cx           *cortex.Cortex
+	rows         []cortex.Row
+	cursor       int
+	current      *trace.Trace // cached detail for selected row
+	currentVotes int          // tier_votes for m.current, refreshed whenever m.current reloads
+
+	// sessionVotes tracks this session's vote intent per trace ID: -1,
+	// 0, or +1. The DB column tier_votes is an accumulator that any
+	// actor can contribute to; this map is the TUI's local "what have
+	// I cast in this session" so a single user can't pile up +6 by
+	// holding the + key. Reddit-style three-state cycle: + on a fresh
+	// trace → +1; + again → 0 (clears); + when at -1 → +1 (flip).
+	sessionVotes map[string]int
 	width       int
 	height      int
 	state       viewState
@@ -353,6 +402,15 @@ type model struct {
 	confirm     confirmAction
 	err         error
 	status      string
+
+	// Memory-tier visibility filters. Long-term is hidden by default
+	// — those are stable "base truths" that would clutter day-to-day
+	// browsing of recent cortex activity. Keys 1/2/3 toggle each tier,
+	// 0 shows all. See docs/plans/consolidation-plan.md §12 in the
+	// Noema-design repo.
+	visibleShort bool
+	visibleMid   bool
+	visibleLong  bool
 
 	// Follow-mode state (auto-refresh).
 	follow    bool           // true when auto-refresh is on
@@ -383,18 +441,90 @@ func initialModel(cx *cortex.Cortex) model {
 	ti.CharLimit = 120
 
 	return model{
-		cx:        cx,
-		search:    ti,
-		state:     stateList,
-		newRowTTL: map[string]int{},
+		cx:           cx,
+		search:       ti,
+		state:        stateList,
+		newRowTTL:    map[string]int{},
+		sessionVotes: map[string]int{},
+		visibleShort: true,
+		visibleMid:   true,
+		visibleLong:  false,
 	}
+}
+
+// tierBadge returns the single-character glyph shown next to each row
+// in the list. S/M/L correspond to short/mid/long. Empty tier renders
+// as "?" to make schema drift visible rather than silent (a trace
+// without a tier at this point is a migration bug).
+func tierBadge(tier string) string {
+	switch tier {
+	case trace.TierShort:
+		return "s"
+	case trace.TierMid:
+		return "m"
+	case trace.TierLong:
+		return "L"
+	default:
+		return "?"
+	}
+}
+
+// renderTierGlyph returns the tier badge pre-styled with its heat-chart
+// color (warm orange → amber → cool blue for short → mid → long) when
+// the pane is in focus. When dim=true (list acting as backdrop while
+// the detail pane has focus), the glyph renders as a plain character
+// so the outer styleRowDim can apply uniform dimming across the whole
+// row — the heat-chart ANSI embeds a reset that would otherwise
+// terminate the outer dim mid-line, leaving the title/badge/date
+// rendered at default terminal color.
+//
+// Unknown tiers render without color in both states to keep the "?"
+// reading as a migration-anomaly signal rather than a fourth tier.
+func renderTierGlyph(tier string, dim bool) string {
+	glyph := tierBadge(tier)
+	if dim {
+		return glyph
+	}
+	switch tier {
+	case trace.TierShort:
+		return styleTierShort.Render(glyph)
+	case trace.TierMid:
+		return styleTierMid.Render(glyph)
+	case trace.TierLong:
+		return styleTierLong.Render(glyph)
+	default:
+		return glyph
+	}
+}
+
+// currentTiers returns the list of tier names the model wants the
+// backend to filter on, in a stable order so the resulting SQL plan is
+// cacheable and tests can assert on the slice contents. An all-
+// visible configuration returns nil so `noema list` and the MCP tools
+// behave identically to pre-Phase-10 (no tier filter) when every
+// tier is turned on.
+func (m model) currentTiers() []string {
+	if m.visibleShort && m.visibleMid && m.visibleLong {
+		return nil
+	}
+	var out []string
+	if m.visibleShort {
+		out = append(out, trace.TierShort)
+	}
+	if m.visibleMid {
+		out = append(out, trace.TierMid)
+	}
+	if m.visibleLong {
+		out = append(out, trace.TierLong)
+	}
+	return out
 }
 
 // ---- commands --------------------------------------------------------------
 
-func loadRows(cx *cortex.Cortex, query string, all, trashed bool) tea.Cmd {
+func loadRows(cx *cortex.Cortex, query string, all, trashed bool, tiers []string) tea.Cmd {
 	return func() tea.Msg {
-		opts := cortex.ListOptions{All: all, Trashed: trashed}
+		opts := cortex.ListOptions{All: all, Trashed: trashed, Tiers: tiers}
 		var (
 			rows []cortex.Row
 			err  error
@@ -409,6 +539,13 @@ func loadRows(cx *cortex.Cortex, query string, all, trashed bool) tea.Cmd {
 		}
 		return rowsLoadedMsg(rows)
 	}
+}
+
+// reload is a convenience wrapper so call sites don't have to re-
+// assemble the filter every time. Every explicit reload triggered
+// from an Update handler flows through here.
+func (m model) reload() tea.Cmd {
+	return loadRows(m.cx, m.searchQuery, m.showAll, m.showTrashed, m.currentTiers())
 }
 
 // tickCmd schedules the next follow-mode poll. The generation is
@@ -437,7 +574,7 @@ func editorCmd(path, id string, isNew bool) tea.Cmd {
 // ---- lifecycle -------------------------------------------------------------
 
 func (m model) Init() tea.Cmd {
-	return loadRows(m.cx, "", false, false)
+	return loadRows(m.cx, "", false, false, m.currentTiers())
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -461,7 +598,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// when the user returns to the list.
 		cmds := []tea.Cmd{tickCmd(msg.gen)}
 		if m.state == stateList {
-			cmds = append(cmds, loadRows(m.cx, m.searchQuery, m.showAll, m.showTrashed))
+			cmds = append(cmds, m.reload())
 		}
 		return m, tea.Batch(cmds...)
 
@@ -622,7 +759,7 @@ func (m model) updateList(msg tea.KeyMsg) (model, tea.Cmd) {
 			return m, nil
 		}
 		m.status = "Recovered " + row.ID
-		return m, loadRows(m.cx, m.searchQuery, m.showAll, m.showTrashed)
+		return m, m.reload()
 
 	case "u":
 		if len(m.rows) == 0 {
@@ -637,19 +774,59 @@ func (m model) updateList(msg tea.KeyMsg) (model, tea.Cmd) {
 			return m, nil
 		}
 		m.status = "Unarchived " + row.ID
-		return m, loadRows(m.cx, m.searchQuery, m.showAll, m.showTrashed)
+		return m, m.reload()
 
 	case "a":
 		m.showAll = !m.showAll
 		m.showTrashed = false
 		m.cursor = 0
-		return m, loadRows(m.cx, m.searchQuery, m.showAll, false)
+		return m, loadRows(m.cx, m.searchQuery, m.showAll, false, m.currentTiers())
 
 	case "t":
 		m.showTrashed = !m.showTrashed
 		m.showAll = false
 		m.cursor = 0
-		return m, loadRows(m.cx, m.searchQuery, false, m.showTrashed)
+		return m, loadRows(m.cx, m.searchQuery, false, m.showTrashed, m.currentTiers())
+
+	case "1":
+		m.visibleShort = !m.visibleShort
+		m.cursor = 0
+		return m, m.reload()
+
+	case "2":
+		m.visibleMid = !m.visibleMid
+		m.cursor = 0
+		return m, m.reload()
+
+	case "3":
+		m.visibleLong = !m.visibleLong
+		m.cursor = 0
+		return m, m.reload()
+
+	case "0":
+		m.visibleShort, m.visibleMid, m.visibleLong = true, true, true
+		m.cursor = 0
+		return m, m.reload()
+
+	case "+", "=":
+		// Accept "=" too so users on layouts where "+" requires Shift
+		// can upvote without the modifier. "-" is unambiguous.
+		//
+		// Three-state cycle per trace per TUI session:
+		//   0 → +1   (cast upvote)
+		//  +1 → 0    (clear my upvote — same key cycles off)
+		//  -1 → +1   (flip downvote to upvote)
+		// sessionVotes tracks the intent; the DB delta is new - prev.
+		if len(m.rows) == 0 {
+			return m, nil
+		}
+		return m.castVote(m.rows[m.cursor].ID, +1, "▲", "cleared ▲ on")
+
+	case "-":
+		if len(m.rows) == 0 {
+			return m, nil
+		}
+		return m.castVote(m.rows[m.cursor].ID, -1, "▼", "cleared ▼ on")
 
 	case "/":
 		m.state = stateSearch
@@ -675,7 +852,7 @@ func (m model) updateList(msg tea.KeyMsg) (model, tea.Cmd) {
 	case "R":
 		// Manual refresh — useful when follow is off, or as a
 		// "refresh now, don't wait for the next tick" escape hatch.
-		return m, loadRows(m.cx, m.searchQuery, m.showAll, m.showTrashed)
+		return m, m.reload()
 
 	case "esc":
 		// First esc pops detail focus back to the list; second esc
@@ -687,7 +864,7 @@ func (m model) updateList(msg tea.KeyMsg) (model, tea.Cmd) {
 		if m.searchQuery != "" {
 			m.searchQuery = ""
 			m.cursor = 0
-			return m, loadRows(m.cx, "", m.showAll, m.showTrashed)
+			return m, loadRows(m.cx, "", m.showAll, m.showTrashed, m.currentTiers())
 		}
 	}
 	return m, nil
@@ -700,7 +877,7 @@ func (m model) updateSearch(msg tea.KeyMsg) (model, tea.Cmd) {
 		m.state = stateList
 		m.search.Blur()
 		m.cursor = 0
-		return m, loadRows(m.cx, m.searchQuery, m.showAll, m.showTrashed)
+		return m, m.reload()
 
 	case "esc":
 		m.state = stateList
@@ -743,7 +920,7 @@ func (m model) updateConfirm(msg tea.KeyMsg) (model, tea.Cmd) {
 			m.err = err
 			return m, nil
 		}
-		return m, loadRows(m.cx, m.searchQuery, m.showAll, m.showTrashed)
+		return m, m.reload()
 
 	case "n", "N", "esc":
 		m.state = stateList
@@ -786,7 +963,7 @@ func (m model) handleEditorDone(msg editorDoneMsg) (model, tea.Cmd) {
 		m.status = "Updated " + msg.id
 	}
 
-	return m, loadRows(m.cx, m.searchQuery, m.showAll, m.showTrashed)
+	return m, m.reload()
 }
 
 // handleRowsLoaded folds a fresh rowset into the model, preserving the
@@ -857,6 +1034,7 @@ func (m model) handleRowsLoaded(newRows []cortex.Row) model {
 	m.lastQuery = m.searchQuery
 
 	m.current = m.loadCurrent()
+	m.currentVotes = m.loadCurrentVotes()
 
 	// If the refresh landed on a different trace (sticky-cursor
 	// failed because the row was archived/deleted, or context
@@ -886,6 +1064,76 @@ func (m model) loadCurrent() *trace.Trace {
 	}
 	t, _ := trace.ParseFile(path)
 	return t
+}
+
+// formatVotes renders the tier_votes count for the detail pane. Zero
+// is shown bare ("0") rather than "+0" — the signed format %+d stamps
+// a sign on every number including zero, which looks wrong. Positive
+// counts get an explicit + so the sign is always legible at a glance.
+func formatVotes(n int) string {
+	switch {
+	case n > 0:
+		return fmt.Sprintf("+%d", n)
+	case n < 0:
+		return fmt.Sprintf("%d", n) // negative values already carry the sign
+	default:
+		return "0"
+	}
+}
+
+// loadCurrentVotes returns the tier_votes count for the row under the
+// cursor. Renders "0" for an empty list or a row that can't be
+// resolved — the detail pane is blanked in those cases anyway, so the
+// value isn't displayed.
+func (m model) loadCurrentVotes() int {
+	if len(m.rows) == 0 {
+		return 0
+	}
+	votes, err := m.cx.TierVotes(m.rows[m.cursor].ID)
+	if err != nil {
+		return 0
+	}
+	return votes
+}
+
+// castVote applies the session-toggle cycle for a ±1 keypress. target
+// is the caller's desired direction (+1 for '+'/'=', -1 for '-').
+// The new session intent is:
+//
+//	prev == target → 0        (same key twice clears the vote)
+//	prev == 0      → target   (fresh cast)
+//	prev == -target → target  (flip)
+//
+// The DB delta sent to cx.Vote is (newIntent - prev) and falls in
+// {-2, -1, 0, 1, 2}. Zero is a no-op (shouldn't happen with the logic
+// above but defended for safety). Any non-zero value hits the
+// accumulator and emits one ActionVote event per keypress.
+//
+// castKind / clearKind are the status-line glyphs shown after the
+// cast depending on whether this was a set or a clear.
+func (m model) castVote(traceID string, target int, castKind, clearKind string) (model, tea.Cmd) {
+	prev := m.sessionVotes[traceID]
+	var newIntent int
+	if prev == target {
+		newIntent = 0
+	} else {
+		newIntent = target
+	}
+	delta := newIntent - prev
+	if delta == 0 {
+		return m, nil
+	}
+	if err := m.cx.Vote(traceID, delta, cortex.ActorHuman); err != nil {
+		m.err = err
+		return m, nil
+	}
+	m.sessionVotes[traceID] = newIntent
+	if newIntent == 0 {
+		m.status = clearKind + " " + traceID
+	} else {
+		m.status = castKind + " " + traceID
+	}
+	return m, m.reload()
 }
 
 // paneWidths returns the widths of the list pane and the detail pane
@@ -997,6 +1245,7 @@ func (m model) selectCursor(idx int) model {
 	}
 	m.cursor = idx
 	m.current = m.loadCurrent()
+	m.currentVotes = m.loadCurrentVotes()
 	var newID string
 	if m.current != nil {
 		newID = m.current.ID
@@ -1102,8 +1351,15 @@ func (m model) renderList(width, height int) string {
 		// badge is at most 14 chars (longest type: "observation"=11 + 2 = 13)
 		badgeW := 14
 		dateW := 10
-		// 1 cursor + 1 space + title + 1 space + badge(14) + 1 space + date(10)
-		titleW := width - 2 - badgeW - 1 - dateW - 1
+		// When the detail pane has focus, the list acts as a dim
+		// backdrop — pass that through so the tier glyph skips its
+		// heat-chart ANSI (whose embedded reset would otherwise
+		// terminate the outer dim style mid-line).
+		dim := m.focus == focusDetail
+		tierGlyph := renderTierGlyph(r.Tier, dim)
+		// 1 cursor + 1 space + tier(1) + 1 space + title + 1 space +
+		// badge(14) + 1 space + date(10)
+		titleW := width - 2 - 2 - badgeW - 1 - dateW - 1
 		if titleW < 4 {
 			titleW = 4
 		}
@@ -1129,39 +1385,62 @@ func (m model) renderList(width, height int) string {
 				cursor = "·"
 			}
 		}
-		line := fmt.Sprintf("%s %-*s %-*s %s",
-			cursor,
+
+		// Split the row into prefix | tier glyph | suffix so the row
+		// style can emit its bg both BEFORE and AFTER the tier glyph.
+		// If we render prefix+glyph+suffix as one string wrapped by
+		// a single rowStyle.Render(...), the heat-chart tier glyph's
+		// embedded `\x1b[0m` reset terminates the outer row style
+		// mid-line — everything after the glyph (title, badge, date)
+		// loses the styled bg and falls back to terminal default.
+		// In dark mode that happens to match styleSurface's near-
+		// black, so the bug was invisible; in light mode, the light
+		// row bg turns into terminal-dark-bg and the list looks
+		// broken. Splitting the render lets each styled chunk assert
+		// its own bg independently.
+		prefix := cursor + " "
+		suffix := fmt.Sprintf(" %-*s %-*s %s",
 			titleW, padRunes(title, titleW),
 			badgeW, badge,
 			date,
 		)
 
-		// When the detail pane owns focus, every row in the list is
-		// rendered through a dim palette — the entire pane fades like
-		// a modal backdrop, not just the selected row. The cursor row
-		// still sits one brightness step above the rest so the
-		// selection is findable at a glance when tabbing back.
-		dim := m.focus == focusDetail
+		// dim was computed above (alongside tierGlyph) so the tier
+		// glyph could opt out of its heat-chart ANSI when the pane
+		// is a backdrop; now it gates the row styles too. The entire
+		// pane fades like a modal backdrop, not just the selected
+		// row — the cursor row still sits one brightness step above
+		// the rest so the selection is findable at a glance when
+		// tabbing back.
+		var rowStyle lipgloss.Style
 		switch {
 		case i == m.cursor:
 			if dim {
-				sb.WriteString(styleSelectedDim.Width(width).Render(line))
+				rowStyle = styleSelectedDim
 			} else {
-				sb.WriteString(styleSelected.Width(width).Render(line))
+				rowStyle = styleSelected
 			}
 		case m.newRowTTL[r.ID] > 0:
 			if dim {
-				sb.WriteString(styleNewRowDim.Width(width).Render(line))
+				rowStyle = styleNewRowDim
 			} else {
-				sb.WriteString(styleNewRow.Width(width).Render(line))
+				rowStyle = styleNewRow
 			}
 		default:
 			if dim {
-				sb.WriteString(styleRowDim.Width(width).Render(line))
+				rowStyle = styleRowDim
 			} else {
-				sb.WriteString(styleSurface.Width(width).Render(line))
+				rowStyle = styleSurface
 			}
 		}
+		// Prefix: exactly 2 cols (cursor + space). Glyph: 1 col.
+		// Suffix: pad to fill the rest of the row so the bg
+		// extends cleanly to the divider.
+		sb.WriteString(
+			rowStyle.Render(prefix) +
+				tierGlyph +
+				rowStyle.Width(width-3).Render(suffix),
+		)
 		if i < end-1 {
 			sb.WriteByte('\n')
 		}
@@ -1214,6 +1493,15 @@ func (m model) renderDetail(width, height int) string {
 	lines = append(lines, metaLine("id", t.ID))
 	lines = append(lines, metaLine("title", t.Title))
 	lines = append(lines, chipLine("type", t.Type))
+	// Tier + current vote count. Surfaced together so a user casting a
+	// +/- vote can see both the tier they're influencing and the count
+	// they're incrementing. Tier defaults to "short" when the field is
+	// omitted from frontmatter (matches DB default).
+	tier := t.Tier
+	if tier == "" {
+		tier = "short"
+	}
+	lines = append(lines, metaLine("tier", fmt.Sprintf("%s  (votes: %s)", tier, formatVotes(m.currentVotes))))
 	if t.Author != "" {
 		lines = append(lines, metaLine("author", t.Author))
 	}
@@ -1334,7 +1622,7 @@ func (m model) renderFooter() string {
 		case m.showTrashed:
 			hint = "j/k:nav  r:recover  D:purge  t:back  /:search  →/tab:body  f:live  R:refresh  q:quit"
 		default:
-			hint = "j/k:nav  n:new  e:edit  d:archive  u:unarchive  D:trash  t:trash-view  a:all  /:search  →/tab:body  f:live  R:refresh  q:quit"
+			hint = "j/k:nav  n:new  e:edit  +/-:vote  d:archive  u:unarchive  D:trash  t:trash-view  a:all  /:search  →/tab:body  f:live  R:refresh  q:quit"
 		}
 		if m.focus == focusList && m.searchQuery != "" {
 			hint = "esc:clear  " + hint

@@ -111,15 +111,27 @@ Each Cortex is a named directory the user manages. Layout:
 
 Trace filenames follow the pattern `YYYYMMDD-slugified-title.md` (ISO 8601). The markdown files are the source of truth for content; the DB is the index.
 
-**`cortex.md` manifest** (YAML, minimal — not a config file):
+**`cortex.md` manifest** — a markdown file with YAML frontmatter. The
+YAML block holds the manifest (minimal — not a config file); any prose
+below the closing fence is preserved verbatim on write, so users can
+keep free-form notes about the cortex alongside its metadata.
 
-```yaml
+```markdown
+---
+id: 01JQ3Z4XKP8VY6H7B9W2R5T8MN
 name: my-cortex
 purpose: "Primary memory for the research agent cluster"
 owner: mark
 created: 2026-03-29
-version: 1
+version: 2
+---
+
+Optional free-form notes about this cortex.
 ```
+
+For back-compat, `ReadManifest` also accepts legacy bare-YAML files
+(no `---` fences) written by older binaries; the next `WriteManifest`
+silently upgrades them to the framed form.
 
 ### Archiving
 
@@ -135,7 +147,7 @@ Archiving is non-destructive and fully reversible:
 
 Every mutation (create / update / archive / unarchive / trash / recover / purge) is recorded as an immutable event in the `events` table inside the same SQLite transaction as the mutation itself. Events carry a ULID, an action, the trace ID, the **stable cortex ID** (`cortex_id`, a ULID), the originating Cortex display name (`origin`, mutable), an RFC3339 timestamp, a JSON snapshot of the trace state (for create/update), and a vector clock snapshot keyed on cortex IDs. `Remove()` (hard delete) and `Sync()` (filesystem reconciliation) intentionally emit no events — hard deletes are local-only escape hatches and Sync is reconciliation, not a semantic mutation.
 
-**Filesystem watcher.** Under `noema serve` (stdio OR http), a background watcher in `internal/watch/` observes `traces/`, `archive/traces/`, and `trash/traces/` with fsnotify. External edits (Obsidian, VS Code, Finder drag, `rm`, iCloud sync from another device, a second noema process on the same cortex) are dispatched through the same `Cortex` mutation methods as MCP tools — `Add`, `Update`, and the `MarkArchivedNoMove` / `MarkTrashedNoMove` / `IngestExternalDelete` / `ApplyExternalPurge` helpers that update DB state and emit events without attempting a file move the OS already did. Loopback is prevented by content-hash comparison: a write whose body hash matches the DB's `content_hash` is Noema's own and gets skipped. Source-locked foreign traces are refused on external edit. The watcher is on by default; opt out with `watch: { enabled: false }` in `cortex.md`. Debounce window defaults to 300ms to collapse editor save bursts. See `internal/watch/reconcile.go` for the action dispatch table. Federation propagation is still HTTP-only (peers need a network endpoint), but external-edit events land in the local log during stdio sessions and flow outward the next time an HTTP serve runs.
+**Filesystem watcher.** Under `noema serve` (stdio OR http), a background watcher in `internal/watch/` observes `traces/`, `archive/traces/`, and `trash/traces/` with fsnotify. External edits (Obsidian, VS Code, Finder drag, `rm`, iCloud sync from another device, a second noema process on the same cortex) are dispatched through the same `Cortex` mutation methods as MCP tools — `Add`, `Update`, and the `MarkArchivedNoMove` / `MarkTrashedNoMove` / `IngestExternalDelete` / `ApplyExternalPurge` helpers that update DB state and emit events without attempting a file move the OS already did. Loopback is prevented by content-hash comparison: a write whose body hash matches the DB's `content_hash` is Noema's own and gets skipped. Source-locked foreign traces are refused on external edit. The watcher is on by default; opt out with `watch: { enabled: false }` in `cortex.md`. Debounce window defaults to 300ms to collapse editor save bursts. **Atomic-save guard:** when reconcile sees a missing file with a known DB row, it waits one debounce window and re-stats before treating the absence as a delete. Editors like Obsidian save by removing then rewriting the file at the same path, briefly leaving it missing on disk; without this guard the watcher misclassifies the gap as `IngestExternalDelete` and trashes the live trace. **Frontmatter heal:** if a tracked active trace's file is rewritten without its frontmatter delimiter (Obsidian saving plain text, a script stripping YAML), the watcher reconstructs the frontmatter from the DB row + the file's raw content as body and emits an `Update` instead of silently skipping the edit. Source-locked foreign traces are excluded from heal so authoritative state stays untouched. See `internal/watch/reconcile.go` for the action dispatch table. Federation propagation is still HTTP-only (peers need a network endpoint), but external-edit events land in the local log during stdio sessions and flow outward the next time an HTTP serve runs.
 
 Lineage is a separate `trace_lineage` join table populated from the `derived_from` frontmatter field. `trace_lineage` supports both directions: `cortex.Get()` reads `derived_from`, and `cortex.DerivedBy()` reads the reverse edge.
 
@@ -165,13 +177,25 @@ The full design rationale, edge cases, and phase breakdown live in `docs/design/
 
 `Archive` and `Unarchive` remain allowed on source-locked traces (non-destructive). CLI commands accept `--force` to bypass the lock. MCP tools surface `ErrSourceLocked` as a tool error. The TUI blocks the `e` key with a status message.
 
-CLI: `noema verify` checks all trace file hashes against their frontmatter `content_hash` (with `--backfill` for old traces). `noema drift` checks federated traces against their `source_hash`.
+CLI: `noema verify` is a subcommand group for integrity checks. `noema verify traces` checks all trace file hashes against their frontmatter `content_hash` (with `--backfill` for old traces); `noema verify cortex` validates the manifest, user config, DB, access posture, and federation config; `noema verify drift` checks federated traces against their `source_hash`. Bare `noema verify` runs `verify traces` for back-compat. The legacy top-level `noema drift` still works as a hidden alias for `noema verify drift` and will be removed in a future release.
 
 **MCP access posture.** The HTTP MCP endpoint runs either in **open mode** (no auth, the default — suitable only for loopback) or in **keyed mode** (every request must carry `Authorization: Bearer <key>`). Keyed mode is mandatory for federation rings and any non-loopback deployment, and it also requires TLS — the server refuses to start with a bearer key over plaintext HTTP. The key is supplied via `NOEMA_MCP_KEY` (env var, wins if both are set) or via an optional `access.shared_key_file` block in `cortex.md` pointing at a 0600 sidecar file. The server logs the active posture on startup as `access=keyed source=env|file fingerprint=SHA256:...`, and `noema federation key fingerprint` reproduces the same non-secret fingerprint for out-of-band verification across ring members. The federation syncer automatically injects the local host's bearer key into every outbound `sync_events` call; there is no per-peer key config, so every host in a ring must share one key. Mixed-mode rings (some keyed, some open) are not supported — they isolate by design. See `docs/design/mcp-auth-plan.md` for the full threat model and decision log, and `internal/mcp/middleware.go` for the CORS + auth middleware chain (CORS outermost so browser preflights bypass the auth gate as the spec requires).
 
 ### MCP Tools
 
-The MCP server (`internal/mcp/server.go`) exposes the full Cortex surface: `get_instructions`, `list_traces`, `get_trace`, `create_trace`, `update_trace`, `append_trace`, `delete_trace`, `recover_trace`, `archive_trace`, `unarchive_trace`, `search_traces`, `trace_history`, `trace_lineage`, `resolve_divergence`, `cortex_identity`, `sync_events`, `federation_status`, and `announce_peer`. The `get_instructions` tool returns a live reference guide for the active Cortex; agents should call it first in any new session. `cortex_identity` returns the stable ULID + display name + manifest version and is called by federation peers on every sync to verify the remote endpoint still belongs to the cortex they paired with.
+The MCP server (`internal/mcp/server.go`) exposes the full Cortex surface: `get_instructions`, `list_traces`, `get_trace`, `create_trace`, `update_trace`, `append_trace`, `delete_trace`, `recover_trace`, `archive_trace`, `unarchive_trace`, `search_traces`, `trace_history`, `trace_lineage`, `resolve_divergence`, `cortex_identity`, `sync_events`, `federation_status`, and `announce_peer`. The `get_instructions` tool returns a live reference guide for the active Cortex; agents should call it first in any new session. `cortex_identity` returns the stable ULID + display name + manifest version and is called by federation peers on every sync to verify the remote endpoint still belongs to the cortex they paired with. `cortex_identity` also piggybacks the local consolidation rank (see below) so remote peers can observe eligibility without a separate round-trip.
+
+### Mid → long graduation (Phase 15)
+
+The three-tier model completes with an automatic mid→long promoter. A graduation pass runs on the same scheduler cadence as the heuristic short→mid pass (`ChainPasses` composes them into one PassFn) and evaluates every mid-tier trace older than `consolidation.graduation.min_age_days` (default 14) against a simple AND-gate: `read_count >= min_read_count` (default 3) AND (modify_count == 0 if `require_unmodified`) AND `tier_votes >= 0`. The AND-gate is deliberate — the long tier is meant to be auditable and slow-moving, not probabilistic. Explicit curation is available via `noema memory promote <id> [--to mid|long]`; `noema memory demote <id>` handles mid→short only (long-term demotion goes through `noema memory purge` to preserve the ceremony). The underlying `internal/cortex/candidates.go:GraduationCandidates` query flips `PromotionCandidates`' `created_at >= cutoff` to `<= cutoff` so it narrows to traces that have had time to prove durability. Every tier transition emits `ActionPromote` / `ActionDemote` which replicate through federation via the new replay handlers in `internal/cortex/cortex.go:replayTierChange`.
+
+### Automatic LLM distillation (auto_distillation_enabled)
+
+`consolidation.llm_enabled: true` alone only wires up `noema consolidate`; the scheduled agent still runs heuristic-only promotion on cron/idle/threshold triggers. Setting `consolidation.auto_distillation_enabled: true` folds the LLM pipeline into every trigger via `consolidation.DistillationPass` (at `internal/consolidation/distill_pass.go`), which `cmd_serve.go:startConsolidator` prepends to the chain so each fire runs distillation → heuristic → graduation. DistillationPass deliberately swallows `NewHTTPLLMClient` and `RunLLMPass` errors (logging instead of propagating) so an unreachable endpoint degrades to heuristic + graduation rather than aborting the pass. Context cancellation is the one exception — it propagates so the election gate and agent unwind cleanly on shutdown. `Manifest.ValidateConsolidation` rejects `auto_distillation_enabled: true` without `llm_enabled: true` + `local_llm_endpoint` + `model_name` at load time.
+
+### Consolidation coordination in a federation
+
+When multiple federated peers have `consolidation.enabled` + `consolidation.llm_enabled` with a reachable `local_llm_endpoint`, exactly one peer runs each consolidation cycle. Each peer's `internal/consolidation.EligibilityLoop` advertises a random rank in `[1,99]` via `federation_state` and the `cortex_identity` heartbeat. At trigger time the `Election.Decide` evaluator picks the highest-ranked eligible peer (with lex-max `cortex_id` breaking ties); the `consolidation.WithElection` wrapper emits `consolidation_claim`, waits one quiet period (`2 × federation.interval`) for conflicting claims, runs the pass, and emits `consolidation_success` or `consolidation_fail`. Subscribe-mode cortexes advertise rank 0 and never win; paused peers naturally drop out via staleness. Zero new config knobs — coordination is automatic when `federation.peers` is non-empty. Single-node cortexes skip the gate entirely to avoid emitting noise for degenerate one-peer elections.
 
 ### Hermes Memory Provider Plugin
 

@@ -142,9 +142,17 @@ func federationStatusCmd() *cobra.Command {
 			if m.Federation.Interval != "" {
 				fmt.Printf("Interval: %s\n", m.Federation.Interval)
 			}
-			fmt.Println()
 
 			state := federation.NewState(cx.DB.DB)
+
+			// Surface the local consolidation rank (plan §14). Empty or
+			// zero entries render as "(ineligible)" so an operator can
+			// see at a glance whether coordination is armed.
+			if localRank, rerr := state.GetLocalRank(); rerr == nil {
+				fmt.Printf("Consolidation Rank: %s\n", formatFederationRank(localRank))
+			}
+			fmt.Println()
+
 			localVersion := version()
 			for _, p := range m.Federation.Peers {
 				ps, err := state.GetPeerState(p.Name, p.Endpoint)
@@ -161,11 +169,15 @@ func federationStatusCmd() *cobra.Command {
 					lastEvent = ps.LastEvent
 				}
 				peerMode := p.EffectiveMode()
+				peerRank := "(none)"
+				if pr, perr := state.GetPeerRank(p.Name); perr == nil && pr.ObservedAt != "" {
+					peerRank = formatFederationRank(pr)
+				}
 				fmt.Printf("  %s\n    endpoint:   %s\n    mode:       %s\n",
 					p.Name, p.Endpoint, peerMode)
 				renderPeerVersion(cmd.OutOrStdout(), ps.Health, localVersion)
-				fmt.Fprintf(cmd.OutOrStdout(), "    last_seen:  %s\n    last_event: %s\n",
-					lastSeen, lastEvent)
+				fmt.Fprintf(cmd.OutOrStdout(), "    rank:       %s\n    last_seen:  %s\n    last_event: %s\n",
+					peerRank, lastSeen, lastEvent)
 				renderPeerHealth(cmd.OutOrStdout(), ps.Health)
 			}
 
@@ -714,4 +726,15 @@ func semverBaseline(v string) (string, bool) {
 		}
 	}
 	return s, true
+}
+
+// formatFederationRank renders a federation.RankEntry for the CLI
+// `noema federation status` output. Mirrors the formatRank helper in
+// internal/mcp/server.go — the two surfaces are parallel views of the
+// same data, so they render it the same way.
+func formatFederationRank(r federation.RankEntry) string {
+	if r.Rank == 0 || r.ObservedAt == "" {
+		return "(ineligible)"
+	}
+	return fmt.Sprintf("%d (observed %s)", r.Rank, r.ObservedAt)
 }

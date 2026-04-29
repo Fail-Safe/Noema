@@ -1,0 +1,19 @@
+{
+  "name": "noema-obsidian",
+  "version": "0.1.0",
+  "description": "Lineage view and tier visibility for Noema cortex traces inside Obsidian.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.21.0",
+    "obsidian": "^1.4.11",
+    "tslib": "^2.6.0",
+    "typescript": "^5.4.0"
+  }
+}

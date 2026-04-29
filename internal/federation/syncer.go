@@ -20,10 +20,15 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
-// EventReplayer materializes a remote event on the local cortex.
+// EventReplayer materializes a remote event on the local cortex and
+// merges peer-owned tier-usage rows into the local trace_usage table.
+// Named for historical reasons (used to be events-only); the merge
+// hook was added when the federation started carrying read-signal
+// deltas alongside events. Implemented by *cortex.Cortex.
 type EventReplayer interface {
 	ReplayEvent(event.Event) error
 	MergeClock(VClock) error
+	MergeRemoteUsage([]TraceUsage) error
 }
 
 // Syncer polls remote peers for new events and replays them locally.
@@ -311,6 +316,17 @@ func (s *Syncer) syncPeer(peer PeerConfig) (string, error) {
 		return peerVersion, &PollError{Reason: classifyIdentityError(err), Err: err}
 	}
 
+	// Publish-mode cortexes serve events outward but never pull. The
+	// identity handshake above still captures the peer's advertised
+	// consolidation rank (plan §14) so election decisions on this peer
+	// see the full ring. We just skip the sync_events pull and exit
+	// after stamping last_seen.
+	if s.config.Mode == "publish" {
+		now := time.Now().UTC().Format(time.RFC3339)
+		s.state.SetPeerSeen(peer.Name, now)
+		return peerVersion, nil
+	}
+
 	// Call sync_events on the remote peer.
 	args := map[string]any{"limit": 100}
 	if cursor != "" {
@@ -335,27 +351,43 @@ func (s *Syncer) syncPeer(peer PeerConfig) (string, error) {
 			break
 		}
 	}
+
+	// If the peer returned an error result (e.g. it's in subscribe mode
+	// and refuses to serve sync_events), surface it cleanly rather than
+	// trying to JSON-parse the human-readable error message as an event
+	// array — that produces a confusing "invalid character 'h' in
+	// literal true" rather than the actual reason.
+	if result.IsError {
+		return peerVersion, fmt.Errorf("peer sync_events refused: %s", text)
+	}
+
 	if text == "" || text == "[]" {
-		// No new events.
-		now := time.Now().UTC().Format(time.RFC3339)
-		s.state.SetPeerSeen(peer.Name, now)
-		return peerVersion, nil
+		// No new events, but still attempt usage sync below.
+	} else {
+		// Guard against a hostile peer returning an oversized payload.
+		// 100 events * 1 MB body each = 100 MB is a generous upper bound.
+		const maxSyncResponseBytes = 100 * 1024 * 1024 // 100 MiB
+		if len(text) > maxSyncResponseBytes {
+			return peerVersion, fmt.Errorf("sync_events response too large (%d bytes, max %d)", len(text), maxSyncResponseBytes)
+		}
+
+		var events []event.Event
+		if err := json.Unmarshal([]byte(text), &events); err != nil {
+			return peerVersion, fmt.Errorf("parsing sync_events response: %w", err)
+		}
+
+		if err := s.replayBatch(peer.Name, events); err != nil {
+			return peerVersion, err
+		}
 	}
 
-	// Guard against a hostile peer returning an oversized payload.
-	// 100 events * 1 MB body each = 100 MB is a generous upper bound.
-	const maxSyncResponseBytes = 100 * 1024 * 1024 // 100 MiB
-	if len(text) > maxSyncResponseBytes {
-		return peerVersion, fmt.Errorf("sync_events response too large (%d bytes, max %d)", len(text), maxSyncResponseBytes)
-	}
-
-	var events []event.Event
-	if err := json.Unmarshal([]byte(text), &events); err != nil {
-		return peerVersion, fmt.Errorf("parsing sync_events response: %w", err)
-	}
-
-	if err := s.replayBatch(peer.Name, events); err != nil {
-		return peerVersion, err
+	// Phase 2: pull usage deltas. A failure here is logged but does
+	// not fail the poll — events already succeeded, the usage cursor
+	// stays at its last-applied position, and the next cycle retries.
+	// Pre-PR-B peers (no sync_read_signal tool) return -32601; we
+	// treat that as a known non-error and keep going.
+	if err := s.syncReadSignalPhase(peer, mcpClient); err != nil {
+		log.Printf("[federation] peer %q: read-signal sync failed (events already applied): %v", peer.Name, err)
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -363,10 +395,118 @@ func (s *Syncer) syncPeer(peer PeerConfig) (string, error) {
 	return peerVersion, nil
 }
 
+// syncReadSignalPhase is the PR B addition to each per-peer poll:
+// after sync_events completes, pull the peer's trace_usage deltas
+// (rows where peer_cortex_id = theirs and updated_at > our cursor)
+// and merge with CRDT MAX semantics so the aggregate heuristic view
+// reflects every peer's attention, not just the local slice.
+//
+// Returns nil on success including the "peer doesn't have the tool"
+// case — that's the pre-PR-B fallback and shouldn't poison the rest
+// of the sync cycle.
+func (s *Syncer) syncReadSignalPhase(peer PeerConfig, mcpClient *client.Client) error {
+	cursor, err := s.state.Get(PeerUsageCursorKey(peer.Name))
+	if err != nil {
+		return fmt.Errorf("loading usage cursor: %w", err)
+	}
+
+	args := map[string]any{"limit": 500}
+	if cursor != "" {
+		args["since"] = cursor
+	}
+
+	result, err := mcpClient.CallTool(s.ctx, mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name:      "sync_read_signal",
+			Arguments: args,
+		},
+	})
+	if err != nil {
+		// A peer on a pre-PR-B binary doesn't know sync_read_signal
+		// and rejects the call. Treated as a clean no-op — next
+		// cycle retries, ring converges once all peers upgrade.
+		if isToolUnknown(err) {
+			return nil
+		}
+		return fmt.Errorf("calling sync_read_signal: %w", err)
+	}
+
+	var text string
+	for _, c := range result.Content {
+		if tc, ok := c.(mcp.TextContent); ok {
+			text = tc.Text
+			break
+		}
+	}
+
+	if result.IsError {
+		// Mode-gate refusals (e.g. subscribe peer refuses to serve):
+		// treat as a clean skip for this cycle. No data lost — we
+		// just don't get their usage this round.
+		return fmt.Errorf("peer sync_read_signal refused: %s", text)
+	}
+
+	if text == "" || text == "[]" {
+		return nil
+	}
+
+	const maxUsageResponseBytes = 16 * 1024 * 1024 // 16 MiB is plenty for 500 rows
+	if len(text) > maxUsageResponseBytes {
+		return fmt.Errorf("sync_read_signal response too large (%d bytes, max %d)", len(text), maxUsageResponseBytes)
+	}
+
+	var rows []TraceUsage
+	if err := json.Unmarshal([]byte(text), &rows); err != nil {
+		return fmt.Errorf("parsing sync_read_signal response: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+
+	if err := s.replayer.MergeRemoteUsage(rows); err != nil {
+		return fmt.Errorf("merging remote usage: %w", err)
+	}
+
+	// Advance the cursor to the last row's UpdatedAt. Rows are
+	// ordered ASC by UpdatedAt on the server side (see
+	// cortex.LocalUsageSince), so the tail element holds the
+	// max timestamp we've now seen from this peer.
+	newCursor := rows[len(rows)-1].UpdatedAt
+	if err := s.state.Set(PeerUsageCursorKey(peer.Name), newCursor); err != nil {
+		return fmt.Errorf("saving usage cursor: %w", err)
+	}
+	return nil
+}
+
 // classifyIdentityError maps errors returned from verifyPeerIdentity
 // into the structured reason set. Pattern-matches on the substrings
 // the verifyPeerIdentity callsites use when constructing the wrapped
 // error (kept here rather than on the error type itself to avoid
+// isToolUnknown reports whether an MCP CallTool error signals that the
+// remote peer does not implement the requested tool. Two shapes appear
+// in practice:
+//
+//   - Raw JSON-RPC peers surface `-32601` (the spec's "method not found"
+//     code) in the error string.
+//   - The mcp-go library wraps the same condition as
+//     `invalid params: tool '<name>' not found: tool not found`.
+//
+// We match both so the mid-upgrade transitional window (where some
+// peers haven't restarted onto a binary that implements a newly-added
+// tool) stays silent at the syncer level instead of logging ERROR for
+// every cycle until the ring finishes upgrading.
+func isToolUnknown(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "-32601") ||
+		strings.Contains(msg, "tool not found") ||
+		strings.Contains(msg, "Tool not found") ||
+		strings.Contains(msg, "method not found") ||
+		strings.Contains(msg, "Method not found")
+}
+
 // adding a new package-scoped sentinel for every condition).
 func classifyIdentityError(err error) string {
 	if err == nil {
@@ -465,17 +605,39 @@ func (s *Syncer) verifyPeerIdentity(mcpClient *client.Client, peer PeerConfig) e
 			break
 		}
 	}
+	if result.IsError {
+		return fmt.Errorf("peer %q cortex_identity refused: %s", peer.Name, text)
+	}
 	if text == "" {
 		return fmt.Errorf("peer %q returned empty cortex_identity response — likely an older version that pre-dates the cortex-id federation handshake. Upgrade the peer to a binary that exposes cortex_identity", peer.Name)
 	}
 
 	var identity struct {
-		ID      string `json:"id"`
-		Name    string `json:"name"`
-		Version int    `json:"version"`
+		ID      string     `json:"id"`
+		Name    string     `json:"name"`
+		Version int        `json:"version"`
+		Rank    *RankEntry `json:"rank,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(text), &identity); err != nil {
 		return fmt.Errorf("parsing cortex_identity response from peer %q: %w", peer.Name, err)
+	}
+
+	// Persist the peer's advertised consolidation rank if they reported
+	// one. Rank is advisory — a failure here logs but doesn't abort the
+	// sync. The CortexID we store is the authoritative identity.ID from
+	// this same response, not the nested rank.CortexID, so a peer that
+	// reports an inconsistent rank.CortexID can't confuse us about who
+	// we're talking to. Peers on older binaries simply omit the field
+	// and are left with whatever rank (if any) we last saw.
+	if identity.Rank != nil {
+		entry := RankEntry{
+			CortexID:   identity.ID,
+			Rank:       identity.Rank.Rank,
+			ObservedAt: identity.Rank.ObservedAt,
+		}
+		if err := s.state.SetPeerRank(peer.Name, entry); err != nil {
+			log.Printf("[federation] peer %q rank persist failed: %v", peer.Name, err)
+		}
 	}
 
 	if identity.Version < minPeerManifestVersion {
@@ -530,6 +692,11 @@ func tlsClientWithCA(caPath string) (*http.Client, error) {
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
 				RootCAs: pool,
+				// Explicit floor per gosec G402 — stdlib default has
+				// drifted upward over Go releases but pinning keeps
+				// the ring from silently negotiating TLS 1.0/1.1 on
+				// older peers with misconfigured OpenSSL-style stacks.
+				MinVersion: tls.VersionTLS12,
 			},
 		},
 	}, nil

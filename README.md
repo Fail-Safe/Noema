@@ -81,6 +81,28 @@ brew install noema          # formula (macOS + Linux)
 brew install --cask noema   # cask (macOS only)
 ```
 
+#### Beta channel
+
+Prerelease builds (`v*-beta*`, `v*-rc*`, `v*-alpha*`) publish to a
+parallel formula so you can track the edge without the stable channel
+moving under you:
+
+```bash
+brew install Fail-Safe/tap/noema-beta
+```
+
+`noema-beta` installs the same `noema` binary and conflicts with the
+stable formula — Homebrew will refuse to install both at once. To
+switch channels:
+
+```bash
+brew uninstall noema      # (or noema-beta)
+brew install Fail-Safe/tap/noema-beta   # (or noema)
+```
+
+`brew upgrade` on `noema-beta` pulls the newest prerelease; stable tags
+(`v0.10.0` vs `v0.10.0-beta.1`) stay on their respective channels.
+
 ### Download a pre-built binary
 
 Grab the archive for your OS/arch from the
@@ -184,6 +206,7 @@ noema add [flags]                         Add a Trace (interactive if flags omit
 noema list [flags]                        List Traces
 noema get <id>                            Show a Trace
 noema edit <id>                           Edit a Trace in $EDITOR
+noema append <id> [--content <text>]      Append to a Trace body (pipe-friendly: `echo X | noema append <id>`)
 noema remove <id>                         Move a Trace to trash (--force to hard-delete)
 noema recover <id>                        Restore a Trace from trash
 noema purge [--days N]                    Permanently delete all trashed Traces older than N days
@@ -198,9 +221,11 @@ noema events backfill [--dry-run] [--yes]
                                           Synthesize create events for active traces missing one (e.g. traces added via `noema sync`)
 noema resolve <divergence-id> --accept <origin> | --custom <body>
                                           Resolve a divergence (concurrent edit conflict)
-noema verify [--backfill]                 Check trace content hashes for integrity; --backfill populates
-                                          hashes for old traces
-noema drift                               Check federated traces for drift from their source hash
+noema verify [--backfill]                 Run integrity checks (alias for `verify traces` for back-compat);
+                                          --backfill populates content_hash for old traces
+noema verify traces [--backfill]          Check trace content hashes against frontmatter content_hash
+noema verify cortex                       Validate manifest, config, db, access posture, and federation
+noema verify drift                        Check federated traces for drift from their source hash
 
 noema federation status                   Show federation config, MCP access posture, peer sync state, and vector clock
 noema federation peers                    List configured federation peers
@@ -304,6 +329,8 @@ noema serve --print-config
 
 The `--cortex` flag, `NOEMA_CORTEX` env, and config default are all respected, so `--print-config` always reflects the cortex you would actually use.
 
+**Log destination.** In stdio mode, operational logs (watcher events, federation sync status, startup messages) are written to `$XDG_STATE_HOME/noema/<cortex>.log` — defaulting to `~/.local/state/noema/<cortex>.log` — so MCP clients that inherit the spawning terminal's stderr (Claude Code, Copilot, Zed, Cursor, Aider, etc.) don't dump logs into your active terminal. The single `[serve] logs -> <path>` line printed at startup tells you exactly where to `tail -f`. Override the destination with `--log-file <path>`, or force logs back to stderr with `--log-stderr` for interactive triage.
+
 ### Streamable HTTP (remote clients, GitHub Copilot, federation peers)
 
 Noema speaks the **Streamable HTTP** transport from the [MCP 2025-03-26 spec](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http) — a single endpoint at `/mcp` that handles JSON-RPC requests and optional SSE streaming on the same path. This is the transport native MCP clients (Zed, Claude Desktop's HTTP support, GitHub Copilot's MCP integration) speak today; the older two-endpoint legacy SSE transport has been removed.
@@ -353,8 +380,9 @@ If both are set, the env var wins and the server logs a warning so operators not
 
 **Sidecar-file example:**
 
-```yaml
-# cortex.md
+```markdown
+<!-- cortex.md -->
+---
 name: my-cortex
 purpose: Primary memory
 owner: mark
@@ -362,6 +390,7 @@ created: 2026-03-29
 version: 2
 access:
   shared_key_file: .access.secret
+---
 ```
 
 ```bash
@@ -433,7 +462,7 @@ Either way you still need `--tls-cert`/`--tls-key` on the serve command that gen
 Whenever `noema serve` is running on a cortex (under **either** `--transport stdio` or `--transport http`), a background watcher observes the `traces/`, `archive/traces/`, and `trash/traces/` directories and turns external filesystem changes into real mutation events. Edit a trace in Obsidian, drop a new `.md` into `traces/`, drag a file to the archive directory in Finder, or `rm` one from the terminal — Noema ingests the change, writes an event to the log, and (under HTTP) propagates it to federation peers. Deletes are restored to `trash/traces/` from the last event snapshot so `noema recover` still works.
 
 ```yaml
-# cortex.md
+# cortex.md frontmatter fragment
 watch:
   enabled: true      # default; set false to opt out
   debounce_ms: 300   # default; collapse editor save bursts
@@ -451,12 +480,14 @@ A Cortex can sync with peer Cortexes over Streamable HTTP: every mutation is rec
 
 ### Configure peers in `cortex.md`
 
-```yaml
+```markdown
+<!-- cortex.md -->
+---
 name: alpha
 purpose: Primary research cortex
 owner: mark
 created: 2026-03-29
-version: 1
+version: 2
 federation:
   interval: 30s
   peers:
@@ -465,6 +496,7 @@ federation:
     - name: gamma
       endpoint: https://192.168.1.11:3000
       ca: /etc/noema/beta-ca.pem    # optional, for self-signed TLS
+---
 ```
 
 Or add a peer from the CLI:
@@ -486,6 +518,7 @@ The `federation.mode` field controls how a Cortex participates in the ring:
 **Publish mode** is for source-of-truth cortexes: a company knowledgebase, a curated dataset, a reference corpus. Content is managed locally via stdio; remote peers pull events via `sync_events` but cannot write back. **Subscribe mode** is the complement: pull everything, share nothing.
 
 ```yaml
+# cortex.md frontmatter fragment
 federation:
   mode: publish
   interval: 30s
@@ -507,6 +540,37 @@ noema federation set-mode subscribe      # switch cortex mode
 
 Changes take effect on the next `noema serve` restart.
 
+### Consolidation coordination in a federation
+
+When multiple peers have `consolidation.enabled`, `consolidation.llm_enabled`, and a reachable `local_llm_endpoint`, only one peer runs each consolidation cycle — without any additional configuration. Each peer advertises a random rank (1..99) on the `cortex_identity` heartbeat; the highest-ranked eligible peer wins (cortex ID breaks ties), runs the pass, and emits `consolidation_success`/`fail` events that replicate through the standard event log. `subscribe`-mode cortexes advertise rank 0 and can never win; `paused` peers naturally drop out via staleness. `federation_status` shows each peer's current rank.
+
+### Mid → long graduation
+
+The three-tier model (short → mid → long) completes with an automatic mid→long promoter. Alongside the short→mid heuristic pass, the scheduler evaluates every mid-tier trace older than 14 days against a simple AND-gate — minimum read count (default 3), optional "unmodified since creation" stability requirement, and no active downvotes. Traces clearing every threshold graduate to long and are locked by the DB-level immutability trigger. Thresholds live under `consolidation.graduation` in cortex.md:
+
+```yaml
+consolidation:
+  enabled: true
+  llm_enabled: true
+  auto_distillation_enabled: true     # run LLM distillation on every trigger
+  local_llm_endpoint: http://localhost:11434/v1
+  model_name: llama3.1:70b
+  window_hours: 6
+  graduation:
+    enabled: true
+    min_age_days: 14
+    min_read_count: 3
+    require_unmodified: true
+```
+
+Explicit curation is always available: `noema memory promote <id>` advances a trace one tier (short→mid or mid→long), and `noema memory demote <id>` steps mid→short. Long-term demotion goes through `noema memory purge` because undoing a base truth deserves the same ceremony as destroying it.
+
+### Automatic LLM distillation
+
+By default, `consolidation.llm_enabled: true` wires up the `noema consolidate` CLI but leaves the in-process agent on cheap heuristic-only work — you'd run the CLI from a separate system cron to get clusters distilled. Set `auto_distillation_enabled: true` to fold the LLM pipeline into every scheduled trigger instead, so each cron/idle/threshold fire runs **distillation → heuristic → graduation** in sequence on the elected peer.
+
+Requires `llm_enabled`, `local_llm_endpoint`, and `model_name` to all be set — Noema refuses to start otherwise. If the LLM endpoint is unreachable at trigger time, distillation is logged and skipped; the chained heuristic + graduation passes still run so an offline LLM doesn't block cheap maintenance.
+
 ### Content hashing and source-locking
 
 Every trace carries a `content_hash` (SHA-256 of the body, recomputed on every write). This enables integrity verification and federation sync optimization.
@@ -527,10 +591,11 @@ source_locked: true
 Source-locked traces refuse `update`, `delete`, and `remove` operations when the local cortex is not the origin. `archive`/`unarchive` remain allowed (non-destructive). Use `--force` on CLI commands to override in emergencies.
 
 ```bash
-noema verify               # check all trace hashes for integrity
-noema verify --backfill     # populate hashes for old traces
-noema drift                 # check federated traces against source hashes
-noema edit <id> --force     # override source-lock
+noema verify traces           # check trace content hashes against frontmatter
+noema verify traces --backfill # populate content_hash for old traces
+noema verify cortex           # validate manifest, config, db, access, federation
+noema verify drift            # check federated traces against source hashes
+noema edit <id> --force       # override source-lock
 ```
 
 ### Authentication
@@ -613,7 +678,7 @@ iteration. We can revisit Rust if the MCP server demands higher concurrency.
 ```
 my-cortex/
   AGENTS.md           ← agent guide (generated by noema init, see below)
-  cortex.md           ← manifest: name, purpose, owner, created
+  cortex.md           ← manifest: YAML frontmatter + optional prose body
   traces/             ← active Traces
   archive/
     traces/           ← archived Traces (hidden by default, fully reversible)
