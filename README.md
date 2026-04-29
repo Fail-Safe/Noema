@@ -673,6 +673,14 @@ iteration. We can revisit Rust if the MCP server demands higher concurrency.
 
 **Trace IDs and titles.** The ID is `YYYYMMDD-<slug>` — today's date prepended to a slugified title. The slug portion is capped at 100 characters (longer titles are silently truncated); aim for titles under 80 characters for scannability. Don't include the date in the title — `noema` prepends today's date automatically, and leading `YYYYMMDD-` / `YYYY-MM-DD-` prefixes in the title are stripped to prevent doubled-date IDs. Mid-title date fragments aren't stripped, so put date context in a tag (`tags: [event-2026-04-02]`) or the body instead of the title.
 
+**Tag conventions.** The cortex accepts any string as a tag — the constraints here are about what *renders correctly in Obsidian's tag panel* if a user is authoring through Obsidian (a common but optional surface). Non-Obsidian authoring (CLI, MCP, TUI, agent integrations) is unaffected.
+
+- **Tags must contain at least one letter.** A pure-numeric tag like `2026` or `42` is stored, indexed, and searchable via `search_traces` / FTS5, but Obsidian silently drops it from the tag panel. Use `y2026`, `2026q1`, or `event-2026-04-02` instead.
+- **Avoid dots inside a tag.** Obsidian interprets `release.candidate` as a nested tag tree (`release` / `candidate`), which is rarely the intent for a flat tag. Use hyphens: `release-candidate`.
+- **No spaces.** Use hyphens or underscores: `network-troubleshooting`, not `network troubleshooting`.
+
+The Obsidian plugin's "New trace" command surfaces these as inline warnings as you type — non-blocking hints, not validation errors. The cortex still accepts the tag.
+
 **Cortex layout on disk:**
 
 ```
