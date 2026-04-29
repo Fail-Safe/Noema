@@ -245,6 +245,26 @@ type ConsolidationConfig struct {
 	// terminal tier for automatic promotion — useful for operators who
 	// want to curate the long tier by hand via `noema memory promote`.
 	Graduation *GraduationConfig `yaml:"graduation,omitempty"`
+
+	// WatchdogTimeout overrides the election watchdog's claim-staleness
+	// ceiling — the duration after which observers treat a
+	// consolidation_claim with no matching success/fail as orphaned and
+	// emit a closing fail (reason=watchdog_expired).
+	//
+	// The default 10 minutes is generous for consolidator passes backed
+	// by GPU-class endpoints, but slow LLM endpoints (low-VRAM laptops,
+	// CPU inference, congested API providers) can take longer than that
+	// for legitimate distillation work. When the pass takes longer than
+	// the watchdog budget, peers correctly emit watchdog_expired — but
+	// the pass eventually succeeds anyway, leaving both events for the
+	// same window in the log. Cosmetically noisy, not a correctness bug;
+	// raise the timeout on cortexes whose LLM is slower than the
+	// federation typical to avoid the noise.
+	//
+	// Format: any duration go's time.ParseDuration accepts ("10m",
+	// "20m", "1h"). Empty preserves the 10-minute default. See
+	// internal/consolidation/watchdog.go for the consumer.
+	WatchdogTimeout string `yaml:"watchdog_timeout,omitempty"`
 }
 
 // GraduationConfig controls the mid→long promotion heuristic. A
@@ -347,6 +367,28 @@ func (cc *ConsolidationConfig) HasTrigger() bool {
 		return false
 	}
 	return cc.Cron != "" || cc.IdleMinutes != 0 || cc.ThresholdShort != 0
+}
+
+// EffectiveWatchdogTimeout returns the configured watchdog claim-
+// staleness duration, or the 10-minute default when unset / unparseable.
+// We tolerate parse failure with a fallback rather than refusing to
+// start the agent: a typo in this knob shouldn't take a peer offline,
+// and 10 minutes is a safe ceiling for any setup we've observed.
+//
+// Manifest validation (separate code path) catches the unparseable
+// case at config-load time and surfaces a clear error to the operator;
+// this method is the runtime-side belt-and-suspenders for any path
+// that bypasses validation.
+func (cc *ConsolidationConfig) EffectiveWatchdogTimeout() time.Duration {
+	const fallback = 10 * time.Minute
+	if cc == nil || cc.WatchdogTimeout == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(cc.WatchdogTimeout)
+	if err != nil || d <= 0 {
+		return fallback
+	}
+	return d
 }
 
 // ErrSourceLocked is returned when a mutation is attempted on a
@@ -507,6 +549,21 @@ func (m Manifest) ValidateConsolidation() error {
 	cc := m.Consolidation
 	if cc == nil || !cc.Enabled {
 		return nil
+	}
+	// watchdog_timeout is independent of auto_distillation — validate
+	// it whenever consolidation is enabled at all, since the watchdog
+	// runs whenever federation peers are configured. A typo here
+	// silently falls back to 10 min via EffectiveWatchdogTimeout, but
+	// we'd rather surface the typo to the operator than have them
+	// wonder why their override didn't take.
+	if cc.WatchdogTimeout != "" {
+		d, err := time.ParseDuration(cc.WatchdogTimeout)
+		if err != nil {
+			return fmt.Errorf("consolidation.watchdog_timeout %q is not a valid duration (use formats like \"10m\", \"30m\", \"1h\"): %w", cc.WatchdogTimeout, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("consolidation.watchdog_timeout must be positive, got %q", cc.WatchdogTimeout)
+		}
 	}
 	if !cc.AutoDistillationEnabled {
 		return nil

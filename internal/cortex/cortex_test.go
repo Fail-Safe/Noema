@@ -79,8 +79,8 @@ func TestCreate_AgentsMDContent(t *testing.T) {
 		"origin",
 		"trace_history",
 		"trace_lineage",
-		"Titles",      // new naming-rules section
-		"under 80",    // title length guidance
+		"Titles",        // new naming-rules section
+		"under 80",      // title length guidance
 		"100 character", // slug cap guidance
 	} {
 		if !strings.Contains(content, want) {
@@ -377,11 +377,11 @@ func TestPeerLabelCollidesWithSelf(t *testing.T) {
 		label string
 		want  bool
 	}{
-		{"alpha", true},      // exact collision
-		{"beta", false},      // distinct
-		{"", false},          // empty is not a collision (other validation handles empty)
-		{"Alpha", false},     // case-sensitive: cortex names are exact strings
-		{"alpha-1", false},   // distinct
+		{"alpha", true},    // exact collision
+		{"beta", false},    // distinct
+		{"", false},        // empty is not a collision (other validation handles empty)
+		{"Alpha", false},   // case-sensitive: cortex names are exact strings
+		{"alpha-1", false}, // distinct
 	}
 	for _, tc := range cases {
 		if got := m.PeerLabelCollidesWithSelf(tc.label); got != tc.want {
@@ -2551,6 +2551,74 @@ func TestValidateConsolidation_AutoDistillationMissingFields(t *testing.T) {
 				t.Fatalf("expected error mentioning %q, got nil", tc.wantSub)
 			}
 			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("error should mention %q, got: %v", tc.wantSub, err)
+			}
+		})
+	}
+}
+
+func TestEffectiveWatchdogTimeout(t *testing.T) {
+	// Default applies on nil receiver, empty string, malformed
+	// duration, and non-positive duration. Configured value applies
+	// otherwise.
+	cases := []struct {
+		name string
+		cfg  *cortex.ConsolidationConfig
+		want time.Duration
+	}{
+		{"nil receiver", nil, 10 * time.Minute},
+		{"empty string", &cortex.ConsolidationConfig{}, 10 * time.Minute},
+		{"valid 20m", &cortex.ConsolidationConfig{WatchdogTimeout: "20m"}, 20 * time.Minute},
+		{"valid 1h", &cortex.ConsolidationConfig{WatchdogTimeout: "1h"}, time.Hour},
+		{"malformed falls back", &cortex.ConsolidationConfig{WatchdogTimeout: "not-a-duration"}, 10 * time.Minute},
+		{"zero falls back", &cortex.ConsolidationConfig{WatchdogTimeout: "0s"}, 10 * time.Minute},
+		{"negative falls back", &cortex.ConsolidationConfig{WatchdogTimeout: "-5m"}, 10 * time.Minute},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.cfg.EffectiveWatchdogTimeout()
+			if got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateConsolidation_WatchdogTimeout(t *testing.T) {
+	// A typo in watchdog_timeout should produce a clear error at
+	// manifest load time rather than silently falling back to the
+	// default — operators tweaking this knob would otherwise
+	// wonder why their override didn't take effect.
+	cases := []struct {
+		name    string
+		raw     string
+		wantErr bool
+		wantSub string
+	}{
+		{"empty is ok", "", false, ""},
+		{"valid duration", "20m", false, ""},
+		{"valid hour", "1h30m", false, ""},
+		{"unparseable", "twenty minutes", true, "watchdog_timeout"},
+		{"missing unit", "20", true, "watchdog_timeout"},
+		{"zero rejected", "0s", true, "must be positive"},
+		{"negative rejected", "-5m", true, "must be positive"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := cortex.Manifest{
+				Consolidation: &cortex.ConsolidationConfig{
+					Enabled:         true,
+					WatchdogTimeout: tc.raw,
+				},
+			}
+			err := m.ValidateConsolidation()
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected error mentioning %q, got nil", tc.wantSub)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("expected no error, got %v", err)
+			}
+			if tc.wantErr && err != nil && !strings.Contains(err.Error(), tc.wantSub) {
 				t.Errorf("error should mention %q, got: %v", tc.wantSub, err)
 			}
 		})
