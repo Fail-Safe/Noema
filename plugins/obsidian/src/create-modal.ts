@@ -18,6 +18,7 @@ export class CreateTraceModal extends Modal {
 	private titleInput!: HTMLInputElement;
 	private typeSelect!: HTMLSelectElement;
 	private tagsInput!: HTMLInputElement;
+	private tagWarningsEl!: HTMLElement;
 	private derivedFromInput!: HTMLInputElement;
 	private submitBtn!: HTMLButtonElement;
 	private errorEl!: HTMLElement;
@@ -55,6 +56,17 @@ export class CreateTraceModal extends Modal {
 			placeholder: "go, language, architecture",
 		}) as HTMLInputElement;
 		this.descriptor("Comma- or semicolon-separated. Optional.");
+		// Tag-validation hints for Obsidian-incompatible tag formats.
+		// We don't BLOCK submission — the cortex accepts any string,
+		// the limitation is purely what Obsidian's tag panel renders.
+		// Inline hints surface the gotcha at the moment of entry, so
+		// users authoring through Obsidian can adjust without
+		// re-reading the docs.
+		this.tagWarningsEl = contentEl.createEl("div", {
+			cls: "noema-create-tag-warnings",
+		});
+		this.tagWarningsEl.style.display = "none";
+		this.tagsInput.addEventListener("input", () => this.refreshTagWarnings());
 
 		this.derivedFromInput = this.row("Derived from", "input", {
 			type: "text",
@@ -117,6 +129,41 @@ export class CreateTraceModal extends Modal {
 			cls: "noema-create-hint",
 			text,
 		});
+	}
+
+	// refreshTagWarnings re-validates the tag input on every keystroke
+	// and updates the inline hint area below the field. Hidden when no
+	// warnings; revealed with a list of `<tag> — <reason>` lines when
+	// any tag would be invisible in Obsidian's tag panel. The cortex
+	// itself accepts every input — this is purely UX guidance for the
+	// Obsidian-authored workflow.
+	private refreshTagWarnings(): void {
+		const tags = splitDelimited(this.tagsInput.value);
+		const warnings = validateObsidianTags(tags);
+		this.tagWarningsEl.empty();
+		if (warnings.length === 0) {
+			this.tagWarningsEl.style.display = "none";
+			return;
+		}
+		this.tagWarningsEl.style.display = "";
+		for (const w of warnings) {
+			const row = this.tagWarningsEl.createEl("div", {
+				cls: "noema-create-tag-warning",
+			});
+			row.createEl("span", {
+				cls: "noema-create-tag-warning-glyph",
+				text: "⚠",
+			});
+			row.createEl("code", {
+				cls: "noema-create-tag-warning-tag",
+				text: w.tag,
+			});
+			row.appendChild(document.createTextNode(" — "));
+			row.createEl("span", {
+				cls: "noema-create-tag-warning-reason",
+				text: w.reason,
+			});
+		}
 	}
 
 	private async submit(): Promise<void> {
@@ -208,6 +255,53 @@ function splitDelimited(raw: string): string[] {
 		.split(/[,;]/)
 		.map((s) => s.trim())
 		.filter(Boolean);
+}
+
+// TagWarning is a hint that a tag will be invisible or misinterpreted
+// in Obsidian's tag panel. The cortex itself accepts every input;
+// these warnings are purely for the Obsidian-authored workflow.
+export interface TagWarning {
+	tag: string;
+	reason: string;
+}
+
+// validateObsidianTags returns a list of warnings for tags that won't
+// render correctly in Obsidian's tag panel. Per Obsidian's tag spec
+// (https://obsidian.md/help/tags#Tag+format):
+//
+//   - Tags must contain at least one non-numeric character. A tag
+//     like "2026" is silently dropped from the tag panel.
+//   - Dots inside a tag are interpreted as nested-tag separators
+//     ("release.candidate" → tag tree "release" / "candidate"),
+//     which is rarely what an author of a flat tag intends.
+//
+// Both forms are valid in the cortex — they're stored, indexed by
+// FTS5, and searchable via MCP tools. The Obsidian-side limitation is
+// purely about what Obsidian's UI surfaces. Exported so a future
+// command-palette tag editor (or other plugin surface) can reuse the
+// rule without duplicating the regex.
+export function validateObsidianTags(tags: string[]): TagWarning[] {
+	const warnings: TagWarning[] = [];
+	for (const t of tags) {
+		// Numeric-only check: any tag whose chars are all in the set
+		// [0-9 - _] (i.e. no letter at all) is dropped by Obsidian.
+		// Trailing-letter "v1" passes, "2026" doesn't, "2026q1" passes.
+		if (/^[0-9_-]+$/.test(t)) {
+			warnings.push({
+				tag: t,
+				reason:
+					"Obsidian requires at least one letter. Pure-numeric tags are not surfaced in its tag panel.",
+			});
+		}
+		if (t.includes(".")) {
+			warnings.push({
+				tag: t,
+				reason:
+					"Obsidian interprets dots as nested-tag separators (so \"a.b\" becomes tag tree a/b).",
+			});
+		}
+	}
+	return warnings;
 }
 
 function sleep(ms: number): Promise<void> {

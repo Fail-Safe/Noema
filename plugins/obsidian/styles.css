@@ -281,3 +281,34 @@
 	gap: 8px;
 	margin-top: 12px;
 }
+
+/* ---- Tag-validation hints in create modal ---- */
+
+.noema-create-tag-warnings {
+	margin: -4px 0 8px 128px;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+
+.noema-create-tag-warning {
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+}
+
+.noema-create-tag-warning-glyph {
+	color: var(--text-warning, var(--text-accent));
+	margin-right: 6px;
+}
+
+.noema-create-tag-warning-tag {
+	font-family: var(--font-monospace);
+	color: var(--text-normal);
+	background: var(--background-modifier-border-hover);
+	padding: 0 4px;
+	border-radius: 3px;
+}
+
+.noema-create-tag-warning-reason {
+	color: var(--text-muted);
+}
