@@ -956,3 +956,49 @@ func TestValidateHTTPServe_ImplicitCortexErrorMessage(t *testing.T) {
 		}
 	}
 }
+
+// TestInICloudDrive pins the path-substring contract used by the
+// startup warning. The check is a string match on the canonical
+// macOS iCloud Drive sync root — adding flexibility (case-insensitive,
+// regex, etc.) is a footgun because legitimate paths like
+// "/library/mobile/documents" don't match the real container.
+func TestInICloudDrive(t *testing.T) {
+	cases := []struct {
+		name string
+		dir  string
+		want bool
+	}{
+		{
+			name: "default iCloud Drive container",
+			dir:  "/Users/alice/Library/Mobile Documents/com~apple~CloudDocs/cortex",
+			want: true,
+		},
+		{
+			name: "Obsidian iCloud-managed vault",
+			dir:  "/Users/alice/Library/Mobile Documents/iCloud~md~obsidian/Documents/cortex",
+			want: true,
+		},
+		{
+			name: "regular home directory",
+			dir:  "/Users/alice/cortex",
+			want: false,
+		},
+		{
+			name: "lowercase library is not iCloud",
+			dir:  "/Users/alice/library/mobile documents/cortex",
+			want: false,
+		},
+		{
+			name: "Linux XDG path",
+			dir:  "/home/alice/.local/share/noema/cortex",
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := inICloudDrive(tc.dir); got != tc.want {
+				t.Errorf("inICloudDrive(%q) = %v, want %v", tc.dir, got, tc.want)
+			}
+		})
+	}
+}
