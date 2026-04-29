@@ -237,7 +237,7 @@ func serveCmd() *cobra.Command {
 			// need a parallel sweeper.
 			if gotLock && manifestErr == nil && m.Consolidation != nil && m.Consolidation.Enabled &&
 				m.Federation != nil && len(m.Federation.Peers) > 0 {
-				watchdog = startWatchdog(cx)
+				watchdog = startWatchdog(cx, m.Consolidation)
 			}
 
 			switch transport {
@@ -583,22 +583,27 @@ func startEligibility(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig, fed *c
 // startWatchdog launches the election watchdog. The caller has already
 // verified that consolidation is enabled AND federation peers are
 // configured — single-node cortexes never have silent winners and skip
-// the watchdog entirely. Defaults are baked into the watchdog package
-// (10-minute claim staleness ceiling, 1-minute sweep cadence); they
-// can be promoted to manifest config in a future change if real
-// deployments need to tune them.
-func startWatchdog(cx *cortex.Cortex) *consolidation.Watchdog {
+// the watchdog entirely. The claim-staleness ceiling is configurable via
+// consolidation.watchdog_timeout in cortex.md (defaults to 10 minutes
+// per consolidation.EffectiveWatchdogTimeout); operators with slow LLM
+// endpoints can raise it to avoid noise where a legitimate long-running
+// pass trips the watchdog before the local consolidator emits success.
+// Sweep cadence is still an internal default (1 minute) — promoting
+// that to manifest config can wait until someone needs it.
+func startWatchdog(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig) *consolidation.Watchdog {
 	logger := func(format string, args ...any) {
 		fmt.Fprintf(os.Stderr, format+"\n", args...)
 	}
+	timeout := cfg.EffectiveWatchdogTimeout()
 	w := consolidation.NewWatchdog(consolidation.WatchdogConfig{
 		DB:            cx.DB.DB,
 		Emitter:       cx,
 		LocalCortexID: cx.ID,
+		Timeout:       timeout,
 		Log:           logger,
 	})
 	w.Start()
-	fmt.Fprintf(os.Stderr, "[consolidation] watchdog started\n")
+	fmt.Fprintf(os.Stderr, "[consolidation] watchdog started (timeout=%s)\n", timeout)
 	return w
 }
 
