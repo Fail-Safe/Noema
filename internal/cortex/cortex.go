@@ -811,6 +811,24 @@ Choose the type that best reflects the **intent** of the memory:
   survive and produce awkward IDs. If a trace is *about* a specific date,
   put it in a tag (` + "`tags: [event-2026-04-02]`" + `) or in the body.
 
+## Tags
+
+The cortex accepts any string as a tag — the constraints below are about
+what *renders correctly in Obsidian's tag panel* if a user is authoring
+traces through Obsidian (a common but optional surface). Non-Obsidian
+authoring (CLI, MCP, TUI, agent integrations) is unaffected.
+
+- **Tags must contain at least one letter.** A pure-numeric tag like
+  ` + "`2026`" + ` or ` + "`42`" + ` is stored, indexed, and searchable, but Obsidian
+  silently drops it from the tag panel. Use ` + "`y2026`" + `, ` + "`2026q1`" + `, or
+  ` + "`event-2026-04-02`" + ` instead.
+- **Avoid dots inside a tag.** Obsidian interprets ` + "`release.candidate`" + `
+  as a nested tag tree (` + "`release/candidate`" + `), which is rarely the
+  intent for a flat tag. Use hyphens: ` + "`release-candidate`" + `.
+- **No spaces.** Tag tokens are split on whitespace by most tooling;
+  use hyphens or underscores to keep multi-word tags as one token:
+  ` + "`network-troubleshooting`" + `, not ` + "`network troubleshooting`" + `.
+
 ## Creating a Trace (filesystem)
 
 1. Pick a type and write your content.

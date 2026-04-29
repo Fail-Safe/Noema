@@ -23,6 +23,16 @@ That's intentionally the whole feature set for v0.1. File-explorer decorations, 
 
 The status bar will show `noema: <cortex-name>` once the connection succeeds.
 
+## Tag conventions
+
+The cortex accepts any string as a tag — these constraints are about what Obsidian's tag panel surfaces:
+
+- **Tags must contain at least one letter.** Pure-numeric tags like `2026` or `42` are stored on the trace and remain searchable through Noema's MCP / FTS5 surfaces, but Obsidian silently drops them from its tag panel. Use `y2026`, `2026q1`, or `event-2026-04-02`.
+- **Avoid dots in a tag.** Obsidian interprets `release.candidate` as a nested tag tree (`release` / `candidate`). Use hyphens: `release-candidate`.
+- **No spaces.** Use hyphens or underscores: `network-troubleshooting`, not `network troubleshooting`.
+
+The "New trace" command shows inline warnings as you type a non-conformant tag. Submission proceeds normally — these are hints, not errors. Authoring through CLI / MCP / TUI is unaffected.
+
 ## Building
 
 ```sh
