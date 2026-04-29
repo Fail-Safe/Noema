@@ -11,7 +11,70 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/Fail-Safe/Noema/internal/cortex"
+	"github.com/Fail-Safe/Noema/internal/trace"
 )
+
+// --------- tier visibility in MCP output ---------
+//
+// Pins the contract that list_traces / search_traces / get_trace must
+// expose the tier of every trace to MCP consumers. Agents reason about
+// immutability and curation based on tier; the TUI and CLI both surface
+// it, so MCP parity is required. A regression here would make agents
+// tier-blind again.
+
+func TestFormatRows_IncludesTierGlyph(t *testing.T) {
+	rows := []cortex.Row{
+		{ID: "20260424-a", Title: "short one", Type: "note", CreatedAt: "2026-04-24T00:00:00Z", Tier: trace.TierShort},
+		{ID: "20260424-b", Title: "mid one", Type: "note", CreatedAt: "2026-04-24T00:00:00Z", Tier: trace.TierMid},
+		{ID: "20260424-c", Title: "long one", Type: "note", CreatedAt: "2026-04-24T00:00:00Z", Tier: trace.TierLong},
+	}
+	out := formatRows(rows)
+	for _, want := range []string{"[s]", "[m]", "[L]"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("formatRows output missing tier glyph %q; got:\n%s", want, out)
+		}
+	}
+}
+
+func TestGetTrace_IncludesTierLine(t *testing.T) {
+	// Integration-level: seed a trace at mid tier through the Cortex,
+	// invoke get_trace over MCP, and assert the output carries a
+	// "Tier: mid" line. Pre-fix this failed because the metadata block
+	// only surfaced ID/Title/Type/Author/Tags/Created/Updated with no
+	// tier slot at all.
+	cx := newTestCortex(t)
+	tr := trace.New("tier-vis", "note", "agent", nil, "body")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := cx.Promote(tr.ID, trace.TierMid); err != nil {
+		t.Fatalf("Promote: %v", err)
+	}
+
+	s := NewServer(cx, "test-version", "")
+	text, isErr := callTool(t, s, "get_trace", map[string]any{"id": tr.ID})
+	if isErr {
+		t.Fatalf("get_trace returned error: %s", text)
+	}
+	if !strings.Contains(text, "Tier: mid") {
+		t.Errorf("get_trace output missing 'Tier: mid' line; got:\n%s", text)
+	}
+}
+
+func TestTierGlyph(t *testing.T) {
+	cases := map[string]string{
+		trace.TierShort: "s",
+		trace.TierMid:   "m",
+		trace.TierLong:  "L",
+		"":              "?",
+		"bogus":         "?",
+	}
+	for in, want := range cases {
+		if got := tierGlyph(in); got != want {
+			t.Errorf("tierGlyph(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
 
 // --------- renderInstructions (pure helper) ---------
 
@@ -280,22 +343,30 @@ func callTool(t *testing.T, s *server.MCPServer, toolName string, args map[strin
 	if result == nil {
 		t.Fatalf("HandleMessage returned nil for %s", toolName)
 	}
-	resp, ok := result.(mcp.JSONRPCResponse)
-	if !ok {
-		t.Fatalf("expected JSONRPCResponse for %s, got %T", toolName, result)
-	}
-	data, _ := json.Marshal(resp.Result)
-	var toolResult mcp.CallToolResult
-	if err := json.Unmarshal(data, &toolResult); err != nil {
-		t.Fatalf("unmarshal CallToolResult for %s: %v", toolName, err)
-	}
-	text := ""
-	if len(toolResult.Content) > 0 {
-		if tc, ok := toolResult.Content[0].(mcp.TextContent); ok {
-			text = tc.Text
+	switch r := result.(type) {
+	case mcp.JSONRPCResponse:
+		data, _ := json.Marshal(r.Result)
+		var toolResult mcp.CallToolResult
+		if err := json.Unmarshal(data, &toolResult); err != nil {
+			t.Fatalf("unmarshal CallToolResult for %s: %v", toolName, err)
 		}
+		text := ""
+		if len(toolResult.Content) > 0 {
+			if tc, ok := toolResult.Content[0].(mcp.TextContent); ok {
+				text = tc.Text
+			}
+		}
+		return text, toolResult.IsError
+	case mcp.JSONRPCError:
+		// Handlers that return `nil, err` surface as protocol-level
+		// JSON-RPC errors rather than tool-result errors. Treat both
+		// as error outcomes so tests can assert on failure modes
+		// uniformly regardless of which path the handler took.
+		return r.Error.Message, true
+	default:
+		t.Fatalf("unexpected response type for %s: %T", toolName, result)
+		return "", false
 	}
-	return text, toolResult.IsError
 }
 
 // initServer drives the MCP initialize handshake so tools can be called.
@@ -338,6 +409,8 @@ func TestPublishMode_BlocksMutatingTools(t *testing.T) {
 		{"archive_trace", map[string]any{"id": "nonexistent"}},
 		{"unarchive_trace", map[string]any{"id": "nonexistent"}},
 		{"resolve_divergence", map[string]any{"id": "nonexistent"}},
+		{"vote_trace", map[string]any{"id": "nonexistent", "direction": "up"}},
+		{"record_consolidation_result", map[string]any{"title": "x", "body": "y", "source_ids": "a,b"}},
 	}
 
 	for _, tc := range mutating {
@@ -420,5 +493,30 @@ func TestSyncMode_AllowsEverything(t *testing.T) {
 	text, isErr = callTool(t, s, "sync_events", nil)
 	if isErr && strings.Contains(text, "subscribe mode") {
 		t.Errorf("sync_events should work in sync mode, got: %s", text)
+	}
+}
+
+func TestSubscribeMode_BlocksSyncReadSignal(t *testing.T) {
+	cx := newTestCortex(t)
+	s := NewServer(cx, "test", "subscribe")
+	initServer(t, s)
+
+	text, isErr := callTool(t, s, "sync_read_signal", nil)
+	if !isErr {
+		t.Errorf("sync_read_signal should be blocked in subscribe mode, got: %s", text)
+	}
+	if !strings.Contains(text, "subscribe mode") {
+		t.Errorf("error should mention subscribe mode, got: %s", text)
+	}
+}
+
+func TestPublishMode_AllowsSyncReadSignal(t *testing.T) {
+	cx := newTestCortex(t)
+	s := NewServer(cx, "test", "publish")
+	initServer(t, s)
+
+	text, isErr := callTool(t, s, "sync_read_signal", nil)
+	if isErr {
+		t.Errorf("sync_read_signal should be served in publish mode, got error: %s", text)
 	}
 }

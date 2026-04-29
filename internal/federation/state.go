@@ -76,6 +76,15 @@ func PeerSeenKey(peerName string) string {
 	return "peer:" + peerName + ":last_seen"
 }
 
+// PeerUsageCursorKey returns the federation_state key for a peer's
+// last_usage cursor (highest trace_usage.updated_at this peer's ever
+// seen from the named peer). Separate from the event cursor because
+// the two streams advance independently — a peer can be quiet on
+// mutations but chatty on reads, or vice versa.
+func PeerUsageCursorKey(peerName string) string {
+	return "peer:" + peerName + ":last_usage"
+}
+
 // PeerCortexIDKey returns the federation_state key under which a peer's verified
 // cortex ULID is pinned after the first successful identity handshake. The
 // syncer refuses to talk to a peer whose advertised ID has changed from what

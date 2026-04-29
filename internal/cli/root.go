@@ -38,6 +38,41 @@ func version() string {
 	return "dev"
 }
 
+// buildFingerprint renders an operator-facing suffix for log lines
+// that want to surface commit + build-date alongside the version.
+// Returns the empty string when neither Commit nor Date is set —
+// Makefile builds inject only Version, so the fallback keeps
+// startup logs uncluttered for those builds. Format:
+//
+//	" (commit abc1234, built 2026-04-28T15:00:00Z)"
+//
+// Includes a leading space so callers can concatenate it directly
+// after the version string without conditional logic at the call site.
+func buildFingerprint() string {
+	if Commit == "" && Date == "" {
+		return ""
+	}
+	switch {
+	case Commit != "" && Date != "":
+		return fmt.Sprintf(" (commit %s, built %s)", shortCommit(Commit), Date)
+	case Commit != "":
+		return fmt.Sprintf(" (commit %s)", shortCommit(Commit))
+	default:
+		return fmt.Sprintf(" (built %s)", Date)
+	}
+}
+
+// shortCommit truncates a full SHA to its leading 7 hex chars (the
+// git default). GoReleaser injects full SHAs; 7 chars is enough to
+// disambiguate in any practical repo and saves horizontal space in
+// startup log lines.
+func shortCommit(c string) string {
+	if len(c) > 7 {
+		return c[:7]
+	}
+	return c
+}
+
 var cortexFlag string
 
 var rootCmd = &cobra.Command{
@@ -61,9 +96,10 @@ func Execute() {
 }
 
 const (
-	groupTrace   = "trace"
-	groupCortex  = "cortex"
-	groupIface   = "interface"
+	groupTrace     = "trace"
+	groupCortex    = "cortex"
+	groupIntegrity = "integrity"
+	groupIface     = "interface"
 )
 
 func init() {
@@ -73,20 +109,28 @@ func init() {
 	rootCmd.AddGroup(
 		&cobra.Group{ID: groupTrace, Title: "Trace commands:"},
 		&cobra.Group{ID: groupCortex, Title: "Cortex management:"},
+		&cobra.Group{ID: groupIntegrity, Title: "Integrity:"},
 		&cobra.Group{ID: groupIface, Title: "Interface:"},
 	)
 
 	addGrouped(groupTrace,
-		addCmd(), listCmd(), getCmd(), editCmd(), removeCmd(),
+		addCmd(), listCmd(), getCmd(), editCmd(), appendCmd(), removeCmd(),
 		searchCmd(), archiveCmd(), unarchiveCmd(), recoverCmd(), purgeCmd(), syncCmd(),
-		eventsCmd(), resolveCmd(), verifyCmd(), driftCmd(),
+		eventsCmd(), resolveCmd(), memoryCmd(), consolidateCmd(),
 	)
 	addGrouped(groupCortex,
 		initCmd(), useCmd(), cortexCmd(), federationCmd(), migrateCmd(),
 	)
+	addGrouped(groupIntegrity,
+		verifyCmd(),
+	)
 	addGrouped(groupIface,
 		serveCmd(), tuiCmd(), completionCmd(),
 	)
+
+	// driftCmd is a hidden top-level alias for `noema verify drift`,
+	// kept for one release cycle so existing scripts keep working.
+	rootCmd.AddCommand(driftCmd())
 
 	// versionCmd and configCmd are intentionally ungrouped — they're
 	// meta (about the binary or user settings, not Traces or

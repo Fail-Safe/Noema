@@ -10,14 +10,17 @@ import (
 	"net/http"
 	"os"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/Fail-Safe/Noema/internal/config"
+	"github.com/Fail-Safe/Noema/internal/consolidation"
 	"github.com/Fail-Safe/Noema/internal/cortex"
 	"github.com/Fail-Safe/Noema/internal/federation"
+	"github.com/Fail-Safe/Noema/internal/lock"
 	mcpserver "github.com/Fail-Safe/Noema/internal/mcp"
 	"github.com/Fail-Safe/Noema/internal/watch"
 	mcpgo "github.com/mark3labs/mcp-go/server"
@@ -30,6 +33,8 @@ func serveCmd() *cobra.Command {
 		port              int
 		tlsCert           string
 		tlsKey            string
+		logFile           string
+		logStderr         bool
 		printConfig       bool
 		printSystemdUnit  bool
 		printLaunchdPlist bool
@@ -77,6 +82,38 @@ func serveCmd() *cobra.Command {
 			}
 			// Don't defer cx.Close() — server runs until interrupted.
 
+			// Route operational logs. In stdio mode the default is to
+			// redirect to $XDG_STATE_HOME/noema/<cortex>.log so MCP
+			// clients (Claude Code, Copilot, Zed, etc.) that inherit
+			// the spawning tty's stderr don't end up dumping watcher +
+			// federation logs into the user's active terminal. Operators
+			// who want the logs interactive pass --log-stderr; those who
+			// want a specific path pass --log-file. In http mode the
+			// default stays stderr since systemd / launchd capture it.
+			//
+			// Print the destination to stderr BEFORE redirecting so the
+			// user sees exactly one "logs going to X" line in their tty
+			// (stdio case) or in their journald stream (http case).
+			if path, err := setupServeLogging(cx.Name, transport, logFile, logStderr); err != nil {
+				return fmt.Errorf("setting up logging: %w", err)
+			} else if path != "" {
+				fmt.Fprintf(os.Stderr, "[serve] logs -> %s\n", path)
+				if err := redirectStderrToFile(path); err != nil {
+					return fmt.Errorf("redirecting logs: %w", err)
+				}
+			}
+
+			// Build-fingerprint line, ahead of everything else, so an
+			// operator triaging journals can immediately spot a process
+			// running a stale binary (e.g. systemd-managed long-lived
+			// service that wasn't restarted after a deploy, or a
+			// launchd-managed agent inheriting an older binary path).
+			// Falls back gracefully when only Version is set (Makefile
+			// builds) and stays compact when all three fields are
+			// available (GoReleaser builds).
+			fmt.Fprintf(os.Stderr, "[serve] noema %s%s starting\n",
+				version(), buildFingerprint())
+
 			// Surface the bound cortex identity on every serve, so an
 			// operator who started the wrong cortex sees it in the very
 			// first log line instead of finding out via peer drift hours
@@ -95,18 +132,112 @@ func serveCmd() *cobra.Command {
 
 			var syncer *federation.Syncer
 			var watcher *watch.Watcher
+			var consolidator *consolidation.Agent
+			var eligibility *consolidation.EligibilityLoop
+			var watchdog *consolidation.Watchdog
+
+			// Per-cortex background-work coordination. Concurrent serve
+			// processes on the same cortex (long-lived `--transport http`
+			// systemd service + transient `--transport stdio` subprocesses
+			// spawned by Claude Code, Hermes plugins, etc.) all open the
+			// same DB and previously each ran their own watcher,
+			// consolidator, eligibility loop, and watchdog. The result was
+			// duplicate event emissions, rank churn, and short-lived
+			// processes polluting the consolidation_claim history when
+			// their schedulers fired briefly before the parent killed them.
+			//
+			// An OS-level advisory lock here picks one process per
+			// cortex to own the background work (flock on Unix,
+			// LockFileEx on Windows — both with non-blocking
+			// exclusive semantics). Losers fall through to "MCP-only"
+			// mode — they still serve their transport's request
+			// handlers, just without redundant background loops. The
+			// kernel auto-releases the lock on process exit (any
+			// path: clean, SIGTERM, SIGKILL, panic), so a crashed
+			// holder hands off cleanly to the next process.
+			//
+			// The lock file lives in a platform-appropriate runtime
+			// directory keyed by cortex ID, NOT inside the cortex dir
+			// itself. That insulates the lock from sync layers (iCloud
+			// Drive, Dropbox, Syncthing, OneDrive) which would otherwise
+			// replicate the file to other hosts (where it has no
+			// semantic meaning) and could replace the inode underneath
+			// our flock during a sync, leaving us holding a flock on
+			// an orphaned inode. See lock.RuntimePath for details.
+			lockPath, lockPathErr := lock.RuntimePath(cx.ID)
+			if lockPathErr != nil {
+				return fmt.Errorf("resolving lock path: %w", lockPathErr)
+			}
+			bgLock, gotLock, lockErr := lock.TryAcquire(lockPath)
+			if lockErr != nil {
+				return fmt.Errorf("acquiring background lock: %w", lockErr)
+			}
+			if gotLock {
+				fmt.Fprintf(os.Stderr, "[serve] background lock at %s\n", lockPath)
+				// Best-effort cleanup of the previous-release lock
+				// location. Earlier versions placed background.lock
+				// inside the cortex dir at <cortex>/db/background.lock,
+				// which had the iCloud-replication problem described
+				// above. Now that we hold the new lock, deleting the
+				// old-location file is safe — no other process should
+				// be relying on it (older binaries would have lost the
+				// race for the new location). If removal fails for any
+				// reason, log and move on; an orphaned 0-byte file is
+				// harmless.
+				oldLockPath := filepath.Join(cx.Dir, "db", "background.lock")
+				if _, statErr := os.Stat(oldLockPath); statErr == nil {
+					if rmErr := os.Remove(oldLockPath); rmErr != nil {
+						fmt.Fprintf(os.Stderr,
+							"[serve] could not remove stale lock at %s: %v (harmless, ignore)\n",
+							oldLockPath, rmErr)
+					} else {
+						fmt.Fprintf(os.Stderr,
+							"[serve] removed stale lock from previous location %s\n",
+							oldLockPath)
+					}
+				}
+			} else {
+				fmt.Fprintf(os.Stderr,
+					"[serve] another noema process owns background work for cortex %q; running as MCP-only\n",
+					cx.Name)
+			}
 
 			// Filesystem watcher: on by default so external edits
 			// (Obsidian, VS Code, Finder, iCloud sync, another agent on
-			// the same cortex) emit real mutation events. Runs under
-			// BOTH stdio and http — a stdio serve is not always the
-			// only mutator (the user may be editing in Obsidian while
-			// Claude Code uses stdio; iCloud may be delivering deltas
-			// from another device; another noema process may be writing
-			// via HTTP). Opt out with `watch: { enabled: false }` in
-			// cortex.md.
-			if manifestErr == nil && m.Watch.WatchEnabled() {
+			// the same cortex) emit real mutation events. Gated on the
+			// background-work lock so two processes don't each emit a
+			// trash/update event for the same fsnotify trigger.
+			if gotLock && manifestErr == nil && m.Watch.WatchEnabled() {
 				watcher = startWatcher(cx, m.Watch)
+			}
+
+			// Consolidation agent: opt-in; drives memory-tier
+			// promotions on cron/idle/threshold triggers. Gated on the
+			// background-work lock so the cron scheduler only fires
+			// once per cortex even when multiple processes are serving
+			// MCP traffic.
+			if gotLock && manifestErr == nil && m.Consolidation != nil && m.Consolidation.Enabled {
+				consolidator = startConsolidator(cx, m.Consolidation, m.Federation)
+			}
+
+			// Eligibility loop: advertises this cortex's consolidation
+			// rank in federation_state so federated peers can observe
+			// whether and how strongly we want to run the next
+			// consolidation window. Gated on the background-work lock
+			// so the rank entry doesn't churn between concurrent
+			// processes overwriting each other.
+			if gotLock && manifestErr == nil && m.Consolidation != nil && m.Consolidation.Enabled {
+				eligibility = startEligibility(cx, m.Consolidation, m.Federation)
+			}
+
+			// Election watchdog: closes out consolidation_claim events
+			// that never received a matching success/fail. Gated on the
+			// background-work lock + federation peers; single-node
+			// cortexes can't have silent winners and lock losers don't
+			// need a parallel sweeper.
+			if gotLock && manifestErr == nil && m.Consolidation != nil && m.Consolidation.Enabled &&
+				m.Federation != nil && len(m.Federation.Peers) > 0 {
+				watchdog = startWatchdog(cx, m.Consolidation)
 			}
 
 			switch transport {
@@ -143,11 +274,13 @@ func serveCmd() *cobra.Command {
 
 				// Federation only runs over the HTTP transport (peers
 				// need an HTTP endpoint to call sync_events on). Start
-				// the syncer only when the bound cortex actually has
-				// peers configured AND the mode is not "publish" (a
-				// publish-mode cortex serves events but never pulls).
+				// the syncer whenever peers are configured. Publish-mode
+				// cortexes still run the syncer so they can pick up
+				// consolidation ranks from peers via cortex_identity
+				// (plan §14); the sync_events pull is suppressed inside
+				// the syncer loop.
 				fedMode := m.Federation.EffectiveMode()
-				if m.Federation != nil && len(m.Federation.Peers) > 0 && fedMode != cortex.FederationModePublish {
+				if m.Federation != nil && len(m.Federation.Peers) > 0 {
 					syncer = startSyncer(cx, accessKey.Value, m.Federation)
 				}
 				fmt.Fprintf(os.Stderr, "[serve] federation mode: %s\n", fedMode)
@@ -235,7 +368,7 @@ func serveCmd() *cobra.Command {
 				err = fmt.Errorf(
 					"the legacy `sse` transport was removed in this release: noema now speaks Streamable HTTP (MCP 2025-03-26).\n" +
 						"  Re-run with --transport http (default endpoint /mcp) and regenerate any\n" +
-						"  systemd unit, launchd plist, or .mcp.json that pinned --transport sse.")
+						"  systemd unit, launchd plist, or .mcp.json that pinned --transport sse")
 			default:
 				err = fmt.Errorf("unknown transport %q: use stdio or http", transport)
 			}
@@ -246,6 +379,23 @@ func serveCmd() *cobra.Command {
 			if watcher != nil {
 				watcher.Stop()
 			}
+			if consolidator != nil {
+				consolidator.Stop()
+			}
+			if eligibility != nil {
+				eligibility.Stop()
+			}
+			if watchdog != nil {
+				watchdog.Stop()
+			}
+			// Release the background-work lock last so background
+			// goroutines have already drained — the kernel would
+			// release it on exit anyway, but explicit release lets
+			// a sibling process pick up the lock before this binary
+			// finishes its own teardown.
+			if releaseErr := bgLock.Release(); releaseErr != nil {
+				fmt.Fprintf(os.Stderr, "[serve] releasing background lock: %v\n", releaseErr)
+			}
 			return err
 		},
 	}
@@ -255,6 +405,8 @@ func serveCmd() *cobra.Command {
 	cmd.Flags().IntVar(&port, "port", 3000, "port for HTTP transport")
 	cmd.Flags().StringVar(&tlsCert, "tls-cert", "", "path to TLS certificate file (enables HTTPS)")
 	cmd.Flags().StringVar(&tlsKey, "tls-key", "", "path to TLS private key file")
+	cmd.Flags().StringVar(&logFile, "log-file", "", "write operational logs to this path (default: $XDG_STATE_HOME/noema/<cortex>.log in stdio mode; stderr in http mode)")
+	cmd.Flags().BoolVar(&logStderr, "log-stderr", false, "force logs to stderr even in stdio mode (overrides the default file redirect)")
 	cmd.Flags().BoolVar(&printConfig, "print-config", false, "print MCP client config JSON and exit")
 	cmd.Flags().BoolVar(&printSystemdUnit, "print-systemd-unit", false, "print a systemd service unit for this serve command and exit")
 	cmd.Flags().BoolVar(&printLaunchdPlist, "print-launchd-plist", false, "print a launchd LaunchAgent plist for this serve command and exit")
@@ -274,6 +426,184 @@ func startWatcher(cx *cortex.Cortex, cfg *cortex.WatchConfig) *watch.Watcher {
 		fmt.Printf("[watch] start failed: %v (serving without watcher)\n", err)
 		return nil
 	}
+	return w
+}
+
+// startConsolidator wires the manifest's consolidation config into a
+// running scheduling agent. Phase 8 injects the heuristic pass as the
+// default PassFn so triggers actually move memory (short -> mid based
+// on a blended score of reads, modifies, lineage, and votes). Phase 9
+// will wrap this with LLM distillation; heuristic 1:1 promotion
+// remains the fallback when LLMs aren't configured.
+//
+// When federation peers are configured, the pass is wrapped with the
+// election gate from consolidation-plan.md §14 so only the elected peer
+// actually runs a cycle. Single-node cortexes skip the wrapper — the
+// gate would work there too, but it would emit a Claim+Success pair on
+// every pass for a degenerate election with a single participant.
+func startConsolidator(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig, fed *cortex.FederationConfig) *consolidation.Agent {
+	if cfg == nil || !cfg.Enabled {
+		return nil
+	}
+	if !cfg.HasTrigger() {
+		fmt.Fprintf(os.Stderr, "[consolidation] enabled but no triggers configured (cron/idle_minutes/threshold_short); agent will not run\n")
+		return nil
+	}
+	logger := func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
+	}
+	pass := consolidation.HeuristicPass(cx, consolidation.PassConfig{
+		Window: cfg.EffectiveWindowHours(),
+	}, logger)
+
+	// When auto-distillation is opted in, prepend the LLM pipeline so
+	// each trigger runs distillation → heuristic → graduation in order.
+	// DistillationPass swallows endpoint/pipeline errors so the chained
+	// heuristic + graduation passes still fire when the LLM is offline.
+	// ValidateConsolidation has already guaranteed llm_enabled +
+	// local_llm_endpoint + model_name are set by the time we get here.
+	if cfg.AutoDistillationEnabled {
+		distill := consolidation.DistillationPass(cx, consolidation.PipelineConfig{
+			Window:     cfg.EffectiveWindowHours(),
+			ModelTier:  cfg.EffectiveModelTier(),
+			ModelName:  cfg.ModelName,
+			MaxRetries: 1,
+		}, cfg.LocalLLMEndpoint, cfg.APIKeyEnv, logger)
+		pass = consolidation.ChainPasses(distill, pass)
+		fmt.Fprintf(os.Stderr, "[consolidation] auto-distillation enabled (endpoint=%s model=%q tier=%s)\n",
+			cfg.LocalLLMEndpoint, cfg.ModelName, cfg.EffectiveModelTier())
+	}
+
+	// Phase 15: mid→long graduation runs on the same trigger cadence
+	// alongside short→mid promotion. Chain the two so each scheduler
+	// fire evaluates both transitions in order.
+	if cfg.Graduation.EffectiveEnabled() {
+		graduate := consolidation.GraduatePass(cx, consolidation.GraduationConfig{
+			MinAge:        cfg.Graduation.EffectiveMinAge(),
+			MinReadCount:  cfg.Graduation.EffectiveMinReadCount(),
+			AllowModified: !cfg.Graduation.EffectiveRequireUnmodified(),
+		}, logger)
+		pass = consolidation.ChainPasses(pass, graduate)
+		fmt.Fprintf(os.Stderr, "[consolidation] graduation enabled (min_age=%s min_reads=%d require_unmodified=%t)\n",
+			cfg.Graduation.EffectiveMinAge(),
+			cfg.Graduation.EffectiveMinReadCount(),
+			cfg.Graduation.EffectiveRequireUnmodified())
+	}
+
+	if fed != nil && len(fed.Peers) > 0 {
+		peerNames := make([]string, 0, len(fed.Peers))
+		for _, p := range fed.Peers {
+			peerNames = append(peerNames, p.Name)
+		}
+		// Quiet period tracks federation sync cadence so a peer's
+		// rank is only trusted once the ring has had a chance to
+		// observe it. Default to 60s (2 × the 30s federation default)
+		// when the manifest leaves Interval unset or unparseable.
+		interval := 30 * time.Second
+		if fed.Interval != "" {
+			if parsed, err := time.ParseDuration(fed.Interval); err == nil && parsed > 0 {
+				interval = parsed
+			}
+		}
+		election := consolidation.NewElection(consolidation.ElectionConfig{
+			CortexID:    cx.ID,
+			PeerNames:   peerNames,
+			QuietPeriod: 2 * interval,
+			State:       federation.NewState(cx.DB.DB),
+			Emitter:     cx,
+			Log:         logger,
+		})
+		pass = consolidation.WithElection(pass, election, logger)
+		fmt.Fprintf(os.Stderr, "[consolidation] election gate enabled (peers=%d quiet=%s)\n",
+			len(peerNames), 2*interval)
+	}
+
+	// Cron retry-on-idle (issue #56) only makes sense when the
+	// election gate is in play: gated passes can defer (peer won)
+	// without actually running, and retry-on-idle re-fires until a
+	// success event lands. On a single-node cortex the pass always
+	// runs to completion when called, so leaving CronRetryWindow=0
+	// preserves the historical "mark day done immediately" behaviour.
+	cronRetryWindow := time.Duration(0)
+	cronMaxRetries := 0
+	if fed != nil && len(fed.Peers) > 0 {
+		cronRetryWindow = 5 * time.Minute
+		cronMaxRetries = 3
+	}
+
+	a := consolidation.New(cx, consolidation.Config{
+		Cron:            cfg.Cron,
+		IdleMinutes:     cfg.IdleMinutes,
+		ThresholdShort:  cfg.ThresholdShort,
+		CronRetryWindow: cronRetryWindow,
+		CronMaxRetries:  cronMaxRetries,
+	}, pass, logger)
+	a.Start()
+	fmt.Fprintf(os.Stderr, "[consolidation] agent started (cron=%q idle=%dm threshold=%d window=%s)\n",
+		cfg.Cron, cfg.IdleMinutes, cfg.ThresholdShort, cfg.EffectiveWindowHours())
+	return a
+}
+
+// startEligibility launches the rank-advertisement loop for federation-
+// aware consolidation coordination (plan §14). Always safe to call when
+// cfg.Enabled is true: on a single-node cortex the loop writes a local
+// kv row nothing reads, at negligible cost; in a federation it seeds
+// the state remote peers pull on every cortex_identity round-trip.
+//
+// fed is consulted for the cortex-wide federation mode: a subscribe-mode
+// cortex forces Rank=0 so it can never win an election, matching the
+// "read-only mirror" semantics in plan §14 and federation-plan.md.
+func startEligibility(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig, fed *cortex.FederationConfig) *consolidation.EligibilityLoop {
+	if cfg == nil || !cfg.Enabled {
+		return nil
+	}
+	logger := func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
+	}
+	mode := cortex.FederationModeSync
+	if fed != nil {
+		mode = fed.EffectiveMode()
+	}
+	loop := consolidation.NewEligibilityLoop(consolidation.EligibilityConfig{
+		Enabled:            cfg.Enabled,
+		LLMEnabled:         cfg.LLMEnabled,
+		TriggersConfigured: cfg.HasTrigger(),
+		FederationMode:     mode,
+		Endpoint:           cfg.LocalLLMEndpoint,
+		CortexID:           cx.ID,
+		State:              federation.NewState(cx.DB.DB),
+		Log:                logger,
+	})
+	loop.Start()
+	fmt.Fprintf(os.Stderr, "[consolidation] eligibility loop started (llm_enabled=%t triggers=%t mode=%s endpoint=%q)\n",
+		cfg.LLMEnabled, cfg.HasTrigger(), mode, cfg.LocalLLMEndpoint)
+	return loop
+}
+
+// startWatchdog launches the election watchdog. The caller has already
+// verified that consolidation is enabled AND federation peers are
+// configured — single-node cortexes never have silent winners and skip
+// the watchdog entirely. The claim-staleness ceiling is configurable via
+// consolidation.watchdog_timeout in cortex.md (defaults to 10 minutes
+// per consolidation.EffectiveWatchdogTimeout); operators with slow LLM
+// endpoints can raise it to avoid noise where a legitimate long-running
+// pass trips the watchdog before the local consolidator emits success.
+// Sweep cadence is still an internal default (1 minute) — promoting
+// that to manifest config can wait until someone needs it.
+func startWatchdog(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig) *consolidation.Watchdog {
+	logger := func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
+	}
+	timeout := cfg.EffectiveWatchdogTimeout()
+	w := consolidation.NewWatchdog(consolidation.WatchdogConfig{
+		DB:            cx.DB.DB,
+		Emitter:       cx,
+		LocalCortexID: cx.ID,
+		Timeout:       timeout,
+		Log:           logger,
+	})
+	w.Start()
+	fmt.Fprintf(os.Stderr, "[consolidation] watchdog started (timeout=%s)\n", timeout)
 	return w
 }
 
@@ -325,7 +655,7 @@ func requireTLSForKeyedMode(access cortex.AccessKey, useTLS bool) error {
 	return fmt.Errorf(
 		"refusing to serve MCP auth over plaintext HTTP: access.shared_key_file is set (source=%s) but --tls-cert/--tls-key are not configured.\n"+
 			"  A bearer token sent without TLS is stolen by the first adversary on the network path.\n"+
-			"  Provide --tls-cert and --tls-key, or remove access.shared_key_file from cortex.md to run in open mode.",
+			"  Provide --tls-cert and --tls-key, or remove access.shared_key_file from cortex.md to run in open mode",
 		access.Source,
 	)
 }
@@ -368,7 +698,7 @@ func guardStdioFlags(hostSet, portSet, tlsCertSet, tlsKeySet bool) error {
 		"%s %s only meaningful with --transport http.\n"+
 			"  noema serve defaults to stdio, which reads JSON-RPC from stdin\n"+
 			"  and has no network endpoint to bind. Re-run with --transport http,\n"+
-			"  or remove the flag(s).",
+			"  or remove the flag(s)",
 		strings.Join(flags, ", "),
 		verb,
 	)
