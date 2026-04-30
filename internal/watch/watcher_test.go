@@ -1,6 +1,7 @@
 package watch_test
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -113,6 +114,52 @@ func TestExternalEditEmitsUpdate(t *testing.T) {
 	}
 	if r.ContentHash == "" {
 		t.Error("content_hash should be refreshed after external edit")
+	}
+}
+
+// TestExternalEditDoesNotRewriteFile pins the regression for the
+// "modified externally" toast loop: when an editor saves a file and
+// the watcher ingests the change, Noema must NOT rewrite the file.
+// Rewriting kicks off a feedback loop where the editor sees a fresh
+// external modification, re-saves, the watcher fires again, and so on.
+//
+// Concretely: capture the file's bytes after the external write,
+// trigger watcher reconcile, and assert the bytes are byte-identical
+// afterwards. The DB-side update must still happen (covered by
+// TestExternalEditEmitsUpdate); only the file must stay untouched.
+func TestExternalEditDoesNotRewriteFile(t *testing.T) {
+	cx, _, id := setupWatcher(t)
+
+	path := cx.TraceFile(id, false)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	modified := []byte(string(data) + "\nedit by an external editor\n")
+	if err := os.WriteFile(path, modified, 0o640); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	time.Sleep(settleTime)
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile after settle: %v", err)
+	}
+	if !bytes.Equal(modified, after) {
+		t.Errorf("watcher rewrote the file after an external edit\n--- expected (caller's bytes) ---\n%s\n--- got (file on disk) ---\n%s",
+			string(modified), string(after))
+	}
+
+	// Sanity: the DB still picked up the change. Without this, a
+	// regression that disabled the watcher entirely would also pass
+	// the byte-equality check.
+	r, err := cx.Get(id)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if r.ContentHash == "" {
+		t.Error("DB content_hash should be set after external edit")
 	}
 }
 
