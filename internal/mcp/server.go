@@ -1135,7 +1135,6 @@ func formatSimilarMatches(matches []cortex.SimilarMatch) string {
 	return sb.String()
 }
 
-
 // tierGlyph returns the one-letter tier indicator used in MCP list/search
 // output, matching the TUI convention (lowercase for short/mid,
 // uppercase L for long to make long-term traces easy to spot). Unknown
