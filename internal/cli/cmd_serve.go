@@ -202,6 +202,20 @@ func serveCmd() *cobra.Command {
 					cx.Name)
 			}
 
+			// iCloud Drive replicates the cortex directory across
+			// hosts and can replace inodes during sync, which the
+			// watcher will see as trash/recreate event bursts. We
+			// don't refuse to start — some operators deliberately use
+			// iCloud as an Obsidian Sync alternative — but the warning
+			// surfaces the escape hatch (`watch.enabled: false`) at
+			// the moment it would matter, so a noisy event log doesn't
+			// look like a bug. Skipped when the watcher is already
+			// disabled or the manifest is unreadable.
+			if manifestErr == nil && m.Watch.WatchEnabled() && inICloudDrive(cx.Dir) {
+				fmt.Fprintf(os.Stderr,
+					"[serve] cortex is in iCloud Drive — watcher may emit sync-driven events; consider watch.enabled: false if noise shows up\n")
+			}
+
 			// Filesystem watcher: on by default so external edits
 			// (Obsidian, VS Code, Finder, iCloud sync, another agent on
 			// the same cortex) emit real mutation events. Gated on the
@@ -411,6 +425,19 @@ func serveCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&printSystemdUnit, "print-systemd-unit", false, "print a systemd service unit for this serve command and exit")
 	cmd.Flags().BoolVar(&printLaunchdPlist, "print-launchd-plist", false, "print a launchd LaunchAgent plist for this serve command and exit")
 	return cmd
+}
+
+// inICloudDrive reports whether the resolved cortex directory lives
+// under the macOS iCloud Drive sync root. Symlinks are resolved so a
+// custom-named link (e.g. ~/cortex -> ~/Library/Mobile Documents/...)
+// is detected too. Returns false on platforms where the path component
+// can't appear, so the caller doesn't need a GOOS guard.
+func inICloudDrive(dir string) bool {
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		resolved = dir
+	}
+	return strings.Contains(resolved, "/Library/Mobile Documents/")
 }
 
 // startWatcher constructs and starts a filesystem watcher for the bound

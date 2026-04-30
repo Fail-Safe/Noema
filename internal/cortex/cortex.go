@@ -899,6 +899,7 @@ they keep the database in sync automatically:
 | ` + "`update_trace`" + ` | Update fields of an existing trace |
 | ` + "`append_trace`" + ` | Append content to a trace body (fire-and-forget) |
 | ` + "`search_traces`" + ` | Full-text search across titles and bodies |
+| ` + "`find_similar_traces`" + ` | Surface traces with overlapping vocabulary (BM25-ranked) — useful when you have a trace in hand and want related ones without crafting a query |
 | ` + "`archive_trace`" + ` | Archive a trace |
 | ` + "`unarchive_trace`" + ` | Restore an archived trace |
 | ` + "`delete_trace`" + ` | Move a trace to trash (soft-delete, recoverable) |

@@ -198,6 +198,27 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 		return mcp.NewToolResultText(formatRows(rows)), nil
 	})
 
+	s.AddTool(mcp.NewTool("find_similar_traces",
+		mcp.WithDescription("Find traces with overlapping vocabulary to a given trace, ranked by FTS5 BM25. Useful when you have one trace and want to surface related ones without crafting a search query."),
+		mcp.WithString("trace_id", mcp.Description("ID of the source trace"), mcp.Required()),
+		mcp.WithNumber("limit", mcp.Description("Maximum matches to return (default 10)")),
+		mcp.WithBoolean("include_archived", mcp.Description("Include archived traces (default false)")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		traceID, err := req.RequireString("trace_id")
+		if err != nil {
+			return nil, err
+		}
+		opts := cortex.SimilarOpts{
+			Limit:           int(req.GetFloat("limit", 0)),
+			IncludeArchived: req.GetBool("include_archived", false),
+		}
+		matches, err := cx.FindSimilar(traceID, opts)
+		if err != nil {
+			return nil, err
+		}
+		return mcp.NewToolResultText(formatSimilarMatches(matches)), nil
+	})
+
 	s.AddTool(mcp.NewTool("delete_trace",
 		mcp.WithDescription("Move a trace to trash (soft-delete, recoverable for 30 days). Use recover_trace to restore it."),
 		mcp.WithString("id", mcp.Description("Trace ID"), mcp.Required()),
@@ -886,6 +907,12 @@ Choose the type that best reflects the intent of the memory:
                                    without reading the full trace first; ideal
                                    for running logs and fire-and-forget writes
   search_traces query [all]      → FTS5 full-text search
+  find_similar_traces trace_id [limit] [include_archived]
+                                 → traces with overlapping vocabulary,
+                                   ranked by BM25 (lower score = closer
+                                   match). Useful when you have one
+                                   trace in hand and want to surface
+                                   related ones without crafting a query
   archive_trace id               → move to archive (reversible)
   unarchive_trace id             → restore from archive
   delete_trace id                → move to trash (soft-delete, recoverable)
@@ -1078,6 +1105,36 @@ func formatRows(rows []cortex.Row) string {
 	}
 	return sb.String()
 }
+
+// formatSimilarMatches renders FindSimilar results in the same shape as
+// formatRows but with a leading score column. Score is FTS5 BM25, where
+// lower = closer match; we surface it so an agent or operator can tell
+// "strong match" from "marginal match" rather than treating every result
+// as equally relevant.
+func formatSimilarMatches(matches []cortex.SimilarMatch) string {
+	if len(matches) == 0 {
+		return "No similar traces found."
+	}
+	var sb strings.Builder
+	for _, m := range matches {
+		typeLabel := m.Type
+		if m.Type == string(trace.TypeDivergence) {
+			typeLabel = "DIVERGENCE"
+		}
+		sb.WriteString(fmt.Sprintf("[%s] [%s] [score=%.2f] %s (%s)",
+			tierGlyph(m.Tier), typeLabel, m.Score, m.ID, m.CreatedAt[:10]))
+		if m.Author != "" {
+			sb.WriteString(fmt.Sprintf(" — %s", m.Author))
+		}
+		if len(m.Tags) > 0 {
+			sb.WriteString(fmt.Sprintf(" [%s]", strings.Join(m.Tags, ", ")))
+		}
+		sb.WriteByte('\n')
+		sb.WriteString(fmt.Sprintf("  %s\n", m.Title))
+	}
+	return sb.String()
+}
+
 
 // tierGlyph returns the one-letter tier indicator used in MCP list/search
 // output, matching the TUI convention (lowercase for short/mid,
