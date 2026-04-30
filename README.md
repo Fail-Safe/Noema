@@ -211,6 +211,7 @@ noema remove <id>                         Move a Trace to trash (--force to hard
 noema recover <id>                        Restore a Trace from trash
 noema purge [--days N]                    Permanently delete all trashed Traces older than N days
 noema search <query> [flags]              Full-text search (FTS5)
+noema similar <id> [--limit N]            Find traces with overlapping vocabulary to <id> (BM25-ranked)
 
 noema archive <id>                        Archive a Trace
 noema unarchive <id>                      Restore an archived Trace
@@ -296,6 +297,7 @@ Noema can run as an [MCP](https://modelcontextprotocol.io) server, giving any MC
 | `update_trace` | Update any subset of fields on an existing trace |
 | `append_trace` | Append content to an existing trace without reading it first (fire-and-forget logging) |
 | `search_traces` | FTS5 full-text search |
+| `find_similar_traces` | Surface traces with overlapping vocabulary (BM25-ranked); useful when you have one trace and want related ones without crafting a query |
 | `archive_trace` / `unarchive_trace` | Archive a trace or restore it |
 | `delete_trace` / `recover_trace` | Soft-delete (move to trash) or restore from trash |
 | `trace_history` | Event log (audit trail) for a trace |
