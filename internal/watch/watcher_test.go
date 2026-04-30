@@ -18,9 +18,14 @@ import (
 const testDebounce = 50 * time.Millisecond
 
 // settleTime is how long to wait after a filesystem change for the
-// watcher to observe, debounce, and reconcile. testDebounce * 4 leaves
-// slack for scheduler jitter on busy machines.
-const settleTime = 4 * testDebounce
+// watcher to observe, debounce, and reconcile. testDebounce * 8 leaves
+// slack for scheduler jitter on busy machines — earlier 4× setting was
+// flaking under race-detector + GitHub Actions CPU contention, where a
+// 200ms wait wasn't always enough for the reconcile pipeline to catch
+// up. Bumping to 400ms eliminates the flakes at a per-test cost of
+// ~200ms and adds ~4s to total watch-package runtime, which is a fair
+// trade for deterministic CI.
+const settleTime = 8 * testDebounce
 
 // setupWatcher builds a cortex in a temp dir, seeds it with a single
 // trace, and starts a watcher with a short debounce. Returns the cortex
@@ -396,7 +401,13 @@ func TestDebounceCollapsesBurst(t *testing.T) {
 		if err := os.WriteFile(path, []byte(body), 0o640); err != nil {
 			t.Fatalf("WriteFile %d: %v", i, err)
 		}
-		time.Sleep(testDebounce / 5)
+		// testDebounce/20 keeps the entire 5-write burst comfortably
+		// inside one debounce window even under CI scheduler jitter.
+		// Earlier setting (testDebounce/5) put total burst time at
+		// exactly the debounce window, so any single write slipping
+		// past the window boundary on a slow runner would split the
+		// burst and emit multiple events.
+		time.Sleep(testDebounce / 20)
 	}
 	time.Sleep(settleTime)
 
