@@ -1791,9 +1791,39 @@ func (c *Cortex) restoreBodyToTrash(id string, r *Row) (bool, error) {
 	return true, nil
 }
 
-// Update rewrites an existing trace's DB row and FTS entry from its (potentially
-// edited) markdown file on disk.
+// Update rewrites an existing trace's DB row, FTS entry, AND the on-disk
+// markdown file from the (potentially edited) frontmatter+body on disk.
+// Use this for explicit Noema-driven mutations (CLI, MCP, TUI) where Noema
+// is the writer and the canonical frontmatter format should be re-stamped.
+//
+// Do NOT use this on the watcher's external-edit ingest path: rewriting
+// the file while an editor (Obsidian, VSCode, etc.) has it open kicks
+// off a "modified externally" feedback loop where each Noema rewrite
+// triggers an editor re-save which triggers a watcher event which
+// triggers another Update. Use UpdateFromFile for that path.
 func (c *Cortex) Update(id string) error {
+	return c.updateFromFile(id, true)
+}
+
+// UpdateFromFile syncs the DB and FTS index from the on-disk file
+// without rewriting the file. Used by the filesystem watcher when an
+// external editor has saved a change — the user's editor is the
+// authoritative writer in that flow, and Noema's job is to mirror the
+// new state into the DB, not to canonicalize the editor's frontmatter
+// format back at it. Skipping the rewrite here breaks the
+// "modified externally" toast loop that would otherwise fight with any
+// editor that has the file open.
+//
+// Side effect of skipping the rewrite: the file's frontmatter
+// `updated:` and `content_hash:` fields will go stale relative to the
+// DB. The DB is authoritative anyway (every Noema read goes through
+// it), and explicit mutations through Update will re-canonicalize the
+// frontmatter the next time the user edits via CLI/MCP/TUI.
+func (c *Cortex) UpdateFromFile(id string) error {
+	return c.updateFromFile(id, false)
+}
+
+func (c *Cortex) updateFromFile(id string, rewriteFile bool) error {
 	if err := c.CheckSourceLock(id); err != nil {
 		return err
 	}
@@ -1808,15 +1838,16 @@ func (c *Cortex) Update(id string) error {
 	}
 
 	// Stamp the update time authoritatively rather than trusting whatever the
-	// editor left in the frontmatter — and write it back to the file so disk,
-	// DB, and emitted event all agree. Tier is DB-managed after creation: if
+	// editor left in the frontmatter. Tier is DB-managed after creation: if
 	// the on-disk frontmatter drifted (manual edit), authoritative value lives
-	// in the DB row and gets stamped back to the file here.
+	// in the DB row and gets stamped back into the parsed trace here.
 	t.Updated = time.Now().UTC().Format(time.RFC3339)
 	t.Tier = r.Tier
 	t.ContentHash = trace.ContentHash(t.Body)
-	if err := t.Write(path); err != nil {
-		return fmt.Errorf("rewriting trace file with updated timestamp: %w", err)
+	if rewriteFile {
+		if err := t.Write(path); err != nil {
+			return fmt.Errorf("rewriting trace file with updated timestamp: %w", err)
+		}
 	}
 
 	tx, err := c.DB.Begin()

@@ -231,7 +231,7 @@ func (w *Watcher) reconcileExisting(path, id string, dir traceDir, row *cortex.R
 			row, _ = w.cx.Get(id)
 		}
 		if bodyHash != row.ContentHash {
-			if err := w.cx.Update(id); err != nil {
+			if err := w.cx.UpdateFromFile(id); err != nil {
 				return fmt.Errorf("update: %w", err)
 			}
 			log.Printf("[watch] ingested external edit: %s", id)
@@ -255,7 +255,7 @@ func (w *Watcher) reconcileExisting(path, id string, dir traceDir, row *cortex.R
 			row, _ = w.cx.Get(id)
 		}
 		if bodyHash != row.ContentHash {
-			if err := w.cx.Update(id); err != nil {
+			if err := w.cx.UpdateFromFile(id); err != nil {
 				return fmt.Errorf("update: %w", err)
 			}
 			log.Printf("[watch] ingested external edit (archived): %s", id)
