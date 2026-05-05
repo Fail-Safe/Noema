@@ -1,0 +1,20 @@
+-- search_hit_count is a CRDT G-counter (grow-only, MAX-merged) that records
+-- when an agent's MCP `search_traces` or `find_similar_traces` call surfaces
+-- a trace as one of its top-ranked hits. It complements read_count: a
+-- get_trace call (noema_recall) is a deliberate consumption signal and
+-- continues to bump read_count, while a search hit is a weaker
+-- "auto-injection" signal that auto-injection-driven providers (Hermes,
+-- agent harnesses that pre-load context) generate without ever calling
+-- get_trace. Without this column those providers produce no usage signal at
+-- all and the graduation gate stays unreachable indefinitely — see the
+-- discussion in docs/design/consolidation-plan.md.
+--
+-- Per-peer ownership matches the rest of trace_usage: each peer writes
+-- only its own (trace_id, peer_cortex_id) row and ships deltas via
+-- sync_read_signal. MergeRemoteUsage MAX-merges this column the same way
+-- it merges read_count and modify_count. Older peers running a binary
+-- without this migration simply omit the field on the wire (it defaults
+-- to zero on the receiver), so a mixed-version ring degrades gracefully:
+-- upgraded peers get richer signal, older peers see only the legacy
+-- counters.
+ALTER TABLE trace_usage ADD COLUMN search_hit_count INTEGER NOT NULL DEFAULT 0;

@@ -15,6 +15,7 @@ type PromotionCandidate struct {
 	Type             string
 	ReadCount        int
 	ModifyCount      int
+	SearchHitCount   int
 	TierVotes        int
 	DerivedFromCount int
 	CreatedAt        string
@@ -34,16 +35,18 @@ func (c *Cortex) GraduationCandidates(minAge time.Duration) ([]PromotionCandidat
 			t.id,
 			t.tier,
 			t.type,
-			COALESCE(u.total_reads, 0)    AS read_count,
-			COALESCE(u.total_modifies, 0) AS modify_count,
+			COALESCE(u.total_reads, 0)        AS read_count,
+			COALESCE(u.total_modifies, 0)     AS modify_count,
+			COALESCE(u.total_search_hits, 0)  AS search_hit_count,
 			t.tier_votes,
 			COALESCE(v.n, 0) AS derived_from_count,
 			t.created_at
 		FROM traces t
 		LEFT JOIN (
 			SELECT trace_id,
-			       SUM(read_count)   AS total_reads,
-			       SUM(modify_count) AS total_modifies
+			       SUM(read_count)       AS total_reads,
+			       SUM(modify_count)     AS total_modifies,
+			       SUM(search_hit_count) AS total_search_hits
 			FROM trace_usage
 			GROUP BY trace_id
 		) u ON u.trace_id = t.id
@@ -67,7 +70,7 @@ func (c *Cortex) GraduationCandidates(minAge time.Duration) ([]PromotionCandidat
 		var pc PromotionCandidate
 		if err := rows.Scan(
 			&pc.ID, &pc.Tier, &pc.Type, &pc.ReadCount, &pc.ModifyCount,
-			&pc.TierVotes, &pc.DerivedFromCount, &pc.CreatedAt,
+			&pc.SearchHitCount, &pc.TierVotes, &pc.DerivedFromCount, &pc.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -93,16 +96,18 @@ func (c *Cortex) PromotionCandidates(tier string, window time.Duration) ([]Promo
 			t.id,
 			t.tier,
 			t.type,
-			COALESCE(u.total_reads, 0)    AS read_count,
-			COALESCE(u.total_modifies, 0) AS modify_count,
+			COALESCE(u.total_reads, 0)        AS read_count,
+			COALESCE(u.total_modifies, 0)     AS modify_count,
+			COALESCE(u.total_search_hits, 0)  AS search_hit_count,
 			t.tier_votes,
 			COALESCE(v.n, 0) AS derived_from_count,
 			t.created_at
 		FROM traces t
 		LEFT JOIN (
 			SELECT trace_id,
-			       SUM(read_count)   AS total_reads,
-			       SUM(modify_count) AS total_modifies
+			       SUM(read_count)       AS total_reads,
+			       SUM(modify_count)     AS total_modifies,
+			       SUM(search_hit_count) AS total_search_hits
 			FROM trace_usage
 			GROUP BY trace_id
 		) u ON u.trace_id = t.id
@@ -126,7 +131,7 @@ func (c *Cortex) PromotionCandidates(tier string, window time.Duration) ([]Promo
 		var pc PromotionCandidate
 		if err := rows.Scan(
 			&pc.ID, &pc.Tier, &pc.Type, &pc.ReadCount, &pc.ModifyCount,
-			&pc.TierVotes, &pc.DerivedFromCount, &pc.CreatedAt,
+			&pc.SearchHitCount, &pc.TierVotes, &pc.DerivedFromCount, &pc.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
