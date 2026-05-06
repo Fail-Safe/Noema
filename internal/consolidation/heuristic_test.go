@@ -45,6 +45,8 @@ func TestScoreCandidate_BlendedFormula(t *testing.T) {
 	}{
 		{"all zero", cortex.PromotionCandidate{}, 0},
 		{"5 reads", cortex.PromotionCandidate{ReadCount: 5}, 5},
+		{"5 search hits", cortex.PromotionCandidate{SearchHitCount: 5}, 5},
+		{"3 reads + 2 search hits sums into reads bucket", cortex.PromotionCandidate{ReadCount: 3, SearchHitCount: 2}, 5},
 		{"1 modify", cortex.PromotionCandidate{ModifyCount: 1}, 2},
 		{"1 lineage ref", cortex.PromotionCandidate{DerivedFromCount: 1}, 3},
 		{"1 vote", cortex.PromotionCandidate{TierVotes: 1}, 5},

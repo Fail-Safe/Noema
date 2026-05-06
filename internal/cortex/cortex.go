@@ -284,9 +284,12 @@ type GraduationConfig struct {
 	// signals the trace hasn't been a transient idea.
 	MinAgeDays int `yaml:"min_age_days,omitempty"`
 
-	// MinReadCount is the minimum read_count required for graduation.
-	// Zero defaults to 3 — at least a few deliberate reads to prove
-	// the trace carries ongoing value.
+	// MinReadCount is the minimum (read_count + search_hit_count)
+	// required for graduation. Zero defaults to 3 — at least a few
+	// reads or top-N search hits to prove the trace carries ongoing
+	// value. The two columns are summed at gate time so auto-injection
+	// providers (Hermes, etc.) that consume traces via search rather
+	// than deliberate get_trace calls can still drive graduation.
 	MinReadCount int `yaml:"min_read_count,omitempty"`
 
 	// RequireUnmodified defaults to true. When true, a trace graduates

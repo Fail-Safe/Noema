@@ -114,6 +114,44 @@ func TestGraduatePass_NegativeVotesBlock(t *testing.T) {
 	}
 }
 
+func TestGraduatePass_SearchHitsCountTowardThreshold(t *testing.T) {
+	// search_hit_count is summed with read_count for the gate so
+	// auto-injection providers (Hermes etc.) can graduate traces they
+	// only ever surface via search results, never via deliberate
+	// get_trace. Reads alone wouldn't pass; combined they should.
+	provider := &fakeGraduationProvider{
+		candidates: []cortex.PromotionCandidate{
+			{ID: "search-only", Tier: "mid", ReadCount: 0, SearchHitCount: 5, ModifyCount: 0, TierVotes: 0},
+			{ID: "blended", Tier: "mid", ReadCount: 1, SearchHitCount: 2, ModifyCount: 0, TierVotes: 0},
+		},
+	}
+	pass := consolidation.GraduatePass(provider, consolidation.GraduationConfig{
+		MinReadCount: 3, AllowModified: false,
+	}, nil)
+	if err := pass(context.Background(), "cron"); err != nil {
+		t.Fatalf("pass: %v", err)
+	}
+	if len(provider.promoted) != 2 {
+		t.Errorf("promoted = %v, want both candidates (search hits should count)", provider.promoted)
+	}
+}
+
+func TestGraduatePass_LowSearchHitsStillBlock(t *testing.T) {
+	// Just below threshold even when summed.
+	provider := &fakeGraduationProvider{
+		candidates: []cortex.PromotionCandidate{
+			{ID: "borderline", Tier: "mid", ReadCount: 1, SearchHitCount: 1, ModifyCount: 0, TierVotes: 0},
+		},
+	}
+	pass := consolidation.GraduatePass(provider, consolidation.GraduationConfig{
+		MinReadCount: 3, AllowModified: false,
+	}, nil)
+	_ = pass(context.Background(), "cron")
+	if len(provider.promoted) != 0 {
+		t.Errorf("promoted = %v, want empty (sum below threshold)", provider.promoted)
+	}
+}
+
 func TestGraduatePass_PromoteErrorCountsAsSkip(t *testing.T) {
 	// A Promote error (e.g. trigger refused, trace purged between
 	// query and promote) must not abort the pass — the next candidate

@@ -189,9 +189,14 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 		if err != nil {
 			return nil, err
 		}
-		rows, err := cx.Search(query, cortex.ListOptions{
+		// Agent-initiated searches bump search_hit_count on the top-N
+		// results. Auto-injection providers (Hermes, etc.) consume search
+		// output without ever calling get_trace, so without this bump the
+		// graduation gate never sees signal from those reads. See
+		// internal/cortex/actor.go SearchAs for the rationale.
+		rows, err := cx.SearchAs(query, cortex.ListOptions{
 			All: req.GetBool("all", false),
-		})
+		}, cortex.ActorAgent, cortex.DefaultSearchHitTopN)
 		if err != nil {
 			return nil, err
 		}
@@ -212,7 +217,8 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 			Limit:           int(req.GetFloat("limit", 0)),
 			IncludeArchived: req.GetBool("include_archived", false),
 		}
-		matches, err := cx.FindSimilar(traceID, opts)
+		// Same actor-aware bump as search_traces; see SearchAs for why.
+		matches, err := cx.FindSimilarAs(traceID, opts, cortex.ActorAgent, cortex.DefaultSearchHitTopN)
 		if err != nil {
 			return nil, err
 		}
@@ -625,7 +631,7 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 	})
 
 	s.AddTool(mcp.NewTool("sync_read_signal",
-		mcp.WithDescription("Returns per-peer tier-usage deltas (read_count, modify_count, last_read_at) for federation sync. Each peer publishes only its own rows — the ring aggregates by SUMing over every peer's contribution, so consolidation decisions operate on a federation-wide signal rather than the local slice. Returns a JSON array of trace_usage rows owned by this cortex with updated_at > since."),
+		mcp.WithDescription("Returns per-peer tier-usage deltas (read_count, modify_count, search_hit_count, last_read_at) for federation sync. Each peer publishes only its own rows — the ring aggregates by SUMing over every peer's contribution, so consolidation decisions operate on a federation-wide signal rather than the local slice. Returns a JSON array of trace_usage rows owned by this cortex with updated_at > since. search_hit_count is omitted when zero for wire compatibility with pre-migration-015 peers."),
 		mcp.WithString("since", mcp.Description("RFC3339 cursor — return only rows with updated_at > this value. Empty returns everything this peer owns.")),
 		mcp.WithNumber("limit", mcp.Description("Max rows to return (default 100, max 1000)")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -997,9 +1003,14 @@ repeat usage. An automatic graduation pass runs on the consolidation schedule an
 promotes every mid-tier trace that clears four AND-gated criteria:
 
   - age >= 14 days (configurable via consolidation.graduation.min_age_days)
-  - read_count >= 3 (configurable via consolidation.graduation.min_read_count)
+  - (read_count + search_hit_count) >= 3 (configurable via consolidation.graduation.min_read_count)
   - modify_count == 0 (unless require_unmodified is false)
   - tier_votes >= 0 (no active downvotes)
+
+read_count bumps on get_trace; search_hit_count bumps on search_traces /
+find_similar_traces top-N hits. Both contribute equally to the read gate so
+auto-injection providers (Hermes, etc.) that consume search output without
+ever calling get_trace can still drive traces to long tier.
 
 Traces at the long tier are DB-level immutable: content / identity fields are
 frozen, tier cannot change except via the admin-purge ceremony, and routine

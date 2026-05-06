@@ -119,8 +119,16 @@ func HeuristicPass(cx HeuristicProvider, cfg PassConfig, log func(format string,
 // scoreCandidate computes the blended signal for a single trace.
 // Exported for tests; package-private callers don't need it because
 // HeuristicPass is the single consumer.
+//
+// search_hit_count is folded into the reads bucket at the same weight
+// because both signals describe passive/weak consumption — the read
+// either came from a deliberate get_trace or from being one of the
+// top-N hits an agent's search returned. Auto-injection providers like
+// Hermes only ever generate search hits, and without this fold-in
+// short-tier traces in those cortexes would never accumulate enough
+// signal to promote.
 func scoreCandidate(pc cortex.PromotionCandidate, cfg PassConfig) int {
-	return pc.ReadCount*cfg.WeightReads +
+	return (pc.ReadCount+pc.SearchHitCount)*cfg.WeightReads +
 		pc.ModifyCount*cfg.WeightModifies +
 		pc.DerivedFromCount*cfg.WeightLineage +
 		pc.TierVotes*cfg.WeightVotes

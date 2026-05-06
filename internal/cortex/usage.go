@@ -19,7 +19,7 @@ func (c *Cortex) LocalUsageSince(since string, limit int) ([]federation.TraceUsa
 		limit = 100
 	}
 	rows, err := c.DB.Query(`
-		SELECT trace_id, peer_cortex_id, read_count, modify_count, last_read_at, updated_at
+		SELECT trace_id, peer_cortex_id, read_count, modify_count, search_hit_count, last_read_at, updated_at
 		FROM trace_usage
 		WHERE peer_cortex_id = ? AND updated_at > ?
 		ORDER BY updated_at ASC
@@ -35,7 +35,7 @@ func (c *Cortex) LocalUsageSince(since string, limit int) ([]federation.TraceUsa
 	for rows.Next() {
 		var r federation.TraceUsage
 		var lastRead *string
-		if err := rows.Scan(&r.TraceID, &r.PeerCortexID, &r.ReadCount, &r.ModifyCount, &lastRead, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.TraceID, &r.PeerCortexID, &r.ReadCount, &r.ModifyCount, &r.SearchHitCount, &lastRead, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if lastRead != nil {
@@ -71,13 +71,14 @@ func (c *Cortex) MergeRemoteUsage(rows []federation.TraceUsage) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO trace_usage (trace_id, peer_cortex_id, read_count, modify_count, last_read_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO trace_usage (trace_id, peer_cortex_id, read_count, modify_count, search_hit_count, last_read_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(trace_id, peer_cortex_id) DO UPDATE SET
-			read_count   = MAX(read_count,   excluded.read_count),
-			modify_count = MAX(modify_count, excluded.modify_count),
-			last_read_at = MAX(COALESCE(last_read_at, ''), COALESCE(excluded.last_read_at, '')),
-			updated_at   = MAX(updated_at,   excluded.updated_at)`)
+			read_count       = MAX(read_count,       excluded.read_count),
+			modify_count     = MAX(modify_count,     excluded.modify_count),
+			search_hit_count = MAX(search_hit_count, excluded.search_hit_count),
+			last_read_at     = MAX(COALESCE(last_read_at, ''), COALESCE(excluded.last_read_at, '')),
+			updated_at       = MAX(updated_at,       excluded.updated_at)`)
 	if err != nil {
 		return fmt.Errorf("preparing upsert: %w", err)
 	}
@@ -93,7 +94,7 @@ func (c *Cortex) MergeRemoteUsage(rows []federation.TraceUsage) error {
 		if r.LastReadAt != "" {
 			last = r.LastReadAt
 		}
-		if _, err := stmt.Exec(r.TraceID, r.PeerCortexID, r.ReadCount, r.ModifyCount, last, r.UpdatedAt); err != nil {
+		if _, err := stmt.Exec(r.TraceID, r.PeerCortexID, r.ReadCount, r.ModifyCount, r.SearchHitCount, last, r.UpdatedAt); err != nil {
 			return fmt.Errorf("merging row (trace=%s peer=%s): %w", r.TraceID, r.PeerCortexID, err)
 		}
 	}

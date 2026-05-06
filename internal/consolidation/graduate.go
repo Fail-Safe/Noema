@@ -105,8 +105,17 @@ func GraduatePass(cx GraduationProvider, cfg GraduationConfig, log func(format s
 // The age check is implicit — GraduationCandidates already filters to
 // created_at <= now-MinAge, so every passed-in pc has cleared the age
 // bar.
+//
+// The read-count gate sums deliberate reads (read_count, from
+// noema_recall / get_trace) with passive search hits (search_hit_count,
+// from noema_search / find_similar_traces top-N results). The two
+// columns are stored separately so the relationship can be reweighted
+// later without a schema change, but for v1 they're equivalent
+// "this trace was useful" signal — auto-injection providers like Hermes
+// only ever generate search_hit_count, so insisting on raw read_count
+// alone would lock those cortexes out of long-tier graduation entirely.
 func shouldGraduate(pc cortex.PromotionCandidate, cfg GraduationConfig) bool {
-	if pc.ReadCount < cfg.MinReadCount {
+	if pc.ReadCount+pc.SearchHitCount < cfg.MinReadCount {
 		return false
 	}
 	if !cfg.AllowModified && pc.ModifyCount > 0 {

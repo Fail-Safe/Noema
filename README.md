@@ -548,7 +548,7 @@ When multiple peers have `consolidation.enabled`, `consolidation.llm_enabled`, a
 
 ### Mid → long graduation
 
-The three-tier model (short → mid → long) completes with an automatic mid→long promoter. Alongside the short→mid heuristic pass, the scheduler evaluates every mid-tier trace older than 14 days against a simple AND-gate — minimum read count (default 3), optional "unmodified since creation" stability requirement, and no active downvotes. Traces clearing every threshold graduate to long and are locked by the DB-level immutability trigger. Thresholds live under `consolidation.graduation` in cortex.md:
+The three-tier model (short → mid → long) completes with an automatic mid→long promoter. Alongside the short→mid heuristic pass, the scheduler evaluates every mid-tier trace older than 14 days against a simple AND-gate — minimum combined read count (default 3, summing deliberate `get_trace` reads with top-N `search_traces` / `find_similar_traces` hits), optional "unmodified since creation" stability requirement, and no active downvotes. Traces clearing every threshold graduate to long and are locked by the DB-level immutability trigger. Thresholds live under `consolidation.graduation` in cortex.md:
 
 ```yaml
 consolidation:
