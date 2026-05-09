@@ -90,26 +90,26 @@ func TestRecordConsolidationResult_CreatesMidTrace(t *testing.T) {
 		t.Errorf("response missing confirmation: %s", text)
 	}
 
-	// Under the v1 "net-add with source promotion" policy, mid-tier
-	// contains the distilled trace PLUS the two promoted sources, so
-	// the expected count is 3 and the check is "distilled title is
-	// present" rather than "list has exactly one row".
+	// Sources stay at their original tier; only the distilled trace
+	// lands in mid. derived_from on the distilled row keeps the
+	// originals reachable, and LLMCandidates filters them out of
+	// subsequent passes via the ActionConsolidate event log.
 	rows, err := cx.List(cortex.ListOptions{Tiers: []string{trace.TierMid}})
 	if err != nil {
 		t.Fatalf("List mid: %v", err)
 	}
-	if len(rows) != 3 {
-		t.Fatalf("mid tier rows = %d, want 3 (1 distilled + 2 promoted sources): %+v", len(rows), rows)
+	if len(rows) != 1 {
+		t.Fatalf("mid tier rows = %d, want 1 (distilled only): %+v", len(rows), rows)
 	}
-	var foundDistilled bool
-	for _, r := range rows {
-		if r.Title == "Auth strategy — distilled" {
-			foundDistilled = true
-			break
-		}
+	if rows[0].Title != "Auth strategy — distilled" {
+		t.Errorf("mid-tier row title = %q, want %q", rows[0].Title, "Auth strategy — distilled")
 	}
-	if !foundDistilled {
-		t.Errorf("distilled title %q not found among mid-tier rows: %+v", "Auth strategy — distilled", rows)
+	shortRows, err := cx.List(cortex.ListOptions{Tiers: []string{trace.TierShort}})
+	if err != nil {
+		t.Fatalf("List short: %v", err)
+	}
+	if len(shortRows) != 2 {
+		t.Errorf("short tier rows = %d, want 2 (sources untouched): %+v", len(shortRows), shortRows)
 	}
 }
 
