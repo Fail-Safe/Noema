@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
 
+	"github.com/Fail-Safe/Noema/internal/cortex"
 	"github.com/Fail-Safe/Noema/internal/trace"
 )
 
@@ -100,7 +102,12 @@ func addCmd() *cobra.Command {
 			}
 
 			t := trace.New(title, traceType, author, tags, body)
-			if err := cx.Add(t); err != nil {
+			err = cx.Add(t)
+			var collision *cortex.ErrTraceIDExists
+			if errors.As(err, &collision) {
+				return resolveCollisionInteractive(cx, t, collision, traceType, author, tags, body)
+			}
+			if err != nil {
 				return err
 			}
 			fmt.Printf("Trace added: %s\n", t.ID)

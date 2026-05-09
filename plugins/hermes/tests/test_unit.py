@@ -24,6 +24,10 @@ from plugins.hermes import (
     _tool_error,
     _now_iso,
     _load_config,
+    _build_session_summary_body,
+    _SUMMARY_MAX_USER_TURNS,
+    _SUMMARY_USER_CHARS,
+    _SUMMARY_FINAL_ASSISTANT_CHARS,
 )
 
 
@@ -592,3 +596,101 @@ class TestSessionTrace:
 
         call_args = p._transport.call_tool.call_args
         assert "abcdefghijkl" in call_args[0][1]["title"]
+
+
+# ---------------------------------------------------------------------------
+# Session-summary body builder
+# ---------------------------------------------------------------------------
+
+class TestBuildSessionSummaryBody:
+    """Pin the structure of the session-summary body so future edits don't
+    silently regress to the old "last assistant message only" shape that
+    polluted the cortex's mid-tier search corpus."""
+
+    def test_includes_all_user_turns_as_topical_signal(self):
+        messages = [
+            {"role": "user", "content": "How does the FTS5 tokenizer handle hyphens?"},
+            {"role": "assistant", "content": "Hyphens split tokens by default."},
+            {"role": "user", "content": "Can we override that?"},
+            {"role": "assistant", "content": "Yes — pass a custom tokenizer."},
+        ]
+        body = _build_session_summary_body(messages, turn_count=2)
+
+        # Both user questions present — these carry the topical scope
+        # FTS5 will rank against.
+        assert "FTS5 tokenizer" in body
+        assert "override" in body
+        # Final assistant turn present.
+        assert "custom tokenizer" in body
+        # Earlier assistant turn deliberately absent — only the final
+        # one is bookended.
+        assert "Hyphens split tokens" not in body
+        # Turn count surfaces.
+        assert "2 turns" in body
+
+    def test_no_messages_returns_turn_count_only(self):
+        body = _build_session_summary_body([], turn_count=0)
+        assert body == "Session with 0 turns."
+
+    def test_skips_blank_and_non_string_content(self):
+        messages = [
+            {"role": "user", "content": ""},
+            {"role": "user", "content": "   "},
+            {"role": "user", "content": None},
+            {"role": "user", "content": "real question"},
+            {"role": "assistant", "content": "real answer"},
+        ]
+        body = _build_session_summary_body(messages, turn_count=1)
+        assert "real question" in body
+        assert "real answer" in body
+        # The blanks must not produce empty bullet rows.
+        assert "- \n" not in body
+        assert "-  \n" not in body
+
+    def test_user_turns_truncated_individually(self):
+        long_q = "x" * (_SUMMARY_USER_CHARS * 3)
+        messages = [
+            {"role": "user", "content": long_q},
+            {"role": "assistant", "content": "ok"},
+        ]
+        body = _build_session_summary_body(messages, turn_count=1)
+        # The single user turn must be capped to _SUMMARY_USER_CHARS so a
+        # verbose user turn can't crowd the rest of the body.
+        assert body.count("x") == _SUMMARY_USER_CHARS
+
+    def test_user_turn_count_capped_to_max(self):
+        # Inject more than the cap; only the most-recent _SUMMARY_MAX_USER_TURNS
+        # should survive (we keep the tail because it carries current
+        # intent).
+        msgs = []
+        for i in range(_SUMMARY_MAX_USER_TURNS + 5):
+            msgs.append({"role": "user", "content": f"q{i}"})
+        body = _build_session_summary_body(msgs, turn_count=len(msgs))
+        # First 5 questions dropped; tail kept.
+        assert "q0" not in body
+        assert "q4" not in body
+        assert f"q{_SUMMARY_MAX_USER_TURNS + 4}" in body
+
+    def test_final_assistant_truncated_to_cap(self):
+        long_a = "y" * (_SUMMARY_FINAL_ASSISTANT_CHARS * 2)
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": long_a},
+        ]
+        body = _build_session_summary_body(messages, turn_count=1)
+        assert body.count("y") == _SUMMARY_FINAL_ASSISTANT_CHARS
+
+    def test_only_user_turns_no_final_assistant(self):
+        # Edge case: session aborted before the model responded.
+        messages = [{"role": "user", "content": "what about Go?"}]
+        body = _build_session_summary_body(messages, turn_count=0)
+        assert "what about Go?" in body
+        assert "Final assistant response" not in body
+
+    def test_only_assistant_no_user_section(self):
+        # Edge case: provider hook fired with assistant-only context
+        # (system prompt aside). Skip the user section entirely.
+        messages = [{"role": "assistant", "content": "I have no input."}]
+        body = _build_session_summary_body(messages, turn_count=0)
+        assert "I have no input." in body
+        assert "User turns" not in body

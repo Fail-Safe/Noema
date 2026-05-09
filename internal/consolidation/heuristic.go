@@ -116,12 +116,42 @@ func HeuristicPass(cx HeuristicProvider, cfg PassConfig, log func(format string,
 	}
 }
 
+// MinLineageSourcesForCredit is the minimum derived_from count that
+// earns the lineage weight in the heuristic score. A single derived_from
+// is provenance metadata (this trace was extracted from / supersedes /
+// annotates one other trace), not consolidation, and shouldn't tilt the
+// promotion threshold on its own. Two-or-more is the same bar
+// CreateDistilledTrace enforces (cortex.ErrDistillSourcesInsufficient at
+// internal/cortex/distill.go:76), so the heuristic agrees with the
+// distillation entry point on what counts as a real synthesis.
+const MinLineageSourcesForCredit = 2
+
 // scoreCandidate computes the blended signal for a single trace.
 // Exported for tests; package-private callers don't need it because
 // HeuristicPass is the single consumer.
+//
+// search_hit_count is folded into the reads bucket at the same weight
+// because both signals describe passive/weak consumption — the read
+// either came from a deliberate get_trace or from being one of the
+// top-N hits an agent's search returned. Auto-injection providers like
+// Hermes only ever generate search hits, and without this fold-in
+// short-tier traces in those cortexes would never accumulate enough
+// signal to promote.
+//
+// Lineage credit is gated by MinLineageSourcesForCredit: a trace with
+// only one derived_from gets zero lineage points, regardless of the
+// configured WeightLineage. This stops 1-source provenance links (e.g.
+// the Hermes session-summary pattern, which sets derived_from to the
+// single session trace it was extracted from) from gliding past the
+// promotion threshold purely on the lineage head start. Multi-source
+// traces still earn the full weight per source.
 func scoreCandidate(pc cortex.PromotionCandidate, cfg PassConfig) int {
-	return pc.ReadCount*cfg.WeightReads +
+	lineageCredit := 0
+	if pc.DerivedFromCount >= MinLineageSourcesForCredit {
+		lineageCredit = pc.DerivedFromCount * cfg.WeightLineage
+	}
+	return (pc.ReadCount+pc.SearchHitCount)*cfg.WeightReads +
 		pc.ModifyCount*cfg.WeightModifies +
-		pc.DerivedFromCount*cfg.WeightLineage +
+		lineageCredit +
 		pc.TierVotes*cfg.WeightVotes
 }

@@ -45,10 +45,20 @@ func TestScoreCandidate_BlendedFormula(t *testing.T) {
 	}{
 		{"all zero", cortex.PromotionCandidate{}, 0},
 		{"5 reads", cortex.PromotionCandidate{ReadCount: 5}, 5},
+		{"5 search hits", cortex.PromotionCandidate{SearchHitCount: 5}, 5},
+		{"3 reads + 2 search hits sums into reads bucket", cortex.PromotionCandidate{ReadCount: 3, SearchHitCount: 2}, 5},
 		{"1 modify", cortex.PromotionCandidate{ModifyCount: 1}, 2},
-		{"1 lineage ref", cortex.PromotionCandidate{DerivedFromCount: 1}, 3},
+		// Lineage credit is gated at >= 2 sources. A single derived_from
+		// is provenance, not consolidation — see MinLineageSourcesForCredit.
+		{"1 lineage ref earns no credit", cortex.PromotionCandidate{DerivedFromCount: 1}, 0},
+		{"2 lineage refs earn full credit", cortex.PromotionCandidate{DerivedFromCount: 2}, 6},
+		{"3 lineage refs scale linearly", cortex.PromotionCandidate{DerivedFromCount: 3}, 9},
 		{"1 vote", cortex.PromotionCandidate{TierVotes: 1}, 5},
 		{"mix: 2 reads + 1 modify + 1 vote", cortex.PromotionCandidate{ReadCount: 2, ModifyCount: 1, TierVotes: 1}, 2 + 2 + 5},
+		// 1-source lineage doesn't push a low-engagement trace over the
+		// threshold — exactly the regression we want this gate to prevent
+		// (Hermes session-summary mids glided past on lineage alone).
+		{"1 lineage + 1 read stays sub-threshold", cortex.PromotionCandidate{ReadCount: 1, DerivedFromCount: 1}, 1},
 		{"negative vote counts against", cortex.PromotionCandidate{TierVotes: -1}, -5},
 	}
 	for _, tc := range tests {
@@ -69,7 +79,14 @@ func TestHeuristicPass_PromotesAboveThreshold(t *testing.T) {
 			{ID: "meh", Tier: trace.TierShort, ReadCount: 2},             // score 2  - skip
 			{ID: "voted", Tier: trace.TierShort, TierVotes: 1},           // score 5  - promote (at threshold)
 			{ID: "cold", Tier: trace.TierShort},                           // score 0  - skip
-			{ID: "referenced", Tier: trace.TierShort, DerivedFromCount: 2}, // score 6  - promote
+			{ID: "referenced", Tier: trace.TierShort, DerivedFromCount: 2}, // score 6  - promote (real consolidation)
+			// Regression guard: a 1-source provenance link with low
+			// engagement must not glide past the threshold. This is the
+			// exact pattern (Hermes session-summary writes one
+			// derived_from pointing at the session trace) that was
+			// silently inflating mid-tier before MinLineageSourcesForCredit
+			// landed. Score: 1*1 (read) + 0 (lineage gated) = 1.
+			{ID: "session-summary-shaped", Tier: trace.TierShort, ReadCount: 1, DerivedFromCount: 1},
 		},
 	}
 	pass := HeuristicPass(cx, PassConfig{}, nil)
@@ -85,7 +102,7 @@ func TestHeuristicPass_PromotesAboveThreshold(t *testing.T) {
 			t.Errorf("expected %q to be promoted, promoted=%v", want, cx.promoted)
 		}
 	}
-	for _, shouldSkip := range []string{"meh", "cold"} {
+	for _, shouldSkip := range []string{"meh", "cold", "session-summary-shaped"} {
 		if got[shouldSkip] {
 			t.Errorf("unexpected promotion of %q", shouldSkip)
 		}

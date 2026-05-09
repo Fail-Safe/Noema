@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -204,14 +205,41 @@ thinking it's short-term.`,
 	return cmd
 }
 
+// statsReport bundles every metric the stats command can surface.
+// Flat structure so JSON output stays predictable and scriptable —
+// downstream tooling can grep for specific fields without descending
+// into nested objects.
+type statsReport struct {
+	Tiers      cortex.TierStats             `json:"tiers"`
+	Engagement *cortex.EngagementStats      `json:"engagement,omitempty"`
+	Lineage    *cortex.MidLineageBreakdown  `json:"mid_lineage,omitempty"`
+	MidHealth  *cortex.MidEngagementSnapshot `json:"mid_engagement,omitempty"`
+}
+
 func memoryStatsCmd() *cobra.Command {
 	var outputFlag string
+	var detailedFlag bool
+	var zeroEngagementAgeDays int
 	cmd := &cobra.Command{
 		Use:   "stats",
-		Short: "Show tier counts for the active cortex",
+		Short: "Show tier counts and (with --detailed) engagement signal for the active cortex",
 		Long: `Reports how many traces currently live in each memory tier, plus the
 count of purged tombstones. Archived and trashed traces are excluded
 so the numbers reflect memory actively in use.
+
+Pass --detailed to add the engagement dashboard:
+
+  - total reads / search hits / modifies across active traces (the
+    federation-wide signal the consolidation heuristic and graduation
+    gate evaluate against)
+  - mid-tier lineage breakdown: 0 sources / 1 source / >=2 sources.
+    Real consolidations live in the >=2 bucket; a growing 1-source
+    bucket usually indicates a writeback pattern emitting "summary"
+    traces that aren't really summarising.
+  - mid-tier zero-engagement count: traces with no reads, no search
+    hits, no modifies. The older-than-14d subset is a candidate pool
+    for archival — the graduation min-age is the same threshold so
+    these traces had a fair chance to accumulate signal.
 
 Later phases will expand this dashboard with consolidation quality
 metrics (validation pass rate, cohesion confidence, model-tier
@@ -223,23 +251,69 @@ profile performance) as the event log accumulates that data.`,
 			}
 			defer cx.Close()
 
-			stats, err := cx.TierStats()
+			tiers, err := cx.TierStats()
 			if err != nil {
 				return err
+			}
+			report := statsReport{Tiers: tiers}
+
+			if detailedFlag {
+				eng, err := cx.EngagementStats()
+				if err != nil {
+					return fmt.Errorf("engagement stats: %w", err)
+				}
+				lineage, err := cx.MidLineageBreakdown()
+				if err != nil {
+					return fmt.Errorf("lineage breakdown: %w", err)
+				}
+				olderThan := time.Duration(zeroEngagementAgeDays) * 24 * time.Hour
+				health, err := cx.MidEngagementSnapshot(olderThan)
+				if err != nil {
+					return fmt.Errorf("mid engagement snapshot: %w", err)
+				}
+				report.Engagement = &eng
+				report.Lineage = &lineage
+				report.MidHealth = &health
 			}
 
 			switch outputFlag {
 			case "json":
-				out, _ := json.MarshalIndent(stats, "", "  ")
+				out, _ := json.MarshalIndent(report, "", "  ")
 				fmt.Println(string(out))
 			case "text", "":
 				w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 				fmt.Fprintf(w, "Tier\tCount\n")
-				fmt.Fprintf(w, "short\t%d\n", stats.Short)
-				fmt.Fprintf(w, "mid\t%d\n", stats.Mid)
-				fmt.Fprintf(w, "long\t%d\n", stats.Long)
-				fmt.Fprintf(w, "purged\t%d\n", stats.Purged)
+				fmt.Fprintf(w, "short\t%d\n", report.Tiers.Short)
+				fmt.Fprintf(w, "mid\t%d\n", report.Tiers.Mid)
+				fmt.Fprintf(w, "long\t%d\n", report.Tiers.Long)
+				fmt.Fprintf(w, "purged\t%d\n", report.Tiers.Purged)
 				w.Flush()
+
+				if detailedFlag {
+					fmt.Fprintln(cmd.OutOrStdout())
+					ew := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
+					fmt.Fprintf(ew, "Signal\tTotal\n")
+					fmt.Fprintf(ew, "reads\t%d\n", report.Engagement.TotalReads)
+					fmt.Fprintf(ew, "search hits\t%d\n", report.Engagement.TotalSearchHits)
+					fmt.Fprintf(ew, "modifies\t%d\n", report.Engagement.TotalModifies)
+					ew.Flush()
+
+					fmt.Fprintln(cmd.OutOrStdout())
+					lw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
+					fmt.Fprintf(lw, "Mid lineage\tCount\n")
+					fmt.Fprintf(lw, "no derived_from\t%d\n", report.Lineage.NoSources)
+					fmt.Fprintf(lw, "1 source\t%d\n", report.Lineage.SingleSource)
+					fmt.Fprintf(lw, ">=2 sources\t%d\n", report.Lineage.MultiSource)
+					lw.Flush()
+
+					fmt.Fprintln(cmd.OutOrStdout())
+					fmt.Fprintf(cmd.OutOrStdout(),
+						"Mid traces with zero engagement: %d (%d older than %dd)\n",
+						report.MidHealth.ZeroEngagement,
+						report.MidHealth.ZeroEngagementOlder,
+						zeroEngagementAgeDays,
+					)
+				}
 			default:
 				return fmt.Errorf("unsupported --output %q (try: text, json)", outputFlag)
 			}
@@ -247,5 +321,7 @@ profile performance) as the event log accumulates that data.`,
 		},
 	}
 	cmd.Flags().StringVar(&outputFlag, "output", "text", "output format: text, json")
+	cmd.Flags().BoolVar(&detailedFlag, "detailed", false, "include engagement signal, lineage breakdown, and zero-engagement counts")
+	cmd.Flags().IntVar(&zeroEngagementAgeDays, "zero-engagement-age-days", 14, "age threshold (days) for the zero-engagement-older count under --detailed")
 	return cmd
 }
