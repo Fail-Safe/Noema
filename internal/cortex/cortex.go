@@ -1170,6 +1170,9 @@ func (c *Cortex) Add(t *trace.Trace) error {
 	}
 	if err := c.insertDB(t); err != nil {
 		os.Remove(path)
+		if pkConflictOnTraceID(err) {
+			return c.describeTraceIDCollision(t.ID, err)
+		}
 		return fmt.Errorf("inserting into database: %w", err)
 	}
 	return nil
