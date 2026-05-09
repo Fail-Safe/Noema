@@ -13,7 +13,7 @@ import (
 // pipeline needs. Separate from the narrower scheduler interface in
 // agent.go so tests of cadence don't have to stub promotion paths.
 type LLMCortex interface {
-	PromotionCandidates(tier string, window time.Duration) ([]cortex.PromotionCandidate, error)
+	LLMCandidates(window time.Duration) ([]cortex.PromotionCandidate, error)
 	Promote(id, newTier string) error
 	CreateDistilledTrace(spec cortex.DistilledTraceSpec) (string, error)
 	TraceFile(id string, archived bool) string
@@ -29,6 +29,14 @@ type PipelineConfig struct {
 	ModelName  string
 	MaxRetries int
 	DryRun     bool
+
+	// Heuristic tunes the fallback scorer that runs when the LLM
+	// rejects a cluster or the endpoint errors out. Zero-value uses
+	// the same defaults as the standalone HeuristicPass (threshold=5,
+	// reads=1, modifies=2, lineage=3, votes=5). Independent from the
+	// scheduled HeuristicPass so an operator can tune the fallback
+	// gate without touching the scheduled cadence.
+	Heuristic PassConfig
 }
 
 // PipelineResult summarises a single pass so the CLI can log what
@@ -89,7 +97,7 @@ func RunLLMPass(ctx context.Context, cx LLMCortex, llm LLMClient, cfg PipelineCo
 	}
 	var result PipelineResult
 
-	candidates, err := cx.PromotionCandidates(trace.TierShort, cfg.Window)
+	candidates, err := cx.LLMCandidates(cfg.Window)
 	if err != nil {
 		return result, fmt.Errorf("selecting candidates: %w", err)
 	}
@@ -161,7 +169,7 @@ func RunLLMPass(ctx context.Context, cx LLMCortex, llm LLMClient, cfg PipelineCo
 					cr.Reason = fmt.Sprintf("llm error (dry-run fallback suppressed): %v", runErr)
 				} else {
 					log("[consolidate] cluster failed after retries: %v; falling back to heuristic promotion", runErr)
-					n := heuristicFallback(cx, chunk, log)
+					n := heuristicFallback(cx, chunk, cfg.Heuristic, log)
 					result.FallbackPromotions += n
 					cr.Outcome = "fallback"
 					cr.Reason = fmt.Sprintf("llm error, heuristic-promoted %d: %v", n, runErr)
@@ -311,15 +319,22 @@ func runWithRetry(ctx context.Context, llm LLMClient, profile Profile, model str
 	return Distillation{}, lastErr
 }
 
-// heuristicFallback promotes every candidate in the chunk 1:1 so a
-// pass that couldn't produce a distillation still moves qualifying
-// short-term traces into mid-term. Individual Promote failures are
-// logged but don't abort the fallback loop — the caller already
-// degraded from LLM to heuristic; one further failure shouldn't
-// cascade.
-func heuristicFallback(cx LLMCortex, chunk []cortex.PromotionCandidate, log func(format string, args ...any)) int {
+// heuristicFallback promotes only the candidates in the chunk that
+// pass the heuristic score gate, so an LLM-failed pass still moves
+// qualifying short-term traces forward without dragging zero-signal
+// chunkmates along. Earlier versions promoted every candidate
+// unconditionally, which produced the same low-engagement mid-tier
+// pollution that the heuristic was deliberately gating against.
+// Individual Promote failures are logged but don't abort the loop —
+// the caller already degraded from LLM to heuristic; one further
+// failure shouldn't cascade.
+func heuristicFallback(cx LLMCortex, chunk []cortex.PromotionCandidate, cfg PassConfig, log func(format string, args ...any)) int {
+	cfg = cfg.resolved()
 	promoted := 0
 	for _, pc := range chunk {
+		if scoreCandidate(pc, cfg) < cfg.PromotionThreshold {
+			continue
+		}
 		if err := cx.Promote(pc.ID, trace.TierMid); err != nil {
 			log("[consolidate] fallback promote failed id=%s: %v", pc.ID, err)
 			continue

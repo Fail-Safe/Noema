@@ -184,6 +184,17 @@ _TOOL_MAP = {
 # Max chars to keep from user/assistant content in the session log.
 _TURN_MAX_CHARS = 2000
 
+# Bookends for session-summary bodies. User questions frame the topical
+# scope of a session — usually short directives or "how do I X" prompts —
+# so we capture all of them at a generous-but-bounded length to give FTS5
+# good signal. The final assistant turn carries the resolution and gets a
+# longer slice. Total body stays under ~4 KB for a typical session, well
+# below Hermes's default memory_char_limit so injecting one summary still
+# leaves room for sibling traces.
+_SUMMARY_MAX_USER_TURNS = 12
+_SUMMARY_USER_CHARS = 240
+_SUMMARY_FINAL_ASSISTANT_CHARS = 1500
+
 
 def _tool_error(msg: str) -> str:
     return json.dumps({"error": msg})
@@ -191,6 +202,46 @@ def _tool_error(msg: str) -> str:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _build_session_summary_body(messages: List[Dict[str, Any]], turn_count: int) -> str:
+    """Construct the body for a session-summary trace.
+
+    Earlier versions used only the final assistant message as the body,
+    which made the trace title ("session-summary: …") inconsistent with
+    its content (a single assistant turn). The result was poor FTS5
+    signal and search results that returned message fragments instead
+    of summaries. This builder bookends the session: every user turn
+    (the topical-scope signal — what was *asked*) followed by the final
+    assistant turn (how it ended). Each user message is truncated
+    individually so a verbose user turn can't crowd out the rest.
+    """
+    user_turns: List[str] = []
+    final_assistant = ""
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content", "")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        if role == "user":
+            user_turns.append(content.strip()[:_SUMMARY_USER_CHARS])
+        elif role == "assistant":
+            final_assistant = content.strip()[:_SUMMARY_FINAL_ASSISTANT_CHARS]
+
+    # Cap user-turn count so a runaway session doesn't blow the body
+    # budget. We keep the most recent turns because they carry the
+    # current intent; opener context degrades fast in long sessions.
+    if len(user_turns) > _SUMMARY_MAX_USER_TURNS:
+        user_turns = user_turns[-_SUMMARY_MAX_USER_TURNS:]
+
+    parts = [f"Session with {turn_count} turns."]
+    if user_turns:
+        parts.append("## User turns")
+        parts.extend(f"- {t}" for t in user_turns)
+    if final_assistant:
+        parts.append("## Final assistant response")
+        parts.append(final_assistant)
+    return "\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -467,14 +518,7 @@ class NoemaMemoryProvider(MemoryProvider):
         turn_count = self._turn_count
         title = self._session_title or self._session_id[:12]
 
-        # Extract last assistant message for the summary.
-        last_assistant = ""
-        for msg in reversed(messages or []):
-            if msg.get("role") == "assistant":
-                content = msg.get("content", "")
-                if isinstance(content, str) and content.strip():
-                    last_assistant = content[:3000]
-                    break
+        body = _build_session_summary_body(messages or [], turn_count)
 
         def _end():
             try:
@@ -482,7 +526,6 @@ class NoemaMemoryProvider(MemoryProvider):
                 if self._sync_thread and self._sync_thread.is_alive():
                     self._sync_thread.join(timeout=5.0)
 
-                body = f"Session with {turn_count} turns.\n\n{last_assistant}" if last_assistant else f"Session with {turn_count} turns."
                 self._transport.call_tool("create_trace", {
                     "title": f"session-summary: {title}",
                     "type": "observation",

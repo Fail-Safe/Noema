@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -175,6 +176,10 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 			t.SourceHash = sh
 		}
 		if err := cx.Add(t); err != nil {
+			var collision *cortex.ErrTraceIDExists
+			if errors.As(err, &collision) {
+				return mcp.NewToolResultError(formatTraceIDCollision(collision)), nil
+			}
 			return nil, err
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("Trace created: %s", t.ID)), nil
@@ -189,9 +194,14 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 		if err != nil {
 			return nil, err
 		}
-		rows, err := cx.Search(query, cortex.ListOptions{
+		// Agent-initiated searches bump search_hit_count on the top-N
+		// results. Auto-injection providers (Hermes, etc.) consume search
+		// output without ever calling get_trace, so without this bump the
+		// graduation gate never sees signal from those reads. See
+		// internal/cortex/actor.go SearchAs for the rationale.
+		rows, err := cx.SearchAs(query, cortex.ListOptions{
 			All: req.GetBool("all", false),
-		})
+		}, cortex.ActorAgent, cortex.DefaultSearchHitTopN)
 		if err != nil {
 			return nil, err
 		}
@@ -212,7 +222,8 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 			Limit:           int(req.GetFloat("limit", 0)),
 			IncludeArchived: req.GetBool("include_archived", false),
 		}
-		matches, err := cx.FindSimilar(traceID, opts)
+		// Same actor-aware bump as search_traces; see SearchAs for why.
+		matches, err := cx.FindSimilarAs(traceID, opts, cortex.ActorAgent, cortex.DefaultSearchHitTopN)
 		if err != nil {
 			return nil, err
 		}
@@ -625,7 +636,7 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 	})
 
 	s.AddTool(mcp.NewTool("sync_read_signal",
-		mcp.WithDescription("Returns per-peer tier-usage deltas (read_count, modify_count, last_read_at) for federation sync. Each peer publishes only its own rows — the ring aggregates by SUMing over every peer's contribution, so consolidation decisions operate on a federation-wide signal rather than the local slice. Returns a JSON array of trace_usage rows owned by this cortex with updated_at > since."),
+		mcp.WithDescription("Returns per-peer tier-usage deltas (read_count, modify_count, search_hit_count, last_read_at) for federation sync. Each peer publishes only its own rows — the ring aggregates by SUMing over every peer's contribution, so consolidation decisions operate on a federation-wide signal rather than the local slice. Returns a JSON array of trace_usage rows owned by this cortex with updated_at > since. search_hit_count is omitted when zero for wire compatibility with pre-migration-015 peers."),
 		mcp.WithString("since", mcp.Description("RFC3339 cursor — return only rows with updated_at > this value. Empty returns everything this peer owns.")),
 		mcp.WithNumber("limit", mcp.Description("Max rows to return (default 100, max 1000)")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -938,6 +949,27 @@ Choose the type that best reflects the intent of the memory:
   origin=<name>        traces from a specific cortex
   (no trashed filter via MCP — use the CLI for trash operations)
 
+## Errors with structured payloads
+
+Some create_trace failures return an error result whose text body is a
+JSON object rather than a plain string. Currently:
+
+  trace_id_collision   create_trace's would-be id (YYYYMMDD-slug form)
+                       is already held by an existing row. Fields:
+                         kind="trace_id_collision"
+                         id=<the colliding id>
+                         existing_state=active|archived|trashed|purged
+                         archived_at, trashed_at, purged_at (RFC3339, may be empty)
+                         fix=[<remediation strings>]
+                         summary=<human-readable rendering>
+                       The (1555) you may see in the underlying SQLite
+                       error string is SQLITE_CONSTRAINT_PRIMARYKEY (a
+                       constant), NOT a rowid — do not chase
+                       AUTOINCREMENT / sqlite_sequence remediations.
+                       The fix array names the right command for
+                       existing_state (recover, unarchive, or
+                       memory purge --hard).
+
 ## Provenance
 - origin is auto-set to the current cortex name on creation. Override it when
   replaying events from a remote peer.
@@ -997,9 +1029,14 @@ repeat usage. An automatic graduation pass runs on the consolidation schedule an
 promotes every mid-tier trace that clears four AND-gated criteria:
 
   - age >= 14 days (configurable via consolidation.graduation.min_age_days)
-  - read_count >= 3 (configurable via consolidation.graduation.min_read_count)
+  - (read_count + search_hit_count) >= 3 (configurable via consolidation.graduation.min_read_count)
   - modify_count == 0 (unless require_unmodified is false)
   - tier_votes >= 0 (no active downvotes)
+
+read_count bumps on get_trace; search_hit_count bumps on search_traces /
+find_similar_traces top-N hits. Both contribute equally to the read gate so
+auto-injection providers (Hermes, etc.) that consume search output without
+ever calling get_trace can still drive traces to long tier.
 
 Traces at the long tier are DB-level immutable: content / identity fields are
 frozen, tier cannot change except via the admin-purge ceremony, and routine
@@ -1081,6 +1118,50 @@ runs.
 - Use derived_from when creating traces based on other traces — it builds a knowledge graph.
 - search_traces supports FTS5 syntax: quoted phrases, AND/OR/NOT, prefix* matching.
 `, m.Name, noemaVersion, m.Version, purposeLine, ownerLine, m.Name)
+}
+
+// formatTraceIDCollision renders an ErrTraceIDExists into a JSON
+// envelope with a human-readable summary. Agents that parse the body
+// can branch on `kind == "trace_id_collision"` and `existing_state`;
+// agents (or LLMs) that read the text directly still get the
+// human-readable lines under `summary`. The MCP error result still
+// carries the same payload as text — clients see `isError: true` plus
+// this JSON body.
+func formatTraceIDCollision(c *cortex.ErrTraceIDExists) string {
+	fix := []string{"vary the title (different slug → different id)"}
+	switch c.State {
+	case "trashed":
+		fix = append(fix,
+			fmt.Sprintf("noema recover %s   (restore the trashed trace)", c.ID),
+			fmt.Sprintf("noema memory purge %s   (free the slot, irreversible)", c.ID),
+		)
+	case "archived":
+		fix = append(fix,
+			fmt.Sprintf("noema unarchive %s (restore the archived trace)", c.ID),
+			fmt.Sprintf("noema memory purge %s (free the slot, irreversible)", c.ID),
+		)
+	case "purged":
+		fix = append(fix,
+			fmt.Sprintf("noema memory purge --hard %s (only a hard purge frees the slot)", c.ID),
+		)
+	default:
+		fix = append(fix, fmt.Sprintf("noema get %s (read the existing trace before deciding)", c.ID))
+	}
+	payload := map[string]any{
+		"kind":           "trace_id_collision",
+		"id":             c.ID,
+		"existing_state": c.State,
+		"archived_at":    c.ArchivedAt,
+		"trashed_at":     c.TrashedAt,
+		"purged_at":      c.PurgedAt,
+		"fix":            fix,
+		"summary":        c.Error(),
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return c.Error()
+	}
+	return string(b)
 }
 
 func formatRows(rows []cortex.Row) string {
