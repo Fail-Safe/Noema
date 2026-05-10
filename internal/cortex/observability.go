@@ -119,6 +119,121 @@ type PromotionStats struct {
 	P95Label string        `json:"p95"`
 }
 
+// PopularTrace is one row in the top-N-by-search-popularity table.
+// SearchHits and ReadCount are federation-wide aggregates (sum across
+// every peer's trace_usage row for this trace), matching the
+// convention EngagementStats already uses.
+type PopularTrace struct {
+	ID         string `json:"id"`
+	Title      string `json:"title"`
+	Type       string `json:"type"`
+	Tier       string `json:"tier"`
+	SearchHits int    `json:"search_hits"`
+	ReadCount  int    `json:"read_count"`
+}
+
+// TagSummary is one row in the per-tag activity table. TraceCount is
+// the number of distinct active traces carrying the tag; the
+// SearchHits / ReadCount / ModifyCount sums attribute the trace's
+// total signal to each of its tags, so a trace with three tags
+// contributes its 10 reads three times across the table (once per
+// tag). That's the right semantic for "which tags are accumulating
+// engagement" — a multi-tagged trace IS engagement for all of its
+// tags. Comparing two tag rows is fair because both columns use the
+// same attribution rule.
+type TagSummary struct {
+	Tag         string `json:"tag"`
+	TraceCount  int    `json:"trace_count"`
+	SearchHits  int    `json:"search_hits"`
+	ReadCount   int    `json:"read_count"`
+	ModifyCount int    `json:"modify_count"`
+}
+
+// TopSearchedTraces returns the top-N active traces ranked by
+// search_hit_count (primary) and read_count (tiebreaker). Cumulative
+// counters across all-time — a since-window filter doesn't apply
+// because the counter rows don't carry timestamps. If the question is
+// "what's hot lately" rather than "what's been hot all-time," the
+// answer needs a different table (per-day usage snapshots), which is
+// deferred to a future iteration.
+func (c *Cortex) TopSearchedTraces(n int) ([]PopularTrace, error) {
+	if n <= 0 {
+		n = 10
+	}
+	q := `
+		SELECT t.id, t.title, t.type, t.tier,
+		       COALESCE(SUM(u.search_hit_count), 0) AS hits,
+		       COALESCE(SUM(u.read_count), 0)       AS reads
+		FROM traces t
+		LEFT JOIN trace_usage u ON u.trace_id = t.id
+		WHERE t.archived_at IS NULL
+		  AND t.trashed_at IS NULL
+		  AND t.purged_at IS NULL
+		GROUP BY t.id
+		HAVING hits > 0 OR reads > 0
+		ORDER BY hits DESC, reads DESC, t.id ASC
+		LIMIT ?`
+	rows, err := c.DB.Query(q, n)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PopularTrace
+	for rows.Next() {
+		var p PopularTrace
+		if err := rows.Scan(&p.ID, &p.Title, &p.Type, &p.Tier, &p.SearchHits, &p.ReadCount); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// TagActivity returns the top-N tags ranked by total engagement
+// (search hits primary, reads secondary). Empty cortex returns an
+// empty slice (not nil) so JSON serializes as `[]` rather than `null`
+// — JSON consumers shouldn't have to special-case absence.
+func (c *Cortex) TagActivity(n int) ([]TagSummary, error) {
+	if n <= 0 {
+		n = 20
+	}
+	q := `
+		SELECT tt.tag,
+		       COUNT(DISTINCT t.id)                AS trace_count,
+		       COALESCE(SUM(u.search_hit_count), 0) AS hits,
+		       COALESCE(SUM(u.read_count), 0)       AS reads,
+		       COALESCE(SUM(u.modify_count), 0)     AS mods
+		FROM trace_tags tt
+		JOIN traces t ON t.id = tt.trace_id
+		LEFT JOIN trace_usage u ON u.trace_id = t.id
+		WHERE t.archived_at IS NULL
+		  AND t.trashed_at IS NULL
+		  AND t.purged_at IS NULL
+		GROUP BY tt.tag
+		ORDER BY hits DESC, reads DESC, mods DESC, tt.tag ASC
+		LIMIT ?`
+	rows, err := c.DB.Query(q, n)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []TagSummary{}
+	for rows.Next() {
+		var s TagSummary
+		if err := rows.Scan(&s.Tag, &s.TraceCount, &s.SearchHits, &s.ReadCount, &s.ModifyCount); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // OneSourceMidCount is the leak detector for the 1-source mid bucket.
 // PRs #86 and #90 closed two distinct paths that were promoting
 // single-derived-from traces past the heuristic; this surface lets us
