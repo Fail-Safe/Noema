@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"text/tabwriter"
 	"time"
 
@@ -34,10 +35,171 @@ is distributed across the cortex without opening the DB.`,
 	cmd.AddCommand(
 		memoryPurgeCmd(),
 		memoryStatsCmd(),
+		memoryHealthCmd(),
 		memoryPromoteCmd(),
 		memoryDemoteCmd(),
 	)
 	return cmd
+}
+
+// memoryHealthReport wraps the three cortex methods that answer "is
+// consolidation actually doing anything, and is anything leaking?"
+// into a single JSON envelope with a top-level schema_version (design
+// doc §3 — single top-level version per output, not per-section). The
+// MCP `consolidation_health` tool returns the same shape modulo field
+// naming.
+type memoryHealthReport struct {
+	SchemaVersion int                          `json:"schema_version"`
+	Activity      cortex.ConsolidationActivity `json:"activity"`
+	Latency       cortex.PromotionLatency      `json:"latency"`
+	OneSourceMid  cortex.OneSourceMidCount     `json:"one_source_mid"`
+}
+
+func memoryHealthCmd() *cobra.Command {
+	var (
+		sinceFlag  string
+		outputFlag string
+	)
+	cmd := &cobra.Command{
+		Use:   "health",
+		Short: "Show consolidation activity, promotion latency, and the 1-source mid leak detector",
+		Long: `Reports the consolidation pipeline's recent behavior — the question
+that motivated the observability surface: "how did consolidation fare
+overnight, and is anything leaking?"
+
+Three sections:
+
+  - Activity over the --since window: per-day counts of consolidation_claim,
+    consolidation_success, consolidation_fail, promote (any tier transition),
+    and consolidate (real LLM distillation events). Totals roll up the same
+    counters across the window.
+
+  - Promotion latency (all-time): count and p50/p95 of short→mid and
+    mid→long transition durations. mid→long measures from when the trace
+    entered the mid tier, not its created_at — a trace that lives short
+    for 30 days then promotes mid→long the next day shows up here as a
+    1-day mid→long latency.
+
+  - 1-source mid leak detector: current count of active mid-tier traces
+    with derived_from_count == 1 (the bucket PR #86 and PR #90 closed),
+    plus the count of traces that landed in that bucket within the last
+    7 days. A healthy gate keeps the recent count at zero.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cx, err := resolveCortex()
+			if err != nil {
+				return err
+			}
+			defer cx.Close()
+			return runMemoryHealth(cmd.OutOrStdout(), cx, sinceFlag, outputFlag)
+		},
+	}
+	cmd.Flags().StringVar(&sinceFlag, "since", "24h", "lookback window for activity buckets (e.g. 24h, 7d, 2w)")
+	cmd.Flags().StringVar(&outputFlag, "output", "text", "output format: text, json")
+	return cmd
+}
+
+// runMemoryHealth is the testable core of the memory-health CLI: it
+// composes the three cortex observability calls into a single report
+// and dispatches to either JSON or text rendering. Split out from the
+// cobra RunE so unit tests can drive it with a constructed Cortex and
+// a captured writer without spinning up the full command tree.
+func runMemoryHealth(w io.Writer, cx *cortex.Cortex, sinceLabel, output string) error {
+	since, err := cortex.ParseSince(sinceLabel)
+	if err != nil {
+		return err
+	}
+	activity, err := cx.ConsolidationActivity(since)
+	if err != nil {
+		return fmt.Errorf("consolidation activity: %w", err)
+	}
+	latency, err := cx.PromotionLatency()
+	if err != nil {
+		return fmt.Errorf("promotion latency: %w", err)
+	}
+	leak, err := cx.OneSourceMidCount()
+	if err != nil {
+		return fmt.Errorf("one-source mid count: %w", err)
+	}
+
+	report := memoryHealthReport{
+		SchemaVersion: 1,
+		Activity:      activity,
+		Latency:       latency,
+		OneSourceMid:  leak,
+	}
+
+	switch output {
+	case "json":
+		buf, _ := json.MarshalIndent(report, "", "  ")
+		fmt.Fprintln(w, string(buf))
+	case "text", "":
+		renderMemoryHealthText(w, report, sinceLabel)
+	default:
+		return fmt.Errorf("unsupported --output %q (try: text, json)", output)
+	}
+	return nil
+}
+
+// renderMemoryHealthText formats the report for a terminal. Two
+// tabwriter blocks (activity table + totals; latency rows) and a
+// final paragraph for the leak detector. Tabwriter rather than
+// hand-aligned spaces keeps the columns clean when day counts grow
+// to 3-digit numbers under busy cortexes.
+func renderMemoryHealthText(w io.Writer, r memoryHealthReport, sinceLabel string) {
+	fmt.Fprintf(w, "Consolidation activity — last %s\n", sinceLabel)
+	if len(r.Activity.Daily) == 0 {
+		fmt.Fprintln(w, "  (no events in window)")
+	} else {
+		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "  Date\tClaim\tSuccess\tFail\tPromote\tDistill")
+		for _, d := range r.Activity.Daily {
+			fmt.Fprintf(tw, "  %s\t%d\t%d\t%d\t%d\t%d\n",
+				d.Date, d.Claim, d.Success, d.Fail, d.Promote, d.Distill)
+		}
+		fmt.Fprintf(tw, "  ----\t-----\t-------\t----\t-------\t-------\n")
+		fmt.Fprintf(tw, "  Total\t%d\t%d\t%d\t%d\t%d\n",
+			r.Activity.Totals.Claim, r.Activity.Totals.Success, r.Activity.Totals.Fail,
+			r.Activity.Totals.Promote, r.Activity.Totals.Distill)
+		tw.Flush()
+	}
+	fmt.Fprintln(w)
+
+	fmt.Fprintln(w, "Promotion latency (all-time)")
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "  Transition\tCount\tp50\tp95")
+	fmt.Fprintf(tw, "  short→mid\t%d\t%s\t%s\n",
+		r.Latency.ShortToMid.Count, formatDuration(r.Latency.ShortToMid.P50), formatDuration(r.Latency.ShortToMid.P95))
+	fmt.Fprintf(tw, "  mid→long\t%d\t%s\t%s\n",
+		r.Latency.MidToLong.Count, formatDuration(r.Latency.MidToLong.P50), formatDuration(r.Latency.MidToLong.P95))
+	tw.Flush()
+	fmt.Fprintln(w)
+
+	fmt.Fprintln(w, "1-source mid leak detector")
+	fmt.Fprintf(w, "  Current:           %d trace(s)\n", r.OneSourceMid.Current)
+	status := "✓ gate is holding"
+	if r.OneSourceMid.PromotedLast7d > 0 {
+		status = "⚠ recent leak — investigate"
+	}
+	fmt.Fprintf(w, "  Promoted last 7d:  %d  %s\n", r.OneSourceMid.PromotedLast7d, status)
+}
+
+// formatDuration renders a duration in days/hours/minutes/seconds for
+// operator-friendly text output. JSON output keeps the raw nanosecond
+// integer so scripts can do whatever bucketing they want.
+func formatDuration(d time.Duration) string {
+	if d == 0 {
+		return "-"
+	}
+	if d >= 24*time.Hour {
+		return fmt.Sprintf("%.1fd", float64(d)/float64(24*time.Hour))
+	}
+	if d >= time.Hour {
+		return fmt.Sprintf("%.1fh", d.Hours())
+	}
+	if d >= time.Minute {
+		return fmt.Sprintf("%.1fm", d.Minutes())
+	}
+	return fmt.Sprintf("%.1fs", d.Seconds())
 }
 
 // memoryPromoteCmd surfaces Cortex.Promote as an operator-facing CLI

@@ -419,6 +419,41 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 		return mcp.NewToolResultText(string(buf)), nil
 	})
 
+	s.AddTool(mcp.NewTool("consolidation_health",
+		mcp.WithDescription("Recent consolidation pipeline health: daily success/fail/promote/distill counts within the lookback window, short→mid and mid→long promotion-latency percentiles, and the 1-source mid leak detector. Lets an agent or operator answer 'is consolidation actually happening, and is anything leaking?' without raw SQL against the events table."),
+		mcp.WithString("since", mcp.Description("Lookback window for the activity buckets, e.g. \"24h\", \"7d\". Default 24h. Latency percentiles and the leak detector ignore this — they are all-time / fixed-window respectively.")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		since, err := cortex.ParseSince(req.GetString("since", "24h"))
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		activity, err := cx.ConsolidationActivity(since)
+		if err != nil {
+			return nil, fmt.Errorf("consolidation activity: %w", err)
+		}
+		latency, err := cx.PromotionLatency()
+		if err != nil {
+			return nil, fmt.Errorf("promotion latency: %w", err)
+		}
+		leak, err := cx.OneSourceMidCount()
+		if err != nil {
+			return nil, fmt.Errorf("one-source mid count: %w", err)
+		}
+		out := struct {
+			SchemaVersion int                          `json:"schema_version"`
+			Activity      cortex.ConsolidationActivity `json:"activity"`
+			Latency       cortex.PromotionLatency      `json:"latency"`
+			OneSourceMid  cortex.OneSourceMidCount     `json:"one_source_mid"`
+		}{
+			SchemaVersion: 1,
+			Activity:      activity,
+			Latency:       latency,
+			OneSourceMid:  leak,
+		}
+		buf, _ := json.MarshalIndent(out, "", "  ")
+		return mcp.NewToolResultText(string(buf)), nil
+	})
+
 	s.AddTool(mcp.NewTool("record_consolidation_result",
 		mcp.WithDescription("Internal tool. Materialises a distilled mid-tier trace from a set of short-term sources. Validates the source IDs exist (>=2 required), creates the new trace with derived_from lineage pointing at the sources, and emits an ActionConsolidate event carrying model/profile/confidence telemetry for the quality dashboard."),
 		mcp.WithString("title", mcp.Description("Title for the distilled trace"), mcp.Required()),
@@ -937,6 +972,12 @@ Choose the type that best reflects the intent of the memory:
   cortex_identity                → return this cortex's stable ULID + name +
                                    manifest version (used by federation peers
                                    to verify identity on every sync)
+  consolidation_health [since]   → daily consolidation activity (success/fail/
+                                   promote/distill) over the window, plus
+                                   short→mid and mid→long latency percentiles
+                                   and the 1-source mid leak detector. since
+                                   accepts Go duration syntax plus d/w (e.g.
+                                   24h, 7d). Defaults to 24h.
   sync_events [since] [limit]    → pull events for federation (JSON array)
   federation_status              → MCP access posture, federation config,
                                    peer states, vector clock

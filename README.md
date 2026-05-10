@@ -228,6 +228,14 @@ noema verify traces [--backfill]          Check trace content hashes against fro
 noema verify cortex                       Validate manifest, config, db, access posture, and federation
 noema verify drift                        Check federated traces for drift from their source hash
 
+noema memory stats [--detailed]           Show tier counts and (with --detailed) engagement signal
+noema memory health [--since 24h]         Show consolidation activity over the window, promotion-latency
+                                          percentiles, and the 1-source mid leak detector
+noema memory promote <id> [--to mid|long] Advance a trace one tier (short→mid or mid→long)
+noema memory demote <id>                  Step a mid trace back to short
+noema memory purge <id> --tier <t> --reason "..." --confirm [--hard]
+                                          Ceremoniously destroy a trace with audit trail (GDPR path)
+
 noema federation status                   Show federation config, MCP access posture, peer sync state, and vector clock
 noema federation peers                    List configured federation peers
 noema federation add-peer <name> <endpoint>
