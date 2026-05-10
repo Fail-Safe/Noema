@@ -454,6 +454,40 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 		return mcp.NewToolResultText(string(buf)), nil
 	})
 
+	s.AddTool(mcp.NewTool("search_activity",
+		mcp.WithDescription("Top-N traces by federation-wide search popularity (search_hit_count then read_count) plus top-N tags by aggregate engagement. Lets an agent answer 'what's worth reading?' or 'which topics are hot?' without scanning every trace. Active traces only; archived/trashed are excluded."),
+		mcp.WithNumber("top", mcp.Description("How many top traces and top tags to return. Default 10. Capped at 100.")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		top := int(req.GetFloat("top", 10))
+		if top <= 0 {
+			top = 10
+		}
+		if top > 100 {
+			top = 100
+		}
+		traces, err := cx.TopSearchedTraces(top)
+		if err != nil {
+			return nil, fmt.Errorf("top searched traces: %w", err)
+		}
+		tags, err := cx.TagActivity(top)
+		if err != nil {
+			return nil, fmt.Errorf("tag activity: %w", err)
+		}
+		out := struct {
+			SchemaVersion int                   `json:"schema_version"`
+			Top           int                   `json:"top"`
+			Traces        []cortex.PopularTrace `json:"traces"`
+			Tags          []cortex.TagSummary   `json:"tags"`
+		}{
+			SchemaVersion: 1,
+			Top:           top,
+			Traces:        traces,
+			Tags:          tags,
+		}
+		buf, _ := json.MarshalIndent(out, "", "  ")
+		return mcp.NewToolResultText(string(buf)), nil
+	})
+
 	s.AddTool(mcp.NewTool("record_consolidation_result",
 		mcp.WithDescription("Internal tool. Materialises a distilled mid-tier trace from a set of short-term sources. Validates the source IDs exist (>=2 required), creates the new trace with derived_from lineage pointing at the sources, and emits an ActionConsolidate event carrying model/profile/confidence telemetry for the quality dashboard."),
 		mcp.WithString("title", mcp.Description("Title for the distilled trace"), mcp.Required()),
@@ -978,6 +1012,12 @@ Choose the type that best reflects the intent of the memory:
                                    and the 1-source mid leak detector. since
                                    accepts Go duration syntax plus d/w (e.g.
                                    24h, 7d). Defaults to 24h.
+  search_activity [top]          → top-N traces by federation-wide search
+                                   popularity, plus top-N tags by aggregate
+                                   engagement (hits + reads + modifies). Use
+                                   this to surface what's worth reading or to
+                                   discover which topics are hot. top defaults
+                                   to 10, capped at 100.
   sync_events [since] [limit]    → pull events for federation (JSON array)
   federation_status              → MCP access posture, federation config,
                                    peer states, vector clock

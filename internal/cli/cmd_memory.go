@@ -36,11 +36,123 @@ is distributed across the cortex without opening the DB.`,
 		memoryPurgeCmd(),
 		memoryStatsCmd(),
 		memoryHealthCmd(),
+		memoryPopularCmd(),
 		memoryPromoteCmd(),
 		memoryDemoteCmd(),
 	)
 	return cmd
 }
+
+// memoryPopularReport is the JSON envelope shared between the CLI
+// (`noema memory popular --output json`) and the MCP tool
+// `search_activity`. Same schema_version namespace as memoryHealthReport
+// — separate report types intentionally so consumers can pin to one
+// without coupling to the other.
+type memoryPopularReport struct {
+	SchemaVersion int                   `json:"schema_version"`
+	Top           int                   `json:"top"`
+	Traces        []cortex.PopularTrace `json:"traces"`
+	Tags          []cortex.TagSummary   `json:"tags"`
+}
+
+func memoryPopularCmd() *cobra.Command {
+	var (
+		topFlag    int
+		outputFlag string
+	)
+	cmd := &cobra.Command{
+		Use:   "popular",
+		Short: "Top traces by search popularity and top tags by aggregate engagement",
+		Long: `Reports two leaderboards over the cortex's federation-wide engagement
+counters:
+
+  - Top-N traces by search_hit_count (primary) and read_count
+    (tiebreaker). search_hit_count is the auto-injection-friendly
+    signal — Hermes-style providers that fold search results into a
+    context window without ever calling get_trace bump this counter
+    but not read_count, so it's the better "what's worth surfacing"
+    proxy than reads alone.
+
+  - Top-N tags by aggregate search hits / reads / modifies across
+    every active trace carrying the tag. A trace with multiple tags
+    contributes its engagement to each tag, so two columns are
+    directly comparable.
+
+Cumulative all-time counters — no --since flag. The trace_usage rows
+don't carry timestamps so a window filter would need a different
+table (per-day usage snapshots), which is deferred to a future
+iteration.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cx, err := resolveCortex()
+			if err != nil {
+				return err
+			}
+			defer cx.Close()
+			return runMemoryPopular(cmd.OutOrStdout(), cx, topFlag, outputFlag)
+		},
+	}
+	cmd.Flags().IntVar(&topFlag, "top", 10, "how many top traces and top tags to return")
+	cmd.Flags().StringVar(&outputFlag, "output", "text", "output format: text, json")
+	return cmd
+}
+
+func runMemoryPopular(w io.Writer, cx *cortex.Cortex, top int, output string) error {
+	if top <= 0 {
+		top = 10
+	}
+	traces, err := cx.TopSearchedTraces(top)
+	if err != nil {
+		return fmt.Errorf("top searched traces: %w", err)
+	}
+	tags, err := cx.TagActivity(top)
+	if err != nil {
+		return fmt.Errorf("tag activity: %w", err)
+	}
+	report := memoryPopularReport{
+		SchemaVersion: 1,
+		Top:           top,
+		Traces:        traces,
+		Tags:          tags,
+	}
+	switch output {
+	case "json":
+		buf, _ := json.MarshalIndent(report, "", "  ")
+		fmt.Fprintln(w, string(buf))
+	case "text", "":
+		renderMemoryPopularText(w, report)
+	default:
+		return fmt.Errorf("unsupported --output %q (try: text, json)", output)
+	}
+	return nil
+}
+
+func renderMemoryPopularText(w io.Writer, r memoryPopularReport) {
+	fmt.Fprintf(w, "Top %d traces by search popularity\n", r.Top)
+	if len(r.Traces) == 0 {
+		fmt.Fprintln(w, "  (no traces with engagement yet)")
+	} else {
+		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "  Hits\tReads\tTier\tType\tTitle")
+		for _, p := range r.Traces {
+			fmt.Fprintf(tw, "  %d\t%d\t%s\t%s\t%s\n", p.SearchHits, p.ReadCount, p.Tier, p.Type, truncate(p.Title, 60))
+		}
+		tw.Flush()
+	}
+	fmt.Fprintln(w)
+
+	fmt.Fprintf(w, "Top %d tags by aggregate engagement\n", r.Top)
+	if len(r.Tags) == 0 {
+		fmt.Fprintln(w, "  (no tagged traces with engagement yet)")
+		return
+	}
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "  Tag\tTraces\tHits\tReads\tModifies")
+	for _, t := range r.Tags {
+		fmt.Fprintf(tw, "  %s\t%d\t%d\t%d\t%d\n", t.Tag, t.TraceCount, t.SearchHits, t.ReadCount, t.ModifyCount)
+	}
+	tw.Flush()
+}
+
 
 // memoryHealthReport wraps the three cortex methods that answer "is
 // consolidation actually doing anything, and is anything leaking?"

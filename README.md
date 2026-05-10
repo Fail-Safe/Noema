@@ -231,6 +231,7 @@ noema verify drift                        Check federated traces for drift from 
 noema memory stats [--detailed]           Show tier counts and (with --detailed) engagement signal
 noema memory health [--since 24h]         Show consolidation activity over the window, promotion-latency
                                           percentiles, and the 1-source mid leak detector
+noema memory popular [--top 10]           Top traces by search popularity and top tags by aggregate engagement
 noema memory promote <id> [--to mid|long] Advance a trace one tier (short→mid or mid→long)
 noema memory demote <id>                  Step a mid trace back to short
 noema memory purge <id> --tier <t> --reason "..." --confirm [--hard]

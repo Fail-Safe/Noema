@@ -225,6 +225,159 @@ func TestPromotionLatency_MidToLong_UsesMidEntry(t *testing.T) {
 	}
 }
 
+// TestTopSearchedTraces_RanksByHitsThenReads pins the primary/secondary
+// sort: search_hit_count first, then read_count as tiebreaker. A trace
+// with more reads but fewer search hits should still rank below a trace
+// with more search hits, because the surface is named "popular by
+// search" — the search counter dominates intentionally.
+func TestTopSearchedTraces_RanksByHitsThenReads(t *testing.T) {
+	cx := setup(t)
+	a := trace.New("alpha", "note", "", nil, "body")
+	if err := cx.Add(a); err != nil {
+		t.Fatalf("Add a: %v", err)
+	}
+	b := trace.New("beta", "note", "", nil, "body")
+	if err := cx.Add(b); err != nil {
+		t.Fatalf("Add b: %v", err)
+	}
+	// alpha: 1 search hit, no reads. beta: 0 search hits, many reads.
+	if _, err := cx.SearchAs("alpha", cortex.ListOptions{}, cortex.ActorAgent, cortex.DefaultSearchHitTopN); err != nil {
+		t.Fatalf("SearchAs: %v", err)
+	}
+	for range 5 {
+		if _, err := cx.GetAs(b.ID, cortex.ActorAgent); err != nil {
+			t.Fatalf("GetAs b: %v", err)
+		}
+	}
+	got, err := cx.TopSearchedTraces(10)
+	if err != nil {
+		t.Fatalf("TopSearchedTraces: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d rows, want 2: %+v", len(got), got)
+	}
+	if got[0].ID != a.ID {
+		t.Errorf("rank 1 = %q, want alpha (search hits dominate over reads)", got[0].ID)
+	}
+	if got[1].ID != b.ID {
+		t.Errorf("rank 2 = %q, want beta", got[1].ID)
+	}
+}
+
+// TestTopSearchedTraces_LimitAndZeroFilter pins two things in one test:
+// the LIMIT cap is honored, and traces with zero engagement on both
+// counters drop out entirely (HAVING clause). Otherwise a fresh cortex
+// would return a long list of just-created untouched traces, drowning
+// out the few actually-searched ones.
+func TestTopSearchedTraces_LimitAndZeroFilter(t *testing.T) {
+	cx := setup(t)
+	for i := range 5 {
+		tr := trace.New(fmt.Sprintf("t%d", i), "note", "", nil, "body")
+		if err := cx.Add(tr); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+	}
+	// Add one searched trace.
+	hot := trace.New("hot", "note", "", nil, "body")
+	if err := cx.Add(hot); err != nil {
+		t.Fatalf("Add hot: %v", err)
+	}
+	if _, err := cx.SearchAs("hot", cortex.ListOptions{}, cortex.ActorAgent, cortex.DefaultSearchHitTopN); err != nil {
+		t.Fatalf("SearchAs: %v", err)
+	}
+
+	got, err := cx.TopSearchedTraces(3)
+	if err != nil {
+		t.Fatalf("TopSearchedTraces: %v", err)
+	}
+	if len(got) != 1 {
+		t.Errorf("got %d rows, want 1 (zero-engagement traces should be filtered):\n%+v", len(got), got)
+	}
+}
+
+func TestTopSearchedTraces_EmptyCortex(t *testing.T) {
+	cx := setup(t)
+	got, err := cx.TopSearchedTraces(10)
+	if err != nil {
+		t.Fatalf("TopSearchedTraces: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("expected empty result on empty cortex, got %+v", got)
+	}
+}
+
+// TestTagActivity_AggregatesAcrossTags pins that a trace with multiple
+// tags contributes its engagement to each tag — a trace tagged
+// [go, language] with 10 reads adds 10 reads to BOTH tag rows. That's
+// the intended semantic: each tag's row answers "what's this tag's
+// total engagement footprint," not "what's exclusively this tag's."
+func TestTagActivity_AggregatesAcrossTags(t *testing.T) {
+	cx := setup(t)
+	dual := trace.New("dual", "note", "", []string{"go", "language"}, "body")
+	if err := cx.Add(dual); err != nil {
+		t.Fatalf("Add dual: %v", err)
+	}
+	if _, err := cx.GetAs(dual.ID, cortex.ActorAgent); err != nil {
+		t.Fatalf("GetAs: %v", err)
+	}
+
+	got, err := cx.TagActivity(10)
+	if err != nil {
+		t.Fatalf("TagActivity: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d tags, want 2: %+v", len(got), got)
+	}
+	for _, ts := range got {
+		if ts.TraceCount != 1 {
+			t.Errorf("tag %q TraceCount = %d, want 1", ts.Tag, ts.TraceCount)
+		}
+		if ts.ReadCount != 1 {
+			t.Errorf("tag %q ReadCount = %d, want 1 (each tag gets full attribution of its trace's reads)", ts.Tag, ts.ReadCount)
+		}
+	}
+}
+
+// TestTagActivity_ExcludesArchived pins the active-only convention:
+// a tag whose only carrier is archived should not appear in the
+// output. Otherwise an operator browsing "what's hot" sees ghost
+// tags from traces they explicitly demoted to archive.
+func TestTagActivity_ExcludesArchived(t *testing.T) {
+	cx := setup(t)
+	tr := trace.New("ghosted", "note", "", []string{"obsolete-tag"}, "body")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if _, err := cx.GetAs(tr.ID, cortex.ActorAgent); err != nil {
+		t.Fatalf("GetAs: %v", err)
+	}
+	if err := cx.Archive(tr.ID); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+
+	got, err := cx.TagActivity(10)
+	if err != nil {
+		t.Fatalf("TagActivity: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("expected empty (archived trace's tag should be excluded), got %+v", got)
+	}
+}
+
+func TestTagActivity_EmptyReturnsEmptySlice(t *testing.T) {
+	cx := setup(t)
+	got, err := cx.TagActivity(10)
+	if err != nil {
+		t.Fatalf("TagActivity: %v", err)
+	}
+	if got == nil {
+		t.Error("got nil, want non-nil empty slice (JSON should serialize as [] not null)")
+	}
+	if len(got) != 0 {
+		t.Errorf("got %+v, want empty", got)
+	}
+}
+
 func TestOneSourceMidCount_Empty(t *testing.T) {
 	cx := setup(t)
 	got, err := cx.OneSourceMidCount()
