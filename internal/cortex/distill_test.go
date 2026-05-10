@@ -148,16 +148,13 @@ func TestCreateDistilledTrace_RejectsEmptyTitleOrBody(t *testing.T) {
 	}
 }
 
-func TestCreateDistilledTrace_PromotesSourcesToMid(t *testing.T) {
-	// v1 policy: once a distillation lands, every short-tier source
-	// is promoted to mid. This keeps both representations available
-	// (distillation as the summary, sources as full-detail backing
-	// store reachable via derived_from) and takes the sources out of
-	// the PromotionCandidates pool so the next pass doesn't
-	// re-consolidate them into a duplicate distillation.
-	//
-	// v2+ will likely replace this with archival-after-grace-period
-	// (see the doc-comment on CreateDistilledTrace).
+func TestCreateDistilledTrace_LeavesSourcesAtShort(t *testing.T) {
+	// Sources stay at their original tier when a distillation lands.
+	// derived_from on the distilled trace keeps them reachable, and
+	// LLMCandidates filters them out of subsequent LLM passes via the
+	// ActionConsolidate event log — so they don't get re-clustered
+	// into duplicate distillations and they don't pollute mid with
+	// zero-engagement promotions either.
 	cx := setup(t)
 	src1 := trace.New("s1", "note", "", nil, "b1")
 	src2 := trace.New("s2", "note", "", nil, "b2")
@@ -177,8 +174,8 @@ func TestCreateDistilledTrace_PromotesSourcesToMid(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Get source: %v", err)
 		}
-		if row.Tier != trace.TierMid {
-			t.Errorf("source %s tier = %q, want mid (sources promoted on distillation)", id, row.Tier)
+		if row.Tier != trace.TierShort {
+			t.Errorf("source %s tier = %q, want short (sources stay put on distillation)", id, row.Tier)
 		}
 	}
 }

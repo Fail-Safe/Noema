@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -175,6 +176,10 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 			t.SourceHash = sh
 		}
 		if err := cx.Add(t); err != nil {
+			var collision *cortex.ErrTraceIDExists
+			if errors.As(err, &collision) {
+				return mcp.NewToolResultError(formatTraceIDCollision(collision)), nil
+			}
 			return nil, err
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("Trace created: %s", t.ID)), nil
@@ -944,6 +949,27 @@ Choose the type that best reflects the intent of the memory:
   origin=<name>        traces from a specific cortex
   (no trashed filter via MCP — use the CLI for trash operations)
 
+## Errors with structured payloads
+
+Some create_trace failures return an error result whose text body is a
+JSON object rather than a plain string. Currently:
+
+  trace_id_collision   create_trace's would-be id (YYYYMMDD-slug form)
+                       is already held by an existing row. Fields:
+                         kind="trace_id_collision"
+                         id=<the colliding id>
+                         existing_state=active|archived|trashed|purged
+                         archived_at, trashed_at, purged_at (RFC3339, may be empty)
+                         fix=[<remediation strings>]
+                         summary=<human-readable rendering>
+                       The (1555) you may see in the underlying SQLite
+                       error string is SQLITE_CONSTRAINT_PRIMARYKEY (a
+                       constant), NOT a rowid — do not chase
+                       AUTOINCREMENT / sqlite_sequence remediations.
+                       The fix array names the right command for
+                       existing_state (recover, unarchive, or
+                       memory purge --hard).
+
 ## Provenance
 - origin is auto-set to the current cortex name on creation. Override it when
   replaying events from a remote peer.
@@ -1092,6 +1118,50 @@ runs.
 - Use derived_from when creating traces based on other traces — it builds a knowledge graph.
 - search_traces supports FTS5 syntax: quoted phrases, AND/OR/NOT, prefix* matching.
 `, m.Name, noemaVersion, m.Version, purposeLine, ownerLine, m.Name)
+}
+
+// formatTraceIDCollision renders an ErrTraceIDExists into a JSON
+// envelope with a human-readable summary. Agents that parse the body
+// can branch on `kind == "trace_id_collision"` and `existing_state`;
+// agents (or LLMs) that read the text directly still get the
+// human-readable lines under `summary`. The MCP error result still
+// carries the same payload as text — clients see `isError: true` plus
+// this JSON body.
+func formatTraceIDCollision(c *cortex.ErrTraceIDExists) string {
+	fix := []string{"vary the title (different slug → different id)"}
+	switch c.State {
+	case "trashed":
+		fix = append(fix,
+			fmt.Sprintf("noema recover %s   (restore the trashed trace)", c.ID),
+			fmt.Sprintf("noema memory purge %s   (free the slot, irreversible)", c.ID),
+		)
+	case "archived":
+		fix = append(fix,
+			fmt.Sprintf("noema unarchive %s (restore the archived trace)", c.ID),
+			fmt.Sprintf("noema memory purge %s (free the slot, irreversible)", c.ID),
+		)
+	case "purged":
+		fix = append(fix,
+			fmt.Sprintf("noema memory purge --hard %s (only a hard purge frees the slot)", c.ID),
+		)
+	default:
+		fix = append(fix, fmt.Sprintf("noema get %s (read the existing trace before deciding)", c.ID))
+	}
+	payload := map[string]any{
+		"kind":           "trace_id_collision",
+		"id":             c.ID,
+		"existing_state": c.State,
+		"archived_at":    c.ArchivedAt,
+		"trashed_at":     c.TrashedAt,
+		"purged_at":      c.PurgedAt,
+		"fix":            fix,
+		"summary":        c.Error(),
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return c.Error()
+	}
+	return string(b)
 }
 
 func formatRows(rows []cortex.Row) string {

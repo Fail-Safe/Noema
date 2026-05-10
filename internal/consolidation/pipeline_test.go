@@ -112,27 +112,27 @@ func TestRunLLMPass_HappyPath_Frontier(t *testing.T) {
 		t.Errorf("CandidatesConsidered = %d, want 3", result.CandidatesConsidered)
 	}
 
-	// Verify a mid-tier trace now exists with derived_from linking
-	// to all three sources. Under the v1 "net-add with source
-	// promotion" policy, mid also contains the three promoted
-	// sources, so the expected count is 4 (1 distillation + 3
-	// sources). The distillation is the one with derived_from set.
+	// Verify a single mid-tier trace exists for the distilled summary;
+	// sources stay at short under the current policy. derived_from on
+	// the distilled row keeps the originals reachable, and LLMCandidates
+	// will skip them on the next pass via the ActionConsolidate event.
 	rows, err := cx.List(cortex.ListOptions{Tiers: []string{trace.TierMid}})
 	if err != nil {
 		t.Fatalf("List mid: %v", err)
 	}
-	if len(rows) != 4 {
-		t.Fatalf("mid tier rows = %d, want 4 (1 distilled + 3 promoted sources)", len(rows))
+	if len(rows) != 1 {
+		t.Fatalf("mid tier rows = %d, want 1 (distilled only; sources stay at short)", len(rows))
 	}
-	var distilledID string
-	for _, r := range rows {
-		if r.Title == "Auth strategy — distilled" {
-			distilledID = r.ID
-			break
-		}
+	distilledID := rows[0].ID
+	if rows[0].Title != "Auth strategy — distilled" {
+		t.Fatalf("mid-tier row title = %q, want %q", rows[0].Title, "Auth strategy — distilled")
 	}
-	if distilledID == "" {
-		t.Fatalf("no mid-tier row titled %q among %d mid rows", "Auth strategy — distilled", len(rows))
+	shortRows, err := cx.List(cortex.ListOptions{Tiers: []string{trace.TierShort}})
+	if err != nil {
+		t.Fatalf("List short: %v", err)
+	}
+	if len(shortRows) != 3 {
+		t.Errorf("short tier rows = %d, want 3 (sources untouched)", len(shortRows))
 	}
 	// List doesn't populate DerivedFrom (that's a separate lineage
 	// query); fetch via Get to verify the derived_from links.
@@ -209,14 +209,15 @@ func TestRunLLMPass_DryRun_SkipsWrite(t *testing.T) {
 }
 
 // TestRunLLMPass_LLMError_FallsBackToHeuristic pins the graceful-
-// degradation rail from Phase 8: when the LLM step repeatedly fails,
-// the pipeline drops to 1:1 heuristic promotion rather than leaving
-// the candidates in short-term forever.
-func TestRunLLMPass_LLMError_FallsBackToHeuristic(t *testing.T) {
+// degradation rail when the LLM step repeatedly fails. The fallback
+// runs the same heuristic score gate as the standalone HeuristicPass:
+// candidates without enough signal stay at short rather than getting
+// dragged forward unconditionally. Three zero-engagement seed traces
+// score 0 — well under the threshold of 5 — so none should promote.
+func TestRunLLMPass_LLMError_FallsBackToHeuristic_GatedByScore(t *testing.T) {
 	cx := setupCortex(t)
 	seedTraces(t, cx, 3)
 
-	// Empty response queue — every call errors with "exhausted".
 	llm := &scriptedLLM{}
 
 	result, err := consolidation.RunLLMPass(context.Background(), cx, llm, consolidation.PipelineConfig{
@@ -231,15 +232,52 @@ func TestRunLLMPass_LLMError_FallsBackToHeuristic(t *testing.T) {
 	if result.DistillationsCreated != 0 {
 		t.Errorf("DistillationsCreated = %d, want 0 (all failed)", result.DistillationsCreated)
 	}
-	if result.FallbackPromotions != 3 {
-		t.Errorf("FallbackPromotions = %d, want 3 (one per candidate)", result.FallbackPromotions)
+	if result.FallbackPromotions != 0 {
+		t.Errorf("FallbackPromotions = %d, want 0 (zero-engagement seeds shouldn't pass the gate)", result.FallbackPromotions)
 	}
 
-	// The three originals should now be mid-tier via heuristic
-	// fallback rather than frozen at short-tier forever.
+	rows, _ := cx.List(cortex.ListOptions{Tiers: []string{trace.TierMid}})
+	if len(rows) != 0 {
+		t.Errorf("mid tier rows after gated fallback = %d, want 0", len(rows))
+	}
+}
+
+// TestRunLLMPass_LLMError_FallbackPromotesQualifyingCandidates pairs
+// with the gated test above: when a candidate has accumulated enough
+// signal to clear the heuristic threshold, the fallback should still
+// promote it. Three reads on the seeded trace gives score=3 with the
+// default reads weight (1) and a derived_from of 2 adds the lineage
+// credit (≥2 sources × WeightLineage 3 = 6) for a total of 9, well
+// over the threshold of 5.
+func TestRunLLMPass_LLMError_FallbackPromotesQualifyingCandidates(t *testing.T) {
+	cx := setupCortex(t)
+	ids := seedTraces(t, cx, 3)
+
+	// Bump tier_votes on each seed so the heuristic score reaches the
+	// threshold without needing to fabricate read/modify history.
+	// One vote × WeightVotes (5) = 5, exactly at threshold.
+	for _, id := range ids {
+		if err := cx.Vote(id, +1, cortex.ActorAgent); err != nil {
+			t.Fatalf("Vote %s: %v", id, err)
+		}
+	}
+
+	llm := &scriptedLLM{}
+	result, err := consolidation.RunLLMPass(context.Background(), cx, llm, consolidation.PipelineConfig{
+		Window:     24 * time.Hour,
+		ModelTier:  "frontier",
+		ModelName:  "m",
+		MaxRetries: 1,
+	}, nil)
+	if err != nil {
+		t.Fatalf("RunLLMPass: %v", err)
+	}
+	if result.FallbackPromotions != 3 {
+		t.Errorf("FallbackPromotions = %d, want 3 (one vote each clears threshold)", result.FallbackPromotions)
+	}
 	rows, _ := cx.List(cortex.ListOptions{Tiers: []string{trace.TierMid}})
 	if len(rows) != 3 {
-		t.Errorf("mid tier rows after fallback = %d, want 3", len(rows))
+		t.Errorf("mid tier rows after qualifying fallback = %d, want 3", len(rows))
 	}
 }
 

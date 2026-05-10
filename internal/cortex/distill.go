@@ -46,26 +46,17 @@ type DistilledTraceSpec struct {
 // which model produced it / how confident" as separate, replayable
 // records.
 //
-// Source handling (v1 — "net-add with source promotion"): every
-// short-tier source is promoted to mid once the distillation lands.
-// The distilled trace is the retrievable summary; sources remain
-// individually addressable at mid so agents can pull the full
-// detail via derived_from when the distillation's compression is
-// lossy. This also prevents the next consolidation pass from
-// re-clustering the same sources into a duplicate distillation —
-// the candidate query filters to tier='short', so promoted sources
-// drop out of the candidate pool.
-//
-// FUTURE (v2+): "source archival" — instead of promoting sources
-// to mid, move them to archived once the distillation is trusted
-// (confidence threshold + retention window). That keeps mid-tier
-// curated and closer to the biological metaphor where the detailed
-// memory fades as the distillation takes its place. Not v1 because
-// the grace-period machinery adds a new daemon and needs a
-// confidence-calibration pass first. The current design's derived_from
-// lineage already supports the retrieval path that option 2 would
-// need, so the switch is local to this function + a new archival
-// sweep — no schema changes.
+// Source handling: sources stay at their original tier. The distilled
+// trace is the retrievable summary, and derived_from lineage keeps the
+// originals reachable for the cases where the distillation's
+// compression is lossy. Earlier versions auto-promoted every source to
+// mid alongside the distillation, which polluted the mid tier with
+// zero-engagement traces (a single ActionConsolidate run could promote
+// 5+ sources that had no reads, modifies, or votes of their own).
+// Re-clustering protection is now provided by LLMCandidates, which
+// excludes any short-tier trace that already appears as a source in a
+// past ActionConsolidate event — so a source isn't re-fed into a
+// duplicate distillation just because it stayed at short.
 func (c *Cortex) CreateDistilledTrace(spec DistilledTraceSpec) (string, error) {
 	if spec.Title == "" {
 		return "", fmt.Errorf("distilled trace: title is required")
@@ -126,36 +117,6 @@ func (c *Cortex) CreateDistilledTrace(spec DistilledTraceSpec) (string, error) {
 	}
 	if err := tx.Commit(); err != nil {
 		return t.ID, fmt.Errorf("committing consolidate event: %w", err)
-	}
-
-	// Promote each source from short to mid. Best-effort per source —
-	// the distillation itself has already landed, so a partial
-	// promotion failure doesn't invalidate anything, it just leaves
-	// one or more sources at short. They'd surface again in the next
-	// consolidation pass, which is suboptimal but self-correcting.
-	// Sources that are not at 'short' are skipped quietly: they may
-	// already have been promoted by a previous run (re-consolidation
-	// after a crash), or they're at a tier this function shouldn't
-	// touch (mid/long — isValidPromotion would reject anyway).
-	for _, sid := range spec.SourceIDs {
-		srow, err := c.Get(sid)
-		if err != nil {
-			// Source vanished between the earlier existence check and
-			// now — log and skip rather than abort the whole operation.
-			// The distilled trace is already committed; lineage is
-			// intact.
-			continue
-		}
-		if srow.Tier != trace.TierShort {
-			continue
-		}
-		if err := c.Promote(sid, trace.TierMid); err != nil {
-			// Non-fatal per the "best-effort" contract. The ActionPromote
-			// event is what keeps federation peers consistent; if this
-			// fails here it fails everywhere, and the next run will
-			// retry.
-			continue
-		}
 	}
 
 	return t.ID, nil

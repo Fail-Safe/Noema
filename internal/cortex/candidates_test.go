@@ -185,3 +185,47 @@ func TestPromotionCandidates_WindowBound(t *testing.T) {
 		t.Errorf("expected zero candidates outside window, got %d (%+v)", len(got), got)
 	}
 }
+
+func TestLLMCandidates_ExcludesAlreadyConsolidatedSources(t *testing.T) {
+	// Once CreateDistilledTrace fires for a pair of sources, the
+	// resulting ActionConsolidate event should keep those source IDs
+	// out of the LLM candidate pool — even though they're still at
+	// short tier under the no-auto-promote policy. PromotionCandidates
+	// (the heuristic pass's pool) is unaffected and still surfaces
+	// them, since the heuristic gates on score not on consolidation
+	// history.
+	cx := setup(t)
+	src1 := trace.New("s1", "note", "", nil, "b1")
+	src2 := trace.New("s2", "note", "", nil, "b2")
+	independent := trace.New("indep", "note", "", nil, "b3")
+	for _, tr := range []*trace.Trace{src1, src2, independent} {
+		if err := cx.Add(tr); err != nil {
+			t.Fatalf("Add %s: %v", tr.Title, err)
+		}
+	}
+	if _, err := cx.CreateDistilledTrace(cortex.DistilledTraceSpec{
+		Title: "dist", Body: "b", SourceIDs: []string{src1.ID, src2.ID},
+	}); err != nil {
+		t.Fatalf("CreateDistilledTrace: %v", err)
+	}
+
+	llm, err := cx.LLMCandidates(24 * time.Hour)
+	if err != nil {
+		t.Fatalf("LLMCandidates: %v", err)
+	}
+	if len(llm) != 1 || llm[0].ID != independent.ID {
+		var ids []string
+		for _, pc := range llm {
+			ids = append(ids, pc.ID)
+		}
+		t.Errorf("LLMCandidates = %v, want only %s (consumed sources excluded)", ids, independent.ID)
+	}
+
+	heuristic, err := cx.PromotionCandidates(trace.TierShort, 24*time.Hour)
+	if err != nil {
+		t.Fatalf("PromotionCandidates: %v", err)
+	}
+	if len(heuristic) != 3 {
+		t.Errorf("PromotionCandidates(short) = %d, want 3 (heuristic pool sees all short-tier traces, including ex-sources)", len(heuristic))
+	}
+}

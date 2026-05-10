@@ -79,6 +79,76 @@ func (c *Cortex) GraduationCandidates(minAge time.Duration) ([]PromotionCandidat
 	return out, rows.Err()
 }
 
+// LLMCandidates returns the short-tier candidate pool for the LLM
+// distillation pass — same shape as PromotionCandidates, but with
+// already-consolidated sources filtered out. A trace is considered
+// "already consolidated" if its ID appears in the source_ids array of
+// any past ActionConsolidate event.
+//
+// CreateDistilledTrace used to keep these out of the pool by promoting
+// every source to mid as a side effect; that polluted mid with
+// zero-engagement traces. Filtering on the event log instead leaves
+// sources at their natural tier while still preventing the next pass
+// from re-clustering them into a duplicate distillation.
+//
+// json_each is part of SQLite's JSON1 extension, which is enabled by
+// modernc.org/sqlite at compile time; no driver flag is needed.
+func (c *Cortex) LLMCandidates(window time.Duration) ([]PromotionCandidate, error) {
+	cutoff := time.Now().UTC().Add(-window).Format(time.RFC3339)
+	q := `
+		SELECT
+			t.id,
+			t.tier,
+			t.type,
+			COALESCE(u.total_reads, 0)        AS read_count,
+			COALESCE(u.total_modifies, 0)     AS modify_count,
+			COALESCE(u.total_search_hits, 0)  AS search_hit_count,
+			t.tier_votes,
+			COALESCE(v.n, 0) AS derived_from_count,
+			t.created_at
+		FROM traces t
+		LEFT JOIN (
+			SELECT trace_id,
+			       SUM(read_count)       AS total_reads,
+			       SUM(modify_count)     AS total_modifies,
+			       SUM(search_hit_count) AS total_search_hits
+			FROM trace_usage
+			GROUP BY trace_id
+		) u ON u.trace_id = t.id
+		LEFT JOIN v_derived_from_count v ON v.trace_id = t.id
+		WHERE t.tier = 'short'
+		  AND t.archived_at IS NULL
+		  AND t.trashed_at IS NULL
+		  AND t.purged_at IS NULL
+		  AND t.created_at >= ?
+		  AND t.id != ''
+		  AND t.id NOT IN (
+		      SELECT je.value
+		      FROM events e, json_each(json_extract(e.data, '$.source_ids')) je
+		      WHERE e.action = 'consolidate'
+		  )
+		ORDER BY t.created_at DESC
+	`
+	rows, err := c.DB.Query(q, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("selecting llm candidates: %w", err)
+	}
+	defer rows.Close()
+
+	var out []PromotionCandidate
+	for rows.Next() {
+		var pc PromotionCandidate
+		if err := rows.Scan(
+			&pc.ID, &pc.Tier, &pc.Type, &pc.ReadCount, &pc.ModifyCount,
+			&pc.SearchHitCount, &pc.TierVotes, &pc.DerivedFromCount, &pc.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, pc)
+	}
+	return out, rows.Err()
+}
+
 // PromotionCandidates returns every active trace in the given tier
 // whose created_at falls within the rolling window. The caller does
 // the scoring; this method is only responsible for narrowing to the
