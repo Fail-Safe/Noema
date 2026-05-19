@@ -104,7 +104,12 @@ func TestConsolidationActivity_BucketsAndTotals(t *testing.T) {
 	insertRawEvent(t, cx, event.ActionConsolidationClaim, tr.ID, day1, nil)
 	insertRawEvent(t, cx, event.ActionConsolidationSuccess, tr.ID, day1, nil)
 	insertRawEvent(t, cx, event.ActionConsolidationSuccess, tr.ID, day2, nil)
-	insertRawEvent(t, cx, event.ActionConsolidationFail, tr.ID, day2, nil)
+	// One genuine failure (no reason field, or a non-preemption reason)…
+	insertRawEvent(t, cx, event.ActionConsolidationFail, tr.ID, day2.Add(1*time.Second),
+		map[string]any{"reason": "llm_error"})
+	// …and one preempted-by-peer fail that must NOT inflate the Fail bucket.
+	insertRawEvent(t, cx, event.ActionConsolidationFail, tr.ID, day2.Add(2*time.Second),
+		map[string]any{"reason": "peer_outranked"})
 	insertRawEvent(t, cx, event.ActionPromote, tr.ID, day2, map[string]any{"from": "short", "to": "mid"})
 	insertRawEvent(t, cx, event.ActionConsolidate, tr.ID, day2, nil)
 
@@ -118,12 +123,47 @@ func TestConsolidationActivity_BucketsAndTotals(t *testing.T) {
 	if got.Daily[0].Date != "2026-05-01" || got.Daily[0].Claim != 1 || got.Daily[0].Success != 1 {
 		t.Errorf("Day 1 = %+v, want date=2026-05-01 claim=1 success=1", got.Daily[0])
 	}
-	if got.Daily[1].Date != "2026-05-02" || got.Daily[1].Success != 1 || got.Daily[1].Fail != 1 || got.Daily[1].Promote != 1 || got.Daily[1].Distill != 1 {
-		t.Errorf("Day 2 = %+v, want date=2026-05-02 success=1 fail=1 promote=1 distill=1", got.Daily[1])
+	if d := got.Daily[1]; d.Date != "2026-05-02" || d.Success != 1 || d.Fail != 1 || d.LostElection != 1 || d.Promote != 1 || d.Distill != 1 {
+		t.Errorf("Day 2 = %+v, want date=2026-05-02 success=1 fail=1 lost_election=1 promote=1 distill=1", d)
 	}
-	want := cortex.ConsolidationTotals{Success: 2, Fail: 1, Claim: 1, Promote: 1, Distill: 1}
+	want := cortex.ConsolidationTotals{Success: 2, Fail: 1, LostElection: 1, Claim: 1, Promote: 1, Distill: 1}
 	if got.Totals != want {
 		t.Errorf("Totals = %+v, want %+v", got.Totals, want)
+	}
+}
+
+// TestConsolidationActivity_AllPreemptionReasons pins that every reason
+// the election gate emits as a "preempted" fail (peer_outranked,
+// no_winner_at_recheck, context_canceled) routes to the LostElection
+// bucket. A new preemption reason added in election.go must also be
+// mirrored in preemptionReasons in observability.go, and this test is
+// the trip wire for that.
+func TestConsolidationActivity_AllPreemptionReasons(t *testing.T) {
+	cx := setup(t)
+	tr := trace.New("seed", "note", "", nil, "body")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	day := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
+	for i, reason := range []string{"peer_outranked", "no_winner_at_recheck", "context_canceled"} {
+		insertRawEvent(t, cx, event.ActionConsolidationFail, tr.ID,
+			day.Add(time.Duration(i)*time.Second),
+			map[string]any{"reason": reason})
+	}
+	// One genuine failure to make sure the Fail bucket isn't being
+	// swallowed wholesale.
+	insertRawEvent(t, cx, event.ActionConsolidationFail, tr.ID, day.Add(10*time.Second),
+		map[string]any{"reason": "watchdog_expired"})
+
+	got, err := cx.ConsolidationActivity(0)
+	if err != nil {
+		t.Fatalf("ConsolidationActivity: %v", err)
+	}
+	if got.Totals.LostElection != 3 {
+		t.Errorf("LostElection total = %d, want 3 (one per preemption reason)", got.Totals.LostElection)
+	}
+	if got.Totals.Fail != 1 {
+		t.Errorf("Fail total = %d, want 1 (watchdog_expired is a real failure)", got.Totals.Fail)
 	}
 }
 

@@ -263,14 +263,15 @@ func renderMemoryHealthText(w io.Writer, r memoryHealthReport, sinceLabel string
 		fmt.Fprintln(w, "  (no events in window)")
 	} else {
 		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "  Date\tClaim\tSuccess\tFail\tPromote\tDistill")
+		fmt.Fprintln(tw, "  Date\tClaim\tSuccess\tFail\tLostElec\tPromote\tDistill")
 		for _, d := range r.Activity.Daily {
-			fmt.Fprintf(tw, "  %s\t%d\t%d\t%d\t%d\t%d\n",
-				d.Date, d.Claim, d.Success, d.Fail, d.Promote, d.Distill)
+			fmt.Fprintf(tw, "  %s\t%d\t%d\t%d\t%d\t%d\t%d\n",
+				d.Date, d.Claim, d.Success, d.Fail, d.LostElection, d.Promote, d.Distill)
 		}
-		fmt.Fprintf(tw, "  ----\t-----\t-------\t----\t-------\t-------\n")
-		fmt.Fprintf(tw, "  Total\t%d\t%d\t%d\t%d\t%d\n",
+		fmt.Fprintf(tw, "  ----\t-----\t-------\t----\t--------\t-------\t-------\n")
+		fmt.Fprintf(tw, "  Total\t%d\t%d\t%d\t%d\t%d\t%d\n",
 			r.Activity.Totals.Claim, r.Activity.Totals.Success, r.Activity.Totals.Fail,
+			r.Activity.Totals.LostElection,
 			r.Activity.Totals.Promote, r.Activity.Totals.Distill)
 		tw.Flush()
 	}
