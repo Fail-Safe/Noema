@@ -33,14 +33,25 @@ left the index pointing at files that no longer exist.`,
 			}
 
 			if recover {
-				fmt.Printf("Added: %d  Updated: %d  Recovered: %d  Orphaned: %d\n",
-					result.Added, result.Updated, result.Recovered, result.Orphaned)
+				fmt.Printf("Added: %d  Updated: %d  Drifted: %d  Recovered: %d  Orphaned: %d\n",
+					result.Added, result.Updated, result.Drifted, result.Recovered, result.Orphaned)
 			} else {
-				fmt.Printf("Added: %d  Updated: %d  Orphaned: %d\n",
-					result.Added, result.Updated, result.Orphaned)
+				fmt.Printf("Added: %d  Updated: %d  Drifted: %d  Orphaned: %d\n",
+					result.Added, result.Updated, result.Drifted, result.Orphaned)
 			}
 			if result.Recovered > 0 {
 				fmt.Println("Note: recovered entries had missing files that were rebuilt from the local event log.")
+			}
+			if result.Drifted > 0 {
+				fmt.Println("Note: drifted entries are long-tier traces whose on-disk files differ from the DB.")
+				fmt.Println("      The DB row is left untouched (long-tier is immutable). Visibility was still reconciled.")
+				fmt.Println("      Investigate with `noema verify drift`. Drifted IDs:")
+				for _, id := range result.DriftedIDs {
+					fmt.Printf("        %s\n", id)
+				}
+				if result.Drifted > len(result.DriftedIDs) {
+					fmt.Printf("        … and %d more\n", result.Drifted-len(result.DriftedIDs))
+				}
 			}
 			if result.Orphaned > 0 {
 				fmt.Println("Note: orphaned entries are in the database but have no file on disk.")

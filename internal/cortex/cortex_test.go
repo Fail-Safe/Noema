@@ -1084,6 +1084,116 @@ func TestSync_PreservesExistingTimestamps(t *testing.T) {
 	}
 }
 
+// TestSync_LongTierDriftIsReportedNotAborted pins the fix for the
+// constraint-failure regression: a long-tier trace whose on-disk file
+// drifted from its DB row (because Obsidian re-saved it, federation
+// replayed a snapshot, an agent appended, …) used to crash the entire
+// Sync transaction with `constraint failed: long-term trace is immutable`.
+// Now Sync should count it in Drifted, leave the DB row untouched on the
+// locked columns, still reconcile visibility, and continue processing
+// the other files.
+func TestSync_LongTierDriftIsReportedNotAborted(t *testing.T) {
+	cx := setup(t)
+
+	// Long-tier trace, created directly at the long tier so we don't
+	// need to drive it through the promotion path.
+	tr := trace.New("Long-tier trace", "note", "agent-1", []string{"a"}, "Original body.")
+	tr.Tier = trace.TierLong
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	// And a short-tier trace that should still get processed even
+	// though the long-tier one drifts. If Sync aborts on the first
+	// drift, this row never reconciles and the test catches it.
+	tr2 := trace.New("Short-tier sibling", "note", "", nil, "Sibling body.")
+	if err := cx.Add(tr2); err != nil {
+		t.Fatalf("Add tr2: %v", err)
+	}
+	path2 := cx.TraceFile(tr2.ID, false)
+	parsed2, err := trace.ParseFile(path2)
+	if err != nil {
+		t.Fatalf("ParseFile tr2: %v", err)
+	}
+	parsed2.Title = "Short-tier sibling (renamed)"
+	if err := parsed2.Write(path2); err != nil {
+		t.Fatalf("Write tr2: %v", err)
+	}
+
+	// Edit the long-tier trace's file directly — simulates Obsidian /
+	// agent / external tool drift. Title change is enough to trip the
+	// immutability trigger via the old code path.
+	path := cx.TraceFile(tr.ID, false)
+	parsed, err := trace.ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	parsed.Title = "Long-tier trace (drifted)"
+	parsed.Body = "Body rewritten by external tool."
+	if err := parsed.Write(path); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	result, err := cx.Sync()
+	if err != nil {
+		t.Fatalf("Sync must not error on long-tier drift: %v", err)
+	}
+	if result.Drifted != 1 {
+		t.Errorf("Drifted = %d, want 1", result.Drifted)
+	}
+	if len(result.DriftedIDs) != 1 || result.DriftedIDs[0] != tr.ID {
+		t.Errorf("DriftedIDs = %v, want [%s]", result.DriftedIDs, tr.ID)
+	}
+	if result.Updated != 1 {
+		t.Errorf("Updated = %d, want 1 (the short-tier sibling)", result.Updated)
+	}
+
+	// DB row for the long-tier trace must NOT carry the drifted title.
+	row, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get long-tier: %v", err)
+	}
+	if row.Title != "Long-tier trace" {
+		t.Errorf("Long-tier title was overwritten: got %q, want %q", row.Title, "Long-tier trace")
+	}
+
+	// Short-tier sibling MUST have been reconciled despite the drift.
+	row2, err := cx.Get(tr2.ID)
+	if err != nil {
+		t.Fatalf("Get short-tier: %v", err)
+	}
+	if row2.Title != "Short-tier sibling (renamed)" {
+		t.Errorf("Short-tier sibling was not reconciled: got %q, want %q",
+			row2.Title, "Short-tier sibling (renamed)")
+	}
+}
+
+// TestSync_LongTierWithoutDriftStillUpdatesVisibility pins that a
+// long-tier trace whose file matches the DB exactly is treated as a
+// normal Updated row (one cheap visibility reconciliation, no drift
+// noise). The previous behavior was the same; this test prevents a
+// future "always skip long-tier" overreaction to the drift fix.
+func TestSync_LongTierWithoutDriftStillUpdatesVisibility(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Long-tier clean", "note", "", nil, "Body.")
+	tr.Tier = trace.TierLong
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	result, err := cx.Sync()
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if result.Drifted != 0 {
+		t.Errorf("Drifted = %d, want 0 (file matches DB)", result.Drifted)
+	}
+	if result.Updated != 1 {
+		t.Errorf("Updated = %d, want 1", result.Updated)
+	}
+}
+
 func TestUpdate(t *testing.T) {
 	cx := setup(t)
 

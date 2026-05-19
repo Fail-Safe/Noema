@@ -1985,6 +1985,19 @@ type SyncResult struct {
 	Updated   int // files found on disk and already in DB (re-synced)
 	Recovered int // orphaned DB rows whose files were rebuilt from the event log
 	Orphaned  int // IDs in DB with no corresponding file on disk (after recovery)
+	// Drifted counts long-tier traces whose on-disk file differs from the DB
+	// row in an immutable field (title, type, body hash, etc.). Sync refuses
+	// to reconcile such drift — the long-tier immutability trigger would
+	// abort, and even if it didn't, the right surface for "long-tier file
+	// drifted" is `noema verify drift`, not silent overwrite in either
+	// direction. Drifted rows still get archive/trash visibility reconciled.
+	// Surface them in the CLI so users know to investigate.
+	Drifted int
+	// DriftedIDs lists the IDs of drifted long-tier traces, in walk order.
+	// Capped at 10 to keep terminal output manageable on a cortex with a
+	// pathological number of drifted rows; the full set is recoverable via
+	// `noema verify drift` if needed.
+	DriftedIDs []string
 }
 
 // SyncOptions controls optional Sync behaviors.
@@ -1993,6 +2006,33 @@ type SyncOptions struct {
 	// rows from the local event log. Off by default so manual `rm` of a trace
 	// file remains a valid way to mark it for cleanup.
 	Recover bool
+}
+
+// longTierDrifted reports whether the on-disk trace's immutable fields
+// disagree with the DB row. Mirrors the WHEN clause of
+// trg_long_term_immutable (migration 013) so the function returns true
+// in exactly the same cases that would trip the trigger. Kept in lockstep
+// with the migration: a new locked field added to the trigger MUST also
+// be added here, otherwise sync will attempt an UPDATE that aborts.
+//
+// Tags and lineage aren't on this list: they live in separate tables
+// (trace_tags, trace_lineage) that the trigger doesn't guard. Sync
+// still won't reconcile them when this function returns true — see the
+// callsite for why ("their content would point at a drifted-but-not-
+// applied state").
+func longTierDrifted(existing *Row, t *trace.Trace, contentHash string) bool {
+	if existing == nil {
+		return false
+	}
+	return existing.Title != t.Title ||
+		existing.Type != t.Type ||
+		existing.Author != t.Author ||
+		existing.Origin != t.Origin ||
+		existing.ContentHash != contentHash ||
+		existing.UpdatedAt != t.Updated ||
+		existing.CreatedAt != t.Created ||
+		existing.SourceLocked != t.SourceLocked ||
+		existing.SourceHash != t.SourceHash
 }
 
 // Sync reconciles the database with the current state of the markdown files on
@@ -2082,7 +2122,14 @@ func (c *Cortex) SyncWithOptions(opts SyncOptions) (SyncResult, error) {
 		}
 
 		contentHash := trace.ContentHash(t.Body)
-		if t.ContentHash != contentHash {
+		// Long-tier traces are DB-level immutable: refuse to rewrite the
+		// file's content_hash frontmatter here. The hash-heal step is
+		// fine for short/mid traces (it self-repairs a metadata row that
+		// fell out of sync with the body) but for long-tier files even a
+		// frontmatter touch counts as mutation. Leave drift for the
+		// drift checker to surface.
+		isLongTier := dbErr == nil && existing != nil && existing.Tier == trace.TierLong
+		if t.ContentHash != contentHash && !isLongTier {
 			t.ContentHash = contentHash
 			if err := t.Write(e.path); err != nil {
 				return result, fmt.Errorf("updating content hash for %s: %w", t.ID, err)
@@ -2099,6 +2146,30 @@ func (c *Cortex) SyncWithOptions(opts SyncOptions) (SyncResult, error) {
 				return result, fmt.Errorf("inserting %s: %w", t.ID, err)
 			}
 			result.Added++
+		} else if isLongTier && longTierDrifted(existing, t, contentHash) {
+			// Long-tier trace with at least one drifted immutable field.
+			// The full UPDATE would trip trg_long_term_immutable; even
+			// if we worked around it, silently mutating an immutable
+			// trace's metadata defeats the purpose of the tier. Narrow
+			// the UPDATE to visibility columns only, count the drift,
+			// and skip tag/lineage/FTS reconciliation (their content
+			// would point at a drifted-but-not-applied state).
+			_, err = tx.Exec(
+				`UPDATE traces SET archived_at=?, trashed_at=? WHERE id=?`,
+				archivedAt, trashedAt, t.ID,
+			)
+			if err != nil {
+				tx.Rollback()
+				return result, fmt.Errorf("reconciling visibility for long-tier %s: %w", t.ID, err)
+			}
+			result.Drifted++
+			if len(result.DriftedIDs) < 10 {
+				result.DriftedIDs = append(result.DriftedIDs, t.ID)
+			}
+			if err := tx.Commit(); err != nil {
+				return result, err
+			}
+			continue
 		} else {
 			// Already in DB — update metadata and reconcile state.
 			_, err = tx.Exec(
