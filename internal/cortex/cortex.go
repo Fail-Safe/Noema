@@ -2013,14 +2013,21 @@ type SyncOptions struct {
 // trg_long_term_immutable (migration 013) so the function returns true
 // in exactly the same cases that would trip the trigger. Kept in lockstep
 // with the migration: a new locked field added to the trigger MUST also
-// be added here, otherwise sync will attempt an UPDATE that aborts.
+// be added here, otherwise the Drifted counter under-reports.
+//
+// existingCortexID is the DB's current cortex_id for the row (not on the
+// Row struct, so the caller queries it separately). The most common
+// real-world drift is federation-inherited rows where the file's origin
+// name matches the local cortex's display name but the DB's cortex_id
+// was correctly captured from the originating peer — Sync's resolver
+// would otherwise overwrite that ID, which the trigger blocks.
 //
 // Tags and lineage aren't on this list: they live in separate tables
 // (trace_tags, trace_lineage) that the trigger doesn't guard. Sync
 // still won't reconcile them when this function returns true — see the
 // callsite for why ("their content would point at a drifted-but-not-
 // applied state").
-func longTierDrifted(existing *Row, t *trace.Trace, contentHash string) bool {
+func longTierDrifted(existing *Row, existingCortexID string, t *trace.Trace, contentHash, computedCortexID string) bool {
 	if existing == nil {
 		return false
 	}
@@ -2028,6 +2035,7 @@ func longTierDrifted(existing *Row, t *trace.Trace, contentHash string) bool {
 		existing.Type != t.Type ||
 		existing.Author != t.Author ||
 		existing.Origin != t.Origin ||
+		existingCortexID != computedCortexID ||
 		existing.ContentHash != contentHash ||
 		existing.UpdatedAt != t.Updated ||
 		existing.CreatedAt != t.Created ||
@@ -2146,14 +2154,37 @@ func (c *Cortex) SyncWithOptions(opts SyncOptions) (SyncResult, error) {
 				return result, fmt.Errorf("inserting %s: %w", t.ID, err)
 			}
 			result.Added++
-		} else if isLongTier && longTierDrifted(existing, t, contentHash) {
-			// Long-tier trace with at least one drifted immutable field.
-			// The full UPDATE would trip trg_long_term_immutable; even
-			// if we worked around it, silently mutating an immutable
-			// trace's metadata defeats the purpose of the tier. Narrow
-			// the UPDATE to visibility columns only, count the drift,
-			// and skip tag/lineage/FTS reconciliation (their content
+		} else if isLongTier {
+			// Long-tier rows are immutable by trigger. ALWAYS use the
+			// narrow UPDATE that touches only the columns the trigger
+			// permits (archived_at, trashed_at). The blanket UPDATE
+			// path below is never safe here: even an apparently-no-op
+			// SET on a locked column trips trg_long_term_immutable
+			// when the OLD and NEW values disagree on a column we
+			// didn't think to check (the live regression was
+			// federation-inherited rows where the file's origin name
+			// matches the local cortex but the DB's cortex_id was
+			// correctly captured from the originating peer — Sync's
+			// resolver would overwrite that, the trigger aborts, and
+			// the entire run dies).
+			//
+			// Detect drift separately so the Drifted counter is right.
+			// The narrow UPDATE runs the same way either way; drift
+			// detection only affects the reported counter and the
+			// decision to skip tag/lineage/FTS reconciliation (which
 			// would point at a drifted-but-not-applied state).
+			var existingCortexID string
+			if err := tx.QueryRow(
+				`SELECT COALESCE(cortex_id, '') FROM traces WHERE id = ?`, t.ID,
+			).Scan(&existingCortexID); err != nil {
+				// Empty string is a fine fallback; the drift comparison
+				// still works (an empty existing vs. a non-empty computed
+				// reads as drift, which is the right answer when the row
+				// is mid-migration).
+				existingCortexID = ""
+			}
+			drifted := longTierDrifted(existing, existingCortexID, t, contentHash, cortexID)
+
 			_, err = tx.Exec(
 				`UPDATE traces SET archived_at=?, trashed_at=? WHERE id=?`,
 				archivedAt, trashedAt, t.ID,
@@ -2162,14 +2193,17 @@ func (c *Cortex) SyncWithOptions(opts SyncOptions) (SyncResult, error) {
 				tx.Rollback()
 				return result, fmt.Errorf("reconciling visibility for long-tier %s: %w", t.ID, err)
 			}
-			result.Drifted++
-			if len(result.DriftedIDs) < 10 {
-				result.DriftedIDs = append(result.DriftedIDs, t.ID)
+			if drifted {
+				result.Drifted++
+				if len(result.DriftedIDs) < 10 {
+					result.DriftedIDs = append(result.DriftedIDs, t.ID)
+				}
+				if err := tx.Commit(); err != nil {
+					return result, err
+				}
+				continue
 			}
-			if err := tx.Commit(); err != nil {
-				return result, err
-			}
-			continue
+			result.Updated++
 		} else {
 			// Already in DB — update metadata and reconcile state.
 			_, err = tx.Exec(

@@ -1194,6 +1194,59 @@ func TestSync_LongTierWithoutDriftStillUpdatesVisibility(t *testing.T) {
 	}
 }
 
+// TestSync_LongTierForeignCortexIDDoesNotAbort pins the live regression
+// from 2026-05-19: a long-tier trace whose DB row carries a foreign
+// cortex_id (federated in from a peer whose display name matches the
+// local cortex's display name) used to crash Sync because the resolver
+// computes cortex_id = local-ID from `origin == c.Name`, but the
+// trigger blocks any cortex_id change on long-tier rows. The first
+// version of the fix missed cortex_id in its drift check, so this case
+// fell through to the blanket UPDATE and re-tripped the trigger.
+//
+// Real-world setup: file frontmatter says `origin: agentbrain` (matches
+// local cortex name); DB row's cortex_id is a foreign ULID. Sync must
+// report drift, leave cortex_id alone, and not abort.
+func TestSync_LongTierForeignCortexIDDoesNotAbort(t *testing.T) {
+	cx := setup(t)
+
+	// Create the row as short-tier first so we can inject the foreign
+	// cortex_id without tripping the immutability trigger (it only
+	// fires when OLD.tier='long' AND NEW.tier='long'). Then flip tier
+	// to long in a single UPDATE that sets both columns at once.
+	tr := trace.New("Federation-inherited long-tier", "context", "hermes/paige", []string{"hermes-session"}, "Body.")
+	tr.Origin = cx.Name // mirrors the live bug: name matches, ID won't.
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	foreignCortexID := "01KNJX4991ASW6NNKS9BQHNCGB" // ai-1's ULID in the live report
+	if _, err := cx.DB.Exec(
+		`UPDATE traces SET cortex_id = ?, tier = 'long' WHERE id = ?`,
+		foreignCortexID, tr.ID,
+	); err != nil {
+		t.Fatalf("seeding foreign cortex_id at long tier: %v", err)
+	}
+
+	result, err := cx.Sync()
+	if err != nil {
+		t.Fatalf("Sync must not error on foreign cortex_id: %v", err)
+	}
+	if result.Drifted != 1 {
+		t.Errorf("Drifted = %d, want 1 (cortex_id mismatch is drift)", result.Drifted)
+	}
+
+	// cortex_id must remain the foreign value — that's the whole point
+	// of long-tier immutability.
+	var got string
+	if err := cx.DB.QueryRow(
+		`SELECT cortex_id FROM traces WHERE id = ?`, tr.ID,
+	).Scan(&got); err != nil {
+		t.Fatalf("reading cortex_id back: %v", err)
+	}
+	if got != foreignCortexID {
+		t.Errorf("cortex_id = %q, want %q (must not be overwritten)", got, foreignCortexID)
+	}
+}
+
 func TestUpdate(t *testing.T) {
 	cx := setup(t)
 
