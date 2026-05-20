@@ -340,6 +340,7 @@ const (
 	stateList    viewState = iota
 	stateSearch
 	stateConfirm
+	stateHelp
 )
 
 // focusPane tracks which pane (list or detail) receives navigation keys.
@@ -620,6 +621,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateSearch(msg)
 		case stateConfirm:
 			return m.updateConfirm(msg)
+		case stateHelp:
+			return m.updateHelp(msg)
 		}
 	}
 	return m, nil
@@ -808,6 +811,10 @@ func (m model) updateList(msg tea.KeyMsg) (model, tea.Cmd) {
 		m.cursor = 0
 		return m, m.reload()
 
+	case "?":
+		m.state = stateHelp
+		return m, nil
+
 	case "+", "=":
 		// Accept "=" too so users on layouts where "+" requires Shift
 		// can upvote without the modifier. "-" is unambiguous.
@@ -925,6 +932,16 @@ func (m model) updateConfirm(msg tea.KeyMsg) (model, tea.Cmd) {
 	case "n", "N", "esc":
 		m.state = stateList
 		m.confirm = confirmAction{}
+	}
+	return m, nil
+}
+
+func (m model) updateHelp(msg tea.KeyMsg) (model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "ctrl+c":
+		return m, tea.Quit
+	case "?", "esc", "enter", " ":
+		m.state = stateList
 	}
 	return m, nil
 }
@@ -1276,20 +1293,25 @@ func (m model) View() string {
 		return "Loading…\n"
 	}
 
-	listW, detailW := m.paneWidths()
 	bodyH := m.bodyHeight()
 
-	list := m.renderList(listW, bodyH)
-	detail := m.renderDetail(detailW, bodyH)
+	var body string
+	if m.state == stateHelp {
+		body = m.renderHelp(m.width, bodyH)
+	} else {
+		listW, detailW := m.paneWidths()
+		list := m.renderList(listW, bodyH)
+		detail := m.renderDetail(detailW, bodyH)
 
-	// Single-column divider
-	divLines := make([]string, bodyH)
-	for i := range divLines {
-		divLines[i] = styleDivider.Render("│")
+		// Single-column divider
+		divLines := make([]string, bodyH)
+		for i := range divLines {
+			divLines[i] = styleDivider.Render("│")
+		}
+		divider := strings.Join(divLines, "\n")
+
+		body = lipgloss.JoinHorizontal(lipgloss.Top, list, divider, detail)
 	}
-	divider := strings.Join(divLines, "\n")
-
-	body := lipgloss.JoinHorizontal(lipgloss.Top, list, divider, detail)
 
 	// Header and footer are single-row strings that only stretch as
 	// far as their content goes; right-pad them with surface cells so
@@ -1597,6 +1619,73 @@ func (m model) renderDetail(width, height int) string {
 	return styleSurface.Width(width).Height(height).Render(content)
 }
 
+// renderHelp draws the keybinding overlay shown when state == stateHelp.
+// It replaces the list+detail body so every binding fits without
+// fighting for space against the row list. Grouped by purpose; tier
+// toggles get their own group because they were previously invisible
+// to anyone who hadn't read the source.
+func (m model) renderHelp(width, height int) string {
+	groups := []struct {
+		title string
+		keys  [][2]string
+	}{
+		{"Navigation", [][2]string{
+			{"j / k or ↓ / ↑", "move cursor"},
+			{"g / G", "top / bottom"},
+			{"PgUp / PgDn", "half-page (detail pane)"},
+			{"→ or tab", "focus detail pane"},
+			{"← or tab", "focus list pane"},
+			{"esc", "clear search / back"},
+		}},
+		{"Trace actions", [][2]string{
+			{"n", "new trace"},
+			{"e", "edit current trace"},
+			{"+ / =", "upvote (cycles +1 → 0)"},
+			{"-", "downvote (cycles -1 → 0)"},
+			{"d", "archive"},
+			{"u", "unarchive"},
+			{"D", "trash (or purge from trash view)"},
+			{"r", "recover from trash"},
+		}},
+		{"Views & filters", [][2]string{
+			{"1", "toggle short-tier visibility"},
+			{"2", "toggle mid-tier visibility"},
+			{"3", "toggle long-tier visibility"},
+			{"0", "show all tiers"},
+			{"a", "toggle archived (active + archived)"},
+			{"t", "toggle trash view"},
+			{"/", "search"},
+			{"f", "live follow (auto-refresh)"},
+			{"R", "manual refresh"},
+		}},
+		{"Other", [][2]string{
+			{"?", "this help (esc / enter / space to dismiss)"},
+			{"q or ctrl+c", "quit"},
+		}},
+	}
+
+	var lines []string
+	lines = append(lines, "")
+	lines = append(lines, "  "+styleHeader.Render("Noema")+styleHeaderAccent.Render(".")+styleDim.Render("  keybindings"))
+	lines = append(lines, "")
+	for _, g := range groups {
+		lines = append(lines, "  "+styleHeaderAccent.Render(g.title))
+		for _, kv := range g.keys {
+			lines = append(lines, fmt.Sprintf("    %-18s  %s", kv[0], styleDim.Render(kv[1])))
+		}
+		lines = append(lines, "")
+	}
+
+	// Pad or truncate to body height so the footer stays pinned.
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	return styleSurface.Width(width).Height(height).Render(strings.Join(lines, "\n"))
+}
+
 func (m model) renderFooter() string {
 	switch m.state {
 	case stateSearch:
@@ -1605,6 +1694,9 @@ func (m model) renderFooter() string {
 	case stateConfirm:
 		prompt := fmt.Sprintf("  %s %q? [y/N] ", m.confirm.action, m.confirm.id)
 		return styleError.Render(prompt)
+
+	case stateHelp:
+		return surfacePad(2) + styleFooter.Render("?/esc/enter:back  q:quit")
 
 	default:
 		if m.err != nil {
@@ -1618,11 +1710,11 @@ func (m model) renderFooter() string {
 		case m.focus == focusDetail:
 			// Detail-pane focus: arrow keys scroll the body, everything
 			// else is either reach-through (quit) or tab back to list.
-			hint = "j/k:scroll  g/G:top/bot  PgUp/PgDn:half  ←/tab:list  esc:list  q:quit"
+			hint = "j/k:scroll  g/G:top/bot  PgUp/PgDn:half  ←/tab:list  esc:list  ?:help  q:quit"
 		case m.showTrashed:
-			hint = "j/k:nav  r:recover  D:purge  t:back  /:search  →/tab:body  f:live  R:refresh  q:quit"
+			hint = "j/k:nav  r:recover  D:purge  t:back  /:search  →/tab:body  f:live  R:refresh  ?:help  q:quit"
 		default:
-			hint = "j/k:nav  n:new  e:edit  +/-:vote  d:archive  u:unarchive  D:trash  t:trash-view  a:all  /:search  →/tab:body  f:live  R:refresh  q:quit"
+			hint = "j/k:nav  n:new  e:edit  d:archive  D:trash  1/2/3:tier  0:all-tiers  /:search  →/tab:body  ?:help  q:quit"
 		}
 		if m.focus == focusList && m.searchQuery != "" {
 			hint = "esc:clear  " + hint
