@@ -269,3 +269,148 @@ func TestWatchdog_StopWithoutStartIsSafe(t *testing.T) {
 	})
 	w.Stop() // should be a no-op
 }
+
+// TestWatchdog_SkipsInFlightLocalClaim pins the Pattern B fix: when the
+// local pass-gate has registered a window as in-flight, the watchdog
+// must not close it out even if Timeout has elapsed. The runner is
+// about to emit Success; the watchdog beating it by milliseconds was
+// the actual production race we observed on 2026-05-15.
+func TestWatchdog_SkipsInFlightLocalClaim(t *testing.T) {
+	cx := buildWatchdogCortex(t)
+	// Emit the claim with cortex_id = local. EmitCoordinationEvent
+	// stamps cortex_id from the cortex itself, so the claim's
+	// WinnerID will match LocalCortexID below.
+	windowID := emitClaim(t, cx, cx.ID)
+
+	registry := consolidation.NewInFlightRegistry()
+	registry.Begin(windowID)
+	defer registry.End(windowID)
+
+	future := time.Now().Add(20 * time.Minute)
+	w := consolidation.NewWatchdog(consolidation.WatchdogConfig{
+		DB:            cx.DB.DB,
+		Emitter:       cx,
+		LocalCortexID: cx.ID,
+		Timeout:       10 * time.Minute,
+		Registry:      registry,
+		Now:           func() time.Time { return future },
+	})
+
+	if err := w.Sweep(); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if got := countActions(t, cx, event.ActionConsolidationFail); got != 0 {
+		t.Errorf("fail events = %d, want 0 (registry says local runner is still executing)", got)
+	}
+}
+
+// TestWatchdog_RemoteGraceDefersClosure pins the Pattern C fix: a
+// remote-emitted claim must not be closed out until Timeout + RemoteGrace
+// has elapsed, giving federation sync time to deliver the runner's
+// Success event. Without this, every long-running pass produces one
+// spurious watchdog_expired fail per observer whose sync lagged.
+func TestWatchdog_RemoteGraceDefersClosure(t *testing.T) {
+	cx := buildWatchdogCortex(t)
+	// Different cortex_id than the local cortex so the row is treated
+	// as remote-emitted. emitClaim stamps the WinnerID into FailData,
+	// but EmitCoordinationEvent stamps the cortex_id column from the
+	// cortex's own ID — which for findOrphans IS the row's cortex_id.
+	// So this test exercises the local-cortex path; for the true
+	// remote case the row would have come through federation replay.
+	// We approximate by inserting a raw event with a foreign cortex_id.
+	otherCortexID := "01REMOTECORTEXIDXXXXXXXXXXX"
+	windowID := "01REMOTECLAIMWINDOWXXXXXXXX"
+	insertRawWatchdogEvent(t, cx, event.ActionConsolidationClaim, windowID,
+		time.Now().Add(-12*time.Minute), otherCortexID)
+
+	// Timeout has elapsed (12m > 10m) but Timeout+RemoteGrace has not
+	// (12m < 10m + 5m). The watchdog must hold off.
+	w := consolidation.NewWatchdog(consolidation.WatchdogConfig{
+		DB:            cx.DB.DB,
+		Emitter:       cx,
+		LocalCortexID: cx.ID,
+		Timeout:       10 * time.Minute,
+		RemoteGrace:   5 * time.Minute,
+	})
+	if err := w.Sweep(); err != nil {
+		t.Fatalf("Sweep within grace: %v", err)
+	}
+	if got := countActions(t, cx, event.ActionConsolidationFail); got != 0 {
+		t.Errorf("fail events within remote grace = %d, want 0", got)
+	}
+
+	// Past the grace window — now the watchdog should close it out.
+	future := time.Now().Add(20 * time.Minute)
+	w2 := consolidation.NewWatchdog(consolidation.WatchdogConfig{
+		DB:            cx.DB.DB,
+		Emitter:       cx,
+		LocalCortexID: cx.ID,
+		Timeout:       10 * time.Minute,
+		RemoteGrace:   5 * time.Minute,
+		Now:           func() time.Time { return future },
+	})
+	if err := w2.Sweep(); err != nil {
+		t.Fatalf("Sweep past grace: %v", err)
+	}
+	if got := countActions(t, cx, event.ActionConsolidationFail); got != 1 {
+		t.Errorf("fail events past remote grace = %d, want 1", got)
+	}
+}
+
+// TestWatchdog_LocalClaimUsesStrictTimeout pins that RemoteGrace does
+// NOT delay closure of the local cortex's own orphaned claims. Only
+// remote claims need the federation-sync buffer; local claims racing
+// the runner are handled by the InFlightRegistry instead.
+func TestWatchdog_LocalClaimUsesStrictTimeout(t *testing.T) {
+	cx := buildWatchdogCortex(t)
+	// Local-emitted claim that has exceeded Timeout but not yet
+	// Timeout+RemoteGrace. The registry is empty (no in-flight pass),
+	// so the watchdog should close it on the strict timeout despite
+	// the configured remote grace.
+	windowID := emitClaim(t, cx, cx.ID)
+
+	future := time.Now().Add(11 * time.Minute) // past 10m timeout, within 10+5m
+	w := consolidation.NewWatchdog(consolidation.WatchdogConfig{
+		DB:            cx.DB.DB,
+		Emitter:       cx,
+		LocalCortexID: cx.ID,
+		Timeout:       10 * time.Minute,
+		RemoteGrace:   5 * time.Minute,
+		Registry:      consolidation.NewInFlightRegistry(),
+		Now:           func() time.Time { return future },
+	})
+	if err := w.Sweep(); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if got := countActions(t, cx, event.ActionConsolidationFail); got != 1 {
+		t.Errorf("fail events = %d, want 1 (local claim past strict timeout, registry empty)", got)
+	}
+	// Sanity: the closed window should be the one we emitted.
+	if r := findFailReason(t, cx, windowID); r != consolidation.FailReasonWatchdogExpired {
+		t.Errorf("fail reason for %s = %q, want %q", windowID, r, consolidation.FailReasonWatchdogExpired)
+	}
+}
+
+// insertRawWatchdogEvent writes an events row with a foreign cortex_id
+// so tests can exercise the "claim emitted by a remote peer" code path
+// without standing up a federation syncer. EmitCoordinationEvent
+// always stamps the LOCAL cortex_id, so the production-path emitClaim
+// helper can't produce a remote-attributed row.
+func insertRawWatchdogEvent(t *testing.T, cx *consolidationCortex, action event.Action, windowID string, ts time.Time, cortexID string) {
+	t.Helper()
+	payload := `{"window_id":"` + windowID + `","cortex_id":"` + cortexID + `"}`
+	id := "test-" + windowID + "-" + string(action)
+	_, err := cx.DB.Exec(
+		`INSERT INTO events (id, action, trace_id, origin, timestamp, data, vclock, cortex_id)
+		 VALUES (?, ?, ?, ?, ?, ?, '{}', ?)`,
+		id, string(action), windowID, "remote-peer", ts.UTC().Format(time.RFC3339), payload, cortexID,
+	)
+	if err != nil {
+		t.Fatalf("insert raw event: %v", err)
+	}
+}
+
+// consolidationCortex is a narrow alias so insertRawWatchdogEvent can
+// accept the *cortex.Cortex from buildWatchdogCortex without dragging
+// the cortex package import into the helper signature.
+type consolidationCortex = cortex.Cortex

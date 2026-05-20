@@ -39,7 +39,7 @@ import (
 // wrapper degenerates to "emit Claim, brief sleep, emit Success
 // around the pass" — correct but mildly wasteful. Phase 4 can add a
 // no-peers fast path if the overhead ever matters.
-func WithElection(inner PassFn, election *Election, log func(format string, args ...any)) PassFn {
+func WithElection(inner PassFn, election *Election, registry *InFlightRegistry, log func(format string, args ...any)) PassFn {
 	if log == nil {
 		log = func(string, ...any) {}
 	}
@@ -77,6 +77,13 @@ func WithElection(inner PassFn, election *Election, log func(format string, args
 			_ = election.Fail(windowID, reason)
 			return nil
 		}
+
+		// Mark the window in-flight before invoking inner() so the
+		// watchdog's Sweep can recognize this peer's own active pass
+		// and skip it. Cleared in a defer so a panic in inner() (or
+		// in Success/Fail emission) still releases the marker.
+		registry.Begin(windowID)
+		defer registry.End(windowID)
 
 		log("[consolidation] running as elected winner (trigger=%s window=%s)",
 			trigger, windowID)

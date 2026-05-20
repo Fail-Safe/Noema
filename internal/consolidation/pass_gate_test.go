@@ -38,7 +38,7 @@ func TestWithElection_SkipsWhenNotElected(t *testing.T) {
 	})
 
 	inner := &callTracker{}
-	wrapped := consolidation.WithElection(inner.pass, e, nil)
+	wrapped := consolidation.WithElection(inner.pass, e, nil, nil)
 
 	if err := wrapped(context.Background(), "cron"); err != nil {
 		t.Fatalf("wrapped: %v", err)
@@ -70,7 +70,7 @@ func TestWithElection_RunsWhenElected(t *testing.T) {
 	})
 
 	inner := &callTracker{}
-	wrapped := consolidation.WithElection(inner.pass, e, nil)
+	wrapped := consolidation.WithElection(inner.pass, e, nil, nil)
 
 	if err := wrapped(context.Background(), "cron"); err != nil {
 		t.Fatalf("wrapped: %v", err)
@@ -105,7 +105,7 @@ func TestWithElection_EmitsFailOnPassError(t *testing.T) {
 
 	passErr := errors.New("LLM backend returned 500")
 	inner := &callTracker{err: passErr}
-	wrapped := consolidation.WithElection(inner.pass, e, nil)
+	wrapped := consolidation.WithElection(inner.pass, e, nil, nil)
 
 	err := wrapped(context.Background(), "cron")
 	if err == nil || !errors.Is(err, passErr) {
@@ -138,7 +138,7 @@ func TestWithElection_HonorsContextCancellationDuringQuietPeriod(t *testing.T) {
 	})
 
 	inner := &callTracker{}
-	wrapped := consolidation.WithElection(inner.pass, e, nil)
+	wrapped := consolidation.WithElection(inner.pass, e, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // pre-cancel so the sleep returns immediately
@@ -217,7 +217,7 @@ func TestWithElection_EmitsNoWinnerAtRecheck(t *testing.T) {
 	})
 
 	inner := &callTracker{}
-	wrapped := consolidation.WithElection(inner.pass, e, nil)
+	wrapped := consolidation.WithElection(inner.pass, e, nil, nil)
 
 	// Demote local rank to 0 partway through the quiet period so the
 	// recheck finds zero eligible peers.
@@ -260,7 +260,7 @@ func TestWithElection_EmitsPeerOutrankedAtRecheck(t *testing.T) {
 	})
 
 	inner := &callTracker{}
-	wrapped := consolidation.WithElection(inner.pass, e, nil)
+	wrapped := consolidation.WithElection(inner.pass, e, nil, nil)
 
 	// Higher-ranked peer surfaces during the quiet wait.
 	go func() {

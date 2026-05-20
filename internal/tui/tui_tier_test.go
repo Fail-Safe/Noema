@@ -77,6 +77,43 @@ func TestTUI_TierToggleResetsCursor(t *testing.T) {
 	}
 }
 
+// TestTUI_HelpToggle pins the discoverability fix: '?' from the list
+// enters the help overlay; '?' or 'esc' exits back to the list. The
+// gap this closes is that tier-toggle keys (1/2/3/0) had been
+// undocumented in any UI surface, so users couldn't find the long-tier
+// rows hidden behind the default filter.
+func TestTUI_HelpToggle(t *testing.T) {
+	m := initialModel(nil)
+	if m.state != stateList {
+		t.Fatalf("starting state = %v, want stateList", m.state)
+	}
+	m = keyPress(m, "?")
+	if m.state != stateHelp {
+		t.Errorf("'?' from list did not enter stateHelp, got %v", m.state)
+	}
+	next, _ := m.updateHelp(tea.KeyMsg{Type: tea.KeyEsc})
+	if next.state != stateList {
+		t.Errorf("'esc' from help did not return to stateList, got %v", next.state)
+	}
+}
+
+// TestFooter_AdvertisesTierKeys locks in that the previously-hidden
+// tier toggle keys and the help overlay are advertised in the default-
+// mode footer hint. The whole point of this work is that these keys
+// are no longer invisible to a user who hasn't read the source.
+func TestFooter_AdvertisesTierKeys(t *testing.T) {
+	cx := setupCortex(t)
+	addTrace(t, cx, "first", "note")
+	m := loadedModel(t, cx)
+
+	hint := m.renderFooter()
+	for _, want := range []string{"1/2/3:tier", "0:all-tiers", "?:help"} {
+		if !strings.Contains(hint, want) {
+			t.Errorf("footer missing %q hint:\n%s", want, hint)
+		}
+	}
+}
+
 func TestTierBadge(t *testing.T) {
 	cases := map[string]string{
 		trace.TierShort: "s",
