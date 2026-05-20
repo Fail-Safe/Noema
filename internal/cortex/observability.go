@@ -74,22 +74,44 @@ type ConsolidationActivity struct {
 // activity are omitted to keep the JSON compact — consumers should
 // treat a missing date as "no events that day" rather than "missing
 // data."
+//
+// LostElection splits the three "preempted" fail reasons (peer_outranked,
+// no_winner_at_recheck, context_canceled) out of Fail. The election gate
+// emits those when the local peer claimed but a higher-ranked peer was
+// going to run anyway — that's the gate working as designed, not a
+// pipeline error. Operators reading the surface needed a way to tell
+// "the LLM endpoint is flapping" apart from "two peers raced and the
+// other one won."
 type ConsolidationDay struct {
-	Date    string `json:"date"` // YYYY-MM-DD (UTC)
-	Success int    `json:"success"`
-	Fail    int    `json:"fail"`
-	Claim   int    `json:"claim"`
-	Promote int    `json:"promote"`
-	Distill int    `json:"distill"`
+	Date         string `json:"date"` // YYYY-MM-DD (UTC)
+	Success      int    `json:"success"`
+	Fail         int    `json:"fail"`
+	LostElection int    `json:"lost_election"`
+	Claim        int    `json:"claim"`
+	Promote      int    `json:"promote"`
+	Distill      int    `json:"distill"`
 }
 
 // ConsolidationTotals sums each action over the entire window.
 type ConsolidationTotals struct {
-	Success int `json:"success"`
-	Fail    int `json:"fail"`
-	Claim   int `json:"claim"`
-	Promote int `json:"promote"`
-	Distill int `json:"distill"`
+	Success      int `json:"success"`
+	Fail         int `json:"fail"`
+	LostElection int `json:"lost_election"`
+	Claim        int `json:"claim"`
+	Promote      int `json:"promote"`
+	Distill      int `json:"distill"`
+}
+
+// preemptionReasons is the set of consolidation_fail reasons that
+// represent the election gate refusing to run (a peer outranked us, no
+// peer qualified at the recheck, or context cancellation) rather than
+// an actual pipeline error. Keeping the set in one place means a new
+// preemption reason added in election.go only needs to be mirrored
+// here; nothing else cares.
+var preemptionReasons = map[string]struct{}{
+	"peer_outranked":       {},
+	"no_winner_at_recheck": {},
+	"context_canceled":     {},
 }
 
 // PromotionLatency reports the distribution of time-to-promotion for
@@ -272,10 +294,18 @@ func (c *Cortex) ConsolidationActivity(since time.Duration) (ConsolidationActivi
 		args = append(args, cutoff.Format(time.RFC3339))
 	}
 
+	// The reason column is only meaningful for ActionConsolidationFail
+	// rows; the COALESCE keeps the grouping stable for every other
+	// action (they all share an empty-string reason bucket). The cost
+	// of the extra GROUP BY column is a few more rows per day on a
+	// noisy cortex — well below any meaningful threshold.
 	q := `
-		SELECT substr(timestamp, 1, 10) AS date, action, COUNT(*)
+		SELECT substr(timestamp, 1, 10)                  AS date,
+		       action,
+		       COALESCE(json_extract(data, '$.reason'), '') AS reason,
+		       COUNT(*)
 		FROM events ` + where + `
-		GROUP BY date, action
+		GROUP BY date, action, reason
 		ORDER BY date`
 	rows, err := c.DB.Query(q, args...)
 	if err != nil {
@@ -285,9 +315,9 @@ func (c *Cortex) ConsolidationActivity(since time.Duration) (ConsolidationActivi
 
 	byDate := map[string]*ConsolidationDay{}
 	for rows.Next() {
-		var date, action string
+		var date, action, reason string
 		var n int
-		if err := rows.Scan(&date, &action, &n); err != nil {
+		if err := rows.Scan(&date, &action, &reason, &n); err != nil {
 			return out, err
 		}
 		d, ok := byDate[date]
@@ -300,8 +330,13 @@ func (c *Cortex) ConsolidationActivity(since time.Duration) (ConsolidationActivi
 			d.Success += n
 			out.Totals.Success += n
 		case event.ActionConsolidationFail:
-			d.Fail += n
-			out.Totals.Fail += n
+			if _, preempted := preemptionReasons[reason]; preempted {
+				d.LostElection += n
+				out.Totals.LostElection += n
+			} else {
+				d.Fail += n
+				out.Totals.Fail += n
+			}
 		case event.ActionConsolidationClaim:
 			d.Claim += n
 			out.Totals.Claim += n
