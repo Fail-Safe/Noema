@@ -45,7 +45,9 @@ left the index pointing at files that no longer exist.`,
 			if result.Drifted > 0 {
 				fmt.Println("Note: drifted entries are long-tier traces whose on-disk files differ from the DB.")
 				fmt.Println("      The DB row is left untouched (long-tier is immutable). Visibility was still reconciled.")
-				fmt.Println("      Investigate with `noema verify drift`. Drifted IDs:")
+				fmt.Println("      Most common cause: federation-inherited rows whose origin name matches this")
+				fmt.Println("      cortex but whose cortex_id was correctly captured from the originating peer.")
+				fmt.Println("      Use `noema get <id>` to inspect each trace's current file body. Drifted IDs:")
 				for _, id := range result.DriftedIDs {
 					fmt.Printf("        %s\n", id)
 				}
