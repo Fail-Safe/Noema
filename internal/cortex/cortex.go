@@ -1985,6 +1985,19 @@ type SyncResult struct {
 	Updated   int // files found on disk and already in DB (re-synced)
 	Recovered int // orphaned DB rows whose files were rebuilt from the event log
 	Orphaned  int // IDs in DB with no corresponding file on disk (after recovery)
+	// Drifted counts long-tier traces whose on-disk file differs from the DB
+	// row in an immutable field (title, type, body hash, etc.). Sync refuses
+	// to reconcile such drift — the long-tier immutability trigger would
+	// abort, and even if it didn't, the right surface for "long-tier file
+	// drifted" is `noema verify drift`, not silent overwrite in either
+	// direction. Drifted rows still get archive/trash visibility reconciled.
+	// Surface them in the CLI so users know to investigate.
+	Drifted int
+	// DriftedIDs lists the IDs of drifted long-tier traces, in walk order.
+	// Capped at 10 to keep terminal output manageable on a cortex with a
+	// pathological number of drifted rows; the full set is recoverable via
+	// `noema verify drift` if needed.
+	DriftedIDs []string
 }
 
 // SyncOptions controls optional Sync behaviors.
@@ -1993,6 +2006,41 @@ type SyncOptions struct {
 	// rows from the local event log. Off by default so manual `rm` of a trace
 	// file remains a valid way to mark it for cleanup.
 	Recover bool
+}
+
+// longTierDrifted reports whether the on-disk trace's immutable fields
+// disagree with the DB row. Mirrors the WHEN clause of
+// trg_long_term_immutable (migration 013) so the function returns true
+// in exactly the same cases that would trip the trigger. Kept in lockstep
+// with the migration: a new locked field added to the trigger MUST also
+// be added here, otherwise the Drifted counter under-reports.
+//
+// existingCortexID is the DB's current cortex_id for the row (not on the
+// Row struct, so the caller queries it separately). The most common
+// real-world drift is federation-inherited rows where the file's origin
+// name matches the local cortex's display name but the DB's cortex_id
+// was correctly captured from the originating peer — Sync's resolver
+// would otherwise overwrite that ID, which the trigger blocks.
+//
+// Tags and lineage aren't on this list: they live in separate tables
+// (trace_tags, trace_lineage) that the trigger doesn't guard. Sync
+// still won't reconcile them when this function returns true — see the
+// callsite for why ("their content would point at a drifted-but-not-
+// applied state").
+func longTierDrifted(existing *Row, existingCortexID string, t *trace.Trace, contentHash, computedCortexID string) bool {
+	if existing == nil {
+		return false
+	}
+	return existing.Title != t.Title ||
+		existing.Type != t.Type ||
+		existing.Author != t.Author ||
+		existing.Origin != t.Origin ||
+		existingCortexID != computedCortexID ||
+		existing.ContentHash != contentHash ||
+		existing.UpdatedAt != t.Updated ||
+		existing.CreatedAt != t.Created ||
+		existing.SourceLocked != t.SourceLocked ||
+		existing.SourceHash != t.SourceHash
 }
 
 // Sync reconciles the database with the current state of the markdown files on
@@ -2082,7 +2130,14 @@ func (c *Cortex) SyncWithOptions(opts SyncOptions) (SyncResult, error) {
 		}
 
 		contentHash := trace.ContentHash(t.Body)
-		if t.ContentHash != contentHash {
+		// Long-tier traces are DB-level immutable: refuse to rewrite the
+		// file's content_hash frontmatter here. The hash-heal step is
+		// fine for short/mid traces (it self-repairs a metadata row that
+		// fell out of sync with the body) but for long-tier files even a
+		// frontmatter touch counts as mutation. Leave drift for the
+		// drift checker to surface.
+		isLongTier := dbErr == nil && existing != nil && existing.Tier == trace.TierLong
+		if t.ContentHash != contentHash && !isLongTier {
 			t.ContentHash = contentHash
 			if err := t.Write(e.path); err != nil {
 				return result, fmt.Errorf("updating content hash for %s: %w", t.ID, err)
@@ -2099,6 +2154,56 @@ func (c *Cortex) SyncWithOptions(opts SyncOptions) (SyncResult, error) {
 				return result, fmt.Errorf("inserting %s: %w", t.ID, err)
 			}
 			result.Added++
+		} else if isLongTier {
+			// Long-tier rows are immutable by trigger. ALWAYS use the
+			// narrow UPDATE that touches only the columns the trigger
+			// permits (archived_at, trashed_at). The blanket UPDATE
+			// path below is never safe here: even an apparently-no-op
+			// SET on a locked column trips trg_long_term_immutable
+			// when the OLD and NEW values disagree on a column we
+			// didn't think to check (the live regression was
+			// federation-inherited rows where the file's origin name
+			// matches the local cortex but the DB's cortex_id was
+			// correctly captured from the originating peer — Sync's
+			// resolver would overwrite that, the trigger aborts, and
+			// the entire run dies).
+			//
+			// Detect drift separately so the Drifted counter is right.
+			// The narrow UPDATE runs the same way either way; drift
+			// detection only affects the reported counter and the
+			// decision to skip tag/lineage/FTS reconciliation (which
+			// would point at a drifted-but-not-applied state).
+			var existingCortexID string
+			if err := tx.QueryRow(
+				`SELECT COALESCE(cortex_id, '') FROM traces WHERE id = ?`, t.ID,
+			).Scan(&existingCortexID); err != nil {
+				// Empty string is a fine fallback; the drift comparison
+				// still works (an empty existing vs. a non-empty computed
+				// reads as drift, which is the right answer when the row
+				// is mid-migration).
+				existingCortexID = ""
+			}
+			drifted := longTierDrifted(existing, existingCortexID, t, contentHash, cortexID)
+
+			_, err = tx.Exec(
+				`UPDATE traces SET archived_at=?, trashed_at=? WHERE id=?`,
+				archivedAt, trashedAt, t.ID,
+			)
+			if err != nil {
+				tx.Rollback()
+				return result, fmt.Errorf("reconciling visibility for long-tier %s: %w", t.ID, err)
+			}
+			if drifted {
+				result.Drifted++
+				if len(result.DriftedIDs) < 10 {
+					result.DriftedIDs = append(result.DriftedIDs, t.ID)
+				}
+				if err := tx.Commit(); err != nil {
+					return result, err
+				}
+				continue
+			}
+			result.Updated++
 		} else {
 			// Already in DB — update metadata and reconcile state.
 			_, err = tx.Exec(
