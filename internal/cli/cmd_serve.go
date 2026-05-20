@@ -230,8 +230,15 @@ func serveCmd() *cobra.Command {
 			// background-work lock so the cron scheduler only fires
 			// once per cortex even when multiple processes are serving
 			// MCP traffic.
+			//
+			// The in-flight registry is shared with the watchdog so
+			// the sweeper can recognize the local runner's active
+			// claims and skip them (Pattern B in the consolidation
+			// race analysis). Built unconditionally — both startups
+			// are cheap and a nil registry is safe-but-race-prone.
+			inFlight := consolidation.NewInFlightRegistry()
 			if gotLock && manifestErr == nil && m.Consolidation != nil && m.Consolidation.Enabled {
-				consolidator = startConsolidator(cx, m.Consolidation, m.Federation)
+				consolidator = startConsolidator(cx, m.Consolidation, m.Federation, inFlight)
 			}
 
 			// Eligibility loop: advertises this cortex's consolidation
@@ -251,7 +258,7 @@ func serveCmd() *cobra.Command {
 			// need a parallel sweeper.
 			if gotLock && manifestErr == nil && m.Consolidation != nil && m.Consolidation.Enabled &&
 				m.Federation != nil && len(m.Federation.Peers) > 0 {
-				watchdog = startWatchdog(cx, m.Consolidation)
+				watchdog = startWatchdog(cx, m.Consolidation, m.Federation, inFlight)
 			}
 
 			switch transport {
@@ -468,7 +475,13 @@ func startWatcher(cx *cortex.Cortex, cfg *cortex.WatchConfig) *watch.Watcher {
 // actually runs a cycle. Single-node cortexes skip the wrapper — the
 // gate would work there too, but it would emit a Claim+Success pair on
 // every pass for a degenerate election with a single participant.
-func startConsolidator(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig, fed *cortex.FederationConfig) *consolidation.Agent {
+//
+// registry is the process-local in-flight tracker shared with the
+// watchdog (built once in the caller). It is consulted by the watchdog
+// to skip windows the local runner is currently executing, eliminating
+// the same-peer race where a Sweep tick fires between the inner pass
+// completing and the Success event being emitted.
+func startConsolidator(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig, fed *cortex.FederationConfig, registry *consolidation.InFlightRegistry) *consolidation.Agent {
 	if cfg == nil || !cfg.Enabled {
 		return nil
 	}
@@ -540,7 +553,7 @@ func startConsolidator(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig, fed *
 			Emitter:     cx,
 			Log:         logger,
 		})
-		pass = consolidation.WithElection(pass, election, logger)
+		pass = consolidation.WithElection(pass, election, registry, logger)
 		fmt.Fprintf(os.Stderr, "[consolidation] election gate enabled (peers=%d quiet=%s)\n",
 			len(peerNames), 2*interval)
 	}
@@ -617,20 +630,41 @@ func startEligibility(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig, fed *c
 // pass trips the watchdog before the local consolidator emits success.
 // Sweep cadence is still an internal default (1 minute) — promoting
 // that to manifest config can wait until someone needs it.
-func startWatchdog(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig) *consolidation.Watchdog {
+func startWatchdog(cx *cortex.Cortex, cfg *cortex.ConsolidationConfig, fed *cortex.FederationConfig, registry *consolidation.InFlightRegistry) *consolidation.Watchdog {
 	logger := func(format string, args ...any) {
 		fmt.Fprintf(os.Stderr, format+"\n", args...)
 	}
 	timeout := cfg.EffectiveWatchdogTimeout()
+
+	// Remote claims need an extra grace period so federation sync has
+	// time to deliver the runner's Success before the observer's
+	// watchdog ticks. Without it, every long-running pass produces one
+	// spurious watchdog_expired fail per observer whose sync interval
+	// hadn't yet caught up. The 2 × interval default mirrors the
+	// election quiet-period and the syncer's worst-case staleness.
+	remoteGrace := time.Duration(0)
+	if fed != nil && len(fed.Peers) > 0 {
+		interval := 30 * time.Second
+		if fed.Interval != "" {
+			if parsed, err := time.ParseDuration(fed.Interval); err == nil && parsed > 0 {
+				interval = parsed
+			}
+		}
+		remoteGrace = 2 * interval
+	}
+
 	w := consolidation.NewWatchdog(consolidation.WatchdogConfig{
 		DB:            cx.DB.DB,
 		Emitter:       cx,
 		LocalCortexID: cx.ID,
 		Timeout:       timeout,
+		RemoteGrace:   remoteGrace,
+		Registry:      registry,
 		Log:           logger,
 	})
 	w.Start()
-	fmt.Fprintf(os.Stderr, "[consolidation] watchdog started (timeout=%s)\n", timeout)
+	fmt.Fprintf(os.Stderr, "[consolidation] watchdog started (timeout=%s remote_grace=%s)\n",
+		timeout, remoteGrace)
 	return w
 }
 

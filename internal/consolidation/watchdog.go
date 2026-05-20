@@ -47,6 +47,29 @@ type WatchdogConfig struct {
 	// closed out. Zero defaults to defaultWatchdogInterval.
 	Interval time.Duration
 
+	// RemoteGrace is added to Timeout when evaluating claims emitted by
+	// a peer other than LocalCortexID. The motivation is the
+	// observer-side race in §14 of the consolidation plan: a peer's
+	// successful pass produces a Success event that takes one
+	// federation.interval to propagate. Without an extra grace, every
+	// observer's watchdog tick that falls between Timeout-elapsed and
+	// Success-arrived emits a spurious watchdog_expired fail, and
+	// `consolidation_health.totals.fail` ends up double-counting the
+	// completed pass by exactly the number of observers whose sync
+	// hadn't caught up. Recommend setting to ~2 × federation.interval;
+	// zero disables the grace (every claim, local or remote, gets the
+	// same Timeout).
+	RemoteGrace time.Duration
+
+	// Registry tracks windows the local pass-gate is currently
+	// executing. Sweep skips windows where IsActive(window) is true to
+	// kill the same-peer race: the runner is about to emit Success but
+	// the watchdog sweep saw the claim as orphaned because it ticked
+	// just before Success landed. A nil registry is permitted (tests
+	// and pre-wiring shims rely on it) and degrades to the previous
+	// race-prone behavior.
+	Registry *InFlightRegistry
+
 	// Now is injected for tests; zero defaults to time.Now.
 	Now func() time.Time
 
@@ -151,17 +174,47 @@ type orphanedClaim struct {
 // Not safe for concurrent invocation — the loop goroutine is the only
 // expected caller in production. The internal mutex serializes any
 // stray test calls against the loop.
+//
+// The SQL prefilter uses the LOCAL cutoff (now − Timeout) so it
+// returns every claim old enough for the local cortex to consider
+// closing. The Go filter then enforces the stricter remote cutoff
+// (now − (Timeout + RemoteGrace)) on claims attributed to a different
+// cortex, plus the in-flight registry check that protects this peer's
+// own active passes.
 func (w *Watchdog) Sweep() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	cutoff := w.cfg.Now().Add(-w.cfg.Timeout).UTC().Format(time.RFC3339)
-	orphans, err := w.findOrphans(cutoff)
+	now := w.cfg.Now()
+	// "Older than X" reads as "timestamp earlier than now − X." The
+	// SQL filter uses the bound that lets the most rows through (the
+	// shorter age) so per-row policy can be applied in Go.
+	localCutoff := now.Add(-w.cfg.Timeout)
+	remoteCutoff := now.Add(-(w.cfg.Timeout + w.cfg.RemoteGrace))
+
+	orphans, err := w.findOrphans(localCutoff.UTC().Format(time.RFC3339))
 	if err != nil {
 		return fmt.Errorf("watchdog query: %w", err)
 	}
 
 	for _, o := range orphans {
+		if w.cfg.Registry.IsActive(o.WindowID) {
+			// Local runner is still executing this window; trust
+			// the runner. Pattern B (runner-Sweep race on the same
+			// peer) lives here.
+			continue
+		}
+		if w.cfg.RemoteGrace > 0 && o.WinnerID != w.cfg.LocalCortexID {
+			// Remote-emitted claim: defer until the federation-sync
+			// grace window has also elapsed. Pattern C (observer's
+			// watchdog firing before the runner's Success replicates)
+			// lives here.
+			claimedAt, perr := time.Parse(time.RFC3339, o.Timestamp)
+			if perr == nil && claimedAt.After(remoteCutoff) {
+				continue
+			}
+		}
+
 		// Each emission goes through the same EmitCoordinationEvent
 		// path used by Election, so the closing fail lands in the
 		// event log with the local cortex as the emitter and the
