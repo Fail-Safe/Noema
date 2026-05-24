@@ -8,12 +8,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/Fail-Safe/Noema/internal/config"
 	"github.com/Fail-Safe/Noema/internal/cortex"
 	"github.com/Fail-Safe/Noema/internal/event"
+	"github.com/Fail-Safe/Noema/internal/tlsutil"
 )
 
 // verifyCortexCmd implements the cortex health check ("doctor"). It is
@@ -94,6 +96,7 @@ func runVerifyCortexFor(out io.Writer, cx *cortex.Cortex, cfg *config.Config, cf
 	results = append(results, checkManifest(cx)...)
 	results = append(results, checkDB(cx))
 	results = append(results, checkAccess(cx))
+	results = append(results, checkTLSCerts(cx, time.Now()))
 	results = append(results, checkFederationConfig(cx)...)
 	results = append(results, checkWatch(cx))
 	results = append(results, checkConsolidation(cx))
@@ -379,6 +382,96 @@ func checkAccess(cx *cortex.Cortex) checkResult {
 		level:   checkOK,
 		summary: fmt.Sprintf("keyed (source=%s, fp=%s)", key.Source, key.Fingerprint),
 		detail:  detail,
+	}
+}
+
+// checkTLSCerts inspects access.tls_cert_path from the manifest and
+// classifies the cert's expiry. When no cert path is configured the
+// check reports ok with a hint — many cortexes run loopback-only over
+// stdio and have no need for TLS. When a path is configured but the
+// file is unreadable, that's a fail. Expired or not-yet-valid certs
+// are fail-level; near-expiry (≤7 days) is a warn so operators see it
+// in the doctor output before serve refuses to start.
+//
+// The key file is checked for existence only — we don't try to load or
+// validate it (that would require parsing a private key, and the key
+// material has no expiry to report on).
+func checkTLSCerts(cx *cortex.Cortex, now time.Time) checkResult {
+	m, err := cortex.ReadManifest(cx.Dir)
+	if err != nil {
+		return checkResult{
+			name:    "tls",
+			level:   checkFail,
+			summary: fmt.Sprintf("manifest unavailable: %v", err),
+		}
+	}
+	certPath, keyPath := cortex.ResolveTLSPaths(cx.Dir, m.Access)
+	if certPath == "" && keyPath == "" {
+		return checkResult{
+			name:    "tls",
+			level:   checkOK,
+			summary: "no TLS configured (loopback-only OK; keyed federation requires TLS)",
+		}
+	}
+	if certPath == "" || keyPath == "" {
+		missing := "tls_cert_path"
+		if certPath != "" {
+			missing = "tls_key_path"
+		}
+		return checkResult{
+			name:    "tls",
+			level:   checkFail,
+			summary: fmt.Sprintf("access.%s is set but the other is empty — configure both", missing),
+		}
+	}
+	if _, err := os.Stat(keyPath); err != nil {
+		return checkResult{
+			name:    "tls",
+			level:   checkFail,
+			summary: fmt.Sprintf("tls_key_path unreadable: %v", err),
+		}
+	}
+	cert, err := tlsutil.LoadLeaf(certPath)
+	if err != nil {
+		return checkResult{
+			name:    "tls",
+			level:   checkFail,
+			summary: err.Error(),
+		}
+	}
+	c := tlsutil.Classify(cert, now)
+	subject := cert.Subject.CommonName
+	if subject == "" {
+		subject = "(no CN)"
+	}
+	notAfter := c.NotAfter.UTC().Format("2006-01-02")
+	switch c.Status {
+	case tlsutil.StatusExpired:
+		return checkResult{
+			name:    "tls",
+			level:   checkFail,
+			summary: fmt.Sprintf("expired %d day(s) ago (NotAfter=%s, CN=%s)", -c.DaysRemaining, notAfter, subject),
+			detail:  fmt.Sprintf("Path: %s. Rotate the cert before restarting `noema serve`.", certPath),
+		}
+	case tlsutil.StatusNotYetValid:
+		return checkResult{
+			name:    "tls",
+			level:   checkFail,
+			summary: fmt.Sprintf("NotBefore is in the future (NotAfter=%s, CN=%s)", notAfter, subject),
+			detail:  fmt.Sprintf("Path: %s. Clock skew, or the wrong cert is configured.", certPath),
+		}
+	case tlsutil.StatusNearExpiry:
+		return checkResult{
+			name:    "tls",
+			level:   checkWarn,
+			summary: fmt.Sprintf("expires in %d day(s) (NotAfter=%s, CN=%s)", c.DaysRemaining, notAfter, subject),
+			detail:  fmt.Sprintf("Path: %s. Rotate within the next week.", certPath),
+		}
+	}
+	return checkResult{
+		name:    "tls",
+		level:   checkOK,
+		summary: fmt.Sprintf("%d days until NotAfter=%s (CN=%s)", c.DaysRemaining, notAfter, subject),
 	}
 }
 

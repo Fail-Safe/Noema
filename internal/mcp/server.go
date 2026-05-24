@@ -1087,6 +1087,12 @@ JSON object rather than a plain string. Currently:
   your client either has it configured and every tool call works, or it doesn't and
   you'll see a 401 from the transport layer.
 - Stdio is unaffected by this posture: stdio implies local-process trust.
+- TLS cert paths can also live in cortex.md as access.tls_cert_path / access.tls_key_path,
+  giving --tls-cert/--tls-key sane defaults for restarts and a static target for
+  noema verify cortex to audit. The serve command refuses to start on an expired
+  or not-yet-valid cert (override: --insecure-allow-expired), warns at startup when
+  the cert expires within 7 days, and runs an hourly background cert monitor that
+  logs [cert-monitor] band transitions at 90 / 30 / 7 / expired.
 
 ## Federation Modes
 The cortex-level federation mode controls how this instance participates in a ring:
