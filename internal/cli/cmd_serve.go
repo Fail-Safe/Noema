@@ -22,6 +22,7 @@ import (
 	"github.com/Fail-Safe/Noema/internal/federation"
 	"github.com/Fail-Safe/Noema/internal/lock"
 	mcpserver "github.com/Fail-Safe/Noema/internal/mcp"
+	"github.com/Fail-Safe/Noema/internal/tlsutil"
 	"github.com/Fail-Safe/Noema/internal/watch"
 	mcpgo "github.com/mark3labs/mcp-go/server"
 )
@@ -31,9 +32,10 @@ func serveCmd() *cobra.Command {
 		transport         string
 		hosts             []string
 		port              int
-		tlsCert           string
-		tlsKey            string
-		logFile           string
+		tlsCert              string
+		tlsKey               string
+		insecureAllowExpired bool
+		logFile              string
 		logStderr         bool
 		printConfig       bool
 		printSystemdUnit  bool
@@ -135,6 +137,7 @@ func serveCmd() *cobra.Command {
 			var consolidator *consolidation.Agent
 			var eligibility *consolidation.EligibilityLoop
 			var watchdog *consolidation.Watchdog
+			var certMonitor *mcpserver.CertMonitor
 
 			// Per-cortex background-work coordination. Concurrent serve
 			// processes on the same cortex (long-lived `--transport http`
@@ -284,10 +287,30 @@ func serveCmd() *cobra.Command {
 						cortex.AccessKeyEnvVar, accessKey.Path)
 				}
 
+				// Manifest fallback for TLS paths. A CLI flag wins; an
+				// unset flag falls back to access.tls_cert_path /
+				// access.tls_key_path so operators don't re-type long
+				// paths on every restart and so `noema verify cortex`
+				// can audit the same cert this serve uses.
+				if mCertPath, mKeyPath := cortex.ResolveTLSPaths(cx.Dir, m.Access); mCertPath != "" || mKeyPath != "" {
+					if tlsCert == "" {
+						tlsCert = mCertPath
+					}
+					if tlsKey == "" {
+						tlsKey = mKeyPath
+					}
+				}
+
 				if err := validateHTTPServe(hosts, tlsCert, tlsKey, cx.Name, cortexFlag != ""); err != nil {
 					return err
 				}
 				useTLS := tlsCert != "" && tlsKey != ""
+
+				if useTLS {
+					if err := gateTLSExpiry(tlsCert, insecureAllowExpired, time.Now(), os.Stderr); err != nil {
+						return err
+					}
+				}
 
 				if err := requireTLSForKeyedMode(accessKey, useTLS); err != nil {
 					return err
@@ -318,6 +341,17 @@ func serveCmd() *cobra.Command {
 						accessKey.Source, accessKey.Fingerprint)
 				} else {
 					fmt.Fprintf(os.Stderr, "[serve] access=open\n")
+				}
+
+				// Background cert monitor: re-checks NotAfter every hour
+				// and logs a band-transition line whenever the cert moves
+				// into a tighter warning window. Gated on the
+				// background-work lock for the same reason as the other
+				// long-lived loops — one process per cortex avoids
+				// duplicate log lines in the journal.
+				if useTLS && gotLock {
+					certMonitor = mcpserver.NewCertMonitor(tlsCert, os.Stderr)
+					certMonitor.Start()
 				}
 
 				// Build the MCP handler. No WithEndpointPath — our
@@ -409,6 +443,9 @@ func serveCmd() *cobra.Command {
 			if watchdog != nil {
 				watchdog.Stop()
 			}
+			if certMonitor != nil {
+				certMonitor.Stop()
+			}
 			// Release the background-work lock last so background
 			// goroutines have already drained — the kernel would
 			// release it on exit anyway, but explicit release lets
@@ -426,6 +463,7 @@ func serveCmd() *cobra.Command {
 	cmd.Flags().IntVar(&port, "port", 3000, "port for HTTP transport")
 	cmd.Flags().StringVar(&tlsCert, "tls-cert", "", "path to TLS certificate file (enables HTTPS)")
 	cmd.Flags().StringVar(&tlsKey, "tls-key", "", "path to TLS private key file")
+	cmd.Flags().BoolVar(&insecureAllowExpired, "insecure-allow-expired", false, "serve even if the TLS certificate is already expired (escape hatch; logs an explicit warning)")
 	cmd.Flags().StringVar(&logFile, "log-file", "", "write operational logs to this path (default: $XDG_STATE_HOME/noema/<cortex>.log in stdio mode; stderr in http mode)")
 	cmd.Flags().BoolVar(&logStderr, "log-stderr", false, "force logs to stderr even in stdio mode (overrides the default file redirect)")
 	cmd.Flags().BoolVar(&printConfig, "print-config", false, "print MCP client config JSON and exit")
@@ -700,6 +738,56 @@ func startSyncer(cx *cortex.Cortex, sharedKey string, fc *cortex.FederationConfi
 
 	fmt.Fprintf(os.Stderr, "Federation syncer started (%d peers, interval %s)\n", len(peers), cfg.EffectiveInterval())
 	return syncer
+}
+
+// gateTLSExpiry refuses to start `noema serve --transport http` when
+// the configured leaf cert is already past its NotAfter (or not yet
+// valid). Near-expiry (≤7 days) is a warning only — the server still
+// starts, but the operator sees a loud line in their journal. The
+// --insecure-allow-expired escape hatch downgrades expired to a warning
+// so an operator can still bring the server up briefly to rotate the
+// cert in place.
+//
+// `now` is injected so tests can pin the reference time. `out` is
+// where warning lines are written (stderr in production).
+func gateTLSExpiry(certPath string, allowExpired bool, now time.Time, out io.Writer) error {
+	cert, err := tlsutil.LoadLeaf(certPath)
+	if err != nil {
+		return fmt.Errorf("refusing to start: cannot read TLS certificate: %w", err)
+	}
+	c := tlsutil.Classify(cert, now)
+	switch c.Status {
+	case tlsutil.StatusExpired:
+		if !allowExpired {
+			return fmt.Errorf(
+				"refusing to start: TLS certificate at %s expired %d day(s) ago (NotAfter=%s).\n"+
+					"  Clients (Claude Code, Hermes, browsers) reject expired certs and the server\n"+
+					"  would appear unreachable to every peer in the federation ring.\n"+
+					"  Rotate the cert and restart, or pass --insecure-allow-expired to bring the\n"+
+					"  server up briefly so you can rotate in place",
+				certPath, -c.DaysRemaining, c.NotAfter.UTC().Format(time.RFC3339),
+			)
+		}
+		fmt.Fprintf(out,
+			"[serve] WARN --insecure-allow-expired: TLS cert at %s expired %d day(s) ago (NotAfter=%s)\n",
+			certPath, -c.DaysRemaining, c.NotAfter.UTC().Format(time.RFC3339))
+	case tlsutil.StatusNotYetValid:
+		if !allowExpired {
+			return fmt.Errorf(
+				"refusing to start: TLS certificate at %s NotBefore is in the future (NotAfter=%s).\n"+
+					"  This is usually clock skew or the wrong cert path.\n"+
+					"  Pass --insecure-allow-expired to bypass this check",
+				certPath, c.NotAfter.UTC().Format(time.RFC3339))
+		}
+		fmt.Fprintf(out,
+			"[serve] WARN --insecure-allow-expired: TLS cert at %s not yet valid (NotAfter=%s)\n",
+			certPath, c.NotAfter.UTC().Format(time.RFC3339))
+	case tlsutil.StatusNearExpiry:
+		fmt.Fprintf(out,
+			"[serve] WARN TLS cert at %s expires in %d day(s) (NotAfter=%s) — rotate soon\n",
+			certPath, c.DaysRemaining, c.NotAfter.UTC().Format(time.RFC3339))
+	}
+	return nil
 }
 
 // requireTLSForKeyedMode returns a startup error when shared-key auth is

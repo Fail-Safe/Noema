@@ -389,6 +389,23 @@ If both are set, the env var wins and the server logs a warning so operators not
 
 **TLS is required.** Keyed mode refuses to start over plaintext HTTP — a bearer token sent without TLS is stolen by the first adversary on the network path. Pair `--tls-cert` with `--tls-key`, or run in open mode.
 
+**TLS cert lifecycle.** Cert paths can be configured once in `cortex.md` so you don't re-type them on every restart:
+
+```yaml
+access:
+  shared_key_file: .access.secret
+  tls_cert_path: /path/server.crt
+  tls_key_path:  /path/server.key
+```
+
+CLI flags still win when both are present. With paths configured, `noema serve` parses the leaf cert at startup and:
+
+- **Refuses to start on an expired or not-yet-valid cert.** Clients reject it anyway — better to fail loud than serve a cert nothing will accept. Pass `--insecure-allow-expired` to bypass briefly for in-place rotation; the override logs a loud warning.
+- **Warns at startup if the cert expires within 7 days.**
+- **Runs a background cert monitor** that re-checks every hour while serving and logs a `[cert-monitor]` line as the cert crosses 90 / 30 / 7 / expired bands. Lines fire on band transitions only, not every hour.
+
+`noema verify cortex` reads the same manifest fields, so you can audit cert health without restarting the server.
+
 **Sidecar-file example:**
 
 ```markdown

@@ -58,6 +58,15 @@ type AccessConfig struct {
 	// against the cortex directory. The manifest itself never holds the
 	// secret — only a pointer to where it lives.
 	SharedKeyFile string `yaml:"shared_key_file,omitempty"`
+
+	// TLSCertPath and TLSKeyPath are optional paths to the PEM cert
+	// and private key the HTTP MCP server should present. When set,
+	// `noema serve --transport http` uses them as the default for
+	// --tls-cert/--tls-key (CLI flags still win), and
+	// `noema verify cortex` reads them to surface upcoming expiry.
+	// Relative paths are resolved against the cortex directory.
+	TLSCertPath string `yaml:"tls_cert_path,omitempty"`
+	TLSKeyPath  string `yaml:"tls_key_path,omitempty"`
 }
 
 // Federation mode constants.
