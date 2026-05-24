@@ -414,14 +414,14 @@ func checkTLSCerts(cx *cortex.Cortex, now time.Time) checkResult {
 		}
 	}
 	if certPath == "" || keyPath == "" {
-		missing := "tls_cert_path"
-		if certPath != "" {
-			missing = "tls_key_path"
+		present, missing := "tls_cert_path", "tls_key_path"
+		if certPath == "" {
+			present, missing = "tls_key_path", "tls_cert_path"
 		}
 		return checkResult{
 			name:    "tls",
 			level:   checkFail,
-			summary: fmt.Sprintf("access.%s is set but the other is empty — configure both", missing),
+			summary: fmt.Sprintf("access.%s is set but access.%s is empty — configure both", present, missing),
 		}
 	}
 	if _, err := os.Stat(keyPath); err != nil {

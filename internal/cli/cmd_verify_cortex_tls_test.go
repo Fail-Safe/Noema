@@ -137,8 +137,34 @@ func TestCheckTLSCerts_OnlyOneFieldSet(t *testing.T) {
 	if r.level != checkFail {
 		t.Fatalf("level = %v want fail; summary=%q", r.level, r.summary)
 	}
-	if !strings.Contains(r.summary, "tls_key_path") {
-		t.Errorf("summary = %q", r.summary)
+	// Both field names should appear, and the wording must identify
+	// tls_cert_path as the one that's set and tls_key_path as the empty one.
+	if !strings.Contains(r.summary, "access.tls_cert_path is set") ||
+		!strings.Contains(r.summary, "access.tls_key_path is empty") {
+		t.Errorf("backwards or imprecise wording: %q", r.summary)
+	}
+}
+
+// TestCheckTLSCerts_OnlyKeyFieldSet pins the mirror case so the
+// present/missing identification stays correct in both directions.
+func TestCheckTLSCerts_OnlyKeyFieldSet(t *testing.T) {
+	dir, _ := newSandboxedCortex(t, "tls-partial-k")
+	m, err := cortex.ReadManifest(dir)
+	if err != nil {
+		t.Fatalf("ReadManifest: %v", err)
+	}
+	m.Access = &cortex.AccessConfig{TLSKeyPath: "/tmp/key.pem"}
+	if err := cortex.WriteManifest(dir, m); err != nil {
+		t.Fatalf("WriteManifest: %v", err)
+	}
+	cx := openCortexDir(t, "tls-partial-k", dir)
+	r := checkTLSCerts(cx, time.Now())
+	if r.level != checkFail {
+		t.Fatalf("level = %v want fail; summary=%q", r.level, r.summary)
+	}
+	if !strings.Contains(r.summary, "access.tls_key_path is set") ||
+		!strings.Contains(r.summary, "access.tls_cert_path is empty") {
+		t.Errorf("backwards or imprecise wording: %q", r.summary)
 	}
 }
 
