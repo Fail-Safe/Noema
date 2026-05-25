@@ -164,6 +164,26 @@ func loadKeyFile(path string) (string, error) {
 	return key, nil
 }
 
+// ResolveTLSPaths returns absolute cert/key paths from an AccessConfig,
+// resolving any relative paths against cortexDir. Empty inputs map to
+// empty outputs (no implicit defaults — TLS is opt-in). Returns
+// ("", "") when cfg is nil or both fields are empty.
+func ResolveTLSPaths(cortexDir string, cfg *AccessConfig) (certPath, keyPath string) {
+	if cfg == nil {
+		return "", ""
+	}
+	abs := func(p string) string {
+		if p == "" {
+			return ""
+		}
+		if filepath.IsAbs(p) {
+			return p
+		}
+		return filepath.Join(cortexDir, p)
+	}
+	return abs(cfg.TLSCertPath), abs(cfg.TLSKeyPath)
+}
+
 // KeyFingerprint returns a non-secret SHA-256 fingerprint of an MCP
 // shared key, formatted SSH-style as SHA256:<pair>:<pair>:... Safe to
 // log, display in federation_status, and read aloud over an
