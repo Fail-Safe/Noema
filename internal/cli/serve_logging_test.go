@@ -41,11 +41,11 @@ func TestSetupServeLogging_StdioDefault(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", tmp)
 
-	got, err := setupServeLogging("agentbrain", "stdio", "", false)
+	got, err := setupServeLogging("mycortex", "stdio", "", false)
 	if err != nil {
 		t.Fatalf("setupServeLogging: %v", err)
 	}
-	want := filepath.Join(tmp, "noema", "agentbrain.log")
+	want := filepath.Join(tmp, "noema", "mycortex.log")
 	if got != want {
 		t.Errorf("path = %q, want %q", got, want)
 	}

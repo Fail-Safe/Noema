@@ -191,7 +191,7 @@ type FailData struct {
 // The three "preempted" reasons (PeerOutranked, NoWinnerAtRecheck,
 // ContextCanceled) replace the older catch-all "aborted_by_peer_conflict"
 // reason that was emitted by all three quiet-period exit paths. Telling
-// them apart in the event log lets operators distinguish "ai-3 outranked
+// them apart in the event log lets operators distinguish "peer-c outranked
 // us during the wait" from "everyone's rank entry expired" from
 // "agent.Stop() interrupted us" — same outcome (no pass), wildly
 // different operational meaning.

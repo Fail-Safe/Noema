@@ -235,8 +235,8 @@ func TestMigrateCortexID_ClearsStalePeerState(t *testing.T) {
 	}
 	m.Federation = &cortex.FederationConfig{
 		Peers: []cortex.PeerEntry{
-			{Name: "ai-2", Endpoint: "https://ai-2.example:3000"},
-			{Name: "ai-3", Endpoint: "https://ai-3.example:3000"},
+			{Name: "peer-b", Endpoint: "https://peer-b.example:3000"},
+			{Name: "peer-c", Endpoint: "https://peer-c.example:3000"},
 		},
 	}
 	if err := cortex.WriteManifest(dir, m); err != nil {
@@ -254,7 +254,7 @@ func TestMigrateCortexID_ClearsStalePeerState(t *testing.T) {
 	}
 	defer conn.Close()
 
-	staleClock := map[string]uint64{name: 1, "ai-2": 5, "ai-3": 7}
+	staleClock := map[string]uint64{name: 1, "peer-b": 5, "peer-c": 7}
 	clockJSON, _ := json.Marshal(staleClock)
 	if _, err := conn.Exec(
 		`INSERT INTO federation_state (key, value) VALUES ('vclock', ?)
@@ -267,8 +267,8 @@ func TestMigrateCortexID_ClearsStalePeerState(t *testing.T) {
 		name string
 		id   string
 	}{
-		{"ai-2", "01JOLD000000000000000AI200"},
-		{"ai-3", "01JOLD000000000000000AI300"},
+		{"peer-b", "01JOLD000000000000000PRB00"},
+		{"peer-c", "01JOLD000000000000000PRC00"},
 	} {
 		if _, err := conn.Exec(
 			`INSERT INTO federation_state (key, value) VALUES (?, ?)`,
@@ -286,10 +286,10 @@ func TestMigrateCortexID_ClearsStalePeerState(t *testing.T) {
 	for _, row := range []struct {
 		key, value string
 	}{
-		{"peer:ai-2:last_event", "01EVENT00000000000000AI201"},
-		{"peer:ai-2:last_seen", "2026-04-07T12:00:00Z"},
-		{"peer:ai-3:last_event", "01EVENT00000000000000AI301"},
-		{"peer:ai-3:last_seen", "2026-04-07T12:00:00Z"},
+		{"peer:peer-b:last_event", "01EVENT00000000000000PRB01"},
+		{"peer:peer-b:last_seen", "2026-04-07T12:00:00Z"},
+		{"peer:peer-c:last_event", "01EVENT00000000000000PRC01"},
+		{"peer:peer-c:last_seen", "2026-04-07T12:00:00Z"},
 	} {
 		if _, err := conn.Exec(
 			`INSERT INTO federation_state (key, value) VALUES (?, ?)`,
@@ -338,11 +338,11 @@ func TestMigrateCortexID_ClearsStalePeerState(t *testing.T) {
 	if err := json.Unmarshal([]byte(clockRaw), &vc); err != nil {
 		t.Fatalf("parse vclock: %v", err)
 	}
-	if _, lingering := vc["ai-2"]; lingering {
-		t.Errorf("vclock still has ai-2 bucket: %v", vc)
+	if _, lingering := vc["peer-b"]; lingering {
+		t.Errorf("vclock still has peer-b bucket: %v", vc)
 	}
-	if _, lingering := vc["ai-3"]; lingering {
-		t.Errorf("vclock still has ai-3 bucket: %v", vc)
+	if _, lingering := vc["peer-c"]; lingering {
+		t.Errorf("vclock still has peer-c bucket: %v", vc)
 	}
 	if vc[newID] == 0 {
 		t.Errorf("vclock missing entry under new id %q: %v", newID, vc)
@@ -384,8 +384,8 @@ func TestMigrateCortexID_ClearsStalePeerState(t *testing.T) {
 // TestMigrateCortexID_ResetClearsCursors pins the new --reset side effect:
 // cursors and last_seen rows are wiped so the post-migration syncer
 // re-pulls each peer's event log from the start. This is the fix for the
-// incident where ai-2/ai-3 migrated with --reset, kept their pre-incident
-// cursors for ai-1, and then only saw the handful of events ai-1 emitted
+// incident where peer-b/peer-c migrated with --reset, kept their pre-incident
+// cursors for peer-a, and then only saw the handful of events peer-a emitted
 // after the chaos — silently skipping everything written during the
 // period of broken federation that motivated the reset in the first place.
 //
@@ -405,8 +405,8 @@ func TestMigrateCortexID_ResetClearsCursors(t *testing.T) {
 	}
 	m.Federation = &cortex.FederationConfig{
 		Peers: []cortex.PeerEntry{
-			{Name: "ai-1", Endpoint: "https://ai-1.example:3000"},
-			{Name: "ai-3", Endpoint: "https://ai-3.example:3000"},
+			{Name: "peer-a", Endpoint: "https://peer-a.example:3000"},
+			{Name: "peer-c", Endpoint: "https://peer-c.example:3000"},
 		},
 	}
 	if err := cortex.WriteManifest(dir, m); err != nil {
@@ -423,10 +423,10 @@ func TestMigrateCortexID_ResetClearsCursors(t *testing.T) {
 	for _, row := range []struct {
 		key, value string
 	}{
-		{"peer:ai-1:last_event", "01EVENT0000000000000000AI1"},
-		{"peer:ai-1:last_seen", "2026-04-07T12:00:00Z"},
-		{"peer:ai-3:last_event", "01EVENT0000000000000000AI3"},
-		{"peer:ai-3:last_seen", "2026-04-07T12:00:00Z"},
+		{"peer:peer-a:last_event", "01EVENT0000000000000000PRA"},
+		{"peer:peer-a:last_seen", "2026-04-07T12:00:00Z"},
+		{"peer:peer-c:last_event", "01EVENT0000000000000000PRC"},
+		{"peer:peer-c:last_seen", "2026-04-07T12:00:00Z"},
 	} {
 		if _, err := conn.Exec(
 			`INSERT INTO federation_state (key, value) VALUES (?, ?)`,

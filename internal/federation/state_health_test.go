@@ -41,10 +41,10 @@ func TestPeerHealth_RoundTrip(t *testing.T) {
 		},
 	}
 
-	if err := s.SetPeerHealth("ai-2", want); err != nil {
+	if err := s.SetPeerHealth("peer-b", want); err != nil {
 		t.Fatalf("SetPeerHealth: %v", err)
 	}
-	got, err := s.GetPeerHealth("ai-2")
+	got, err := s.GetPeerHealth("peer-b")
 	if err != nil {
 		t.Fatalf("GetPeerHealth: %v", err)
 	}
@@ -78,11 +78,11 @@ func TestPeerHealth_MissingReturnsEmpty(t *testing.T) {
 
 func TestGetPeerState_IncludesHealth(t *testing.T) {
 	s := newStateForTest(t)
-	err := s.SetPeerHealth("ai-3", federation.PeerHealth{Version: "v0.5.0"})
+	err := s.SetPeerHealth("peer-c", federation.PeerHealth{Version: "v0.5.0"})
 	if err != nil {
 		t.Fatalf("SetPeerHealth: %v", err)
 	}
-	ps, err := s.GetPeerState("ai-3", "https://ai-3:3000")
+	ps, err := s.GetPeerState("peer-c", "https://peer-c:3000")
 	if err != nil {
 		t.Fatalf("GetPeerState: %v", err)
 	}

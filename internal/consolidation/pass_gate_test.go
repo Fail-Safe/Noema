@@ -26,12 +26,12 @@ func TestWithElection_SkipsWhenNotElected(t *testing.T) {
 	state := newElectionState(t)
 	now := time.Date(2026, 4, 21, 12, 0, 0, 0, time.UTC)
 	must(t, state.SetLocalRank(federation.RankEntry{CortexID: "01LOCAL", Rank: 20, ObservedAt: stale(now)}))
-	must(t, state.SetPeerRank("ai-2", federation.RankEntry{CortexID: "01PEER", Rank: 80, ObservedAt: stale(now)}))
+	must(t, state.SetPeerRank("peer-b", federation.RankEntry{CortexID: "01PEER", Rank: 80, ObservedAt: stale(now)}))
 
 	emitter := &fakeEmitter{}
 	e := consolidation.NewElection(consolidation.ElectionConfig{
 		CortexID:  "01LOCAL",
-		PeerNames: []string{"ai-2"},
+		PeerNames: []string{"peer-b"},
 		Now:       func() time.Time { return now },
 		State:     state,
 		Emitter:   emitter,
@@ -57,12 +57,12 @@ func TestWithElection_RunsWhenElected(t *testing.T) {
 	state := newElectionState(t)
 	now := time.Date(2026, 4, 21, 12, 0, 0, 0, time.UTC)
 	must(t, state.SetLocalRank(federation.RankEntry{CortexID: "01LOCAL", Rank: 99, ObservedAt: stale(now)}))
-	must(t, state.SetPeerRank("ai-2", federation.RankEntry{CortexID: "01PEER", Rank: 10, ObservedAt: stale(now)}))
+	must(t, state.SetPeerRank("peer-b", federation.RankEntry{CortexID: "01PEER", Rank: 10, ObservedAt: stale(now)}))
 
 	emitter := &fakeEmitter{}
 	e := consolidation.NewElection(consolidation.ElectionConfig{
 		CortexID:    "01LOCAL",
-		PeerNames:   []string{"ai-2"},
+		PeerNames:   []string{"peer-b"},
 		QuietPeriod: 0, // zero = skip the sleep for fast tests
 		Now:         func() time.Time { return now },
 		State:       state,
@@ -237,14 +237,14 @@ func TestWithElection_EmitsPeerOutrankedAtRecheck(t *testing.T) {
 	emitter := &fakeEmitter{}
 	e := consolidation.NewElection(consolidation.ElectionConfig{
 		CortexID:    "01LOCAL",
-		PeerNames:   []string{"ai-2"},
+		PeerNames:   []string{"peer-b"},
 		QuietPeriod: 50 * time.Millisecond,
 		Now:         func() time.Time { return now },
 		State:       state,
 		Emitter:     emitter,
 	})
 	e.SetQuietWaitHook(func(context.Context, time.Duration) error {
-		return state.SetPeerRank("ai-2", federation.RankEntry{CortexID: "01PEER", Rank: 90, ObservedAt: stale(now)})
+		return state.SetPeerRank("peer-b", federation.RankEntry{CortexID: "01PEER", Rank: 90, ObservedAt: stale(now)})
 	})
 
 	inner := &callTracker{}

@@ -19,7 +19,7 @@ func resolveCmd() *cobra.Command {
 versions (by origin name) or supplying a custom merged body.
 
 Examples:
-  noema resolve 20260406-divergence-... --accept ai-1
+  noema resolve 20260406-divergence-... --accept peer-a
   noema resolve 20260406-divergence-... --custom "merged content here"
 
 Use 'noema get <divergence-id>' to see the available origins listed under
