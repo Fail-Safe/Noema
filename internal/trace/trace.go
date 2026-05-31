@@ -211,9 +211,9 @@ func (t *Trace) Write(path string) error {
 // `YYYYMMDD-` or `YYYY-MM-DD-`), the leading date is stripped before
 // today's date is prepended. This is a defensive measure: agents
 // commonly include dates in titles to mark when an event occurred
-// (e.g., "20260402 dadbot heartbeat check"), and without the strip
+// (e.g., "20260402 agent-1 heartbeat check"), and without the strip
 // the resulting ID would carry two date prefixes
-// (`20260402-20260402-dadbot-heartbeat-check`). The strip does not
+// (`20260402-20260402-agent-1-heartbeat-check`). The strip does not
 // validate that the digits form a real calendar date — its only job
 // is to prevent visual prefix duplication in the final ID.
 func NewID(title string) string {

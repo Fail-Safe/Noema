@@ -1,6 +1,7 @@
 package consolidation
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -65,6 +66,14 @@ type Outcome struct {
 // lives in federation_state rather than in the struct.
 type Election struct {
 	cfg ElectionConfig
+
+	// quietWait blocks for the quiet period between Claim and the
+	// recheck Decide, returning the ctx error if cancelled mid-wait.
+	// Defaults to a real-time, ctx-aware sleep; tests override it (via
+	// SetQuietWaitHook in export_test.go) to drive the recheck
+	// deterministically instead of racing a real sleep from a separate
+	// goroutine.
+	quietWait func(ctx context.Context, d time.Duration) error
 }
 
 // NewElection constructs an evaluator with defaults filled in.
@@ -75,7 +84,30 @@ func NewElection(cfg ElectionConfig) *Election {
 	if cfg.Log == nil {
 		cfg.Log = func(string, ...any) {}
 	}
-	return &Election{cfg: cfg}
+	return &Election{cfg: cfg, quietWait: realQuietWait}
+}
+
+// realQuietWait is the production quiet-period waiter: a ctx-aware sleep
+// of d. A non-positive d returns immediately (tests pass zero to skip
+// the wait). Cancellation returns ctx.Err so the pass gate can classify
+// it as context_canceled.
+func realQuietWait(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
+}
+
+// waitQuietPeriod blocks for the configured quiet period (or until ctx
+// is cancelled) between the Claim and the recheck Decide. Returns
+// ctx.Err on cancellation, nil otherwise.
+func (e *Election) waitQuietPeriod(ctx context.Context) error {
+	return e.quietWait(ctx, e.cfg.QuietPeriod)
 }
 
 // CortexID returns the configured local cortex ID. Exposed so callers
@@ -159,7 +191,7 @@ type FailData struct {
 // The three "preempted" reasons (PeerOutranked, NoWinnerAtRecheck,
 // ContextCanceled) replace the older catch-all "aborted_by_peer_conflict"
 // reason that was emitted by all three quiet-period exit paths. Telling
-// them apart in the event log lets operators distinguish "ai-3 outranked
+// them apart in the event log lets operators distinguish "peer-c outranked
 // us during the wait" from "everyone's rank entry expired" from
 // "agent.Stop() interrupted us" — same outcome (no pass), wildly
 // different operational meaning.
