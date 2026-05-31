@@ -699,11 +699,22 @@ class NoemaMemoryProvider(MemoryProvider):
     def _create_session_trace(self) -> None:
         """Create the session log trace on initialize.
 
-        If the trace already exists (same session re-initialized on the same
-        day), look it up and reuse it instead of failing.
+        The session id is suffixed onto the title so the derived trace id
+        (``YYYYMMDD-hermes-session-<label>-<sid>``) stays unique per session
+        while still grouping under the ``hermes-session-`` prefix. If the same
+        session re-initializes on the same day the id collides
+        deterministically; we detect the collision envelope and reuse the
+        existing trace instead of failing.
         """
-        title_label = self._session_title or self._session_id[:12]
-        session_tag = f"session-{self._session_id[:12]}"
+        sid = self._session_id[:12]
+        label = self._session_title or sid
+        # sid trails the human label so session traces still group under the
+        # `hermes-session-` prefix while staying unique per session.
+        title = (
+            f"hermes-session: {label} ({sid})" if label != sid
+            else f"hermes-session: {sid}"
+        )
+        session_tag = f"session-{sid}"
         body = (
             f"Session ID: {self._session_id}\n"
             f"Agent: {self._agent_identity}\n"
@@ -712,26 +723,50 @@ class NoemaMemoryProvider(MemoryProvider):
         )
         try:
             result = self._transport.call_tool("create_trace", {
-                "title": f"hermes-session: {title_label}",
+                "title": title,
                 "type": "context",
                 "author": self._author,
                 "tags": f"hermes-session, {session_tag}",
                 "body": body,
             })
-            # Extract trace ID from "Trace created: <id>" response.
-            if result and result.startswith("Trace created: "):
-                self._session_trace_id = result.split("Trace created: ", 1)[1].strip()
-            else:
-                logger.warning("Unexpected create_trace response: %s", result)
-        except RuntimeError as e:
-            if "UNIQUE constraint" in str(e):
-                # Session re-initialized — find and reuse the existing trace.
-                logger.info("Session trace already exists, reusing")
-                self._recover_session_trace(session_tag)
-            else:
-                logger.warning("Failed to create session trace: %s", e)
         except Exception as e:
             logger.warning("Failed to create session trace: %s", e)
+            return
+
+        # Success: "Trace created: <id>".
+        if result and result.startswith("Trace created: "):
+            self._session_trace_id = result.split("Trace created: ", 1)[1].strip()
+            return
+        # create_trace surfaces a failure as an isError text body, not an
+        # exception. A deterministic-id collision means this session was
+        # already initialized today — reuse the existing trace.
+        collision = self._parse_collision(result)
+        if collision and collision.get("id"):
+            self._session_trace_id = collision["id"]
+            logger.info("Session trace already exists, reusing %s", collision["id"])
+        elif collision:
+            # Malformed envelope (no id) — fall back to a tag lookup.
+            self._recover_session_trace(session_tag)
+        else:
+            logger.warning("Unexpected create_trace response: %s", result)
+
+    @staticmethod
+    def _parse_collision(text: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Return the trace_id_collision envelope if `text` is one, else None.
+
+        create_trace reports a duplicate id as an isError result whose text
+        body is a JSON envelope with ``kind == "trace_id_collision"`` and the
+        existing trace's id under ``id``.
+        """
+        if not text:
+            return None
+        try:
+            payload = json.loads(text)
+        except (ValueError, TypeError):
+            return None
+        if isinstance(payload, dict) and payload.get("kind") == "trace_id_collision":
+            return payload
+        return None
 
     def _recover_session_trace(self, session_tag: str) -> None:
         """Find an existing session trace by tag and reuse it."""

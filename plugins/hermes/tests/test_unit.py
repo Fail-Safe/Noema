@@ -316,6 +316,85 @@ class TestHelpers:
 
 
 # ---------------------------------------------------------------------------
+# __init__.py — session trace creation
+# ---------------------------------------------------------------------------
+
+class TestSessionTrace:
+    def _provider(self):
+        p = NoemaMemoryProvider()
+        p._transport = MagicMock()
+        p._author = "hermes/tester"
+        p._session_id = "abcdef123456789"
+        p._session_title = "hey max"
+        p._agent_identity = "max"
+        p._platform = "test"
+        return p
+
+    def test_title_suffixes_session_id(self):
+        p = self._provider()
+        p._transport.call_tool.return_value = (
+            "Trace created: 20260531-hermes-session-hey-max-abcdef123456"
+        )
+        p._create_session_trace()
+        args = p._transport.call_tool.call_args[0][1]
+        # sid trails the human label so the derived id is unique per session
+        # while still grouping under the `hermes-session-` prefix.
+        assert args["title"] == "hermes-session: hey max (abcdef123456)"
+        assert args["type"] == "context"
+        assert args["author"] == "hermes/tester"
+        assert args["tags"] == "hermes-session, session-abcdef123456"
+        assert p._session_trace_id == "20260531-hermes-session-hey-max-abcdef123456"
+
+    def test_title_omits_redundant_sid_when_no_session_title(self):
+        p = self._provider()
+        p._session_title = ""
+        p._transport.call_tool.return_value = "Trace created: 20260531-x"
+        p._create_session_trace()
+        args = p._transport.call_tool.call_args[0][1]
+        assert args["title"] == "hermes-session: abcdef123456"
+
+    def test_collision_envelope_reuses_existing_id(self):
+        p = self._provider()
+        p._transport.call_tool.return_value = json.dumps({
+            "kind": "trace_id_collision",
+            "id": "20260531-hermes-session-hey-max-abcdef123456",
+            "existing_state": "active",
+            "summary": "trace id ... already exists",
+        })
+        p._create_session_trace()
+        # No tag-search fallback needed — the envelope carries the id.
+        assert p._session_trace_id == "20260531-hermes-session-hey-max-abcdef123456"
+        assert p._transport.call_tool.call_count == 1
+
+    def test_collision_without_id_falls_back_to_tag_search(self):
+        p = self._provider()
+        p._transport.call_tool.side_effect = [
+            json.dumps({"kind": "trace_id_collision"}),
+            "[context] 20260531-hermes-session-hey-max-abcdef123456 (2026-05-31) — max [hermes-session]",
+        ]
+        p._create_session_trace()
+        assert p._session_trace_id == "20260531-hermes-session-hey-max-abcdef123456"
+        assert p._transport.call_tool.call_count == 2
+
+    def test_unexpected_response_leaves_trace_id_unset(self):
+        p = self._provider()
+        p._transport.call_tool.return_value = "something weird"
+        p._create_session_trace()
+        assert p._session_trace_id == ""
+
+    def test_parse_collision(self):
+        env = json.dumps({"kind": "trace_id_collision", "id": "20260531-x"})
+        assert NoemaMemoryProvider._parse_collision(env) == {
+            "kind": "trace_id_collision", "id": "20260531-x",
+        }
+        assert NoemaMemoryProvider._parse_collision("Trace created: 20260531-x") is None
+        assert NoemaMemoryProvider._parse_collision('{"kind":"other"}') is None
+        assert NoemaMemoryProvider._parse_collision("not json") is None
+        assert NoemaMemoryProvider._parse_collision("") is None
+        assert NoemaMemoryProvider._parse_collision(None) is None
+
+
+# ---------------------------------------------------------------------------
 # __init__.py — config loading
 # ---------------------------------------------------------------------------
 
@@ -559,44 +638,6 @@ class TestPrefetch:
 # ---------------------------------------------------------------------------
 # __init__.py — session trace creation (mocked transport)
 # ---------------------------------------------------------------------------
-
-class TestSessionTrace:
-    def test_session_trace_created(self):
-        p = NoemaMemoryProvider()
-        p._transport = MagicMock()
-        p._transport.call_tool.return_value = "Trace created: 20260412-hermes-session-abc"
-        p._session_id = "session-abc123"
-        p._agent_identity = "researcher"
-        p._author = "hermes/researcher"
-        p._session_title = "Research session"
-        p._platform = "cli"
-
-        p._create_session_trace()
-
-        call_args = p._transport.call_tool.call_args
-        assert call_args[0][0] == "create_trace"
-        args = call_args[0][1]
-        assert args["title"] == "hermes-session: Research session"
-        assert args["type"] == "context"
-        assert args["author"] == "hermes/researcher"
-        assert "hermes-session" in args["tags"]
-        assert p._session_trace_id == "20260412-hermes-session-abc"
-
-    def test_session_trace_uses_id_fallback(self):
-        p = NoemaMemoryProvider()
-        p._transport = MagicMock()
-        p._transport.call_tool.return_value = "Trace created: 20260412-hermes-session-x"
-        p._session_id = "abcdefghijklmnop"
-        p._session_title = ""
-        p._author = "hermes/unknown"
-        p._platform = "cli"
-        p._agent_identity = "unknown"
-
-        p._create_session_trace()
-
-        call_args = p._transport.call_tool.call_args
-        assert "abcdefghijkl" in call_args[0][1]["title"]
-
 
 # ---------------------------------------------------------------------------
 # Session-summary body builder
