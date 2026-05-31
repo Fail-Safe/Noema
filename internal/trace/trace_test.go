@@ -181,13 +181,13 @@ func TestNewID_StripsLeadingDatePrefix(t *testing.T) {
 	}{
 		{
 			name:     "YYYYMMDD prefix with space separator",
-			title:    "20260402 dadbot autonomous infrastructure access",
-			wantSlug: "dadbot-autonomous-infrastructure-access",
+			title:    "20260402 agent-1 autonomous infrastructure access",
+			wantSlug: "agent-1-autonomous-infrastructure-access",
 		},
 		{
 			name:     "YYYYMMDD prefix already slug-shaped",
-			title:    "20260402-dadbot-autonomous-infrastructure-access",
-			wantSlug: "dadbot-autonomous-infrastructure-access",
+			title:    "20260402-agent-1-autonomous-infrastructure-access",
+			wantSlug: "agent-1-autonomous-infrastructure-access",
 		},
 		{
 			name:     "YYYY-MM-DD prefix with space separator",
@@ -211,8 +211,8 @@ func TestNewID_StripsLeadingDatePrefix(t *testing.T) {
 		},
 		{
 			name:     "eight digits without trailing hyphen are not stripped",
-			title:    "20260402dadbot",
-			wantSlug: "20260402dadbot",
+			title:    "20260402agent-1",
+			wantSlug: "20260402agent-1",
 		},
 	}
 

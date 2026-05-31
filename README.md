@@ -450,7 +450,7 @@ MCP clients talking to a keyed endpoint must send `Authorization: Bearer <key>`.
 For ad-hoc use, backgrounding with `nohup` works fine:
 
 ```bash
-nohup noema serve --cortex agentbrain --transport http --host 127.0.0.1 \
+nohup noema serve --cortex mycortex --transport http --host 127.0.0.1 \
   > ~/noema.log 2>&1 &
 disown
 ```
@@ -460,18 +460,18 @@ For a real federation host you probably want a process supervisor — restart on
 **Linux (systemd)**
 
 ```bash
-noema serve --cortex agentbrain --transport http --host 192.168.1.10 --print-systemd-unit | sudo tee /etc/systemd/system/noema-agentbrain.service
+noema serve --cortex mycortex --transport http --host 192.168.1.10 --print-systemd-unit | sudo tee /etc/systemd/system/noema-mycortex.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now noema-agentbrain
-sudo journalctl -u noema-agentbrain -f
+sudo systemctl enable --now noema-mycortex
+sudo journalctl -u noema-mycortex -f
 ```
 
 **macOS (launchd)**
 
 ```bash
-noema serve --cortex agentbrain --transport http --host 127.0.0.1 --print-launchd-plist > ~/Library/LaunchAgents/com.fail-safe.noema.agentbrain.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fail-safe.noema.agentbrain.plist
-tail -f ~/Library/Logs/noema-agentbrain.log
+noema serve --cortex mycortex --transport http --host 127.0.0.1 --print-launchd-plist > ~/Library/LaunchAgents/com.fail-safe.noema.mycortex.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fail-safe.noema.mycortex.plist
+tail -f ~/Library/Logs/noema-mycortex.log
 ```
 
 Both flags require `--transport http` (stdio has no endpoint to supervise) and an explicit `--cortex` (the unit/plist pins exactly one cortex — NOEMA_CORTEX and the config default aren't carried into the service environment). All the usual HTTP flag invariants (`--host` not `0.0.0.0`, TLS pair symmetry) are validated at preview time, so you catch misconfigurations before installing.

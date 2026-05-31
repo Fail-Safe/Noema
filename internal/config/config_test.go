@@ -42,8 +42,8 @@ func TestConfigMarshalRoundTrip(t *testing.T) {
 
 // TestSave_RejectsDuplicatePaths pins the guardrail in validatePaths: two
 // cortex entries cannot share the same on-disk directory. The motivating
-// failure mode was a stray `noema serve --cortex agentbrain` process
-// federating agentbrain's events under the "ai-1" alias because both
+// failure mode was a stray `noema serve --cortex mycortex` process
+// federating mycortex's events under the "peer-a" alias because both
 // entries had been pointed (via copy/paste) at the same directory.
 //
 // HOME is redirected so a passing run can't accidentally stomp on the

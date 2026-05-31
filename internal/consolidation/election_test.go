@@ -74,11 +74,11 @@ func TestDecide_NoEligiblePeers(t *testing.T) {
 	state := newElectionState(t)
 	now := time.Date(2026, 4, 21, 12, 0, 0, 0, time.UTC)
 	must(t, state.SetLocalRank(federation.RankEntry{CortexID: "01LOCAL", Rank: 0, ObservedAt: stale(now)}))
-	must(t, state.SetPeerRank("ai-2", federation.RankEntry{CortexID: "01PEER", Rank: 0, ObservedAt: stale(now)}))
+	must(t, state.SetPeerRank("peer-b", federation.RankEntry{CortexID: "01PEER", Rank: 0, ObservedAt: stale(now)}))
 
 	e := consolidation.NewElection(consolidation.ElectionConfig{
 		CortexID:  "01LOCAL",
-		PeerNames: []string{"ai-2"},
+		PeerNames: []string{"peer-b"},
 		Now:       func() time.Time { return now },
 		State:     state,
 		Emitter:   &fakeEmitter{},
@@ -121,11 +121,11 @@ func TestDecide_HigherRankedPeerWins(t *testing.T) {
 	state := newElectionState(t)
 	now := time.Date(2026, 4, 21, 12, 0, 0, 0, time.UTC)
 	must(t, state.SetLocalRank(federation.RankEntry{CortexID: "01LOCAL", Rank: 30, ObservedAt: stale(now)}))
-	must(t, state.SetPeerRank("ai-2", federation.RankEntry{CortexID: "01PEER", Rank: 80, ObservedAt: stale(now)}))
+	must(t, state.SetPeerRank("peer-b", federation.RankEntry{CortexID: "01PEER", Rank: 80, ObservedAt: stale(now)}))
 
 	e := consolidation.NewElection(consolidation.ElectionConfig{
 		CortexID:  "01LOCAL",
-		PeerNames: []string{"ai-2"},
+		PeerNames: []string{"peer-b"},
 		Now:       func() time.Time { return now },
 		State:     state,
 		Emitter:   &fakeEmitter{},
@@ -145,11 +145,11 @@ func TestDecide_LocalWinsOnTiebreak(t *testing.T) {
 	state := newElectionState(t)
 	now := time.Date(2026, 4, 21, 12, 0, 0, 0, time.UTC)
 	must(t, state.SetLocalRank(federation.RankEntry{CortexID: "01ZZZ", Rank: 50, ObservedAt: stale(now)}))
-	must(t, state.SetPeerRank("ai-2", federation.RankEntry{CortexID: "01AAA", Rank: 50, ObservedAt: stale(now)}))
+	must(t, state.SetPeerRank("peer-b", federation.RankEntry{CortexID: "01AAA", Rank: 50, ObservedAt: stale(now)}))
 
 	e := consolidation.NewElection(consolidation.ElectionConfig{
 		CortexID:  "01ZZZ",
-		PeerNames: []string{"ai-2"},
+		PeerNames: []string{"peer-b"},
 		Now:       func() time.Time { return now },
 		State:     state,
 		Emitter:   &fakeEmitter{},
@@ -174,7 +174,7 @@ func TestDecide_QuietPeriodExcludesFreshEntries(t *testing.T) {
 		Rank:       99,
 		ObservedAt: now.Add(-5 * time.Second).UTC().Format(time.RFC3339), // fresh
 	}))
-	must(t, state.SetPeerRank("ai-2", federation.RankEntry{
+	must(t, state.SetPeerRank("peer-b", federation.RankEntry{
 		CortexID:   "01PEER",
 		Rank:       30,
 		ObservedAt: now.Add(-time.Hour).UTC().Format(time.RFC3339), // stale
@@ -182,7 +182,7 @@ func TestDecide_QuietPeriodExcludesFreshEntries(t *testing.T) {
 
 	e := consolidation.NewElection(consolidation.ElectionConfig{
 		CortexID:    "01LOCAL",
-		PeerNames:   []string{"ai-2"},
+		PeerNames:   []string{"peer-b"},
 		QuietPeriod: time.Minute,
 		Now:         func() time.Time { return now },
 		State:       state,

@@ -17,7 +17,7 @@ import (
 // weakens the check (e.g. re-adding a "but only if peers are configured"
 // condition).
 func TestValidateHTTPServe(t *testing.T) {
-	const cortexName = "ai-1"
+	const cortexName = "peer-a"
 
 	cases := []struct {
 		name           string
@@ -34,7 +34,7 @@ func TestValidateHTTPServe(t *testing.T) {
 		},
 		{
 			name:           "happy path with TLS",
-			hosts:          []string{"ai-1.example.com"},
+			hosts:          []string{"peer-a.example.com"},
 			tlsCert:        "/etc/ssl/cert.pem",
 			tlsKey:         "/etc/ssl/key.pem",
 			cortexExplicit: true,
@@ -72,27 +72,27 @@ func TestValidateHTTPServe(t *testing.T) {
 			wantErrSubstr:  "--tls-cert and --tls-key must be provided together",
 		},
 		{
-			// The regression case: a cortex is bound (here "ai-1") but
+			// The regression case: a cortex is bound (here "peer-a") but
 			// --cortex was not on the command line. Even though host and
 			// TLS look fine, the implicit binding is a federation
 			// footgun and must be rejected.
 			name:           "implicit cortex on HTTP",
-			hosts:          []string{"ai-1.example.com"},
+			hosts:          []string{"peer-a.example.com"},
 			tlsCert:        "/etc/ssl/cert.pem",
 			tlsKey:         "/etc/ssl/key.pem",
 			cortexExplicit: false,
 			wantErrSubstr:  "without an explicit --cortex flag",
 		},
 		{
-			// Specifically the agentbrain-on-ai-1 case from the field:
+			// Specifically the mycortex-on-peer-a case from the field:
 			// the bound cortex has no peers of its own, but is being
 			// served on a host where another cortex's peers expect to
 			// find a different identity. The guard must fire regardless
 			// of the bound cortex's federation config.
 			name:           "implicit cortex on HTTP includes cortex name in error",
-			hosts:          []string{"ai-1-tb.home-dns.com"},
+			hosts:          []string{"peer-a-tb.example.com"},
 			cortexExplicit: false,
-			wantErrSubstr:  "\"ai-1\"",
+			wantErrSubstr:  "\"peer-a\"",
 		},
 		{
 			// Multi-host: all hosts must be valid. The second host is
@@ -220,16 +220,16 @@ func TestBuildServeArgs_OmitsEmptyOptionals(t *testing.T) {
 	// should NOT appear; callers using the real serve command always
 	// have port=3000 by default, but the print functions can be called
 	// with arbitrary values and must not emit --port 0.
-	got := buildServeArgs("agentbrain", "http", nil, 0, "", "")
-	want := []string{"serve", "--cortex", "agentbrain", "--transport", "http"}
+	got := buildServeArgs("mycortex", "http", nil, 0, "", "")
+	want := []string{"serve", "--cortex", "mycortex", "--transport", "http"}
 	if !equalSlices(got, want) {
 		t.Errorf("minimal args: got %v, want %v", got, want)
 	}
 
 	// Full: every optional flag set, single host.
-	got = buildServeArgs("agentbrain", "http", []string{"10.0.0.5"}, 3000, "/etc/ssl/cert.pem", "/etc/ssl/key.pem")
+	got = buildServeArgs("mycortex", "http", []string{"10.0.0.5"}, 3000, "/etc/ssl/cert.pem", "/etc/ssl/key.pem")
 	want = []string{
-		"serve", "--cortex", "agentbrain", "--transport", "http",
+		"serve", "--cortex", "mycortex", "--transport", "http",
 		"--host", "10.0.0.5",
 		"--port", "3000",
 		"--tls-cert", "/etc/ssl/cert.pem",
@@ -240,9 +240,9 @@ func TestBuildServeArgs_OmitsEmptyOptionals(t *testing.T) {
 	}
 
 	// Multi-host: each host gets its own --host flag.
-	got = buildServeArgs("agentbrain", "http", []string{"10.0.0.5", "192.168.45.3"}, 3000, "", "")
+	got = buildServeArgs("mycortex", "http", []string{"10.0.0.5", "192.168.45.3"}, 3000, "", "")
 	want = []string{
-		"serve", "--cortex", "agentbrain", "--transport", "http",
+		"serve", "--cortex", "mycortex", "--transport", "http",
 		"--host", "10.0.0.5",
 		"--host", "192.168.45.3",
 		"--port", "3000",
@@ -273,11 +273,11 @@ func equalSlices(a, b []string) bool {
 // rejected by systemd or would silently start the wrong process.
 func TestBuildSystemdUnit_RendersRequiredSections(t *testing.T) {
 	out := buildSystemdUnit(systemdUnitParams{
-		Cortex: "agentbrain",
+		Cortex: "mycortex",
 		User:   "mark",
-		Exe:    "/home/mark/bin/noema",
+		Exe:    "/home/user/bin/noema",
 		ServeArgs: []string{
-			"serve", "--cortex", "agentbrain",
+			"serve", "--cortex", "mycortex",
 			"--transport", "http",
 			"--host", "192.168.1.10",
 			"--port", "3000",
@@ -289,9 +289,9 @@ func TestBuildSystemdUnit_RendersRequiredSections(t *testing.T) {
 		"[Unit]",
 		"[Service]",
 		"[Install]",
-		"Description=Noema memory server (agentbrain)",
+		"Description=Noema memory server (mycortex)",
 		"User=mark",
-		"ExecStart=/home/mark/bin/noema serve --cortex agentbrain --transport http --host 192.168.1.10 --port 3000",
+		"ExecStart=/home/user/bin/noema serve --cortex mycortex --transport http --host 192.168.1.10 --port 3000",
 		"Restart=on-failure",
 		"WantedBy=multi-user.target",
 		"After=network-online.target",
@@ -354,11 +354,11 @@ func TestBuildSystemdUnit_ReflectsTLSFlags(t *testing.T) {
 // on a developer's Mac.
 func TestBuildLaunchdPlist_IsValidXML(t *testing.T) {
 	out := buildLaunchdPlist(launchdPlistParams{
-		Cortex:  "agentbrain",
+		Cortex:  "mycortex",
 		Exe:     "/usr/local/bin/noema",
-		HomeDir: "/Users/mark",
+		HomeDir: "/Users/user",
 		ServeArgs: []string{
-			"serve", "--cortex", "agentbrain",
+			"serve", "--cortex", "mycortex",
 			"--transport", "http", "--host", "127.0.0.1",
 		},
 	})
@@ -383,27 +383,27 @@ func TestBuildLaunchdPlist_IsValidXML(t *testing.T) {
 // won't start, won't restart on crash, or silently swallows its output.
 func TestBuildLaunchdPlist_RendersRequiredKeys(t *testing.T) {
 	out := buildLaunchdPlist(launchdPlistParams{
-		Cortex:  "agentbrain",
+		Cortex:  "mycortex",
 		Exe:     "/usr/local/bin/noema",
-		HomeDir: "/Users/mark",
+		HomeDir: "/Users/user",
 		ServeArgs: []string{
-			"serve", "--cortex", "agentbrain",
+			"serve", "--cortex", "mycortex",
 			"--transport", "http", "--host", "127.0.0.1",
 			"--port", "3000",
 		},
 	})
 	for _, want := range []string{
 		"<key>Label</key>",
-		"<string>com.fail-safe.noema.agentbrain</string>",
+		"<string>com.fail-safe.noema.mycortex</string>",
 		"<key>ProgramArguments</key>",
 		"<string>/usr/local/bin/noema</string>",
 		"<string>serve</string>",
 		"<string>--cortex</string>",
-		"<string>agentbrain</string>",
+		"<string>mycortex</string>",
 		"<key>RunAtLoad</key>",
 		"<key>KeepAlive</key>",
 		"<key>StandardOutPath</key>",
-		"<string>/Users/mark/Library/Logs/noema-agentbrain.log</string>",
+		"<string>/Users/user/Library/Logs/noema-mycortex.log</string>",
 		"<key>StandardErrorPath</key>",
 	} {
 		if !strings.Contains(out, want) {
@@ -478,7 +478,7 @@ func TestRunPrintSystemdUnit_RejectsMissingCortex(t *testing.T) {
 // wrapping it in systemd is meaningless and would just mask bugs.
 func TestRunPrintSystemdUnit_RejectsStdioTransport(t *testing.T) {
 	prev := cortexFlag
-	cortexFlag = "agentbrain"
+	cortexFlag = "mycortex"
 	t.Cleanup(func() { cortexFlag = prev })
 
 	var out bytes.Buffer
@@ -497,7 +497,7 @@ func TestRunPrintSystemdUnit_RejectsStdioTransport(t *testing.T) {
 // would install a unit file that fails only on first start.
 func TestRunPrintSystemdUnit_PropagatesHTTPValidationErrors(t *testing.T) {
 	prev := cortexFlag
-	cortexFlag = "agentbrain"
+	cortexFlag = "mycortex"
 	t.Cleanup(func() { cortexFlag = prev })
 
 	var out bytes.Buffer
@@ -518,7 +518,7 @@ func TestRunPrintSystemdUnit_PropagatesHTTPValidationErrors(t *testing.T) {
 // together.
 func TestRunPrintSystemdUnit_HappyPath(t *testing.T) {
 	prev := cortexFlag
-	cortexFlag = "agentbrain"
+	cortexFlag = "mycortex"
 	t.Cleanup(func() { cortexFlag = prev })
 
 	var out bytes.Buffer
@@ -526,8 +526,8 @@ func TestRunPrintSystemdUnit_HappyPath(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	s := out.String()
-	if !strings.Contains(s, "--cortex agentbrain") {
-		t.Errorf("output does not include --cortex agentbrain:\n%s", s)
+	if !strings.Contains(s, "--cortex mycortex") {
+		t.Errorf("output does not include --cortex mycortex:\n%s", s)
 	}
 	if !strings.Contains(s, "[Unit]") {
 		t.Errorf("output is not a systemd unit:\n%s", s)
@@ -555,7 +555,7 @@ func TestRunPrintLaunchdPlist_RejectsMissingCortex(t *testing.T) {
 // stdio rejection for launchd.
 func TestRunPrintLaunchdPlist_RejectsStdioTransport(t *testing.T) {
 	prev := cortexFlag
-	cortexFlag = "agentbrain"
+	cortexFlag = "mycortex"
 	t.Cleanup(func() { cortexFlag = prev })
 
 	var out bytes.Buffer
@@ -573,7 +573,7 @@ func TestRunPrintLaunchdPlist_RejectsStdioTransport(t *testing.T) {
 // ProgramArguments.
 func TestRunPrintLaunchdPlist_HappyPath(t *testing.T) {
 	prev := cortexFlag
-	cortexFlag = "agentbrain"
+	cortexFlag = "mycortex"
 	t.Cleanup(func() { cortexFlag = prev })
 
 	var out bytes.Buffer
@@ -581,10 +581,10 @@ func TestRunPrintLaunchdPlist_HappyPath(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	s := out.String()
-	if !strings.Contains(s, "<string>agentbrain</string>") {
+	if !strings.Contains(s, "<string>mycortex</string>") {
 		t.Errorf("plist does not pin cortex name:\n%s", s)
 	}
-	if !strings.Contains(s, "com.fail-safe.noema.agentbrain") {
+	if !strings.Contains(s, "com.fail-safe.noema.mycortex") {
 		t.Errorf("plist label does not include cortex name:\n%s", s)
 	}
 }
@@ -671,10 +671,10 @@ func TestRequireTLSForKeyedMode(t *testing.T) {
 // that looks fine but never injects NOEMA_MCP_KEY.
 func TestBuildSystemdUnit_EmitsOptionalEnvironmentFile(t *testing.T) {
 	out := buildSystemdUnit(systemdUnitParams{
-		Cortex:    "agentbrain",
+		Cortex:    "mycortex",
 		User:      "mark",
 		Exe:       "/usr/local/bin/noema",
-		ServeArgs: []string{"serve", "--cortex", "agentbrain", "--transport", "http", "--host", "127.0.0.1"},
+		ServeArgs: []string{"serve", "--cortex", "mycortex", "--transport", "http", "--host", "127.0.0.1"},
 	})
 
 	// The "-" prefix is load-bearing: without it, systemd refuses to
@@ -682,7 +682,7 @@ func TestBuildSystemdUnit_EmitsOptionalEnvironmentFile(t *testing.T) {
 	// default state for open-mode cortexes. The test pins the exact
 	// path form so a refactor that changes ~/.config to /etc (or
 	// drops the "-") is caught here.
-	const wantLine = "EnvironmentFile=-%h/.config/noema/agentbrain.env"
+	const wantLine = "EnvironmentFile=-%h/.config/noema/mycortex.env"
 	if !strings.Contains(out, wantLine) {
 		t.Errorf("unit missing optional EnvironmentFile line %q\nfull:\n%s", wantLine, out)
 	}
@@ -709,10 +709,10 @@ func TestBuildSystemdUnit_EmitsOptionalEnvironmentFile(t *testing.T) {
 // sync instead of getting the env file checklist up front.
 func TestBuildSystemdUnit_IncludesKeyedModeInstallInstructions(t *testing.T) {
 	out := buildSystemdUnit(systemdUnitParams{
-		Cortex:    "agentbrain",
+		Cortex:    "mycortex",
 		User:      "mark",
 		Exe:       "/usr/local/bin/noema",
-		ServeArgs: []string{"serve", "--cortex", "agentbrain", "--transport", "http", "--host", "127.0.0.1"},
+		ServeArgs: []string{"serve", "--cortex", "mycortex", "--transport", "http", "--host", "127.0.0.1"},
 	})
 	for _, want := range []string{
 		"keyed-mode MCP auth",
@@ -735,10 +735,10 @@ func TestBuildSystemdUnit_IncludesKeyedModeInstallInstructions(t *testing.T) {
 // the dict (which would downgrade every keyed-mode Mac to open mode).
 func TestBuildLaunchdPlist_EmitsEnvironmentVariablesBlock(t *testing.T) {
 	out := buildLaunchdPlist(launchdPlistParams{
-		Cortex:    "agentbrain",
+		Cortex:    "mycortex",
 		Exe:       "/usr/local/bin/noema",
-		HomeDir:   "/Users/mark",
-		ServeArgs: []string{"serve", "--cortex", "agentbrain", "--transport", "http", "--host", "127.0.0.1"},
+		HomeDir:   "/Users/user",
+		ServeArgs: []string{"serve", "--cortex", "mycortex", "--transport", "http", "--host", "127.0.0.1"},
 	})
 	for _, want := range []string{
 		"<key>EnvironmentVariables</key>",
@@ -785,7 +785,7 @@ func TestBuildLaunchdPlist_EmitsEnvironmentVariablesBlock(t *testing.T) {
 // local-only workflows.
 func TestRunPrintMCPConfig_StdioShape(t *testing.T) {
 	prev := cortexFlag
-	cortexFlag = "agentbrain"
+	cortexFlag = "mycortex"
 	t.Cleanup(func() { cortexFlag = prev })
 
 	var buf bytes.Buffer
@@ -821,13 +821,13 @@ func TestRunPrintMCPConfig_StdioShape(t *testing.T) {
 	// pins exactly the cortex the operator was viewing at print time.
 	found := false
 	for _, a := range entry.Args {
-		if a == "agentbrain" {
+		if a == "mycortex" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("stdio entry args do not pin --cortex agentbrain: %v", entry.Args)
+		t.Errorf("stdio entry args do not pin --cortex mycortex: %v", entry.Args)
 	}
 }
 
@@ -938,16 +938,16 @@ func TestRunPrintMCPConfig_HTTPIPv6Brackets(t *testing.T) {
 // --cortex" error would be technically correct but would put the operator
 // right back in the same diagnostic loop the guard exists to short-circuit.
 func TestValidateHTTPServe_ImplicitCortexErrorMessage(t *testing.T) {
-	err := validateHTTPServe([]string{"ai-1.example.com"}, "", "", "ai-1", false)
+	err := validateHTTPServe([]string{"peer-a.example.com"}, "", "", "peer-a", false)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
 	msg := err.Error()
 	for _, want := range []string{
-		`"ai-1"`,                             // names the bound cortex
-		"--cortex ai-1",                      // suggests the exact fix
+		`"peer-a"`,                             // names the bound cortex
+		"--cortex peer-a",                      // suggests the exact fix
 		"--transport http",                   // includes the transport flag
-		"--host ai-1.example.com",            // includes the host
+		"--host peer-a.example.com",            // includes the host
 		"silent failures on the peer side",   // explains *why*
 		"NOEMA_CORTEX or the config default", // names the implicit paths
 	} {
