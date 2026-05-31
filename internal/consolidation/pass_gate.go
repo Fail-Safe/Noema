@@ -3,7 +3,6 @@ package consolidation
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/Fail-Safe/Noema/internal/event"
 )
@@ -57,13 +56,9 @@ func WithElection(inner PassFn, election *Election, registry *InFlightRegistry, 
 
 		// Quiet-period wait for conflicting claims. Respect ctx so
 		// Agent.Stop() doesn't block on a multi-second sleep.
-		if election.QuietPeriod() > 0 {
-			select {
-			case <-ctx.Done():
-				_ = election.Fail(windowID, FailReasonContextCanceled)
-				return ctx.Err()
-			case <-time.After(election.QuietPeriod()):
-			}
+		if err := election.waitQuietPeriod(ctx); err != nil {
+			_ = election.Fail(windowID, FailReasonContextCanceled)
+			return err
 		}
 
 		recheck := election.Decide()
