@@ -656,7 +656,7 @@ func TestSearch_StructuralCharsAsLiterals(t *testing.T) {
 func TestSearch_HyphenatedTerms(t *testing.T) {
 	cx := setup(t)
 
-	tr := trace.New("format-test-create", "note", "hermes/testbot", []string{"hermes-contract-test"}, "Testing create response format.")
+	tr := trace.New("format-test-create", "note", "hermes/agent-3", []string{"hermes-contract-test"}, "Testing create response format.")
 	if err := cx.Add(tr); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
@@ -1203,7 +1203,7 @@ func TestSync_LongTierWithoutDriftStillUpdatesVisibility(t *testing.T) {
 // version of the fix missed cortex_id in its drift check, so this case
 // fell through to the blanket UPDATE and re-tripped the trigger.
 //
-// Real-world setup: file frontmatter says `origin: agentbrain` (matches
+// Real-world setup: file frontmatter says `origin: mycortex` (matches
 // local cortex name); DB row's cortex_id is a foreign ULID. Sync must
 // report drift, leave cortex_id alone, and not abort.
 func TestSync_LongTierForeignCortexIDDoesNotAbort(t *testing.T) {
@@ -1213,12 +1213,12 @@ func TestSync_LongTierForeignCortexIDDoesNotAbort(t *testing.T) {
 	// cortex_id without tripping the immutability trigger (it only
 	// fires when OLD.tier='long' AND NEW.tier='long'). Then flip tier
 	// to long in a single UPDATE that sets both columns at once.
-	tr := trace.New("Federation-inherited long-tier", "context", "hermes/paige", []string{"hermes-session"}, "Body.")
+	tr := trace.New("Federation-inherited long-tier", "context", "hermes/agent-2", []string{"hermes-session"}, "Body.")
 	tr.Origin = cx.Name // mirrors the live bug: name matches, ID won't.
 	if err := cx.Add(tr); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
-	foreignCortexID := "01KNJX4991ASW6NNKS9BQHNCGB" // ai-1's ULID in the live report
+	foreignCortexID := "01JQ3Z4XKP8VY6H7B9W2R5T8MN" // peer-a's ULID in the live report
 	if _, err := cx.DB.Exec(
 		`UPDATE traces SET cortex_id = ?, tier = 'long' WHERE id = ?`,
 		foreignCortexID, tr.ID,
@@ -1704,7 +1704,7 @@ func TestBackfillCreateEvents_SyncedTraceGetsCreate(t *testing.T) {
 
 	// Drop a markdown file directly to disk and Sync it — this is the path
 	// that creates a DB row without an event, exactly like the production
-	// case the user is hitting on ai-1.
+	// case the user is hitting on peer-a.
 	tr := trace.New("Synced trace", "fact", "agent-x", []string{"alpha", "beta"}, "Body content.")
 	if err := tr.Write(cx.TraceFile(tr.ID, false)); err != nil {
 		t.Fatalf("Write: %v", err)
@@ -2420,7 +2420,7 @@ func triggerDivergence(t *testing.T, cx *cortex.Cortex, traceID string) {
 // promote into a create (the snapshot in the event is enough to materialize
 // the trace); the four soft-state mutations (archive/unarchive/trash/recover)
 // store the event idempotently and move on. The original failure mode that
-// motivated this — orphan agentbrain events spamming ai-2/ai-3 with
+// motivated this — orphan mycortex events spamming peer-b/peer-c with
 // "trace not found" replay errors — must stay fixed.
 
 // missingTraceUpdateEvent builds an update event for a trace ID that does

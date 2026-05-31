@@ -243,7 +243,7 @@ the peer's event log so no events are silently skipped.
 
 This is the supported way to clear stale federation state — never edit
 the federation_state SQLite table by hand.`,
-		Example: "  noema federation reset-peer ai-2\n  noema federation reset-peer ai-2 ai-3 --yes",
+		Example: "  noema federation reset-peer peer-b\n  noema federation reset-peer peer-b peer-c --yes",
 		Args:    cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cx, err := resolveCortex()
@@ -472,7 +472,7 @@ func federationPausePeerCmd() *cobra.Command {
 		Use:     "pause-peer <name>",
 		Short:   "Pause syncing with a federation peer",
 		Long:    "Sets a peer's mode to \"paused\" in cortex.md. The syncer will skip this peer\nuntil it is resumed. No state is lost — the cursor and pinned identity are preserved.",
-		Example: "  noema federation pause-peer ai-2",
+		Example: "  noema federation pause-peer peer-b",
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return setPeerMode(cmd, args[0], cortex.PeerModePaused)
@@ -485,7 +485,7 @@ func federationResumePeerCmd() *cobra.Command {
 		Use:     "resume-peer <name>",
 		Short:   "Resume syncing with a paused federation peer",
 		Long:    "Clears a peer's mode back to \"sync\" in cortex.md. The syncer will resume\npulling from this peer on the next poll.",
-		Example: "  noema federation resume-peer ai-2",
+		Example: "  noema federation resume-peer peer-b",
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return setPeerMode(cmd, args[0], cortex.PeerModeSync)

@@ -163,10 +163,10 @@ func TestPeerRank_RoundTrip(t *testing.T) {
 		Rank:       77,
 		ObservedAt: "2026-04-21T12:01:00Z",
 	}
-	if err := s.SetPeerRank("ai-2", want); err != nil {
+	if err := s.SetPeerRank("peer-b", want); err != nil {
 		t.Fatalf("SetPeerRank: %v", err)
 	}
-	got, err = s.GetPeerRank("ai-2")
+	got, err = s.GetPeerRank("peer-b")
 	if err != nil {
 		t.Fatalf("GetPeerRank after write: %v", err)
 	}
@@ -180,16 +180,16 @@ func TestPeerRank_Isolation(t *testing.T) {
 	s := newStateForTest(t)
 
 	aEntry := federation.RankEntry{CortexID: "01A", Rank: 10, ObservedAt: "2026-04-21T12:00:00Z"}
-	if err := s.SetPeerRank("ai-2", aEntry); err != nil {
-		t.Fatalf("SetPeerRank ai-2: %v", err)
+	if err := s.SetPeerRank("peer-b", aEntry); err != nil {
+		t.Fatalf("SetPeerRank peer-b: %v", err)
 	}
 
-	b, err := s.GetPeerRank("ai-3")
+	b, err := s.GetPeerRank("peer-c")
 	if err != nil {
-		t.Fatalf("GetPeerRank ai-3: %v", err)
+		t.Fatalf("GetPeerRank peer-c: %v", err)
 	}
 	if b.Rank != consolidation.RankIneligible {
-		t.Errorf("ai-3 rank bled from ai-2: got %d, want %d", b.Rank, consolidation.RankIneligible)
+		t.Errorf("peer-c rank bled from peer-b: got %d, want %d", b.Rank, consolidation.RankIneligible)
 	}
 
 	local, err := s.GetLocalRank()

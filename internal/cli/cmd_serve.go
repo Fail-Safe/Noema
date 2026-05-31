@@ -1032,7 +1032,7 @@ func runPrintLaunchdPlist(out io.Writer, transport string, hosts []string, port 
 // as a plain struct (vs. positional args) makes tests self-documenting
 // and leaves room for future fields without breaking the call sites.
 type systemdUnitParams struct {
-	Cortex    string   // e.g. "agentbrain" — pinned into Description and filename suggestion
+	Cortex    string   // e.g. "mycortex" — pinned into Description and filename suggestion
 	User      string   // Linux username the service runs as (from os/user.Current)
 	Exe       string   // absolute path to the noema binary (from os.Executable)
 	ServeArgs []string // argv after the binary path, starting with "serve"
@@ -1102,7 +1102,7 @@ func buildSystemdUnit(p systemdUnitParams) string {
 // used only for the log path (~/Library/Logs/noema-<cortex>.log); the
 // agent itself runs as the user who loads the plist.
 type launchdPlistParams struct {
-	Cortex    string   // e.g. "agentbrain" — pinned into Label and filename
+	Cortex    string   // e.g. "mycortex" — pinned into Label and filename
 	Exe       string   // absolute path to the noema binary
 	HomeDir   string   // user home dir (from os.UserHomeDir) for log path
 	ServeArgs []string // argv after the binary path, starting with "serve"

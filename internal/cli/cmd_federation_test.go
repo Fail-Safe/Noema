@@ -94,7 +94,7 @@ func endpointMap(cx *cortex.Cortex, t *testing.T) map[string]string {
 // TestFederationResetPeer_ClearsAllState pins the headline behavior: a peer
 // with full state present (pin + cursor + last_seen + a vector-clock bucket
 // keyed on the pinned id) loses all four after a successful reset. This is
-// the exact scenario in the recent ai-1/ai-2/ai-3 incident — without this
+// the exact scenario in the recent peer-a/peer-b/peer-c incident — without this
 // test the next refactor could quietly skip clearing the vclock bucket and
 // nobody would notice until federation started reporting ghost dominance.
 func TestFederationResetPeer_ClearsAllState(t *testing.T) {

@@ -92,7 +92,7 @@ func TestCortexList_NoDefaultSingleCortex(t *testing.T) {
 	cfg := &config.Config{
 		Default: "",
 		Cortexes: map[string]config.CortexEntry{
-			"agentbrain": {Path: "/home/mark/.noema/agentbrain"},
+			"mycortex": {Path: "/home/user/.noema/mycortex"},
 		},
 	}
 	var out bytes.Buffer
@@ -100,7 +100,7 @@ func TestCortexList_NoDefaultSingleCortex(t *testing.T) {
 		t.Fatalf("runCortexList: %v", err)
 	}
 	s := out.String()
-	if !strings.Contains(s, "noema use agentbrain") {
+	if !strings.Contains(s, "noema use mycortex") {
 		t.Errorf("hint does not name the specific use command: %s", s)
 	}
 	if !strings.Contains(s, "auto-promoted on next use") {

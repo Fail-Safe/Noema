@@ -86,7 +86,7 @@ func TestTierGlyph(t *testing.T) {
 // keeps that fix from regressing.
 func TestRenderInstructions_IncludesNoemaVersion(t *testing.T) {
 	out := renderInstructions(cortex.Manifest{
-		Name:    "agentbrain",
+		Name:    "mycortex",
 		Version: 2,
 	}, "v0.2.5-test")
 
@@ -163,7 +163,7 @@ func TestRenderInstructions_ManifestVersionReflectsInput(t *testing.T) {
 
 // TestRenderInstructions_WarnsAgainstDateInTitle pins the warning text
 // added after a fleet of agents on the live federation ring was found
-// creating traces with IDs like 20260402-20260402-dadbot-foo. The agents
+// creating traces with IDs like 20260402-20260402-agent-1-foo. The agents
 // were dutifully putting dates in titles to mark when an event occurred,
 // and trace.NewID was prepending today's date on top — producing the
 // doubled prefix. NewID now strips leading YYYYMMDD- and YYYY-MM-DD-
