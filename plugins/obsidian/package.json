@@ -1,6 +1,6 @@
 {
   "name": "noema-obsidian",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "description": "Lineage view and tier visibility for Noema cortex traces inside Obsidian.",
   "main": "main.js",
   "scripts": {

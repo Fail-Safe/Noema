@@ -28,6 +28,22 @@ export class JsonRpcError extends Error {
 	}
 }
 
+// UnauthorizedError signals that the server rejected our credentials —
+// an HTTP 401 from noema's AuthMiddleware, which fires before any MCP
+// routing when the server is in keyed mode and the Authorization header
+// is missing or doesn't match. It's distinct from generic transport
+// failures (server down, DNS, TLS) and from InvalidSessionError (404)
+// so the plugin can tell the user "your bearer key is wrong" rather
+// than the ambiguous "disconnected". serverMessage carries the body the
+// middleware returned (e.g. `unauthorized: NOEMA_MCP_KEY ... required`)
+// when one was present.
+export class UnauthorizedError extends Error {
+	constructor(public serverMessage?: string) {
+		super("MCP server rejected the bearer key (HTTP 401)");
+		this.name = "UnauthorizedError";
+	}
+}
+
 export interface NoemaIdentity {
 	id: string;
 	name: string;
@@ -263,7 +279,7 @@ export class McpClient {
 			params: {
 				protocolVersion: MCP_PROTOCOL_VERSION,
 				capabilities: {},
-				clientInfo: { name: "noema-obsidian", version: "0.1.0" },
+				clientInfo: { name: "noema-obsidian", version: "0.2.1" },
 			},
 		};
 		const resp = await fetch(url, {
@@ -271,6 +287,12 @@ export class McpClient {
 			headers,
 			body: JSON.stringify(initBody),
 		});
+		if (resp.status === 401) {
+			// Keyed-mode server, missing/wrong bearer key. Surface this
+			// distinctly — re-handshaking won't help, the credential is
+			// the problem.
+			throw new UnauthorizedError(await read401Message(resp));
+		}
 		if (!resp.ok) {
 			throw new Error(`initialize: HTTP ${resp.status}: ${resp.statusText}`);
 		}
@@ -310,6 +332,13 @@ export class McpClient {
 			headers,
 			body: JSON.stringify({ jsonrpc: "2.0", id, ...body }),
 		});
+		if (resp.status === 401) {
+			// Bearer key rejected mid-session (e.g. the server was
+			// restarted into keyed mode, or the key was rotated). The
+			// retry loop deliberately does NOT re-handshake on this —
+			// re-sending the same bad key just 401s again.
+			throw new UnauthorizedError(await read401Message(resp));
+		}
 		if (resp.status === 404) {
 			// "Invalid session ID" or similar. Caller will re-
 			// handshake and retry. We swallow the body here because
@@ -355,6 +384,28 @@ class InvalidSessionError extends Error {
 	constructor() {
 		super("invalid MCP session");
 		this.name = "InvalidSessionError";
+	}
+}
+
+// read401Message best-effort-extracts the human-readable reason from a
+// 401 response body. noema's AuthMiddleware returns
+// `{"error":"unauthorized: ..."}`; anything else (proxy, gateway) we
+// just hand back verbatim, trimmed. Never throws — a missing/garbled
+// body simply yields undefined so the caller falls back to its default
+// message.
+async function read401Message(resp: Response): Promise<string | undefined> {
+	try {
+		const text = (await resp.text()).trim();
+		if (!text) return undefined;
+		try {
+			const parsed = JSON.parse(text) as { error?: string };
+			if (parsed && typeof parsed.error === "string") return parsed.error;
+		} catch {
+			// Not JSON — return the raw body.
+		}
+		return text;
+	} catch {
+		return undefined;
 	}
 }
 
