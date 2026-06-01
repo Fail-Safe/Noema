@@ -1,13 +1,19 @@
 import { Notice, Plugin, TFile, WorkspaceLeaf } from "obsidian";
 import { DEFAULT_SETTINGS, NoemaSettings, NoemaSettingTab } from "./settings";
 import { LineageView, LINEAGE_VIEW_TYPE } from "./lineage-view";
-import { McpClient } from "./mcp-client";
+import { McpClient, UnauthorizedError } from "./mcp-client";
 import { readTraceMetadata, tierGlyph, tierLabel } from "./tier-status";
 import { CreateTraceModal } from "./create-modal";
 import { ImmutableWarning } from "./immutable-warning";
 import { openAppendModalFromActive } from "./append-modal";
 
 const STATUS_PING_INTERVAL_MS = 30_000;
+
+// ConnState is the outcome of the most recent cortex_identity probe.
+// "unauthorized" is a first-class state rather than a flavor of
+// "disconnected" because the remedy is different and we want to nudge
+// the user toward it (see setConnState's one-shot Notice).
+type ConnState = "connected" | "disconnected" | "unauthorized";
 
 // NoemaPlugin is the Obsidian-side entry point. It wires up:
 //
@@ -30,7 +36,11 @@ export default class NoemaPlugin extends Plugin {
 	// "foreign" (warn) or local (don't warn).
 	cortexName = "";
 	private statusBarEl: HTMLElement | null = null;
-	private connected = false;
+	// connState tracks the last probe result. "unauthorized" is split
+	// out from "disconnected" so a rejected/missing bearer key reads as
+	// a credential problem (actionable: fix the key) rather than as an
+	// unreachable server (actionable: check the endpoint/network).
+	private connState: ConnState = "disconnected";
 	private immutableWarning: ImmutableWarning | null = null;
 
 	async onload(): Promise<void> {
@@ -158,7 +168,7 @@ export default class NoemaPlugin extends Plugin {
 	refreshClient(): void {
 		if (!this.settings.endpoint) {
 			this.client = null;
-			this.connected = false;
+			this.connState = "disconnected";
 			this.renderStatus();
 			return;
 		}
@@ -173,21 +183,93 @@ export default class NoemaPlugin extends Plugin {
 		this.pingConnection();
 	}
 
-	private async pingConnection(): Promise<void> {
+	// probe runs one cortex_identity round-trip and classifies the
+	// outcome, updating cortexName as a side effect. It does NOT touch
+	// the status bar or fire notices — callers decide how to surface the
+	// result. Both the background ping and the settings "Test
+	// connection" button build on it so they classify failures
+	// identically.
+	private async probe(): Promise<ConnState> {
 		if (!this.client) {
-			this.connected = false;
 			this.cortexName = "";
-			this.renderStatus();
-			return;
+			return "disconnected";
 		}
 		try {
 			const id = await this.client.cortexIdentity();
-			this.connected = true;
 			this.cortexName = id.name;
-		} catch {
-			this.connected = false;
+			return "connected";
+		} catch (err) {
+			this.cortexName = "";
+			// A bearer-key rejection is distinct from "server's not
+			// there" — the AuthMiddleware 401 surfaces as
+			// UnauthorizedError, everything else (DNS, TLS, refused
+			// connection, 5xx) is a plain disconnect.
+			return err instanceof UnauthorizedError ? "unauthorized" : "disconnected";
 		}
+	}
+
+	private async pingConnection(): Promise<void> {
+		this.setConnState(await this.probe());
 		this.renderStatus();
+	}
+
+	// testConnection is the explicit, user-triggered probe behind the
+	// settings "Test connection" button. Unlike the passive ping, it
+	// reports an outcome on every invocation — that's the whole point of
+	// a test button — so it writes connState directly rather than
+	// through setConnState, whose Notice fires only on transitions (which
+	// would leave a repeat click on an already-unauthorized server
+	// silent). The status bar still stays in sync.
+	async testConnection(): Promise<void> {
+		if (!this.settings.endpoint) {
+			new Notice("Noema: set an HTTP endpoint first.");
+			return;
+		}
+		// The settings onChange handlers keep the client current, but a
+		// freshly-opened settings tab with a saved endpoint may not have
+		// constructed one yet if the endpoint was unset at load.
+		if (!this.client) {
+			this.client = new McpClient(this.settings.endpoint, this.settings.bearerKey);
+		}
+		const state = await this.probe();
+		this.connState = state;
+		this.renderStatus();
+		switch (state) {
+			case "connected":
+				new Notice(`Noema: connected to ${this.cortexName || this.settings.endpoint}.`);
+				break;
+			case "unauthorized":
+				new Notice(
+					this.settings.bearerKey
+						? `Noema: ${this.settings.endpoint} rejected the bearer key (HTTP 401). Check the key below.`
+						: `Noema: ${this.settings.endpoint} requires a bearer key (HTTP 401). Set one below.`,
+					8000
+				);
+				break;
+			case "disconnected":
+				new Notice(`Noema: couldn't reach ${this.settings.endpoint}.`);
+				break;
+		}
+	}
+
+	// setConnState updates the cached state and, on the *transition*
+	// into "unauthorized", fires a single Notice. Gating on the
+	// transition (rather than the state) keeps the 30s ping loop from
+	// re-toasting the same rejection every tick — the user gets one
+	// actionable nudge when the auth failure first appears, and again
+	// only if they recover and then break it again.
+	private setConnState(next: ConnState): void {
+		const prev = this.connState;
+		this.connState = next;
+		if (next === "unauthorized" && prev !== "unauthorized") {
+			const detail = this.settings.bearerKey
+				? "the bearer key was rejected"
+				: "this server requires a bearer key";
+			new Notice(
+				`Noema: ${detail} (HTTP 401). Update it in the Noema plugin settings.`,
+				8000
+			);
+		}
 	}
 
 	private renderStatus(): void {
@@ -219,10 +301,17 @@ export default class NoemaPlugin extends Plugin {
 			conn.setAttr("title", "Set an HTTP endpoint in settings to connect.");
 			return;
 		}
-		if (this.connected) {
+		if (this.connState === "connected") {
 			conn.setText(`noema: ${this.cortexName || "connected"}`);
 			conn.setAttr("title", `Connected to ${this.settings.endpoint}`);
 			conn.addClass("noema-status-ok");
+		} else if (this.connState === "unauthorized") {
+			conn.setText("noema: unauthorized");
+			conn.setAttr(
+				"title",
+				`${this.settings.endpoint} rejected the bearer key (HTTP 401). Check the key in Noema settings.`
+			);
+			conn.addClass("noema-status-err");
 		} else {
 			conn.setText("noema: disconnected");
 			conn.setAttr("title", `Couldn't reach ${this.settings.endpoint}`);
