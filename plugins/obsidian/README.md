@@ -6,7 +6,7 @@ Lineage view and tier visibility for [Noema](https://github.com/Fail-Safe/Noema)
 
 - **Lineage sidebar.** When you open a trace, the sidebar shows its `derived_from` ancestors and the traces derived from it, both clickable. Useful for navigating "where did this come from / what came out of this" without leaving the editor.
 - **Tier badge in the status bar.** Shows `[s]` / `[m]` / `[L]` for the currently-open trace and a tooltip note that long-tier traces are immutable.
-- **Connection status.** The same status bar item shows whether the plugin is connected to a `noema serve --transport http` endpoint.
+- **Connection status.** The same status bar item shows whether the plugin is connected to a `noema serve --transport http` endpoint. A keyed-mode server that rejects (or requires) the bearer key shows `noema: unauthorized` instead of `noema: disconnected`, and pops a one-time notice pointing you at the bearer-key setting — so a wrong key reads as a credential problem, not an unreachable server.
 
 That's intentionally the whole feature set for v0.1. File-explorer decorations, trace creation UI, and FTS5-backed search are reasonable next-version additions but aren't here yet.
 
@@ -19,6 +19,7 @@ That's intentionally the whole feature set for v0.1. File-explorer decorations, 
 5. Open the plugin's settings tab and set:
    - **HTTP endpoint** — e.g. `https://noema.local:3000`
    - **Bearer key** — required if the server is in keyed mode (`NOEMA_MCP_KEY` or `access.shared_key_file`); leave empty for open-mode (loopback only).
+   - **Test connection** — click to probe the endpoint immediately and get a notice telling you whether it connected, was rejected (HTTP 401, fix the key), or was unreachable.
 6. Open the lineage sidebar via the command palette: `Noema: Open lineage view`.
 
 The status bar will show `noema: <cortex-name>` once the connection succeeds.

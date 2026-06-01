@@ -68,6 +68,26 @@ export class NoemaSettingTab extends PluginSettingTab {
 				text.inputEl.type = "password";
 			});
 
+		// An explicit probe button. The plugin already probes on every
+		// endpoint/key edit and every 30s, but a button gives confirmation
+		// on demand — including the "still wrong" case, where the passive
+		// transition-gated notice stays silent.
+		new Setting(containerEl)
+			.setName("Test connection")
+			.setDesc("Probe the endpoint now with the current key and report the result.")
+			.addButton((btn) =>
+				btn.setButtonText("Test connection").onClick(async () => {
+					btn.setDisabled(true);
+					btn.setButtonText("Testing…");
+					try {
+						await this.plugin.testConnection();
+					} finally {
+						btn.setButtonText("Test connection");
+						btn.setDisabled(false);
+					}
+				})
+			);
+
 		new Setting(containerEl)
 			.setName("Traces folder")
 			.setDesc("Folder inside the vault that contains trace markdown files. Default: traces")
