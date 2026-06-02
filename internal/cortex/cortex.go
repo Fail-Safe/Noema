@@ -1178,10 +1178,24 @@ func (c *Cortex) Add(t *trace.Trace) error {
 		return fmt.Errorf("writing trace file: %w", err)
 	}
 	if err := c.insertDB(t); err != nil {
-		os.Remove(path)
 		if pkConflictOnTraceID(err) {
+			// A row with this id already exists. If it carries the same
+			// content hash, a concurrent or duplicate Add already landed
+			// this exact trace — the watcher's reconcile can race its own
+			// auto-onboard write this way (issue #102). The t.Write above
+			// left the canonical file byte-identical, so leave it in
+			// place and treat the duplicate as a benign no-op. Removing
+			// the file here would orphan the live row, and a later
+			// reconcile pass would then misread the gap as an external
+			// delete and trash the trace.
+			if c.contentHashFor(t.ID) == t.ContentHash {
+				return nil
+			}
+			// Genuine collision: a different trace already owns this id.
+			os.Remove(path)
 			return c.describeTraceIDCollision(t.ID, err)
 		}
+		os.Remove(path)
 		return fmt.Errorf("inserting into database: %w", err)
 	}
 	return nil
