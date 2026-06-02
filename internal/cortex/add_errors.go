@@ -115,6 +115,19 @@ func (c *Cortex) describeTraceIDCollision(id string, wrapped error) error {
 	}
 }
 
+// contentHashFor returns the content_hash stored for id, or "" if the
+// row is absent or unreadable. Add uses it on a PK conflict to tell a
+// benign duplicate (same hash → idempotent no-op) apart from a genuine
+// id collision (different content → surfaced to the caller). The lookup
+// runs against the live DB, not the failed insert transaction.
+func (c *Cortex) contentHashFor(id string) string {
+	var h sql.NullString
+	if err := c.DB.QueryRow(`SELECT content_hash FROM traces WHERE id = ?`, id).Scan(&h); err != nil {
+		return ""
+	}
+	return h.String
+}
+
 func nullString(s sql.NullString) string {
 	if s.Valid {
 		return s.String

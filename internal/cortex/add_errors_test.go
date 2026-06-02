@@ -2,6 +2,7 @@ package cortex_test
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -38,6 +39,41 @@ func TestAdd_CollidesActive_ReturnsTypedError(t *testing.T) {
 	}
 	if !strings.Contains(collision.Error(), "already exists (currently active)") {
 		t.Errorf("Error() should mention active state, got: %s", collision.Error())
+	}
+}
+
+// TestAdd_DuplicateSameContent_IsIdempotentNoOp is the regression for
+// issue #102. The watcher's reconcile loop can race its own auto-onboard
+// write: one goroutine commits the trace's row while a second, which read
+// the DB a moment earlier and saw no row, also calls Add for the same
+// file. The second Add's insert hits a PK conflict — and the old rollback
+// unconditionally os.Remove'd the file, deleting a trace a live row now
+// owned. A later reconcile then saw file-missing + row-present and trashed
+// it (TestAtomicSaveDoesNotTrash flaked on exactly this under -race). When
+// the existing row carries the same content hash, the duplicate must be a
+// benign no-op that leaves the file untouched.
+func TestAdd_DuplicateSameContent_IsIdempotentNoOp(t *testing.T) {
+	cx := setup(t)
+	first := trace.New("dup-target", "note", "", nil, "identical body")
+	if err := cx.Add(first); err != nil {
+		t.Fatalf("seed Add: %v", err)
+	}
+	path := cx.TraceFile(first.ID, false)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("seed trace file missing: %v", err)
+	}
+
+	dup := trace.New("dup-target", "note", "", nil, "identical body")
+	if dup.ID != first.ID {
+		t.Fatalf("precondition: same title+body must yield same id (%q vs %q)", dup.ID, first.ID)
+	}
+	if err := cx.Add(dup); err != nil {
+		t.Fatalf("duplicate Add with identical content should be a no-op, got: %v", err)
+	}
+
+	// The rollback must NOT have removed the file the existing row owns.
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("trace file was removed by duplicate Add (issue #102 regression): %v", err)
 	}
 }
 

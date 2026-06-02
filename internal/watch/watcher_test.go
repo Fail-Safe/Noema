@@ -83,6 +83,57 @@ func countByAction(es []event.Event, a event.Action) int {
 	return n
 }
 
+// TestExternalFrontmatterTagEditReindexes pins the tag-drift regression:
+// adding a tag in a trace's frontmatter (e.g. via Obsidian's Properties
+// panel) changes only frontmatter, not the body. The watcher's loopback
+// guard keys on the body hash, so before the fix it skipped the edit and
+// the trace_tags index never learned the tag — list_traces tag=X then
+// returned nothing while the file plainly carried it.
+func TestExternalFrontmatterTagEditReindexes(t *testing.T) {
+	cx, _, id := setupWatcher(t)
+	path := cx.TraceFile(id, false)
+
+	// External edit: add a tag in frontmatter, leave the body identical.
+	// trace.Write recomputes the file's content_hash from the (unchanged)
+	// body, so the body hash still matches the DB — exactly the loopback
+	// guard's blind spot.
+	tr, err := trace.ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	bodyBefore := tr.Body
+	tr.Tags = append(tr.Tags, "ghostty")
+	if err := tr.Write(path); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	time.Sleep(settleTime)
+
+	// Precondition: the body must be unchanged, or this test isn't
+	// exercising a frontmatter-only edit anymore.
+	reparsed, err := trace.ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile after edit: %v", err)
+	}
+	if reparsed.Body != bodyBefore {
+		t.Fatalf("precondition: body changed (%q -> %q)", bodyBefore, reparsed.Body)
+	}
+
+	// The DB index must now carry the tag so list-by-tag finds it.
+	got, err := cx.List(cortex.ListOptions{Tag: "ghostty"})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	found := false
+	for _, r := range got {
+		if r.ID == id {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("trace %s not returned by list tag=ghostty after a frontmatter tag edit; trace_tags index was not updated", id)
+	}
+}
+
 // TestExternalEditEmitsUpdate writes new body content to the trace file
 // using a non-Noema write path and asserts the watcher emits ActionUpdate.
 func TestExternalEditEmitsUpdate(t *testing.T) {

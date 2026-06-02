@@ -230,7 +230,7 @@ func (w *Watcher) reconcileExisting(path, id string, dir traceDir, row *cortex.R
 			log.Printf("[watch] external unarchive: %s", id)
 			row, _ = w.cx.Get(id)
 		}
-		if bodyHash != row.ContentHash {
+		if bodyHash != row.ContentHash || indexedMetadataDrift(t, row) {
 			if err := w.cx.UpdateFromFile(id); err != nil {
 				return fmt.Errorf("update: %w", err)
 			}
@@ -254,7 +254,7 @@ func (w *Watcher) reconcileExisting(path, id string, dir traceDir, row *cortex.R
 			log.Printf("[watch] external archive: %s", id)
 			row, _ = w.cx.Get(id)
 		}
-		if bodyHash != row.ContentHash {
+		if bodyHash != row.ContentHash || indexedMetadataDrift(t, row) {
 			if err := w.cx.UpdateFromFile(id); err != nil {
 				return fmt.Errorf("update: %w", err)
 			}
@@ -336,4 +336,48 @@ func (w *Watcher) reconcileMissing(id string, dir traceDir, row *cortex.Row, inD
 		log.Printf("[watch] external purge: %s", id)
 	}
 	return nil
+}
+
+// indexedMetadataDrift reports whether the file's frontmatter carries
+// indexed metadata (title, type, author, tags, derived_from) that differs
+// from the DB row. The watcher's loopback guard keys on the body content
+// hash, so a frontmatter-only external edit — adding a tag in Obsidian's
+// Properties panel, retyping a note as a decision, fixing an author — has
+// a matching body hash and would otherwise be skipped, leaving the DB
+// index (and FTS, lineage) stale: `list_traces tag=X` then returns nothing
+// even though the file plainly carries the tag. Comparing the indexed
+// fields catches those edits and routes them through UpdateFromFile.
+//
+// It stays loopback-safe: Noema's own writes keep frontmatter and DB in
+// lockstep, so a self-write never shows drift here. Tag and lineage lists
+// are compared as sets — the DB returns tags sorted, while frontmatter
+// preserves author order, so a slice-equality check would false-positive.
+func indexedMetadataDrift(t *trace.Trace, row *cortex.Row) bool {
+	return t.Title != row.Title ||
+		t.Type != row.Type ||
+		t.Author != row.Author ||
+		!sameStringSet(t.Tags, row.Tags) ||
+		!sameStringSet(t.DerivedFrom, row.DerivedFrom)
+}
+
+// sameStringSet reports whether a and b contain the same distinct
+// elements, ignoring order and duplicates.
+func sameStringSet(a, b []string) bool {
+	sa := make(map[string]struct{}, len(a))
+	for _, s := range a {
+		sa[s] = struct{}{}
+	}
+	sb := make(map[string]struct{}, len(b))
+	for _, s := range b {
+		sb[s] = struct{}{}
+	}
+	if len(sa) != len(sb) {
+		return false
+	}
+	for s := range sa {
+		if _, ok := sb[s]; !ok {
+			return false
+		}
+	}
+	return true
 }
