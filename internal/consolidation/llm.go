@@ -314,6 +314,11 @@ func (c *HTTPLLMClient) embedBatch(ctx context.Context, model string, batch []st
 		if len(d.Embedding) == 0 {
 			return nil, fmt.Errorf("embeddings response has an empty vector at slot %d", slot)
 		}
+		// Non-finite guard is unnecessary here: encoding/json rejects NaN
+		// and out-of-range (±Inf) numbers when decoding into []float32, so
+		// vectors that reach this point are already finite. The decode→rank
+		// consumer path (Phase 3) validates finiteness of stored vectors,
+		// where a corrupted BLOB — not the wire — is the real risk.
 		vecs[slot] = d.Embedding
 	}
 	return vecs, nil

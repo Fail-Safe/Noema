@@ -93,6 +93,40 @@ func TestSearchConfigAccessors(t *testing.T) {
 	}
 }
 
+func TestEffectiveBoundaries(t *testing.T) {
+	hw := []struct {
+		in   float64
+		want float64
+	}{
+		{1, 1},    // exactly 1 passes through
+		{0, 0.5},  // explicit-0 reads as unset -> default (documented quirk)
+		{-0.3, 0}, // negative clamps to 0
+		{0.25, 0.25},
+	}
+	for _, c := range hw {
+		got := (&cortex.SearchConfig{HybridWeight: c.in}).EffectiveHybridWeight()
+		if got != c.want {
+			t.Errorf("EffectiveHybridWeight(%v) = %v, want %v", c.in, got, c.want)
+		}
+	}
+
+	mc := []struct {
+		in   int
+		want int
+	}{
+		{0, 32000},  // unset -> default
+		{-5, 32000}, // negative -> default
+		{1, 1},      // positive passes through
+		{16000, 16000},
+	}
+	for _, c := range mc {
+		got := (&cortex.SearchConfig{MaxChars: c.in}).EffectiveMaxChars()
+		if got != c.want {
+			t.Errorf("EffectiveMaxChars(%d) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
 func TestResolvedEmbeddingEndpoint_Inheritance(t *testing.T) {
 	// Search block wins when set.
 	m := cortex.Manifest{
