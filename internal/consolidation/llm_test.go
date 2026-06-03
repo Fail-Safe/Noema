@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -124,3 +125,98 @@ func TestNewHTTPLLMClient_ValidatesEndpoint(t *testing.T) {
 		t.Error("empty endpoint should error")
 	}
 }
+
+// TestHTTPLLMClient_Embed verifies the /embeddings envelope: path, auth,
+// model, input-order preservation, and batching across the
+// defaultEmbedBatch boundary. The fake server encodes each input's numeric
+// suffix into the returned vector so alignment is checkable.
+func TestHTTPLLMClient_Embed(t *testing.T) {
+	const wantModel = "nomic-embed-text"
+	const wantToken = "embed-token"
+	batches := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/embeddings" {
+			t.Errorf("endpoint path = %q, want /embeddings", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer "+wantToken {
+			t.Errorf("auth header = %q, want Bearer token", got)
+		}
+		body, _ := io.ReadAll(r.Body)
+		var req embedRequestBody
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("decoding request: %v", err)
+		}
+		if req.Model != wantModel {
+			t.Errorf("model = %q, want %q", req.Model, wantModel)
+		}
+		batches++
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("{\"data\":["))
+		for i, in := range req.Input {
+			n := strings.TrimPrefix(in, "t")
+			if i > 0 {
+				w.Write([]byte(","))
+			}
+			// vector = [suffix, 0.0]; index aligns to request order.
+			w.Write([]byte(`{"index":` + itoa(i) + `,"embedding":[` + n + `,0.0]}`))
+		}
+		w.Write([]byte("]}"))
+	}))
+	defer server.Close()
+
+	t.Setenv("TEST_EMBED_KEY", wantToken)
+	client, err := NewHTTPLLMClient(server.URL, "TEST_EMBED_KEY")
+	if err != nil {
+		t.Fatalf("NewHTTPLLMClient: %v", err)
+	}
+
+	// 150 inputs forces 3 batches (64+64+22).
+	inputs := make([]string, 150)
+	for i := range inputs {
+		inputs[i] = "t" + itoa(i)
+	}
+	got, err := client.Embed(context.Background(), wantModel, inputs)
+	if err != nil {
+		t.Fatalf("Embed: %v", err)
+	}
+	if len(got) != len(inputs) {
+		t.Fatalf("got %d vectors, want %d", len(got), len(inputs))
+	}
+	if batches != 3 {
+		t.Errorf("server saw %d batches, want 3 (chunking by defaultEmbedBatch)", batches)
+	}
+	for i, v := range got {
+		if len(v) != 2 {
+			t.Fatalf("vector %d has dim %d, want 2", i, len(v))
+		}
+		if int(v[0]) != i {
+			t.Errorf("vector %d carries suffix %v, want %d (order not preserved across batches)", i, v[0], i)
+		}
+	}
+}
+
+// TestHTTPLLMClient_EmbedReindexes verifies that an out-of-order response
+// (data shuffled but carrying correct index fields) is realigned.
+func TestHTTPLLMClient_EmbedReindexes(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Two inputs returned in reverse, but index fields are correct.
+		w.Write([]byte(`{"data":[{"index":1,"embedding":[1.0]},{"index":0,"embedding":[0.0]}]}`))
+	}))
+	defer server.Close()
+
+	client, err := NewHTTPLLMClient(server.URL, "")
+	if err != nil {
+		t.Fatalf("NewHTTPLLMClient: %v", err)
+	}
+	got, err := client.Embed(context.Background(), "m", []string{"a", "b"})
+	if err != nil {
+		t.Fatalf("Embed: %v", err)
+	}
+	if got[0][0] != 0.0 || got[1][0] != 1.0 {
+		t.Errorf("reindex failed: got[0]=%v got[1]=%v, want [0] then [1]", got[0], got[1])
+	}
+}
+
+func itoa(i int) string { return strconv.Itoa(i) }
