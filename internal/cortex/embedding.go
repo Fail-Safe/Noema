@@ -1,11 +1,46 @@
 package cortex
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 )
+
+// Embedder turns text into vectors. Defined here (not imported from
+// consolidation) so the cortex package stays free of an import cycle —
+// consolidation.HTTPLLMClient satisfies this structurally and is injected
+// by the CLI/serve layer, which may import both packages.
+type Embedder interface {
+	Embed(ctx context.Context, model string, inputs []string) ([][]float32, error)
+}
+
+// embeddingText builds the string sent to the embedding model for a trace:
+// title and body joined, trimmed, and truncated to maxChars runes to stay
+// within model input limits. A blank body embeds the title alone (and vice
+// versa). Truncation is on a rune boundary so a multibyte character is
+// never split.
+func embeddingText(title, body string, maxChars int) string {
+	title = strings.TrimSpace(title)
+	body = strings.TrimSpace(body)
+	var s string
+	switch {
+	case body == "":
+		s = title
+	case title == "":
+		s = body
+	default:
+		s = title + "\n\n" + body
+	}
+	if maxChars > 0 {
+		if r := []rune(s); len(r) > maxChars {
+			s = string(r[:maxChars])
+		}
+	}
+	return s
+}
 
 // embeddingCodecVersion prefixes every stored embedding BLOB so a future
 // encoding (e.g. int8 quantization) can be introduced without ambiguity:

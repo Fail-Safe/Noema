@@ -116,7 +116,7 @@ func init() {
 	addGrouped(groupTrace,
 		addCmd(), listCmd(), getCmd(), editCmd(), appendCmd(), removeCmd(),
 		searchCmd(), similarCmd(), archiveCmd(), unarchiveCmd(), recoverCmd(), purgeCmd(), syncCmd(),
-		eventsCmd(), resolveCmd(), memoryCmd(), consolidateCmd(),
+		eventsCmd(), resolveCmd(), memoryCmd(), consolidateCmd(), embeddingsCmd(),
 	)
 	addGrouped(groupCortex,
 		initCmd(), useCmd(), cortexCmd(), federationCmd(), migrateCmd(),
