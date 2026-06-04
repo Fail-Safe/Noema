@@ -601,8 +601,9 @@ const (
 	SearchModeSemantic = "semantic"
 	SearchModeHybrid   = "hybrid"
 
-	defaultHybridWeight  = 0.5
-	defaultEmbedMaxChars = 32000
+	defaultHybridWeight         = 0.5
+	defaultEmbedMaxChars        = 32000
+	defaultEmbedIntervalSeconds = 300
 )
 
 // SearchConfig is the optional `search:` block in cortex.md. It is off by
@@ -641,6 +642,11 @@ type SearchConfig struct {
 	// MaxChars caps the trace text sent to the embedding model, to stay
 	// within model input limits. Zero/unset means defaultEmbedMaxChars.
 	MaxChars int `yaml:"max_chars,omitempty"`
+
+	// EmbedIntervalSeconds is how often the serve-time embed maintainer
+	// runs a backfill pass to embed new/edited traces. Zero/unset means
+	// defaultEmbedIntervalSeconds. Only used under `noema serve`.
+	EmbedIntervalSeconds int `yaml:"embed_interval_seconds,omitempty"`
 }
 
 // SemanticOn reports whether semantic search is enabled. Nil-safe.
@@ -678,6 +684,15 @@ func (sc *SearchConfig) EffectiveMaxChars() int {
 		return defaultEmbedMaxChars
 	}
 	return sc.MaxChars
+}
+
+// EffectiveEmbedInterval returns the serve-time backfill cadence, defaulting
+// to 5 minutes.
+func (sc *SearchConfig) EffectiveEmbedInterval() time.Duration {
+	if sc == nil || sc.EmbedIntervalSeconds <= 0 {
+		return defaultEmbedIntervalSeconds * time.Second
+	}
+	return time.Duration(sc.EmbedIntervalSeconds) * time.Second
 }
 
 // ResolvedEmbeddingEndpoint returns the embedding endpoint, falling back to
