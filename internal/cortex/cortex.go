@@ -1078,8 +1078,8 @@ they keep the database in sync automatically:
 | ` + "`create_trace`" + ` | Create a new trace (supports derived_from, origin) |
 | ` + "`update_trace`" + ` | Update fields of an existing trace |
 | ` + "`append_trace`" + ` | Append content to a trace body (fire-and-forget) |
-| ` + "`search_traces`" + ` | Full-text search across titles and bodies |
-| ` + "`find_similar_traces`" + ` | Surface traces with overlapping vocabulary (BM25-ranked) — useful when you have a trace in hand and want related ones without crafting a query |
+| ` + "`search_traces`" + ` | Search across titles and bodies. ` + "`mode`" + `: ` + "`lexical`" + ` (FTS5, default), ` + "`semantic`" + ` (embedding similarity), or ` + "`hybrid`" + ` (RRF fusion). Semantic/hybrid need a configured ` + "`search:`" + ` block; they fall back to lexical otherwise |
+| ` + "`find_similar_traces`" + ` | Surface traces related to one you have in hand. Default ranks by BM25 vocabulary overlap; ` + "`mode=semantic`" + `/` + "`hybrid`" + ` ranks by embedding similarity to the source trace's own vector |
 | ` + "`archive_trace`" + ` | Archive a trace |
 | ` + "`unarchive_trace`" + ` | Restore an archived trace |
 | ` + "`delete_trace`" + ` | Move a trace to trash (soft-delete, recoverable) |
