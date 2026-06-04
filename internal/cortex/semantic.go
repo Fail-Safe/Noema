@@ -127,6 +127,9 @@ func (c *Cortex) embedQuery(ctx context.Context, e Embedder, model, query string
 	if q == "" {
 		return nil, nil
 	}
+	if len(q) > MaxSearchQueryLen {
+		return nil, fmt.Errorf("query too long (%d chars, max %d)", len(q), MaxSearchQueryLen)
+	}
 	vecs, err := e.Embed(ctx, model, []string{q})
 	if err != nil {
 		return nil, fmt.Errorf("embedding query: %w", err)
@@ -240,6 +243,9 @@ func rrfFuse(lex []Row, sem []ScoredRow, weight float64, limit int) []ScoredRow 
 // BM25 relevance order (best first) — the lexical input to hybrid fusion.
 // Trashed excluded; archived excluded unless includeArchived.
 func (c *Cortex) lexicalRanked(query string, includeArchived bool) ([]Row, error) {
+	if len(query) > MaxSearchQueryLen {
+		return nil, fmt.Errorf("query too long (%d chars, max %d)", len(query), MaxSearchQueryLen)
+	}
 	ftsQuery := SanitizeFTS5Query(query)
 	if strings.TrimSpace(ftsQuery) == "" {
 		return nil, nil

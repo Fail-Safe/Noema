@@ -183,6 +183,18 @@ func TestHybridSimilar_ExcludesSource(t *testing.T) {
 	}
 }
 
+func TestSemanticSearch_QueryTooLong(t *testing.T) {
+	cx, _ := setupSemantic(t)
+	ctx := context.Background()
+	long := strings.Repeat("x", 1001) // > MaxSearchQueryLen (1000)
+	if _, err := cx.SemanticSearch(ctx, topicEmbedder{}, long, cortex.SemanticOpts{Model: "tm"}); err == nil {
+		t.Error("over-long semantic query should be rejected (DoS guard)")
+	}
+	if _, err := cx.HybridSearch(ctx, topicEmbedder{}, long, cortex.SemanticOpts{Model: "tm"}, 0.5); err == nil {
+		t.Error("over-long hybrid query should be rejected (DoS guard)")
+	}
+}
+
 func TestSemanticSearch_Guards(t *testing.T) {
 	cx := setup(t)
 	ctx := context.Background()

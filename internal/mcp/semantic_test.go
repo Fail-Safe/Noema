@@ -158,6 +158,32 @@ func TestSearchTraces_SemanticEndToEnd(t *testing.T) {
 	}
 }
 
+func TestSearchTraces_SemanticEndpointDownGenericNote(t *testing.T) {
+	cx := newTestCortex(t)
+	// Configured but unreachable endpoint with a recognizable host:port.
+	writeSearchConfig(t, cx, "http://127.0.0.1:1/v1", "tm")
+	tr := trace.New("lexical findable widget", "note", "agent", nil, "body about widgets")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	s := NewServer(cx, "test", "")
+	text, isErr := callTool(t, s, "search_traces", map[string]any{"query": "findable", "mode": "semantic"})
+	if isErr {
+		t.Fatalf("search_traces errored: %s", text)
+	}
+	if !strings.Contains(text, "temporarily unavailable") {
+		t.Errorf("expected generic degradation note, got:\n%s", text)
+	}
+	// The endpoint host must NOT leak into client-facing output.
+	if strings.Contains(text, "127.0.0.1") {
+		t.Errorf("degradation note leaked the endpoint host:\n%s", text)
+	}
+	// Lexical fallback still returns the matching trace.
+	if !strings.Contains(text, tr.ID) {
+		t.Errorf("expected lexical fallback result %s, got:\n%s", tr.ID, text)
+	}
+}
+
 func TestSearchTraces_HybridEndToEnd(t *testing.T) {
 	server := topicEmbedServer(t)
 	defer server.Close()
