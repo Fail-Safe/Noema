@@ -16,6 +16,7 @@ func similarCmd() *cobra.Command {
 		limit    int
 		archived bool
 		semantic bool
+		hybrid   bool
 	)
 
 	cmd := &cobra.Command{
@@ -33,7 +34,7 @@ func similarCmd() *cobra.Command {
 			}
 			defer cx.Close()
 
-			if semantic {
+			if semantic || hybrid {
 				m, err := cortex.ReadManifest(cx.Dir)
 				if err != nil {
 					return err
@@ -41,13 +42,15 @@ func similarCmd() *cobra.Command {
 				if m.Search == nil || m.Search.EmbeddingModel == "" {
 					return fmt.Errorf("semantic mode needs search.embedding_model in cortex.md (then: noema embeddings backfill)")
 				}
-				res, err := cx.SemanticSimilar(args[0], cortex.SemanticOpts{
-					Model:           m.Search.EmbeddingModel,
-					Limit:           limit,
-					IncludeArchived: archived,
-				})
+				opts := cortex.SemanticOpts{Model: m.Search.EmbeddingModel, Limit: limit, IncludeArchived: archived}
+				var res []cortex.ScoredRow
+				if hybrid {
+					res, err = cx.HybridSimilar(args[0], opts, m.Search.EffectiveHybridWeight())
+				} else {
+					res, err = cx.SemanticSimilar(args[0], opts)
+				}
 				if err != nil {
-					return fmt.Errorf("semantic similar: %w", err)
+					return fmt.Errorf("vector similar: %w", err)
 				}
 				if len(res) == 0 {
 					fmt.Println("No similar traces found.")
@@ -80,6 +83,7 @@ func similarCmd() *cobra.Command {
 	cmd.Flags().IntVar(&limit, "limit", 10, "maximum matches to return")
 	cmd.Flags().BoolVar(&archived, "archived", false, "include archived traces in results")
 	cmd.Flags().BoolVar(&semantic, "semantic", false, "rank by embedding similarity instead of FTS5 (needs backfilled embeddings)")
+	cmd.Flags().BoolVar(&hybrid, "hybrid", false, "fuse lexical + semantic similarity via reciprocal rank fusion")
 	return cmd
 }
 

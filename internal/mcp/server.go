@@ -20,34 +20,35 @@ import (
 
 // resolveSearchMode determines the effective search mode for a request and,
 // for semantic/hybrid modes, builds the embedder from the cortex manifest.
-// It returns (mode, embedder, model): the embedder is nil when semantic
-// search isn't configured (no model/endpoint) so callers degrade to lexical.
-// reqMode is the caller-supplied "mode" arg ("" means use the manifest
-// default, which is lexical unless configured otherwise).
-func resolveSearchMode(cx *cortex.Cortex, reqMode string) (string, cortex.Embedder, string) {
+// It returns (mode, embedder, model, hybridWeight): the embedder is nil when
+// semantic search isn't configured (no model/endpoint) so callers degrade to
+// lexical. reqMode is the caller-supplied "mode" arg ("" means use the
+// manifest default, which is lexical unless configured otherwise).
+func resolveSearchMode(cx *cortex.Cortex, reqMode string) (string, cortex.Embedder, string, float64) {
 	m, err := cortex.ReadManifest(cx.Dir)
 	if err != nil {
-		return cortex.SearchModeLexical, nil, ""
+		return cortex.SearchModeLexical, nil, "", 0
 	}
+	weight := m.Search.EffectiveHybridWeight()
 	mode := reqMode
 	if mode == "" {
 		mode = m.Search.EffectiveDefaultMode()
 	}
 	if mode == cortex.SearchModeLexical {
-		return cortex.SearchModeLexical, nil, ""
+		return cortex.SearchModeLexical, nil, "", weight
 	}
 	if m.Search == nil || m.Search.EmbeddingModel == "" {
-		return mode, nil, ""
+		return mode, nil, "", weight
 	}
 	endpoint := m.ResolvedEmbeddingEndpoint()
 	if endpoint == "" {
-		return mode, nil, ""
+		return mode, nil, "", weight
 	}
 	client, err := consolidation.NewHTTPLLMClient(endpoint, m.ResolvedEmbeddingAPIKeyEnv())
 	if err != nil {
-		return mode, nil, ""
+		return mode, nil, "", weight
 	}
-	return mode, client, m.Search.EmbeddingModel
+	return mode, client, m.Search.EmbeddingModel, weight
 }
 
 func scoredToRows(s []cortex.ScoredRow) []cortex.Row {
@@ -245,7 +246,7 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 			return nil, err
 		}
 		includeArchived := req.GetBool("all", false)
-		mode, emb, model := resolveSearchMode(cx, req.GetString("mode", ""))
+		mode, emb, model, weight := resolveSearchMode(cx, req.GetString("mode", ""))
 
 		// Semantic/hybrid path with graceful degradation to lexical: a
 		// missing config or an unreachable endpoint should still return
@@ -254,17 +255,20 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 		if mode == cortex.SearchModeSemantic || mode == cortex.SearchModeHybrid {
 			if emb == nil {
 				note = "[semantic search not configured; showing lexical results]\n"
-			} else if res, serr := cx.SemanticSearchAs(ctx, emb, query, cortex.SemanticOpts{
-				Model:           model,
-				IncludeArchived: includeArchived,
-			}, cortex.ActorAgent, cortex.DefaultSearchHitTopN); serr != nil {
-				note = "[semantic search unavailable (" + serr.Error() + "); showing lexical results]\n"
 			} else {
-				out := formatRows(scoredToRows(res))
+				opts := cortex.SemanticOpts{Model: model, IncludeArchived: includeArchived}
+				var res []cortex.ScoredRow
+				var serr error
 				if mode == cortex.SearchModeHybrid {
-					out = "[hybrid fusion not yet available; showing semantic results]\n" + out
+					res, serr = cx.HybridSearchAs(ctx, emb, query, opts, weight, cortex.ActorAgent, cortex.DefaultSearchHitTopN)
+				} else {
+					res, serr = cx.SemanticSearchAs(ctx, emb, query, opts, cortex.ActorAgent, cortex.DefaultSearchHitTopN)
 				}
-				return mcp.NewToolResultText(out), nil
+				if serr != nil {
+					note = "[" + mode + " search unavailable (" + serr.Error() + "); showing lexical results]\n"
+				} else {
+					return mcp.NewToolResultText(formatRows(scoredToRows(res))), nil
+				}
 			}
 		}
 
@@ -292,26 +296,29 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 		}
 		limit := int(req.GetFloat("limit", 0))
 		includeArchived := req.GetBool("include_archived", false)
-		// Semantic similarity uses the source's stored vector — no embedder
-		// needed — so we only require the configured model from the manifest.
-		mode, _, model := resolveSearchMode(cx, req.GetString("mode", ""))
+		// Similarity uses the source's stored vector (semantic) and/or
+		// FindSimilar (lexical) — no query embedder needed — so we only
+		// require the configured model from the manifest.
+		mode, _, model, weight := resolveSearchMode(cx, req.GetString("mode", ""))
 
 		note := ""
 		if mode == cortex.SearchModeSemantic || mode == cortex.SearchModeHybrid {
 			if model == "" {
 				note = "[semantic search not configured; showing lexical results]\n"
-			} else if res, serr := cx.SemanticSimilarAs(traceID, cortex.SemanticOpts{
-				Model:           model,
-				Limit:           limit,
-				IncludeArchived: includeArchived,
-			}, cortex.ActorAgent, cortex.DefaultSearchHitTopN); serr != nil {
-				note = "[semantic similar unavailable (" + serr.Error() + "); showing lexical results]\n"
 			} else {
-				out := formatSimilarMatches(scoredToMatches(res))
+				opts := cortex.SemanticOpts{Model: model, Limit: limit, IncludeArchived: includeArchived}
+				var res []cortex.ScoredRow
+				var serr error
 				if mode == cortex.SearchModeHybrid {
-					out = "[hybrid fusion not yet available; showing semantic results]\n" + out
+					res, serr = cx.HybridSimilarAs(traceID, opts, weight, cortex.ActorAgent, cortex.DefaultSearchHitTopN)
+				} else {
+					res, serr = cx.SemanticSimilarAs(traceID, opts, cortex.ActorAgent, cortex.DefaultSearchHitTopN)
 				}
-				return mcp.NewToolResultText(out), nil
+				if serr != nil {
+					note = "[" + mode + " similar unavailable (" + serr.Error() + "); showing lexical results]\n"
+				} else {
+					return mcp.NewToolResultText(formatSimilarMatches(scoredToMatches(res))), nil
+				}
 			}
 		}
 

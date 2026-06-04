@@ -140,6 +140,49 @@ func TestSemanticSearch_SkipsNonFiniteVectors(t *testing.T) {
 	}
 }
 
+func TestHybridSearch_FusesAndRanks(t *testing.T) {
+	cx, ids := setupSemantic(t)
+	ctx := context.Background()
+
+	// "alpha" matches the alpha trace both lexically (title token) and
+	// semantically (topic vector), so it must rank first; semantic
+	// contributes the other topics, so all 3 appear.
+	res, err := cx.HybridSearch(ctx, topicEmbedder{}, "alpha alpha", cortex.SemanticOpts{Model: "tm"}, 0.5)
+	if err != nil {
+		t.Fatalf("HybridSearch: %v", err)
+	}
+	if len(res) != 3 {
+		t.Fatalf("got %d fused results, want 3", len(res))
+	}
+	if res[0].ID != ids[0] {
+		t.Errorf("top fused result = %s, want alpha trace %s", res[0].ID, ids[0])
+	}
+
+	// Blank query short-circuits; nil embedder errors.
+	if r, err := cx.HybridSearch(ctx, topicEmbedder{}, "  ", cortex.SemanticOpts{Model: "tm"}, 0.5); err != nil || r != nil {
+		t.Errorf("blank query => (nil,nil); got (%v,%v)", r, err)
+	}
+	if _, err := cx.HybridSearch(ctx, nil, "x", cortex.SemanticOpts{Model: "tm"}, 0.5); err == nil {
+		t.Error("nil embedder should error")
+	}
+}
+
+func TestHybridSimilar_ExcludesSource(t *testing.T) {
+	cx, ids := setupSemantic(t)
+	res, err := cx.HybridSimilar(ids[0], cortex.SemanticOpts{Model: "tm"}, 0.5)
+	if err != nil {
+		t.Fatalf("HybridSimilar: %v", err)
+	}
+	for _, r := range res {
+		if r.ID == ids[0] {
+			t.Error("source trace must be excluded from its own hybrid similarity")
+		}
+	}
+	if len(res) == 0 {
+		t.Error("expected fused similar results")
+	}
+}
+
 func TestSemanticSearch_Guards(t *testing.T) {
 	cx := setup(t)
 	ctx := context.Background()
