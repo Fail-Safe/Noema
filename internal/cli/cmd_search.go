@@ -15,6 +15,7 @@ func searchCmd() *cobra.Command {
 		trashed  bool
 		all      bool
 		semantic bool
+		hybrid   bool
 		typ      string
 	)
 
@@ -29,8 +30,8 @@ func searchCmd() *cobra.Command {
 			}
 			defer cx.Close()
 
-			if semantic {
-				return runSemanticSearch(cmd, cx, args[0], all || archived)
+			if semantic || hybrid {
+				return runVectorSearch(cmd, cx, args[0], all || archived, hybrid)
 			}
 
 			rows, err := cx.Search(args[0], cortex.ListOptions{
@@ -54,15 +55,17 @@ func searchCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&archived, "archived", false, "search only archived traces")
 	cmd.Flags().BoolVar(&trashed, "trashed", false, "search only trashed traces")
 	cmd.Flags().BoolVar(&all, "all", false, "search active and archived traces")
-	cmd.Flags().BoolVar(&semantic, "semantic", false, "rank by embedding similarity (needs a configured search: block + `noema embeddings backfill`)")
+	cmd.Flags().BoolVar(&semantic, "semantic", false, "rank by embedding similarity (needs a configured search: block + backfilled embeddings)")
+	cmd.Flags().BoolVar(&hybrid, "hybrid", false, "fuse lexical (FTS5) + semantic rankings via reciprocal rank fusion")
 	cmd.Flags().StringVar(&typ, "type", "", "filter results by type")
 	return cmd
 }
 
-// runSemanticSearch builds the embedder from the cortex manifest and ranks
-// traces by embedding similarity. Kept separate so the lexical path stays
+// runVectorSearch builds the embedder from the cortex manifest and ranks
+// traces by embedding similarity (hybrid=false) or by RRF fusion of lexical
+// + semantic (hybrid=true). Kept separate so the lexical path stays
 // untouched. The embedder reuses the consolidation endpoint config.
-func runSemanticSearch(cmd *cobra.Command, cx *cortex.Cortex, query string, includeArchived bool) error {
+func runVectorSearch(cmd *cobra.Command, cx *cortex.Cortex, query string, includeArchived, hybrid bool) error {
 	m, err := cortex.ReadManifest(cx.Dir)
 	if err != nil {
 		return err
@@ -78,12 +81,15 @@ func runSemanticSearch(cmd *cobra.Command, cx *cortex.Cortex, query string, incl
 	if err != nil {
 		return fmt.Errorf("embedding client: %w", err)
 	}
-	res, err := cx.SemanticSearch(cmd.Context(), client, query, cortex.SemanticOpts{
-		Model:           m.Search.EmbeddingModel,
-		IncludeArchived: includeArchived,
-	})
+	opts := cortex.SemanticOpts{Model: m.Search.EmbeddingModel, IncludeArchived: includeArchived}
+	var res []cortex.ScoredRow
+	if hybrid {
+		res, err = cx.HybridSearch(cmd.Context(), client, query, opts, m.Search.EffectiveHybridWeight())
+	} else {
+		res, err = cx.SemanticSearch(cmd.Context(), client, query, opts)
+	}
 	if err != nil {
-		return fmt.Errorf("semantic search failed: %w", err)
+		return fmt.Errorf("vector search failed: %w", err)
 	}
 	if len(res) == 0 {
 		fmt.Println("No matching traces.")

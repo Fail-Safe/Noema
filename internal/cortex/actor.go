@@ -162,6 +162,30 @@ func (c *Cortex) SemanticSimilarAs(traceID string, opts SemanticOpts, actor Read
 	return res, nil
 }
 
+// HybridSearchAs is the actor-aware counterpart to HybridSearch.
+func (c *Cortex) HybridSearchAs(ctx context.Context, e Embedder, query string, opts SemanticOpts, weight float64, actor ReadActor, topN int) ([]ScoredRow, error) {
+	res, err := c.HybridSearch(ctx, e, query, opts, weight)
+	if err != nil {
+		return nil, err
+	}
+	if actor == ActorAgent && len(res) > 0 {
+		c.bumpSearchHitsForScored(res, topN)
+	}
+	return res, nil
+}
+
+// HybridSimilarAs is the actor-aware counterpart to HybridSimilar.
+func (c *Cortex) HybridSimilarAs(traceID string, opts SemanticOpts, weight float64, actor ReadActor, topN int) ([]ScoredRow, error) {
+	res, err := c.HybridSimilar(traceID, opts, weight)
+	if err != nil {
+		return nil, err
+	}
+	if actor == ActorAgent && len(res) > 0 {
+		c.bumpSearchHitsForScored(res, topN)
+	}
+	return res, nil
+}
+
 // bumpSearchHitsForScored adapts []ScoredRow to the shared bump path.
 func (c *Cortex) bumpSearchHitsForScored(res []ScoredRow, topN int) {
 	ids := make([]string, 0, len(res))

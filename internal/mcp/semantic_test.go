@@ -74,18 +74,21 @@ func TestResolveSearchMode(t *testing.T) {
 	cx := newTestCortex(t)
 
 	// Unconfigured: default is lexical; explicit semantic yields no embedder.
-	if mode, e, _ := resolveSearchMode(cx, ""); mode != cortex.SearchModeLexical || e != nil {
+	if mode, e, _, _ := resolveSearchMode(cx, ""); mode != cortex.SearchModeLexical || e != nil {
 		t.Errorf("unconfigured default = (%s, embedder!=nil:%v), want lexical/nil", mode, e != nil)
 	}
-	if mode, e, _ := resolveSearchMode(cx, "semantic"); mode != cortex.SearchModeSemantic || e != nil {
+	if mode, e, _, _ := resolveSearchMode(cx, "semantic"); mode != cortex.SearchModeSemantic || e != nil {
 		t.Errorf("semantic-unconfigured = (%s, embedder!=nil:%v), want semantic/nil-embedder", mode, e != nil)
 	}
 
-	// Configured: semantic yields an embedder + model.
+	// Configured: semantic yields an embedder + model + default weight.
 	writeSearchConfig(t, cx, "http://localhost:1", "tm")
-	mode, e, model := resolveSearchMode(cx, "semantic")
+	mode, e, model, weight := resolveSearchMode(cx, "semantic")
 	if mode != cortex.SearchModeSemantic || e == nil || model != "tm" {
 		t.Errorf("configured semantic = (%s, embedder!=nil:%v, model=%q), want semantic/embedder/tm", mode, e != nil, model)
+	}
+	if weight != 0.5 {
+		t.Errorf("default hybrid weight = %v, want 0.5", weight)
 	}
 }
 
@@ -152,6 +155,41 @@ func TestSearchTraces_SemanticEndToEnd(t *testing.T) {
 	}
 	if gi >= 0 && ai > gi {
 		t.Errorf("alpha (%d) should rank before gamma (%d) for an alpha query:\n%s", ai, gi, text)
+	}
+}
+
+func TestSearchTraces_HybridEndToEnd(t *testing.T) {
+	server := topicEmbedServer(t)
+	defer server.Close()
+
+	cx := newTestCortex(t)
+	writeSearchConfig(t, cx, server.URL, "tm")
+	add := func(title, body string) string {
+		tr := trace.New(title, "note", "agent", nil, body)
+		if err := cx.Add(tr); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+		return tr.ID
+	}
+	alphaID := add("alpha topic", "alpha alpha content")
+	add("beta topic", "beta beta content")
+
+	client, _ := consolidation.NewHTTPLLMClient(server.URL, "")
+	if _, err := cx.EmbedBackfill(context.Background(), client, "tm", cortex.EmbedBackfillOpts{}); err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+
+	s := NewServer(cx, "test", "")
+	text, isErr := callTool(t, s, "search_traces", map[string]any{"query": "alpha alpha", "mode": "hybrid"})
+	if isErr {
+		t.Fatalf("search_traces hybrid errored: %s", text)
+	}
+	// Real RRF fusion now — no "not yet available" or fallback note.
+	if strings.Contains(text, "not yet") || strings.Contains(text, "unavailable") || strings.Contains(text, "not configured") {
+		t.Fatalf("unexpected note in hybrid result:\n%s", text)
+	}
+	if !strings.Contains(text, alphaID) {
+		t.Errorf("alpha trace %s missing from hybrid results:\n%s", alphaID, text)
 	}
 }
 
