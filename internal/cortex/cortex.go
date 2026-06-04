@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -40,6 +41,7 @@ type Manifest struct {
 	Federation    *FederationConfig    `yaml:"federation,omitempty"`
 	Watch         *WatchConfig         `yaml:"watch,omitempty"`
 	Consolidation *ConsolidationConfig `yaml:"consolidation,omitempty"`
+	Search        *SearchConfig        `yaml:"search,omitempty"`
 
 	// Body is the free-form markdown content that follows the YAML
 	// frontmatter in cortex.md. Never serialized through YAML; populated
@@ -592,6 +594,169 @@ func (m Manifest) ValidateConsolidation() error {
 	return nil
 }
 
+// Search-mode identifiers. These string values are part of the frozen v1.0
+// surface (the MCP `mode` param and cortex.md `default_mode`); don't rename.
+const (
+	SearchModeLexical  = "lexical"
+	SearchModeSemantic = "semantic"
+	SearchModeHybrid   = "hybrid"
+
+	defaultHybridWeight         = 0.5
+	defaultEmbedMaxChars        = 32000
+	defaultEmbedIntervalSeconds = 300
+)
+
+// SearchConfig is the optional `search:` block in cortex.md. It is off by
+// default; semantic search requires SemanticEnabled plus a resolvable
+// embedding endpoint and an explicit embedding model. There is no
+// baked-in default model — we never imply a model we don't ship. The
+// embedding endpoint and API-key env-var fall back to the consolidation
+// block when left empty, so a single local-LLM host can serve both
+// distillation and embeddings from one configuration.
+type SearchConfig struct {
+	// SemanticEnabled is the master opt-in for embedding-based search.
+	// When false (the default), only lexical FTS5 search is available.
+	SemanticEnabled bool `yaml:"semantic_enabled,omitempty"`
+
+	// EmbeddingEndpoint is the OpenAI-compatible base URL for the
+	// /embeddings call. Empty inherits consolidation.local_llm_endpoint.
+	EmbeddingEndpoint string `yaml:"embedding_endpoint,omitempty"`
+
+	// EmbeddingModel is the embedding model identifier. Required when
+	// SemanticEnabled — there is no default.
+	EmbeddingModel string `yaml:"embedding_model,omitempty"`
+
+	// APIKeyEnv names an env var holding the bearer token for the
+	// embedding endpoint. Empty inherits consolidation.api_key_env.
+	APIKeyEnv string `yaml:"api_key_env,omitempty"`
+
+	// DefaultMode is the search mode used when a caller doesn't specify
+	// one: lexical|semantic|hybrid. Empty means lexical, which keeps
+	// existing callers byte-for-byte unchanged.
+	DefaultMode string `yaml:"default_mode,omitempty"`
+
+	// HybridWeight is the vector weight (0..1) in hybrid rank fusion.
+	// Zero/unset means the default 0.5 (equal lexical/semantic).
+	HybridWeight float64 `yaml:"hybrid_weight,omitempty"`
+
+	// MaxChars caps the trace text sent to the embedding model, to stay
+	// within model input limits. Zero/unset means defaultEmbedMaxChars.
+	MaxChars int `yaml:"max_chars,omitempty"`
+
+	// EmbedIntervalSeconds is how often the serve-time embed maintainer
+	// runs a backfill pass to embed new/edited traces. Zero/unset means
+	// defaultEmbedIntervalSeconds. Only used under `noema serve`.
+	EmbedIntervalSeconds int `yaml:"embed_interval_seconds,omitempty"`
+}
+
+// SemanticOn reports whether semantic search is enabled. Nil-safe.
+func (sc *SearchConfig) SemanticOn() bool { return sc != nil && sc.SemanticEnabled }
+
+// EffectiveDefaultMode returns the configured default mode or "lexical"
+// when unset.
+func (sc *SearchConfig) EffectiveDefaultMode() string {
+	if sc == nil || sc.DefaultMode == "" {
+		return SearchModeLexical
+	}
+	return sc.DefaultMode
+}
+
+// EffectiveHybridWeight returns the hybrid vector weight, defaulting to
+// 0.5 when unset and clamping to [0,1] otherwise. (An explicit 0 reads as
+// unset and yields the default; use mode=lexical for pure lexical.)
+func (sc *SearchConfig) EffectiveHybridWeight() float64 {
+	if sc == nil || sc.HybridWeight == 0 {
+		return defaultHybridWeight
+	}
+	if sc.HybridWeight < 0 {
+		return 0
+	}
+	if sc.HybridWeight > 1 {
+		return 1
+	}
+	return sc.HybridWeight
+}
+
+// EffectiveMaxChars returns the per-trace embedding text budget, defaulting
+// to 32k characters.
+func (sc *SearchConfig) EffectiveMaxChars() int {
+	if sc == nil || sc.MaxChars <= 0 {
+		return defaultEmbedMaxChars
+	}
+	return sc.MaxChars
+}
+
+// EffectiveEmbedInterval returns the serve-time backfill cadence, defaulting
+// to 5 minutes.
+func (sc *SearchConfig) EffectiveEmbedInterval() time.Duration {
+	if sc == nil || sc.EmbedIntervalSeconds <= 0 {
+		return defaultEmbedIntervalSeconds * time.Second
+	}
+	return time.Duration(sc.EmbedIntervalSeconds) * time.Second
+}
+
+// ResolvedEmbeddingEndpoint returns the embedding endpoint, falling back to
+// consolidation.local_llm_endpoint when the search block leaves it empty.
+func (m Manifest) ResolvedEmbeddingEndpoint() string {
+	if m.Search != nil && m.Search.EmbeddingEndpoint != "" {
+		return m.Search.EmbeddingEndpoint
+	}
+	if m.Consolidation != nil {
+		return m.Consolidation.LocalLLMEndpoint
+	}
+	return ""
+}
+
+// ResolvedEmbeddingAPIKeyEnv mirrors ResolvedEmbeddingEndpoint for the
+// API-key env-var name.
+func (m Manifest) ResolvedEmbeddingAPIKeyEnv() string {
+	if m.Search != nil && m.Search.APIKeyEnv != "" {
+		return m.Search.APIKeyEnv
+	}
+	if m.Consolidation != nil {
+		return m.Consolidation.APIKeyEnv
+	}
+	return ""
+}
+
+// ValidateSearch enforces the search block's cross-field rules: an
+// invalid default_mode is rejected even when semantic search is off (so a
+// typo surfaces early), and enabling semantic search requires an explicit
+// embedding model plus a resolvable, well-formed endpoint. Returns nil
+// when the block is absent and no mode override is set.
+func (m Manifest) ValidateSearch() error {
+	sc := m.Search
+	if sc != nil && sc.DefaultMode != "" && !validSearchMode(sc.DefaultMode) {
+		return fmt.Errorf("search.default_mode %q is not one of lexical|semantic|hybrid", sc.DefaultMode)
+	}
+	if !sc.SemanticOn() {
+		return nil
+	}
+	if sc.HybridWeight < 0 || sc.HybridWeight > 1 {
+		return fmt.Errorf("search.hybrid_weight must be in [0,1], got %v", sc.HybridWeight)
+	}
+	if sc.EmbeddingModel == "" {
+		return fmt.Errorf("search.semantic_enabled requires search.embedding_model to be set (no default embedding model is assumed)")
+	}
+	endpoint := m.ResolvedEmbeddingEndpoint()
+	if endpoint == "" {
+		return fmt.Errorf("search.semantic_enabled requires search.embedding_endpoint (or consolidation.local_llm_endpoint) to be set")
+	}
+	if _, err := url.Parse(endpoint); err != nil {
+		return fmt.Errorf("search.embedding_endpoint %q is not a valid URL: %w", endpoint, err)
+	}
+	return nil
+}
+
+func validSearchMode(mode string) bool {
+	switch mode {
+	case SearchModeLexical, SearchModeSemantic, SearchModeHybrid:
+		return true
+	default:
+		return false
+	}
+}
+
 // ReadManifest parses the cortex.md manifest in the given cortex directory.
 // cortex.md is a markdown file with YAML frontmatter: a `---` fence, the
 // manifest YAML, a closing `---` fence, and an optional free-form body.
@@ -614,6 +779,9 @@ func ReadManifest(dir string) (Manifest, error) {
 		return Manifest{}, err
 	}
 	if err := m.ValidateConsolidation(); err != nil {
+		return Manifest{}, err
+	}
+	if err := m.ValidateSearch(); err != nil {
 		return Manifest{}, err
 	}
 	return m, nil
@@ -910,8 +1078,8 @@ they keep the database in sync automatically:
 | ` + "`create_trace`" + ` | Create a new trace (supports derived_from, origin) |
 | ` + "`update_trace`" + ` | Update fields of an existing trace |
 | ` + "`append_trace`" + ` | Append content to a trace body (fire-and-forget) |
-| ` + "`search_traces`" + ` | Full-text search across titles and bodies |
-| ` + "`find_similar_traces`" + ` | Surface traces with overlapping vocabulary (BM25-ranked) — useful when you have a trace in hand and want related ones without crafting a query |
+| ` + "`search_traces`" + ` | Search across titles and bodies. ` + "`mode`" + `: ` + "`lexical`" + ` (FTS5, default), ` + "`semantic`" + ` (embedding similarity), or ` + "`hybrid`" + ` (RRF fusion). Semantic/hybrid need a configured ` + "`search:`" + ` block; they fall back to lexical otherwise |
+| ` + "`find_similar_traces`" + ` | Surface traces related to one you have in hand. Default ranks by BM25 vocabulary overlap; ` + "`mode=semantic`" + `/` + "`hybrid`" + ` ranks by embedding similarity to the source trace's own vector |
 | ` + "`archive_trace`" + ` | Archive a trace |
 | ` + "`unarchive_trace`" + ` | Restore an archived trace |
 | ` + "`delete_trace`" + ` | Move a trace to trash (soft-delete, recoverable) |

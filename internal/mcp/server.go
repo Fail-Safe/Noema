@@ -5,17 +5,68 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
+	"github.com/Fail-Safe/Noema/internal/consolidation"
 	"github.com/Fail-Safe/Noema/internal/cortex"
 	"github.com/Fail-Safe/Noema/internal/event"
 	"github.com/Fail-Safe/Noema/internal/federation"
 	"github.com/Fail-Safe/Noema/internal/trace"
 )
+
+// resolveSearchMode determines the effective search mode for a request and,
+// for semantic/hybrid modes, builds the embedder from the cortex manifest.
+// It returns (mode, embedder, model, hybridWeight): the embedder is nil when
+// semantic search isn't configured (no model/endpoint) so callers degrade to
+// lexical. reqMode is the caller-supplied "mode" arg ("" means use the
+// manifest default, which is lexical unless configured otherwise).
+func resolveSearchMode(cx *cortex.Cortex, reqMode string) (string, cortex.Embedder, string, float64) {
+	m, err := cortex.ReadManifest(cx.Dir)
+	if err != nil {
+		return cortex.SearchModeLexical, nil, "", 0
+	}
+	weight := m.Search.EffectiveHybridWeight()
+	mode := reqMode
+	if mode == "" {
+		mode = m.Search.EffectiveDefaultMode()
+	}
+	if mode == cortex.SearchModeLexical {
+		return cortex.SearchModeLexical, nil, "", weight
+	}
+	if m.Search == nil || m.Search.EmbeddingModel == "" {
+		return mode, nil, "", weight
+	}
+	endpoint := m.ResolvedEmbeddingEndpoint()
+	if endpoint == "" {
+		return mode, nil, "", weight
+	}
+	client, err := consolidation.NewHTTPLLMClient(endpoint, m.ResolvedEmbeddingAPIKeyEnv())
+	if err != nil {
+		return mode, nil, "", weight
+	}
+	return mode, client, m.Search.EmbeddingModel, weight
+}
+
+func scoredToRows(s []cortex.ScoredRow) []cortex.Row {
+	rows := make([]cortex.Row, len(s))
+	for i := range s {
+		rows[i] = s[i].Row
+	}
+	return rows
+}
+
+func scoredToMatches(s []cortex.ScoredRow) []cortex.SimilarMatch {
+	out := make([]cortex.SimilarMatch, len(s))
+	for i := range s {
+		out[i] = cortex.SimilarMatch{Row: s[i].Row, Score: s[i].Score}
+	}
+	return out
+}
 
 // NewServer builds an MCP server exposing all Cortex operations. The
 // version string is plumbed through to the MCP protocol's serverInfo
@@ -189,45 +240,103 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 		mcp.WithDescription("Full-text search across traces"),
 		mcp.WithString("query", mcp.Description("Search query"), mcp.Required()),
 		mcp.WithBoolean("all", mcp.Description("Include archived traces")),
+		mcp.WithString("mode", mcp.Description("Search mode: 'lexical' (FTS5, default), 'semantic' (embedding similarity), or 'hybrid'. Semantic/hybrid need a configured search: block; if unavailable, falls back to lexical.")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		query, err := req.RequireString("query")
 		if err != nil {
 			return nil, err
 		}
-		// Agent-initiated searches bump search_hit_count on the top-N
-		// results. Auto-injection providers (Hermes, etc.) consume search
-		// output without ever calling get_trace, so without this bump the
-		// graduation gate never sees signal from those reads. See
-		// internal/cortex/actor.go SearchAs for the rationale.
+		includeArchived := req.GetBool("all", false)
+		mode, emb, model, weight := resolveSearchMode(cx, req.GetString("mode", ""))
+
+		// Semantic/hybrid path with graceful degradation to lexical: a
+		// missing config or an unreachable endpoint should still return
+		// useful (lexical) results with a note, never an error.
+		note := ""
+		if mode == cortex.SearchModeSemantic || mode == cortex.SearchModeHybrid {
+			if emb == nil {
+				note = "[semantic search not configured; showing lexical results]\n"
+			} else {
+				opts := cortex.SemanticOpts{Model: model, IncludeArchived: includeArchived}
+				var res []cortex.ScoredRow
+				var serr error
+				if mode == cortex.SearchModeHybrid {
+					res, serr = cx.HybridSearchAs(ctx, emb, query, opts, weight, cortex.ActorAgent, cortex.DefaultSearchHitTopN)
+				} else {
+					res, serr = cx.SemanticSearchAs(ctx, emb, query, opts, cortex.ActorAgent, cortex.DefaultSearchHitTopN)
+				}
+				if serr != nil {
+					// Log the detailed error server-side; surface only a generic
+					// note to the client so endpoint URLs / internal hostnames in
+					// the error don't leak into MCP output.
+					log.Printf("[mcp] %s search failed, falling back to lexical: %v", mode, serr)
+					note = "[" + mode + " search temporarily unavailable; showing lexical results]\n"
+				} else {
+					return mcp.NewToolResultText(formatRows(scoredToRows(res))), nil
+				}
+			}
+		}
+
+		// Lexical (default or fallback). Agent-initiated searches bump
+		// search_hit_count on the top-N results — see actor.go SearchAs.
 		rows, err := cx.SearchAs(query, cortex.ListOptions{
-			All: req.GetBool("all", false),
+			All: includeArchived,
 		}, cortex.ActorAgent, cortex.DefaultSearchHitTopN)
 		if err != nil {
 			return nil, err
 		}
-		return mcp.NewToolResultText(formatRows(rows)), nil
+		return mcp.NewToolResultText(note + formatRows(rows)), nil
 	})
 
 	s.AddTool(mcp.NewTool("find_similar_traces",
-		mcp.WithDescription("Find traces with overlapping vocabulary to a given trace, ranked by FTS5 BM25. Useful when you have one trace and want to surface related ones without crafting a search query."),
+		mcp.WithDescription("Find traces related to a given trace. Default mode ranks by FTS5 BM25 vocabulary overlap; 'semantic' mode ranks by embedding similarity to the source trace's own vector (needs a configured search: block + backfilled embeddings). Useful when you have one trace and want related ones without crafting a query."),
 		mcp.WithString("trace_id", mcp.Description("ID of the source trace"), mcp.Required()),
 		mcp.WithNumber("limit", mcp.Description("Maximum matches to return (default 10)")),
 		mcp.WithBoolean("include_archived", mcp.Description("Include archived traces (default false)")),
+		mcp.WithString("mode", mcp.Description("'lexical' (FTS5, default) or 'semantic'/'hybrid' (embedding similarity). Falls back to lexical if semantic isn't configured or the source isn't embedded.")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		traceID, err := req.RequireString("trace_id")
 		if err != nil {
 			return nil, err
 		}
-		opts := cortex.SimilarOpts{
-			Limit:           int(req.GetFloat("limit", 0)),
-			IncludeArchived: req.GetBool("include_archived", false),
+		limit := int(req.GetFloat("limit", 0))
+		includeArchived := req.GetBool("include_archived", false)
+		// Similarity uses the source's stored vector (semantic) and/or
+		// FindSimilar (lexical) — no query embedder needed — so we only
+		// require the configured model from the manifest.
+		mode, _, model, weight := resolveSearchMode(cx, req.GetString("mode", ""))
+
+		note := ""
+		if mode == cortex.SearchModeSemantic || mode == cortex.SearchModeHybrid {
+			if model == "" {
+				note = "[semantic search not configured; showing lexical results]\n"
+			} else {
+				opts := cortex.SemanticOpts{Model: model, Limit: limit, IncludeArchived: includeArchived}
+				var res []cortex.ScoredRow
+				var serr error
+				if mode == cortex.SearchModeHybrid {
+					res, serr = cx.HybridSimilarAs(traceID, opts, weight, cortex.ActorAgent, cortex.DefaultSearchHitTopN)
+				} else {
+					res, serr = cx.SemanticSimilarAs(traceID, opts, cortex.ActorAgent, cortex.DefaultSearchHitTopN)
+				}
+				if serr != nil {
+					log.Printf("[mcp] %s similar failed, falling back to lexical: %v", mode, serr)
+					note = "[" + mode + " similar temporarily unavailable; showing lexical results]\n"
+				} else {
+					return mcp.NewToolResultText(formatSimilarMatches(scoredToMatches(res))), nil
+				}
+			}
 		}
-		// Same actor-aware bump as search_traces; see SearchAs for why.
-		matches, err := cx.FindSimilarAs(traceID, opts, cortex.ActorAgent, cortex.DefaultSearchHitTopN)
+
+		// Lexical (default or fallback). Same actor-aware bump as search_traces.
+		matches, err := cx.FindSimilarAs(traceID, cortex.SimilarOpts{
+			Limit:           limit,
+			IncludeArchived: includeArchived,
+		}, cortex.ActorAgent, cortex.DefaultSearchHitTopN)
 		if err != nil {
 			return nil, err
 		}
-		return mcp.NewToolResultText(formatSimilarMatches(matches)), nil
+		return mcp.NewToolResultText(note + formatSimilarMatches(matches)), nil
 	})
 
 	s.AddTool(mcp.NewTool("delete_trace",
@@ -986,10 +1095,13 @@ Choose the type that best reflects the intent of the memory:
   append_trace id content        → append content to an existing trace's body
                                    without reading the full trace first; ideal
                                    for running logs and fire-and-forget writes
-  search_traces query [all]      → FTS5 full-text search
-  find_similar_traces trace_id [limit] [include_archived]
-                                 → traces with overlapping vocabulary,
-                                   ranked by BM25 (lower score = closer
+  search_traces query [all] [mode]
+                                 → full-text (lexical, default) or embedding
+                                   (mode=semantic) search; semantic needs a
+                                   configured search: block, else falls back
+  find_similar_traces trace_id [limit] [include_archived] [mode]
+                                 → related traces by BM25 vocabulary overlap,
+                                   or mode=semantic for embedding similarity
                                    match). Useful when you have one
                                    trace in hand and want to surface
                                    related ones without crafting a query
@@ -1204,6 +1316,10 @@ runs.
 - author should be your agent name so traces are attributable in multi-agent systems.
 - Use derived_from when creating traces based on other traces — it builds a knowledge graph.
 - search_traces supports FTS5 syntax: quoted phrases, AND/OR/NOT, prefix* matching.
+- search_traces / find_similar_traces accept mode=semantic or mode=hybrid for
+  embedding-based ranking when this cortex has a search: block configured and
+  embeddings backfilled (noema embeddings backfill); they fall back to lexical
+  otherwise. Use semantic when a query matches by concept rather than wording.
 `, m.Name, noemaVersion, m.Version, purposeLine, ownerLine, m.Name)
 }
 

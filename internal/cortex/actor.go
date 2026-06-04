@@ -1,6 +1,7 @@
 package cortex
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"time"
@@ -134,6 +135,66 @@ func (c *Cortex) FindSimilarAs(traceID string, opts SimilarOpts, actor ReadActor
 	}
 	c.bumpSearchHitsForIDs(ids, tiers, topN)
 	return matches, nil
+}
+
+// SemanticSearchAs is the actor-aware counterpart to SemanticSearch: same
+// top-N search_hit_count bump for ActorAgent as SearchAs.
+func (c *Cortex) SemanticSearchAs(ctx context.Context, e Embedder, query string, opts SemanticOpts, actor ReadActor, topN int) ([]ScoredRow, error) {
+	res, err := c.SemanticSearch(ctx, e, query, opts)
+	if err != nil {
+		return nil, err
+	}
+	if actor == ActorAgent && len(res) > 0 {
+		c.bumpSearchHitsForScored(res, topN)
+	}
+	return res, nil
+}
+
+// SemanticSimilarAs is the actor-aware counterpart to SemanticSimilar.
+func (c *Cortex) SemanticSimilarAs(traceID string, opts SemanticOpts, actor ReadActor, topN int) ([]ScoredRow, error) {
+	res, err := c.SemanticSimilar(traceID, opts)
+	if err != nil {
+		return nil, err
+	}
+	if actor == ActorAgent && len(res) > 0 {
+		c.bumpSearchHitsForScored(res, topN)
+	}
+	return res, nil
+}
+
+// HybridSearchAs is the actor-aware counterpart to HybridSearch.
+func (c *Cortex) HybridSearchAs(ctx context.Context, e Embedder, query string, opts SemanticOpts, weight float64, actor ReadActor, topN int) ([]ScoredRow, error) {
+	res, err := c.HybridSearch(ctx, e, query, opts, weight)
+	if err != nil {
+		return nil, err
+	}
+	if actor == ActorAgent && len(res) > 0 {
+		c.bumpSearchHitsForScored(res, topN)
+	}
+	return res, nil
+}
+
+// HybridSimilarAs is the actor-aware counterpart to HybridSimilar.
+func (c *Cortex) HybridSimilarAs(traceID string, opts SemanticOpts, weight float64, actor ReadActor, topN int) ([]ScoredRow, error) {
+	res, err := c.HybridSimilar(traceID, opts, weight)
+	if err != nil {
+		return nil, err
+	}
+	if actor == ActorAgent && len(res) > 0 {
+		c.bumpSearchHitsForScored(res, topN)
+	}
+	return res, nil
+}
+
+// bumpSearchHitsForScored adapts []ScoredRow to the shared bump path.
+func (c *Cortex) bumpSearchHitsForScored(res []ScoredRow, topN int) {
+	ids := make([]string, 0, len(res))
+	tiers := make([]string, 0, len(res))
+	for _, r := range res {
+		ids = append(ids, r.ID)
+		tiers = append(tiers, r.Tier)
+	}
+	c.bumpSearchHitsForIDs(ids, tiers, topN)
 }
 
 // bumpSearchHitsForRows is the slice-of-Row entry point used by SearchAs.

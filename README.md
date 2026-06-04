@@ -210,8 +210,11 @@ noema append <id> [--content <text>]      Append to a Trace body (pipe-friendly:
 noema remove <id>                         Move a Trace to trash (--force to hard-delete)
 noema recover <id>                        Restore a Trace from trash
 noema purge [--days N]                    Permanently delete all trashed Traces older than N days
-noema search <query> [flags]              Full-text search (FTS5)
-noema similar <id> [--limit N]            Find traces with overlapping vocabulary to <id> (BM25-ranked)
+noema search <query> [flags]              Full-text search (FTS5). --semantic / --hybrid
+                                          rank by embedding similarity (needs a search: block + backfill)
+noema similar <id> [--limit N]            Find traces related to <id> (BM25; --semantic / --hybrid for embeddings)
+noema embeddings status                   Show semantic-search embedding coverage (embedded / stale / missing)
+noema embeddings backfill [--force]       Embed traces that are missing or stale (for semantic search)
 
 noema archive <id>                        Archive a Trace
 noema unarchive <id>                      Restore an archived Trace
@@ -305,8 +308,8 @@ Noema can run as an [MCP](https://modelcontextprotocol.io) server, giving any MC
 | `create_trace` | Create a new trace (supports `derived_from`, `origin`) |
 | `update_trace` | Update any subset of fields on an existing trace |
 | `append_trace` | Append content to an existing trace without reading it first (fire-and-forget logging) |
-| `search_traces` | FTS5 full-text search |
-| `find_similar_traces` | Surface traces with overlapping vocabulary (BM25-ranked); useful when you have one trace and want related ones without crafting a query |
+| `search_traces` | Search traces. `mode`: `lexical` (FTS5, default), `semantic` (embedding similarity), or `hybrid` (RRF fusion); semantic/hybrid need a configured `search:` block and fall back to lexical otherwise |
+| `find_similar_traces` | Surface traces related to one you hold. Default ranks by BM25 vocabulary overlap; `mode=semantic`/`hybrid` ranks by embedding similarity to the source trace's vector |
 | `archive_trace` / `unarchive_trace` | Archive a trace or restore it |
 | `delete_trace` / `recover_trace` | Soft-delete (move to trash) or restore from trash |
 | `trace_history` | Event log (audit trail) for a trace |
@@ -499,6 +502,37 @@ watch:
 Loopback is prevented by content hash comparison: when the watcher sees a write, it hashes the body and compares to the DB's `content_hash` — matches are skipped, so Noema's own writes don't trigger duplicate events. Source-locked foreign traces are refused on external edit and logged (the watcher will not silently circumvent a publisher's authority). Malformed drop-in files (missing frontmatter, invalid id) are skipped with a warning.
 
 The watcher runs under both transports because stdio sessions are not always the only mutator — the user may be editing in Obsidian while Claude Code holds a stdio connection, iCloud may deliver deltas from another device, or another noema process may be writing over HTTP on the same cortex. Federation propagation still only happens under `--transport http` (peers need a network endpoint), but external-edit events land in the local log and flow outward the next time an HTTP serve is running. Without any running `serve` process, external edits sit on disk safely, but stay invisible to the DB until `noema sync` (which, by design, emits no events — federation peers won't see those edits).
+
+---
+
+## Semantic search (optional)
+
+Lexical FTS5 search is always on. An **opt-in semantic layer** adds embedding-based ranking — useful when a query matches by *concept* rather than shared words (e.g. "how do we authenticate agents" surfacing a trace titled "bearer-key posture for the MCP endpoint"). It stays true to Noema's lightweight, local-first posture: embeddings are stored as a SQLite `BLOB` and cosine similarity is computed in pure Go — no CGo, no vector extension, no external vector database. Embeddings are a **local index** (never federated), like the FTS5 index.
+
+Enable it with a `search:` block in `cortex.md`:
+
+```yaml
+search:
+  semantic_enabled: true
+  embedding_model: nomic-embed-text          # required — no default
+  embedding_endpoint: http://localhost:11434/v1   # OpenAI-compatible /embeddings;
+                                             # inherits consolidation.local_llm_endpoint if unset
+  # default_mode: hybrid    # lexical | semantic | hybrid (default lexical)
+  # hybrid_weight: 0.5      # vector weight in hybrid fusion (0..1)
+  # max_chars: 32000        # per-trace embed-text budget; lower for small-context models
+```
+
+Then build the index and search:
+
+```sh
+noema embeddings backfill            # embed existing traces (idempotent)
+noema embeddings status              # coverage: embedded / stale / missing
+noema search "concept query" --semantic
+noema search "concept query" --hybrid   # fuse FTS5 + embeddings (reciprocal rank fusion)
+noema similar <id> --semantic
+```
+
+Over MCP, `search_traces` and `find_similar_traces` take a `mode` arg (`lexical` | `semantic` | `hybrid`). If semantic search isn't configured or the embedding endpoint is unreachable, both **degrade to lexical results with a note** rather than erroring. Under `noema serve`, a background maintainer re-embeds new and edited traces on an interval, so the index stays fresh without a manual backfill.
 
 ---
 
