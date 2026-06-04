@@ -41,7 +41,9 @@ Super simple, super basic. Intentionally lightweight. Transparently open.
 **Language:** Go (v1). Revisit Rust if MCP server concurrency demands it.
 - SQLite: `modernc.org/sqlite` (pure-Go, no CGo required)
 - TUI: Charm / Bubble Tea
-- Search: SQLite FTS5 — no semantic/vector search in v1
+- Search: SQLite FTS5 (lexical, always on) plus an **opt-in semantic / hybrid**
+  layer (embeddings + pure-Go cosine; see Semantic Search below). No CGo, no
+  vector extension, no external vector DB.
 
 Markdown files are the content holders of data. The SQLite DB is a basic schema to hold pieces of metadata about the markdown files (location, author, type, tag(s), ...) in order to provide mapping, related contexts, search performance.
 
@@ -194,6 +196,18 @@ The three-tier model completes with an automatic mid→long promoter. A graduati
 ### Search-hit instrumentation (Phase 15.5)
 
 `search_traces` and `find_similar_traces` bump a per-peer `search_hit_count` column in `trace_usage` for the top-N results (default N=3 via `cortex.DefaultSearchHitTopN`) when the caller is `ActorAgent`. This complements `read_count` (which only bumps on `get_trace` / `noema_recall`): auto-injection providers like the Hermes plugin consume search output without ever drilling into individual traces, so without this signal their cortexes generate no usage data and traces never accumulate enough to graduate. The graduation gate and the heuristic short→mid scorer both fold `search_hit_count` into the read bucket at 1:1, which preserves the option to reweight later (the columns stay separate on the wire and in the DB) without a schema change. Long-tier traces are skipped on bump — see `internal/cortex/actor.go` `SearchAs` / `FindSimilarAs` for the rationale and the `bumpSearchHitsForIDs` guard. Migration `015_search_hit_count.sql` adds the column with default 0; older peers in a federation ring stay wire-compatible because `federation.TraceUsage.SearchHitCount` uses `omitempty`.
+
+### Semantic Search (opt-in)
+
+Lexical FTS5 search is always on. An **opt-in semantic layer** adds embedding-based ranking, kept pure-Go: `modernc.org/sqlite` can't load the `sqlite-vec` C extension, so embeddings are stored as a `BLOB` (migration `016_trace_embeddings.sql`: `trace_id, embedding_model, dim, embedding, source_hash, updated_at`) and cosine similarity is computed in Go (brute-force; interactive to ~50k traces — a feasibility spike measured ~7ms/query at 10k×768-dim). Embeddings are a **local derived index, never federated** (vectors from different models aren't comparable, and trace bodies + `content_hash` already sync) — so there is no `sync_events`/wire-format impact, like FTS5.
+
+Enable via a `search:` block in `cortex.md` (off by default): `semantic_enabled: true`, `embedding_model` (required — no baked-in default), `embedding_endpoint` (OpenAI-compatible `/embeddings`; inherits `consolidation.local_llm_endpoint` when empty), optional `api_key_env`, `default_mode` (lexical|semantic|hybrid), `hybrid_weight` (0..1, default 0.5), `max_chars` (per-trace embed-text budget, default 32000 — lower it for small-context embed models), `embed_interval_seconds` (serve maintainer cadence, default 300). `Manifest.ValidateSearch` enforces the cross-field rules. The embedder reuses `consolidation.HTTPLLMClient` via an `Embed()` method; the `cortex.Embedder` interface is defined in `internal/cortex` to avoid an import cycle and injected by the CLI/serve layer.
+
+- **Storage / lifecycle** (`internal/cortex/embedding.go`, `embedding_store.go`): the BLOB codec (1-byte version + LE float32, L2-normalized so cosine == dot), `EmbedBackfill` (idempotent, resumable, `--force`/`--limit`, model-change re-embed; staleness keyed on `source_hash` vs `content_hash`), and `EmbeddingStatus`. Body text = `title + "\n\n" + body`, rune-truncated to `max_chars`.
+- **Query** (`semantic.go`): `SemanticSearch` (embeds the query), `SemanticSimilar` (reuses the source trace's stored vector), `HybridSearch`/`HybridSimilar` (Reciprocal Rank Fusion, K=60, of BM25-ranked `lexicalRanked` + cosine, weighted by `hybrid_weight`). Non-finite or dimension-mismatched stored vectors are skipped at the consumer so a corrupted BLOB can't poison ranking. Actor wrappers (`*As`) bump `search_hit_count` for `ActorAgent`, matching the lexical path.
+- **CLI**: `noema embeddings status|backfill [--force] [--limit]`; `noema search --semantic|--hybrid`; `noema similar --semantic|--hybrid`.
+- **MCP**: `search_traces` and `find_similar_traces` take a `mode` arg (`lexical`|`semantic`|`hybrid`); the server builds the embedder from the manifest and **degrades to lexical with a bracketed note** (never an error) when semantic is unconfigured, the endpoint is unreachable, or the source isn't embedded.
+- **Serve-time freshness** (`internal/embed/Maintainer`): under `noema serve`, a background loop runs a periodic idempotent backfill (gated on the background-work lock) so new/edited traces get embedded without a manual backfill. It is NOT a per-mutation hook — embedding never blocks or fails a write; freshness is eventual, bounded by `embed_interval_seconds`.
 
 ### Automatic LLM distillation (auto_distillation_enabled)
 

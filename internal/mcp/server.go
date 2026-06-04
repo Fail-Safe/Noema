@@ -1310,6 +1310,10 @@ runs.
 - author should be your agent name so traces are attributable in multi-agent systems.
 - Use derived_from when creating traces based on other traces — it builds a knowledge graph.
 - search_traces supports FTS5 syntax: quoted phrases, AND/OR/NOT, prefix* matching.
+- search_traces / find_similar_traces accept mode=semantic or mode=hybrid for
+  embedding-based ranking when this cortex has a search: block configured and
+  embeddings backfilled (noema embeddings backfill); they fall back to lexical
+  otherwise. Use semantic when a query matches by concept rather than wording.
 `, m.Name, noemaVersion, m.Version, purposeLine, ownerLine, m.Name)
 }
 
