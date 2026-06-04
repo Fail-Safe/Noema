@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"strings"
 
@@ -265,7 +266,11 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 					res, serr = cx.SemanticSearchAs(ctx, emb, query, opts, cortex.ActorAgent, cortex.DefaultSearchHitTopN)
 				}
 				if serr != nil {
-					note = "[" + mode + " search unavailable (" + serr.Error() + "); showing lexical results]\n"
+					// Log the detailed error server-side; surface only a generic
+					// note to the client so endpoint URLs / internal hostnames in
+					// the error don't leak into MCP output.
+					log.Printf("[mcp] %s search failed, falling back to lexical: %v", mode, serr)
+					note = "[" + mode + " search temporarily unavailable; showing lexical results]\n"
 				} else {
 					return mcp.NewToolResultText(formatRows(scoredToRows(res))), nil
 				}
@@ -315,7 +320,8 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 					res, serr = cx.SemanticSimilarAs(traceID, opts, cortex.ActorAgent, cortex.DefaultSearchHitTopN)
 				}
 				if serr != nil {
-					note = "[" + mode + " similar unavailable (" + serr.Error() + "); showing lexical results]\n"
+					log.Printf("[mcp] %s similar failed, falling back to lexical: %v", mode, serr)
+					note = "[" + mode + " similar temporarily unavailable; showing lexical results]\n"
 				} else {
 					return mcp.NewToolResultText(formatSimilarMatches(scoredToMatches(res))), nil
 				}
