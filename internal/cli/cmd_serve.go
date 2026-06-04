@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"github.com/Fail-Safe/Noema/internal/config"
 	"github.com/Fail-Safe/Noema/internal/consolidation"
 	"github.com/Fail-Safe/Noema/internal/cortex"
+	"github.com/Fail-Safe/Noema/internal/embed"
 	"github.com/Fail-Safe/Noema/internal/federation"
 	"github.com/Fail-Safe/Noema/internal/lock"
 	mcpserver "github.com/Fail-Safe/Noema/internal/mcp"
@@ -29,17 +31,17 @@ import (
 
 func serveCmd() *cobra.Command {
 	var (
-		transport         string
-		hosts             []string
-		port              int
+		transport            string
+		hosts                []string
+		port                 int
 		tlsCert              string
 		tlsKey               string
 		insecureAllowExpired bool
 		logFile              string
-		logStderr         bool
-		printConfig       bool
-		printSystemdUnit  bool
-		printLaunchdPlist bool
+		logStderr            bool
+		printConfig          bool
+		printSystemdUnit     bool
+		printLaunchdPlist    bool
 	)
 
 	cmd := &cobra.Command{
@@ -138,6 +140,7 @@ func serveCmd() *cobra.Command {
 			var eligibility *consolidation.EligibilityLoop
 			var watchdog *consolidation.Watchdog
 			var certMonitor *mcpserver.CertMonitor
+			var embedMaintainer *embed.Maintainer
 
 			// Per-cortex background-work coordination. Concurrent serve
 			// processes on the same cortex (long-lived `--transport http`
@@ -226,6 +229,14 @@ func serveCmd() *cobra.Command {
 			// trash/update event for the same fsnotify trigger.
 			if gotLock && manifestErr == nil && m.Watch.WatchEnabled() {
 				watcher = startWatcher(cx, m.Watch)
+			}
+
+			// Embed maintainer: when semantic search is configured, keep the
+			// embedding index fresh by periodically backfilling new/edited
+			// traces. Gated on the background-work lock so only one serve
+			// process embeds per cortex (backfill is idempotent regardless).
+			if gotLock && manifestErr == nil && m.Search.SemanticOn() {
+				embedMaintainer = startEmbedMaintainer(cx, m)
 			}
 
 			// Consolidation agent: opt-in; drives memory-tier
@@ -434,6 +445,9 @@ func serveCmd() *cobra.Command {
 			if watcher != nil {
 				watcher.Stop()
 			}
+			if embedMaintainer != nil {
+				embedMaintainer.Stop()
+			}
 			if consolidator != nil {
 				consolidator.Stop()
 			}
@@ -499,6 +513,34 @@ func startWatcher(cx *cortex.Cortex, cfg *cortex.WatchConfig) *watch.Watcher {
 		return nil
 	}
 	return w
+}
+
+// startEmbedMaintainer wires the manifest's search config into a background
+// loop that periodically backfills semantic embeddings (idempotent). Returns
+// nil (and logs) when the embedder can't be built, so a misconfigured
+// endpoint degrades to "no auto-embed" rather than taking down serve.
+func startEmbedMaintainer(cx *cortex.Cortex, m cortex.Manifest) *embed.Maintainer {
+	model := ""
+	if m.Search != nil {
+		model = m.Search.EmbeddingModel
+	}
+	endpoint := m.ResolvedEmbeddingEndpoint()
+	if model == "" || endpoint == "" {
+		fmt.Printf("[embed] semantic enabled but model/endpoint unresolved; auto-embed disabled\n")
+		return nil
+	}
+	client, err := consolidation.NewHTTPLLMClient(endpoint, m.ResolvedEmbeddingAPIKeyEnv())
+	if err != nil {
+		fmt.Printf("[embed] client construct failed: %v (auto-embed disabled)\n", err)
+		return nil
+	}
+	maxChars := m.Search.EffectiveMaxChars()
+	mt := embed.New(m.Search.EffectiveEmbedInterval(), func(ctx context.Context) (int, error) {
+		res, err := cx.EmbedBackfill(ctx, client, model, cortex.EmbedBackfillOpts{MaxChars: maxChars})
+		return res.Embedded, err
+	})
+	mt.Start()
+	return mt
 }
 
 // startConsolidator wires the manifest's consolidation config into a
