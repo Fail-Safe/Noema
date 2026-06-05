@@ -214,7 +214,8 @@ noema search <query> [flags]              Full-text search (FTS5). --semantic / 
                                           rank by embedding similarity (needs a search: block + backfill)
 noema similar <id> [--limit N]            Find traces related to <id> (BM25; --semantic / --hybrid for embeddings)
 noema embeddings status                   Show semantic-search embedding coverage (embedded / stale / missing)
-noema embeddings backfill [--force]       Embed traces that are missing or stale (for semantic search)
+noema embeddings backfill [--force] [--limit N]
+                                          Embed traces that are missing or stale (for semantic search)
 
 noema archive <id>                        Archive a Trace
 noema unarchive <id>                      Restore an archived Trace

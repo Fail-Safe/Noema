@@ -153,7 +153,7 @@ Every mutation (create / update / archive / unarchive / trash / recover / purge)
 
 Lineage is a separate `trace_lineage` join table populated from the `derived_from` frontmatter field. `trace_lineage` supports both directions: `cortex.Get()` reads `derived_from`, and `cortex.DerivedBy()` reads the reverse edge.
 
-**Cortex identity.** Every Cortex has a stable ULID stored in `cortex.md` as `id` and surfaced via the `cortex_identity` MCP tool. The display name (`name`) can be renamed without affecting federation; the ID is the federation key. Vector clocks are keyed on cortex IDs, not names, so two peers that share a display name can no longer silently collapse into one bucket. The federation syncer pins a peer's ID on first contact and refuses to talk to an endpoint whose advertised ID has changed (peer reset, replaced, or restored from another cortex's backup). The same-name guardrail is still enforced at config time as a UX safety net even though identity is now ID-based. See `docs/design/cortex-uuid-plan.md` for the full design.
+**Cortex identity.** Every Cortex has a stable ULID stored in `cortex.md` as `id` and surfaced via the `cortex_identity` MCP tool. The display name (`name`) can be renamed without affecting federation; the ID is the federation key. Vector clocks are keyed on cortex IDs, not names, so two peers that share a display name can no longer silently collapse into one bucket. The federation syncer pins a peer's ID on first contact and refuses to talk to an endpoint whose advertised ID has changed (peer reset, replaced, or restored from another cortex's backup). The same-name guardrail is still enforced at config time as a UX safety net even though identity is now ID-based.
 
 Federation is opt-in via a `federation:` block in `cortex.md` (peers + interval). When `noema serve --transport http` starts on a Cortex with peers configured, a background syncer polls each peer's `sync_events` MCP tool over Streamable HTTP (the `/mcp` endpoint, MCP 2025-03-26), replays new events into the local Cortex, and merges the remote vector clock into the local one. Replayed events are stored with their original ID, cortex_id, and origin so the event log becomes the union of all peers' events (no event amplification). When two peers update the same trace concurrently — vector clocks neither dominate nor are dominated — Noema creates a `type: divergence` Trace preserving every conflicting version under deterministically-sorted `### Version from <name> (<id-prefix>)` headers, rather than overwriting. Resolve via `noema resolve <divergence-id> --accept <name|id-prefix>` or `--custom <body>` (or the `resolve_divergence` MCP tool).
 
@@ -169,8 +169,6 @@ In publish mode, mutating MCP tools (`create_trace`, `update_trace`, `append_tra
 
 Each peer can also declare `mode: paused` to temporarily skip syncing without losing cursor/identity state. CLI commands: `noema federation set-mode <sync|publish|subscribe>`, `noema federation pause-peer <name>`, `noema federation resume-peer <name>`.
 
-The full design rationale, edge cases, and phase breakdown live in `docs/design/federation-plan.md`.
-
 **Content hashing and source-locking.** Every trace mutation (`Add`, `Update`, `Append`) computes a SHA-256 hash of the body (`sha256:<hex>`) and stores it in the `content_hash` frontmatter field and DB column. The hash travels through federation events so peers receive it. Three frontmatter fields support integrity:
 
 - `content_hash` — current body hash, recomputed on every write
@@ -181,7 +179,7 @@ The full design rationale, edge cases, and phase breakdown live in `docs/design/
 
 CLI: `noema verify` is a subcommand group for integrity checks. `noema verify traces` checks all trace file hashes against their frontmatter `content_hash` (with `--backfill` for old traces); `noema verify cortex` validates the manifest, user config, DB, access posture, and federation config; `noema verify drift` checks federated traces against their `source_hash`. Bare `noema verify` runs `verify traces` for back-compat. The legacy top-level `noema drift` still works as a hidden alias for `noema verify drift` and will be removed in a future release.
 
-**MCP access posture.** The HTTP MCP endpoint runs either in **open mode** (no auth, the default — suitable only for loopback) or in **keyed mode** (every request must carry `Authorization: Bearer <key>`). Keyed mode is mandatory for federation rings and any non-loopback deployment, and it also requires TLS — the server refuses to start with a bearer key over plaintext HTTP. The key is supplied via `NOEMA_MCP_KEY` (env var, wins if both are set) or via an optional `access.shared_key_file` block in `cortex.md` pointing at a 0600 sidecar file. The server logs the active posture on startup as `access=keyed source=env|file fingerprint=SHA256:...`, and `noema federation key fingerprint` reproduces the same non-secret fingerprint for out-of-band verification across ring members. The federation syncer automatically injects the local host's bearer key into every outbound `sync_events` call; there is no per-peer key config, so every host in a ring must share one key. Mixed-mode rings (some keyed, some open) are not supported — they isolate by design. See `docs/design/mcp-auth-plan.md` for the full threat model and decision log, and `internal/mcp/middleware.go` for the CORS + auth middleware chain (CORS outermost so browser preflights bypass the auth gate as the spec requires).
+**MCP access posture.** The HTTP MCP endpoint runs either in **open mode** (no auth, the default — suitable only for loopback) or in **keyed mode** (every request must carry `Authorization: Bearer <key>`). Keyed mode is mandatory for federation rings and any non-loopback deployment, and it also requires TLS — the server refuses to start with a bearer key over plaintext HTTP. The key is supplied via `NOEMA_MCP_KEY` (env var, wins if both are set) or via an optional `access.shared_key_file` block in `cortex.md` pointing at a 0600 sidecar file. The server logs the active posture on startup as `access=keyed source=env|file fingerprint=SHA256:...`, and `noema federation key fingerprint` reproduces the same non-secret fingerprint for out-of-band verification across ring members. The federation syncer automatically injects the local host's bearer key into every outbound `sync_events` call; there is no per-peer key config, so every host in a ring must share one key. Mixed-mode rings (some keyed, some open) are not supported — they isolate by design. See `internal/mcp/middleware.go` for the CORS + auth middleware chain (CORS outermost so browser preflights bypass the auth gate as the spec requires).
 
 **TLS cert lifecycle.** When `noema serve --transport http` is started with TLS (via `--tls-cert`/`--tls-key` or the manifest fallback `access.tls_cert_path` / `access.tls_key_path`), the leaf cert is parsed at startup and classified against its `NotAfter`. An already-expired or not-yet-valid cert is a hard startup error — the server refuses to come up rather than presenting a cert clients will reject anyway. The `--insecure-allow-expired` flag exists as an escape hatch for in-place rotation but logs a loud warning line. Certs within 7 days of expiry produce a warning at startup; the server still starts. A background `cert-monitor` goroutine (mirroring the federation syncer's lifecycle) re-checks the cert every hour while serving and logs a band-transition line as the cert crosses the 90 / 30 / 7 / expired thresholds. `noema verify cortex` reads the same manifest fields and surfaces upcoming expiry passively (`[warn]` ≤ 7 days, `[fail]` once expired or not-yet-valid). See `internal/tlsutil/` for the parser/classifier, `internal/mcp/certmonitor.go` for the loop, and `cmd_serve.go:gateTLSExpiry` for the startup gate.
 
@@ -237,9 +235,26 @@ Schema changes must always be transparent and non-destructive. Rules:
 - If a migration would require removing or restructuring data, provide a separate explicit `noema migrate` command with a clear description of what it does, requiring user confirmation
 - Migration failures abort startup with a clear error; they never partially apply
 
-The runner is a thin hand-rolled loop over embedded `*.sql` files in `internal/db/migrations/`, sorted by leading version number. Currently applied: `001_initial.sql`, `002_trash.sql`, `003_events_and_lineage.sql` (event log + `trace_lineage` + `traces.origin` column), `004_federation_state.sql` (key-value store for vector clocks and per-peer cursors), `005_cortex_identity.sql` (`cortex_id` column on `traces` and `events`), `006_content_hash.sql` (`content_hash` column on `traces`), and `007_source_locking.sql` (`source_locked` + `source_hash` columns on `traces`).
+The runner is a thin hand-rolled loop over embedded `*.sql` files in `internal/db/migrations/`, sorted by leading version number. Currently applied:
 
-`cortex.md` carries a `version` field. The current `ManifestVersion` is **2** — version 2 carries a stable cortex `id` (a ULID) and re-keys the local event log + vector clock from cortex-name to cortex-id. Cortexes written by older binaries must run `noema migrate cortex-id` (an explicit, interactive, backed-up migration in `internal/cli/cmd_migrate.go`) before they can be opened by this binary; the `--reset` flag handles the case where the directory is a copy of another cortex (Gotcha #3 in the design doc).
+- `001_initial.sql` — base trace metadata, tags, and FTS tables
+- `002_trash.sql` — soft-delete/trash lifecycle
+- `003_events_and_lineage.sql` — event log, `trace_lineage`, and `traces.origin`
+- `004_federation_state.sql` — key-value store for vector clocks and peer cursors
+- `005_cortex_identity.sql` — `cortex_id` on `traces` and `events`
+- `006_content_hash.sql` — `content_hash` on `traces`
+- `007_source_locking.sql` — `source_locked` and `source_hash` on `traces`
+- `008_fts5_include_tags.sql` — include tags in the FTS5 search document
+- `009_memory_tiering.sql` — short/mid/long tier metadata and tier votes
+- `010_long_term_trigger_refine.sql` — long-term immutability trigger refinements
+- `011_purge_columns.sql` — purge audit metadata
+- `012_lineage_count_view.sql` — derived-from count view for consolidation signals
+- `013_long_term_trigger_visibility.sql` — long-tier visibility trigger behavior
+- `014_trace_usage.sql` — per-peer read/modify usage signals
+- `015_search_hit_count.sql` — search hit usage signal for top-N results
+- `016_trace_embeddings.sql` — local semantic-search embedding index
+
+`cortex.md` carries a `version` field. The current `ManifestVersion` is **2** — version 2 carries a stable cortex `id` (a ULID) and re-keys the local event log + vector clock from cortex-name to cortex-id. Cortexes written by older binaries must run `noema migrate cortex-id` (an explicit, interactive, backed-up migration in `internal/cli/cmd_migrate.go`) before they can be opened by this binary; the `--reset` flag handles the case where the directory is a copy of another cortex and needs a fresh identity.
 
 ### Cortex Creation
 
