@@ -130,3 +130,50 @@ func TestRunKeygenRequiresCortexID(t *testing.T) {
 		t.Fatalf("error should point to the fix, got: %v", err)
 	}
 }
+
+// TestWriteSecretFileAtomicReplace locks in the rotation guarantees: the file
+// lands at exactly 0600 with the new contents even when it pre-existed with
+// looser bits, and the atomic temp-then-rename leaves no stray temp files in
+// the directory.
+func TestWriteSecretFileAtomicReplace(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not enforced on Windows")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "noema-signing.key")
+
+	// Pre-existing file with deliberately loose permissions and old contents.
+	if err := os.WriteFile(path, []byte("old-seed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := writeSecretFile(path, "new-seed\n"); err != nil {
+		t.Fatalf("writeSecretFile: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "new-seed\n" {
+		t.Fatalf("content = %q, want the replacement seed", got)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("mode = %#o, want 0600 even over a 0644 original", perm)
+	}
+
+	// The atomic write must not leave its temp file behind.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != "noema-signing.key" {
+			t.Fatalf("unexpected leftover file in dir: %q", e.Name())
+		}
+	}
+}

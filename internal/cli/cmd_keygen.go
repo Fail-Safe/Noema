@@ -134,20 +134,40 @@ func runKeygen(out io.Writer, name, dir string, force bool) error {
 	return nil
 }
 
-// writeSecretFile writes content to path with 0600 permissions, truncating any
-// existing file and forcing the mode even if the file pre-existed with looser
-// bits. Used for the signing-key seed sidecar.
+// writeSecretFile atomically writes content to path with 0600 permissions.
+// It writes a temp file in the same directory, fsyncs it, and renames it into
+// place, so a crash or error mid-write can never truncate or partially
+// overwrite an existing key: the path always resolves to either the complete
+// old contents or the complete new ones. This matters for the signing-key
+// seed sidecar — a key clobbered halfway through a `keygen --force` rotation
+// would force every peer to re-pin. The temp file lives beside the target so
+// the rename stays on one filesystem (cross-device renames are not atomic).
 func writeSecretFile(path, content string) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".noema-signing-*.tmp")
 	if err != nil {
 		return err
 	}
-	if _, err := f.WriteString(content); err != nil {
-		f.Close()
+	// Best-effort cleanup on any error path; a no-op once the rename succeeds.
+	defer os.Remove(tmp.Name())
+
+	// os.CreateTemp already uses 0600, but force it explicitly so the guarantee
+	// does not depend on that detail.
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
 		return err
 	}
-	if err := f.Close(); err != nil {
+	if _, err := tmp.WriteString(content); err != nil {
+		tmp.Close()
 		return err
 	}
-	return os.Chmod(path, 0o600)
+	// Flush to disk before the rename so the swapped-in file can't be left
+	// empty if the machine loses power right after the rename lands.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
