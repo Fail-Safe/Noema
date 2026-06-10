@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -114,12 +115,16 @@ func runKeygen(out io.Writer, name, dir string, force bool) error {
 		return fmt.Errorf("generating signing key: %w", err)
 	}
 
-	// Write the seed with owner-only permissions. O_TRUNC so a rotation
-	// cleanly replaces the old seed; an explicit Chmod guards the case where
-	// the file already existed with looser bits.
+	// Write the seed atomically with owner-only permissions, so a crash during
+	// a rotation can't leave the key truncated (see writeSecretFile).
 	if err := writeSecretFile(keyPath, seed+"\n"); err != nil {
 		return fmt.Errorf("writing signing key file: %w", err)
 	}
+
+	// Best-effort guard against committing the seed if the cortex directory is
+	// a git repo: add it to .gitignore. A failure here doesn't invalidate the
+	// key, so warn rather than abort.
+	ignored, giErr := ensureSeedGitignored(dir, keyPath)
 
 	m.Signing = &cortex.SigningConfig{PublicKey: pub, PrivateKeyFile: keyFile}
 	if err := cortex.WriteManifest(dir, m); err != nil {
@@ -130,8 +135,61 @@ func runKeygen(out io.Writer, name, dir string, force bool) error {
 	fmt.Fprintf(out, "  public key:  %s\n", pub)
 	fmt.Fprintf(out, "  private key: %s (mode 0600 — keep it secret, never commit it)\n", keyPath)
 	fmt.Fprintf(out, "  cortex.md:   signing block updated\n")
+	switch {
+	case giErr != nil:
+		fmt.Fprintf(out, "  warning:     could not update .gitignore (%v); never commit %s\n", giErr, filepath.Base(keyPath))
+	case ignored:
+		fmt.Fprintf(out, "  .gitignore:  %s ignored\n", filepath.Base(keyPath))
+	}
 	fmt.Fprintln(out, "\nPeers pin this public key on their next sync (trust-on-first-use).")
 	return nil
+}
+
+// ensureSeedGitignored makes sure the signing-key seed can't be accidentally
+// committed if the cortex directory is (or later becomes) a git repo, by adding
+// it to a .gitignore at the cortex root. It is idempotent (an existing entry is
+// left alone) and creates the .gitignore if absent. Returns true when the seed
+// is now ignored. A key stored outside the cortex directory is left to the
+// operator — a .gitignore here couldn't cover it — and returns false, nil.
+func ensureSeedGitignored(dir, keyPath string) (bool, error) {
+	rel, err := filepath.Rel(dir, keyPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return false, nil
+	}
+	rel = filepath.ToSlash(rel)
+
+	gitignore := filepath.Join(dir, ".gitignore")
+	data, err := os.ReadFile(gitignore)
+	if err != nil && !os.IsNotExist(err) {
+		return false, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == rel {
+			return true, nil // already ignored
+		}
+	}
+
+	var entry string
+	switch {
+	case len(data) == 0:
+		entry = "# Noema signing-key seed — never commit this\n" + rel + "\n"
+	case !strings.HasSuffix(string(data), "\n"):
+		entry = "\n" + rel + "\n"
+	default:
+		entry = rel + "\n"
+	}
+	f, err := os.OpenFile(gitignore, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return false, err
+	}
+	if _, err := f.WriteString(entry); err != nil {
+		f.Close()
+		return false, err
+	}
+	if err := f.Close(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // writeSecretFile atomically writes content to path with 0600 permissions.

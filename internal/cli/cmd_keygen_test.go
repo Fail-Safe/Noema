@@ -131,6 +131,44 @@ func TestRunKeygenRequiresCortexID(t *testing.T) {
 	}
 }
 
+// TestRunKeygenGitignoresSeed verifies the seed is added to a .gitignore at the
+// cortex root and that a rotation doesn't duplicate the entry.
+func TestRunKeygenGitignoresSeed(t *testing.T) {
+	dir := t.TempDir()
+	writeTestManifest(t, dir, "01HV0000000000000000000CTX")
+
+	var out bytes.Buffer
+	if err := runKeygen(&out, "test", dir, false); err != nil {
+		t.Fatal(err)
+	}
+
+	count := func() int {
+		data, err := os.ReadFile(filepath.Join(dir, ".gitignore"))
+		if err != nil {
+			t.Fatalf("reading .gitignore: %v", err)
+		}
+		n := 0
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.TrimSpace(line) == defaultSigningKeyFile {
+				n++
+			}
+		}
+		return n
+	}
+	if got := count(); got != 1 {
+		t.Fatalf("expected the seed ignored exactly once, got %d occurrences", got)
+	}
+
+	// Rotation must not append a duplicate entry.
+	out.Reset()
+	if err := runKeygen(&out, "test", dir, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := count(); got != 1 {
+		t.Fatalf("rotation duplicated the .gitignore entry: %d occurrences", got)
+	}
+}
+
 // TestWriteSecretFileAtomicReplace locks in the rotation guarantees: the file
 // lands at exactly 0600 with the new contents even when it pre-existed with
 // looser bits, and the atomic temp-then-rename leaves no stray temp files in
