@@ -107,37 +107,46 @@ func LoadAccessKey(cortexDir string, cfg *AccessConfig) (AccessKey, error) {
 	}, nil
 }
 
-// loadKeyFile reads a sidecar key file, enforcing permissions and
-// format rules. Returns the parsed key with surrounding whitespace
+// loadKeyFile reads the MCP shared-key sidecar file, enforcing permissions
+// and format rules. Returns the parsed key with surrounding whitespace
 // stripped.
 func loadKeyFile(path string) (string, error) {
+	return loadSidecarLine(path, "access key file")
+}
+
+// loadSidecarLine reads a single-secret sidecar file (the MCP shared key, or
+// the Ed25519 signing-key seed), enforcing the same permission, size, and
+// single-line format rules for both. The label is woven into every error so
+// the message names the right file kind. Returns the first non-empty line
+// with surrounding whitespace stripped.
+func loadSidecarLine(path, label string) (string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return "", fmt.Errorf("reading access key file %s: %w", path, err)
+		return "", fmt.Errorf("reading %s %s: %w", label, path, err)
 	}
 	if info.IsDir() {
-		return "", fmt.Errorf("access key file %s is a directory", path)
+		return "", fmt.Errorf("%s %s is a directory", label, path)
 	}
 	if info.Size() > accessKeyMaxBytes {
-		return "", fmt.Errorf("access key file %s is %d bytes; maximum is %d", path, info.Size(), accessKeyMaxBytes)
+		return "", fmt.Errorf("%s %s is %d bytes; maximum is %d", label, path, info.Size(), accessKeyMaxBytes)
 	}
 	// SSH-style permissions check: group/other bits must be zero. This
 	// is a Unix-only guardrail — on Windows info.Mode().Perm() does not
 	// carry POSIX bits, so the check is a no-op there (v1 is Unix-first).
 	if mode := info.Mode().Perm(); mode&0o077 != 0 {
 		return "", fmt.Errorf(
-			"refusing to read access key file %s: mode %#o is too permissive; chmod 600 %s",
-			path, mode, path,
+			"refusing to read %s %s: mode %#o is too permissive; chmod 600 %s",
+			label, path, mode, path,
 		)
 	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", fmt.Errorf("reading access key file %s: %w", path, err)
+		return "", fmt.Errorf("reading %s %s: %w", label, path, err)
 	}
 
-	// Parse: first non-empty trimmed line is the key; two or more
-	// non-empty lines is an error (v1 does not support multi-key
+	// Parse: first non-empty trimmed line is the secret; two or more
+	// non-empty lines is an error (v1 does not support multi-secret
 	// files). CRLF line endings are handled naturally because the
 	// per-line TrimSpace strips the trailing \r.
 	var key string
@@ -154,11 +163,11 @@ func loadKeyFile(path string) (string, error) {
 	}
 	switch {
 	case nonEmpty == 0:
-		return "", fmt.Errorf("access key file %s is empty or whitespace-only", path)
+		return "", fmt.Errorf("%s %s is empty or whitespace-only", label, path)
 	case nonEmpty > 1:
 		return "", fmt.Errorf(
-			"access key file %s contains %d non-empty lines; v1 supports a single key per file",
-			path, nonEmpty,
+			"%s %s contains %d non-empty lines; v1 supports a single key per file",
+			label, path, nonEmpty,
 		)
 	}
 	return key, nil

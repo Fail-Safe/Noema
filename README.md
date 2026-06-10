@@ -33,6 +33,12 @@ Noema gives AI agents — and the humans working alongside them — a persistent
 | **Trace** | A single memory — one markdown file + its database row |
 | **Cortex** | A named collection of Traces, stored in a directory you control |
 
+Contributor and architecture notes:
+
+- [Repository Guidelines](AGENTS.md)
+- [Architecture](docs/architecture.md)
+- [Development Guide](docs/development.md)
+
 A Trace has a **type** that describes its intent:
 
 | Type | Meaning |
@@ -660,6 +666,29 @@ noema verify cortex           # validate manifest, config, db, access, federatio
 noema verify drift            # check federated traces against source hashes
 noema edit <id> --force       # override source-lock
 ```
+
+Locally, source-locking is enforced by refusing foreign-origin mutations. Across a federation, that guarantee is only as strong as the events that carry it — which is what **event signing** (below) protects.
+
+### Federation event signing
+
+Content hashing proves a body matches its hash; it does not prove *who* wrote the event. On a shared-key federation, any peer holding the key could otherwise forge events under another cortex's identity, overwrite source-locked traces, or rewrite `source_hash` so drift checks still pass. Event signing closes that gap by authenticating the originating cortex with an Ed25519 signature.
+
+```bash
+noema keygen                  # generate this cortex's Ed25519 signing key
+noema keygen --force          # rotate the key (peers must re-pin)
+```
+
+Once a cortex has a key, it signs every event it emits. Peers learn its public key through the `cortex_identity` handshake and pin it per cortex id (trust-on-first-use); a later key change is refused until you run `noema federation reset-peer`. Verification of *incoming* events is staged so a mixed-version ring never hard-partitions, controlled by `federation.verify` in `cortex.md`:
+
+| `federation.verify` | Behavior on a bad/unsigned event |
+|---|---|
+| `off` (default) | accept — no change for cortexes that haven't enabled signing |
+| `warn` | accept, but log every unsigned/forged/unverifiable event |
+| `enforce` | reject — only correctly-signed events from their owning cortex are replayed |
+
+Under `enforce`, source-lock enforcement extends to replay: a locked trace can only be mutated by the cortex that owns it.
+
+Trust-on-first-use has a first-contact window. For a high-assurance peer you can skip it by hard-pinning the peer's key out-of-band — add `pubkey: ed25519:<base64>` to that peer's entry under `federation.peers` in `cortex.md`. The peer must then advertise exactly that key at the handshake or the sync is refused (overriding TOFU); to rotate, edit the pinned value.
 
 ### Authentication
 

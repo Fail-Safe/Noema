@@ -766,6 +766,13 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 			"version": m.Version,
 			"mode":    m.Federation.EffectiveMode(),
 		}
+		// Advertise the federation signing public key so peers can pin it
+		// (trust-on-first-use) and verify this cortex's events. Omitted when
+		// the cortex is unsigned; older peers ignore the field. The public
+		// key is not a secret.
+		if pub := cx.PublicKey(); pub != "" {
+			payload["pubkey"] = pub
+		}
 		// Piggyback the current consolidation rank on the identity
 		// response so federated peers can observe eligibility without a
 		// separate round-trip. Missing state (feature off, eligibility
@@ -1281,6 +1288,19 @@ get_trace shows Source Locked, Source Hash, and Content Hash fields when present
 Both list_traces and search_traces prefix each row with a tier glyph (s=short,
 m=mid, L=long) so you can see the tier without a second lookup. get_trace surfaces
 the full tier name on a dedicated "Tier:" line in the metadata block.
+
+## Federation Event Signing
+content_hash proves a body matches its hash but not which cortex authored an event.
+Run noema keygen (CLI) to give a cortex an Ed25519 signing key; it then signs every
+event it emits and advertises its public key through the cortex_identity handshake.
+Peers pin that key per cortex id on first contact and refuse a later change until
+noema federation reset-peer clears it.
+
+Incoming events are checked according to federation.verify in cortex.md: off (default,
+no change), warn (log unsigned/forged events but accept), or enforce (reject anything
+that is not correctly signed by its owning cortex). Under enforce, source-locking is
+also enforced on replay: a locked trace can only be mutated by the cortex that owns it,
+so a peer cannot overwrite, trash, or purge another cortex's locked trace.
 
 ## External Filesystem Edits
 Whenever noema serve is running (stdio OR http), a background watcher

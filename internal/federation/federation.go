@@ -14,8 +14,13 @@ const (
 type PeerConfig struct {
 	Name     string `yaml:"name"`
 	Endpoint string `yaml:"endpoint"`
-	CA       string `yaml:"ca,omitempty"` // path to CA certificate for TLS verification
+	CA       string `yaml:"ca,omitempty"`   // path to CA certificate for TLS verification
 	Mode     string `yaml:"mode,omitempty"` // sync | paused
+
+	// PubKey, when non-empty, hard-pins this peer's "ed25519:<base64>"
+	// signing key: the peer must advertise exactly it at the handshake or the
+	// sync is refused, overriding trust-on-first-use.
+	PubKey string `yaml:"pubkey,omitempty"`
 }
 
 // Config holds federation settings from cortex.md.

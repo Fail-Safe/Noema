@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 )
 
-const eventColumns = `id, action, trace_id, cortex_id, origin, timestamp, data, vclock`
+const eventColumns = `id, action, trace_id, cortex_id, origin, timestamp, data, vclock, signature, pubkey`
 
 // Append inserts an event into the event log within an existing transaction.
 func Append(tx *sql.Tx, e *Event) error {
@@ -13,13 +13,10 @@ func Append(tx *sql.Tx, e *Event) error {
 	if err != nil {
 		return err
 	}
-	data := e.Data
-	if data == nil {
-		data = json.RawMessage("{}")
-	}
+	data := NormalizeData(e.Data)
 	_, err = tx.Exec(
-		`INSERT INTO events (`+eventColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		e.ID, string(e.Action), e.TraceID, e.CortexID, e.Origin, e.Timestamp, string(data), string(vclock),
+		`INSERT INTO events (`+eventColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.ID, string(e.Action), e.TraceID, e.CortexID, e.Origin, e.Timestamp, string(data), string(vclock), e.Signature, e.PubKey,
 	)
 	return err
 }
@@ -62,7 +59,7 @@ func scanEvents(rows *sql.Rows) ([]Event, error) {
 	for rows.Next() {
 		var e Event
 		var data, vclock string
-		if err := rows.Scan(&e.ID, &e.Action, &e.TraceID, &e.CortexID, &e.Origin, &e.Timestamp, &data, &vclock); err != nil {
+		if err := rows.Scan(&e.ID, &e.Action, &e.TraceID, &e.CortexID, &e.Origin, &e.Timestamp, &data, &vclock, &e.Signature, &e.PubKey); err != nil {
 			return nil, err
 		}
 		e.Data = json.RawMessage(data)

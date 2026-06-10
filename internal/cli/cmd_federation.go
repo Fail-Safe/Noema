@@ -365,6 +365,13 @@ func runFederationResetPeer(out io.Writer, in io.Reader, cx *cortex.Cortex, name
 				delete(vc, s.pinnedID)
 				bucketsDropped++
 			}
+			// Drop the pinned federation signing key for this cortex_id too,
+			// so a peer that rotated its key (`noema keygen --force`) gets
+			// re-pinned cleanly on the next handshake instead of failing the
+			// signing-key mismatch check forever.
+			if err := state.Delete(federation.CortexPubKeyKey(s.pinnedID)); err != nil {
+				return fmt.Errorf("clearing signing-key pin for peer %q: %w", s.name, err)
+			}
 		}
 	}
 

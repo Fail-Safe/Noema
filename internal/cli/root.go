@@ -119,7 +119,7 @@ func init() {
 		eventsCmd(), resolveCmd(), memoryCmd(), consolidateCmd(), embeddingsCmd(),
 	)
 	addGrouped(groupCortex,
-		initCmd(), useCmd(), cortexCmd(), federationCmd(), migrateCmd(),
+		initCmd(), useCmd(), cortexCmd(), federationCmd(), migrateCmd(), keygenCmd(),
 	)
 	addGrouped(groupIntegrity,
 		verifyCmd(),
