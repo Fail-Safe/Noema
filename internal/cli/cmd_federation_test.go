@@ -114,7 +114,7 @@ func TestFederationResetPeer_ClearsAllState(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runFederationResetPeer(&out, strings.NewReader("y\n"), cx, []string{"beta"}, endpointMap(cx, t), false); err != nil {
+	if err := runFederationResetPeer(&out, strings.NewReader("y\n"), cx, []string{"beta"}, endpointMap(cx, t), false, false); err != nil {
 		t.Fatalf("runFederationResetPeer: %v\noutput:\n%s", err, out.String())
 	}
 
@@ -155,6 +155,52 @@ func TestFederationResetPeer_ClearsAllState(t *testing.T) {
 	}
 	if !strings.Contains(output, "vector-clock buckets dropped: 1") {
 		t.Errorf("output missing vclock bucket count:\n%s", output)
+	}
+}
+
+// TestFederationResetPeer_KeyRotated pins the rotation-recovery path: with
+// --key-rotated, reset-peer clears ONLY the pinned signing key and leaves the
+// cursor, pinned identity, and vclock bucket intact. That lets an already-
+// caught-up peer re-pin the rotated key on its next handshake and pull only
+// post-rotation events, instead of a full reset re-pulling pre-rotation history
+// that would be rejected under verify=enforce for carrying the retired key.
+func TestFederationResetPeer_KeyRotated(t *testing.T) {
+	cx := newCortexWithPeers(t, "alpha", "beta")
+
+	const pinned = "01PEER000000000000000BETA00"
+	const cursor = "01EVENT00000000000000000001"
+	seedPeerState(t, cx, "beta", pinned, cursor, "2026-04-07T12:00:00Z")
+
+	st := federation.NewState(cx.DB.DB)
+	if err := st.SetCortexPubKey(pinned, "ed25519:OLDKEYPLACEHOLDER"); err != nil {
+		t.Fatalf("seed signing key: %v", err)
+	}
+	if err := st.SetClock(federation.VClock{pinned: 5}); err != nil {
+		t.Fatalf("SetClock: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runFederationResetPeer(&out, strings.NewReader("y\n"), cx, []string{"beta"}, endpointMap(cx, t), false, true); err != nil {
+		t.Fatalf("runFederationResetPeer(--key-rotated): %v\noutput:\n%s", err, out.String())
+	}
+
+	// Signing-key pin must be gone so the new key re-pins on next handshake.
+	if v, _ := st.GetCortexPubKey(pinned); v != "" {
+		t.Errorf("signing-key pin should be cleared, got %q", v)
+	}
+	// Identity, cursor, and vclock bucket must all be KEPT — that's what avoids
+	// the pre-rotation history re-pull.
+	if v, _ := st.Get(federation.PeerCortexIDKey("beta")); v != pinned {
+		t.Errorf("cortex_id pin should be kept, got %q", v)
+	}
+	if v, _ := st.Get(federation.PeerCursorKey("beta")); v != cursor {
+		t.Errorf("cursor should be kept, got %q", v)
+	}
+	if vc, _ := st.GetClock(); vc[pinned] != 5 {
+		t.Errorf("vclock bucket should be kept, got %v", vc)
+	}
+	if !strings.Contains(out.String(), "signing-key pin cleared") {
+		t.Errorf("output missing confirmation:\n%s", out.String())
 	}
 }
 
@@ -215,7 +261,7 @@ func TestFederationResetPeer_NoStateNoOp(t *testing.T) {
 	cx := newCortexWithPeers(t, "alpha", "beta")
 
 	var out bytes.Buffer
-	if err := runFederationResetPeer(&out, strings.NewReader("y\n"), cx, []string{"beta"}, endpointMap(cx, t), false); err != nil {
+	if err := runFederationResetPeer(&out, strings.NewReader("y\n"), cx, []string{"beta"}, endpointMap(cx, t), false, false); err != nil {
 		t.Fatalf("runFederationResetPeer: %v\noutput:\n%s", err, out.String())
 	}
 
@@ -240,7 +286,7 @@ func TestFederationResetPeer_AbortLeavesStateIntact(t *testing.T) {
 	seedPeerState(t, cx, "beta", pinned, "01EVENT00000000000000000001", "2026-04-07T12:00:00Z")
 
 	var out bytes.Buffer
-	err := runFederationResetPeer(&out, strings.NewReader("n\n"), cx, []string{"beta"}, endpointMap(cx, t), false)
+	err := runFederationResetPeer(&out, strings.NewReader("n\n"), cx, []string{"beta"}, endpointMap(cx, t), false, false)
 	if err == nil {
 		t.Fatal("expected error on user abort, got nil")
 	}
@@ -276,7 +322,7 @@ func TestFederationResetPeer_MultiplePeers(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runFederationResetPeer(&out, strings.NewReader("y\n"), cx, []string{"beta", "gamma"}, endpointMap(cx, t), false); err != nil {
+	if err := runFederationResetPeer(&out, strings.NewReader("y\n"), cx, []string{"beta", "gamma"}, endpointMap(cx, t), false, false); err != nil {
 		t.Fatalf("runFederationResetPeer: %v\noutput:\n%s", err, out.String())
 	}
 

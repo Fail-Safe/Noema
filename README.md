@@ -692,6 +692,8 @@ Under `enforce`, source-lock enforcement extends to replay: a locked trace can o
 
 Trust-on-first-use has a first-contact window. For a high-assurance peer you can skip it by hard-pinning the peer's key out-of-band — add `pubkey: ed25519:<base64>` to that peer's entry under `federation.peers` in `cortex.md`. The peer must then advertise exactly that key at the handshake or the sync is refused (overriding TOFU); to rotate, edit the pinned value.
 
+**Rotating a key.** `noema keygen --force` retires the old key and signs future events with the new one. Peers that pinned the old key refuse the rotated cortex until they re-pin. For a peer that was already caught up, recover with `noema federation reset-peer <name> --key-rotated`: it drops only the pinned key (re-pinned on the next handshake) while keeping the cursor, so the peer pulls only post-rotation events. **Limitation under `enforce`:** a *from-scratch* resync of a rotated cortex — a brand-new peer, or a full `reset-peer` — cannot replay that cortex's **pre-rotation** events, because they were signed with the now-retired key and there is no key history. The peer pins the new key and rejects the older events. Rotate only when forfeiting verifiable replay of pre-rotation history to peers that resync from zero is acceptable; existing caught-up peers recovered with `--key-rotated` are unaffected.
+
 ### Authentication
 
 Federation peers share a single bearer key — the same `NOEMA_MCP_KEY` / `access.shared_key_file` described in [Shared-key authentication](#shared-key-authentication) above. When the syncer polls a peer's `sync_events` tool, it automatically attaches `Authorization: Bearer <key>` from the local host's active key; nothing peer-specific lives in `cortex.md`. This means:

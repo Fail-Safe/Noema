@@ -225,6 +225,7 @@ func federationPeersCmd() *cobra.Command {
 
 func federationResetPeerCmd() *cobra.Command {
 	var assumeYes bool
+	var keyRotated bool
 
 	cmd := &cobra.Command{
 		Use:   "reset-peer <name>...",
@@ -241,9 +242,18 @@ re-paired) and the local syncer is now refusing to talk to it with a
 the peer's new cortex_id and the cursor restarts from the beginning of
 the peer's event log so no events are silently skipped.
 
+For a peer that only rotated its signing key (ran ` + "`noema keygen --force`" + `)
+without changing its cortex_id, use --key-rotated instead. That clears just
+the pinned signing key — so the new key is re-pinned on the next handshake —
+while keeping the cursor and pinned identity, so already-replayed history is
+not re-pulled. A full reset would re-pull from the start and reject the
+peer's pre-rotation events under verify=enforce, because they were signed
+with the now-retired key. (--key-rotated assumes the local cursor was caught
+up to the peer before the rotation, which is the normal case.)
+
 This is the supported way to clear stale federation state — never edit
 the federation_state SQLite table by hand.`,
-		Example: "  noema federation reset-peer peer-b\n  noema federation reset-peer peer-b peer-c --yes",
+		Example: "  noema federation reset-peer peer-b\n  noema federation reset-peer peer-b --key-rotated\n  noema federation reset-peer peer-b peer-c --yes",
 		Args:    cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cx, err := resolveCortex()
@@ -280,17 +290,18 @@ the federation_state SQLite table by hand.`,
 				}
 			}
 
-			return runFederationResetPeer(cmd.OutOrStdout(), cmd.InOrStdin(), cx, args, configured, assumeYes)
+			return runFederationResetPeer(cmd.OutOrStdout(), cmd.InOrStdin(), cx, args, configured, assumeYes, keyRotated)
 		},
 	}
 	cmd.Flags().BoolVarP(&assumeYes, "yes", "y", false, "skip the confirmation prompt")
+	cmd.Flags().BoolVar(&keyRotated, "key-rotated", false, "peer rotated its signing key: clear only the pinned key (keep cursor + identity, no history re-pull)")
 	return cmd
 }
 
 // runFederationResetPeer is split out so tests can drive it without going
 // through cobra. It assumes args have already been validated against
 // cortex.md so it never sees an unknown peer name.
-func runFederationResetPeer(out io.Writer, in io.Reader, cx *cortex.Cortex, names []string, endpoints map[string]string, assumeYes bool) error {
+func runFederationResetPeer(out io.Writer, in io.Reader, cx *cortex.Cortex, names []string, endpoints map[string]string, assumeYes, keyRotatedOnly bool) error {
 	state := federation.NewState(cx.DB.DB)
 
 	// Snapshot what we're about to delete so the prompt actually shows the
@@ -319,6 +330,43 @@ func runFederationResetPeer(out io.Writer, in io.Reader, cx *cortex.Cortex, name
 			lastSeen:  ps.LastSeen,
 			hadAnyRow: ps.CortexID != "" || ps.LastEvent != "" || ps.LastSeen != "",
 		})
+	}
+
+	// --key-rotated is a narrow operation: clear only the pinned signing key
+	// (keyed on the peer's pinned cortex_id), leaving the cursor, identity, and
+	// vclock intact. The peer re-pins its new key on the next handshake and the
+	// kept cursor means only post-rotation events (signed with the new key) are
+	// pulled — so we never re-pull pre-rotation events that would be rejected
+	// under verify=enforce for carrying the retired key.
+	if keyRotatedOnly {
+		fmt.Fprintf(out, "About to clear the pinned signing key for %d peer(s) in cortex %q.\n", len(snaps), cx.Name)
+		fmt.Fprintln(out, "The cursor and pinned identity are kept, so already-replayed history is not")
+		fmt.Fprintln(out, "re-pulled; the peer's new key is re-pinned on the next handshake.")
+		for _, s := range snaps {
+			fmt.Fprintf(out, "  %s (%s) — pinned cortex_id %s (kept)\n", s.name, s.endpoint, emptyDash(s.pinnedID))
+		}
+		if !assumeYes {
+			fmt.Fprint(out, "Proceed? [y/N]: ")
+			var resp string
+			_, _ = fmt.Fscanln(in, &resp)
+			if resp != "y" && resp != "Y" && resp != "yes" {
+				return fmt.Errorf("aborted by user")
+			}
+		}
+		cleared := 0
+		for _, s := range snaps {
+			if s.pinnedID == "" {
+				fmt.Fprintf(out, "  %s: no pinned identity yet — nothing to clear\n", s.name)
+				continue
+			}
+			if err := state.Delete(federation.CortexPubKeyKey(s.pinnedID)); err != nil {
+				return fmt.Errorf("clearing signing-key pin for peer %q: %w", s.name, err)
+			}
+			cleared++
+			fmt.Fprintf(out, "  %s: signing-key pin cleared (cursor and identity kept)\n", s.name)
+		}
+		fmt.Fprintf(out, "\nCleared %d signing-key pin(s). Restart `noema serve` (or wait for the next poll) to re-pin the rotated key.\n", cleared)
+		return nil
 	}
 
 	fmt.Fprintf(out, "About to reset federation state for %d peer(s) in cortex %q:\n", len(snaps), cx.Name)
