@@ -686,6 +686,8 @@ Once a cortex has a key, it signs every event it emits. Peers learn its public k
 | `warn` | accept, but log every unsigned/forged/unverifiable event |
 | `enforce` | reject — only correctly-signed events from their owning cortex are replayed |
 
+> **Signing only protects you under `enforce`.** Generating a key and signing emitted events changes nothing about what a cortex *accepts*: in the default `off` mode no signature is checked, and `warn` logs problems but still applies the event. Until every cortex you trust is set to `verify: enforce`, the forgery and source-lock-bypass risks above remain fully open — `off`/`warn` are a rollout on-ramp, not protection. Move to `enforce` once you have confirmed the peers it talks to are signing.
+
 Under `enforce`, source-lock enforcement extends to replay: a locked trace can only be mutated by the cortex that owns it.
 
 Trust-on-first-use has a first-contact window. For a high-assurance peer you can skip it by hard-pinning the peer's key out-of-band — add `pubkey: ed25519:<base64>` to that peer's entry under `federation.peers` in `cortex.md`. The peer must then advertise exactly that key at the handshake or the sync is refused (overriding TOFU); to rotate, edit the pinned value.
