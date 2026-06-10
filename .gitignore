@@ -26,5 +26,6 @@
 
 # Local dev
 .claude/
+docs/layout.md
 install.sh
 push-binary.sh

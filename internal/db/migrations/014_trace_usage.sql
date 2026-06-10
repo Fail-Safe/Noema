@@ -10,9 +10,7 @@
 -- local cortex ID (from cortex.md) to know which peer to credit the
 -- historical counters to, and migrations don't have access to it.
 --
--- See feat/trace-usage-storage and the CLAUDE.md "Memory tier"
--- description for full context on why federation-wide signal is the
--- right input for consolidation-election decisions.
+-- See docs/architecture.md for the memory-tier and federation overview.
 
 CREATE TABLE trace_usage (
     trace_id        TEXT NOT NULL,
