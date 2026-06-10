@@ -1217,10 +1217,11 @@ func Open(name, dir string) (*Cortex, error) {
 		cx.ID = m.ID
 
 		// Copied-directory detection (Gotcha #3 in the design doc).
-		// If the manifest claims an ID but the events table has rows under
-		// a *different* cortex_id (and none under this one), the directory
-		// was copied from another machine and would silently corrupt vector
-		// clocks if allowed to run. Refuse with a clear escape hatch.
+		// If the manifest claims an ID but events this cortex *authored* are
+		// recorded under a different cortex_id, the directory was copied or
+		// re-identified and would silently corrupt vector clocks if allowed to
+		// run. Peer events replayed via federation are excluded — see
+		// detectCopiedDirectory. Refuse with a clear escape hatch.
 		if cx.ID != "" {
 			if err := cx.detectCopiedDirectory(); err != nil {
 				conn.Close()
@@ -1345,41 +1346,42 @@ func (c *Cortex) backfillTraceUsage() error {
 	return nil
 }
 
-// detectCopiedDirectory refuses to start if the events table contains rows
-// from a different cortex ID than the one declared in cortex.md, and zero
-// rows under the declared ID. That signature only happens when a Cortex
-// directory has been copied wholesale from another machine — the new
-// "instance" inherits the original's ULID but has none of its own writes.
-// Allowing this would create two physical Cortexes claiming the same
-// identity in any federation they joined.
+// detectCopiedDirectory refuses to start when events this cortex *authored*
+// (origin == its display name) are recorded under a cortex_id other than the
+// one cortex.md now declares. That is the signature of a directory copied or
+// re-identified from another instance: its own history lives under a stale
+// identity, and running it would create two physical Cortexes claiming the same
+// id in any federation they joined, silently merging vector clocks.
+//
+// Crucially, the check keys on origin, NOT on "any foreign cortex_id". Events
+// replayed from peers via federation legitimately carry the originating
+// cortex's id, so a receiver or subscribe cortex normally holds many
+// foreign-id events with none of its own — that is expected, not a copy. The
+// earlier id-only heuristic flagged exactly that case, making such a cortex
+// unopenable (serve restart and every CLI command, including the reset-peer
+// recovery) after its first sync. Scoping to origin matches precisely the rows
+// `noema migrate cortex-id --reset` re-keys, so the guard and its remedy agree.
 func (c *Cortex) detectCopiedDirectory() error {
-	var distinctIDs, ownRows int
+	var ownUnderForeignID int
 	if err := c.DB.QueryRow(
-		`SELECT COUNT(DISTINCT cortex_id) FROM events WHERE cortex_id != ''`,
-	).Scan(&distinctIDs); err != nil {
-		return nil // table missing or empty — fresh cortex, fine
+		`SELECT COUNT(*) FROM events WHERE origin = ? AND cortex_id != '' AND cortex_id != ?`,
+		c.Name, c.ID,
+	).Scan(&ownUnderForeignID); err != nil {
+		return nil // table missing or unreadable — treat as fresh, don't block
 	}
-	if distinctIDs == 0 {
-		return nil // never written; fresh or pre-migration
-	}
-	if err := c.DB.QueryRow(
-		`SELECT COUNT(*) FROM events WHERE cortex_id = ?`, c.ID,
-	).Scan(&ownRows); err != nil {
-		return nil
-	}
-	if ownRows > 0 {
-		return nil // we have our own writes — legitimate
+	if ownUnderForeignID == 0 {
+		return nil // no locally-authored events under a stale id — legitimate
 	}
 	return fmt.Errorf(
 		"cortex %q at %s appears to be a copy of another Cortex.\n"+
-			"Its cortex.md declares id=%s but the event log contains no rows under that id\n"+
-			"(it has %d distinct other id(s)). Two Cortexes cannot share an identity in a\n"+
-			"federation — vector clocks would silently merge and concurrent edits would be\n"+
-			"clobbered. To make this directory a distinct Cortex, run:\n"+
+			"Its cortex.md declares id=%s but %d event(s) it authored are recorded under a\n"+
+			"different cortex_id. Two Cortexes cannot share an identity in a federation —\n"+
+			"vector clocks would silently merge and concurrent edits would be clobbered.\n"+
+			"To make this directory a distinct Cortex, run:\n"+
 			"    noema migrate cortex-id --cortex %s --reset\n"+
 			"That will assign a fresh id and re-key the local event log. If this is not a\n"+
 			"copy and you expected the events to be present, restore from backup instead",
-		c.Name, c.Dir, c.ID, distinctIDs, c.Name,
+		c.Name, c.Dir, c.ID, ownUnderForeignID, c.Name,
 	)
 }
 
