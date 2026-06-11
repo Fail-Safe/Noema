@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Fail-Safe/Noema/internal/event"
+	"github.com/Fail-Safe/Noema/internal/eventsig"
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -616,6 +617,7 @@ func (s *Syncer) verifyPeerIdentity(mcpClient *client.Client, peer PeerConfig) e
 		ID      string     `json:"id"`
 		Name    string     `json:"name"`
 		Version int        `json:"version"`
+		PubKey  string     `json:"pubkey,omitempty"`
 		Rank    *RankEntry `json:"rank,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(text), &identity); err != nil {
@@ -655,21 +657,115 @@ func (s *Syncer) verifyPeerIdentity(mcpClient *client.Client, peer PeerConfig) e
 	if err != nil {
 		return fmt.Errorf("loading pinned cortex id for peer %q: %w", peer.Name, err)
 	}
-	if pinned == "" {
+	switch {
+	case pinned == "":
 		// First successful handshake — pin the ID.
 		if err := s.state.SetPeerCortexID(peer.Name, identity.ID); err != nil {
 			return fmt.Errorf("pinning cortex id for peer %q: %w", peer.Name, err)
 		}
 		log.Printf("[federation] peer %q identity pinned: %s (%s)", peer.Name, identity.Name, identity.ID)
-		return nil
-	}
-	if pinned != identity.ID {
+	case pinned != identity.ID:
 		return fmt.Errorf(
 			"peer %q identity mismatch: pinned id is %s but the endpoint now reports %s. "+
 				"This can happen if the peer was reset, replaced, or restored from a different cortex's backup. "+
 				"If this change is intentional, run `noema federation reset-peer %s` to clear the pin and cursor — the next sync will re-pin the peer's new identity",
 			peer.Name, pinned, identity.ID, peer.Name,
 		)
+	}
+
+	// The cortex_id is trusted now (freshly pinned or matched its pin). Pin or
+	// verify the peer's federation signing key under that cortex_id.
+	return s.pinSigningKey(peer.Name, identity.ID, identity.PubKey, peer.PubKey)
+}
+
+// pinSigningKey records a peer's advertised federation signing public key,
+// keyed on its cortex_id rather than its peer name so that transitively-relayed
+// events from the same cortex verify under the same key. It mirrors the
+// cortex_id pin: first contact establishes trust-on-first-use, and a later
+// change is refused with a reset-peer escape hatch, because a peer that swaps
+// its signing key is indistinguishable from an impostor without an
+// out-of-band check.
+//
+// An empty advertised key (an older peer, or an unsigned cortex) is a no-op:
+// it neither pins nor clears. Preserving any existing pin means a peer cannot
+// silently downgrade to unsigned to dodge enforce-mode replay verification.
+//
+// hardPin is the operator-asserted "ed25519:<base64>" key from this peer's
+// cortex.md entry, or "" for trust-on-first-use. When set it overrides TOFU
+// entirely (see hardPinSigningKey): the peer must advertise exactly it, and a
+// mismatch fails the handshake regardless of verify mode.
+func (s *Syncer) pinSigningKey(peerName, cortexID, advertised, hardPin string) error {
+	if hardPin != "" {
+		return s.hardPinSigningKey(peerName, cortexID, advertised, hardPin)
+	}
+	if advertised == "" {
+		return nil
+	}
+	pinned, err := s.state.GetCortexPubKey(cortexID)
+	if err != nil {
+		return fmt.Errorf("loading pinned signing key for peer %q: %w", peerName, err)
+	}
+	if pinned == "" {
+		if err := s.state.SetCortexPubKey(cortexID, advertised); err != nil {
+			return fmt.Errorf("pinning signing key for peer %q: %w", peerName, err)
+		}
+		log.Printf("[federation] peer %q signing key pinned (%s)", peerName, cortexID)
+		return nil
+	}
+	if !eventsig.PublicKeysEqual(pinned, advertised) {
+		return fmt.Errorf(
+			"peer %q signing-key mismatch: the pinned key for cortex %s differs from the one now advertised. "+
+				"If the peer intentionally rotated its key (`noema keygen --force`), run `noema federation reset-peer %s` "+
+				"to clear the pin — the next sync re-pins the new key",
+			peerName, cortexID, peerName,
+		)
+	}
+	return nil
+}
+
+// hardPinSigningKey enforces an operator-configured hard-pin: the key declared
+// on the peer's cortex.md entry is authoritative, so trust-on-first-use does
+// not apply. The peer must advertise exactly the hard-pinned key — an empty or
+// differing advertisement fails the handshake regardless of verify mode,
+// mirroring how a changed cortex_id always refuses. This is what closes the
+// TOFU first-contact window for high-assurance peers.
+//
+// On a match, the cortex_id → pubkey store is set to the hard-pin so the replay
+// path (including transitively-relayed events from this cortex_id) verifies
+// against the operator-asserted key. A pre-existing TOFU pin that differs is
+// overwritten — explicit out-of-band config beats first-use — and the override
+// is logged so the change is auditable. To rotate a hard-pinned peer the
+// operator edits cortex.md; no reset-peer is needed.
+func (s *Syncer) hardPinSigningKey(peerName, cortexID, advertised, hardPin string) error {
+	if advertised == "" {
+		return fmt.Errorf(
+			"peer %q is hard-pinned to a signing key in cortex.md but advertised none; "+
+				"the peer must run `noema keygen`, or remove the pubkey pin to fall back to trust-on-first-use",
+			peerName,
+		)
+	}
+	if !eventsig.PublicKeysEqual(advertised, hardPin) {
+		return fmt.Errorf(
+			"peer %q signing-key mismatch: the key advertised by cortex %s does not match the pubkey hard-pinned "+
+				"for this peer in cortex.md. If the peer intentionally rotated its key, update the pinned pubkey; "+
+				"otherwise this may be an impersonation attempt",
+			peerName, cortexID,
+		)
+	}
+	pinned, err := s.state.GetCortexPubKey(cortexID)
+	if err != nil {
+		return fmt.Errorf("loading pinned signing key for peer %q: %w", peerName, err)
+	}
+	if eventsig.PublicKeysEqual(pinned, hardPin) {
+		return nil
+	}
+	if err := s.state.SetCortexPubKey(cortexID, hardPin); err != nil {
+		return fmt.Errorf("applying hard-pin for peer %q: %w", peerName, err)
+	}
+	if pinned == "" {
+		log.Printf("[federation] peer %q signing key hard-pinned from cortex.md (%s)", peerName, cortexID)
+	} else {
+		log.Printf("[federation] peer %q hard-pin in cortex.md overrode the prior trust-on-first-use key (%s)", peerName, cortexID)
 	}
 	return nil
 }

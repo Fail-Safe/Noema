@@ -246,6 +246,71 @@ func TestOpen_PreservesAgentsMDWhenMatching(t *testing.T) {
 	}
 }
 
+// TestOpen_AllowsFederatedReceiver is the regression for the copied-directory
+// guard: a cortex that has only ever received peer events (foreign cortex_id,
+// origin = the peer's name) — the normal state of a receiver/subscribe cortex
+// after its first sync — must reopen cleanly. The old id-only heuristic wrongly
+// flagged this as a copy, making such a cortex unopenable (serve restart and
+// every CLI command, including reset-peer) after its first federation sync.
+func TestOpen_AllowsFederatedReceiver(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := cortex.Create("recv", dir); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	root := filepath.Join(dir, "recv")
+
+	cx, err := cortex.Open("recv", root)
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	// A peer-authored event replayed via federation: foreign cortex_id, origin
+	// is the PEER's display name, not this cortex's.
+	if _, err := cx.DB.Exec(
+		`INSERT INTO events (id, action, trace_id, cortex_id, origin, timestamp) VALUES (?, ?, ?, ?, ?, ?)`,
+		"01EVPEER0000000000000000A", "create", "20260610-peer", "01PEERCORTEX0000000000000A", "peer-a", "2026-06-10T00:00:00Z",
+	); err != nil {
+		t.Fatalf("seed peer event: %v", err)
+	}
+	cx.Close()
+
+	cx2, err := cortex.Open("recv", root)
+	if err != nil {
+		t.Fatalf("reopening a receiver with peer-replayed events must succeed, got: %v", err)
+	}
+	cx2.Close()
+}
+
+// TestOpen_RejectsReIdentifiedCopy keeps the real copy detection: when events
+// THIS cortex authored (origin == its name) are recorded under a cortex_id that
+// differs from the one cortex.md now declares, the directory was copied or
+// re-identified and must be refused.
+func TestOpen_RejectsReIdentifiedCopy(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := cortex.Create("copied", dir); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	root := filepath.Join(dir, "copied")
+
+	cx, err := cortex.Open("copied", root)
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	// Locally-authored event (origin == this cortex's name) under a stale id.
+	if _, err := cx.DB.Exec(
+		`INSERT INTO events (id, action, trace_id, cortex_id, origin, timestamp) VALUES (?, ?, ?, ?, ?, ?)`,
+		"01EVOWN00000000000000000A", "create", "20260610-own", "01STALEID00000000000000000", "copied", "2026-06-10T00:00:00Z",
+	); err != nil {
+		t.Fatalf("seed own event under stale id: %v", err)
+	}
+	cx.Close()
+
+	if _, err := cortex.Open("copied", root); err == nil {
+		t.Fatal("a cortex whose own events live under a foreign id must be refused as a copy")
+	} else if !strings.Contains(err.Error(), "appears to be a copy") {
+		t.Fatalf("expected copy-detection error, got: %v", err)
+	}
+}
+
 func TestReadManifest(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := cortex.Create("manifested", dir); err != nil {

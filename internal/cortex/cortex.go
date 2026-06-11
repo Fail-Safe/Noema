@@ -20,6 +20,7 @@ import (
 	"github.com/Fail-Safe/Noema/internal/config"
 	"github.com/Fail-Safe/Noema/internal/db"
 	"github.com/Fail-Safe/Noema/internal/event"
+	"github.com/Fail-Safe/Noema/internal/eventsig"
 	"github.com/Fail-Safe/Noema/internal/federation"
 	"github.com/Fail-Safe/Noema/internal/trace"
 )
@@ -39,6 +40,7 @@ type Manifest struct {
 	Version       int                  `yaml:"version"`
 	Access        *AccessConfig        `yaml:"access,omitempty"`
 	Federation    *FederationConfig    `yaml:"federation,omitempty"`
+	Signing       *SigningConfig       `yaml:"signing,omitempty"`
 	Watch         *WatchConfig         `yaml:"watch,omitempty"`
 	Consolidation *ConsolidationConfig `yaml:"consolidation,omitempty"`
 	Search        *SearchConfig        `yaml:"search,omitempty"`
@@ -71,6 +73,25 @@ type AccessConfig struct {
 	TLSKeyPath  string `yaml:"tls_key_path,omitempty"`
 }
 
+// SigningConfig holds the cortex's Ed25519 federation signing material.
+// PublicKey is safe to keep in the manifest and is what gets advertised to
+// peers via cortex_identity;
+// PrivateKeyFile points to a 0600 sidecar holding the base64 seed, never the
+// secret itself — the same "manifest holds a pointer, not the secret" rule as
+// AccessConfig.SharedKeyFile. A cortex with no SigningConfig emits unsigned
+// events and federates exactly as before.
+type SigningConfig struct {
+	// PublicKey is the "ed25519:<base64>" public key. Advertised in the
+	// cortex_identity handshake so peers can pin it and verify this
+	// cortex's events.
+	PublicKey string `yaml:"public_key,omitempty"`
+
+	// PrivateKeyFile is a path to the sidecar file whose first non-empty
+	// line is the base64-encoded 32-byte Ed25519 seed. Relative paths are
+	// resolved against the cortex directory.
+	PrivateKeyFile string `yaml:"private_key_file,omitempty"`
+}
+
 // Federation mode constants.
 const (
 	FederationModeSync      = "sync"      // bidirectional: pull from peers + serve events
@@ -84,11 +105,20 @@ const (
 	PeerModePaused = "paused" // configured but skipped by the syncer
 )
 
+// Federation signature-verification mode constants. They control how replayed
+// events are checked against their signatures.
+const (
+	VerifyOff     = "off"     // do not verify event signatures
+	VerifyWarn    = "warn"    // verify and log problems, but accept the event
+	VerifyEnforce = "enforce" // reject events that fail verification
+)
+
 // FederationConfig holds peer declarations for cortex.md.
 type FederationConfig struct {
 	Mode     string      `yaml:"mode,omitempty"` // sync | publish | subscribe
 	Peers    []PeerEntry `yaml:"peers,omitempty"`
 	Interval string      `yaml:"interval,omitempty"` // e.g. "30s", "1m"
+	Verify   string      `yaml:"verify,omitempty"`   // off | warn | enforce
 }
 
 // EffectiveMode returns the configured federation mode, defaulting to "sync".
@@ -99,12 +129,29 @@ func (fc *FederationConfig) EffectiveMode() string {
 	return fc.Mode
 }
 
+// EffectiveVerify returns the configured signature-verification mode,
+// defaulting to "off" so upgrading a cortex never starts rejecting a peer
+// that hasn't enabled signing yet. Operators opt into warn/enforce.
+func (fc *FederationConfig) EffectiveVerify() string {
+	if fc == nil || fc.Verify == "" {
+		return VerifyOff
+	}
+	return fc.Verify
+}
+
 // PeerEntry is a peer declared in cortex.md.
 type PeerEntry struct {
 	Name     string `yaml:"name"`
 	Endpoint string `yaml:"endpoint"`
 	CA       string `yaml:"ca,omitempty"`   // path to CA cert for TLS verification
 	Mode     string `yaml:"mode,omitempty"` // sync | paused
+
+	// PubKey optionally hard-pins this peer's "ed25519:<base64>" federation
+	// signing key. When set, the peer MUST advertise exactly this key at the
+	// identity handshake or the sync is refused — out-of-band operator intent
+	// that takes precedence over trust-on-first-use and closes the TOFU
+	// first-contact window for high-assurance peers. Empty means TOFU.
+	PubKey string `yaml:"pubkey,omitempty"`
 }
 
 // EffectiveMode returns the configured peer mode, defaulting to "sync".
@@ -470,7 +517,9 @@ type Cortex struct {
 	Name            string // human-readable display label
 	Dir             string
 	DB              *db.DB
-	forceSourceLock bool // when true, checkSourceLock is a no-op
+	forceSourceLock bool       // when true, checkSourceLock is a no-op
+	signKey         SigningKey // Ed25519 signing material; zero value = unsigned mode
+	verifyMode      string     // off | warn | enforce — how replayed signatures are checked
 }
 
 // SetForceSourceLock enables or disables the source-lock override. When
@@ -543,11 +592,24 @@ func (m Manifest) ValidateFederation() error {
 	default:
 		return fmt.Errorf("federation.mode %q is not valid; use sync, publish, or subscribe", m.Federation.Mode)
 	}
+	switch m.Federation.EffectiveVerify() {
+	case VerifyOff, VerifyWarn, VerifyEnforce:
+	default:
+		return fmt.Errorf("federation.verify %q is not valid; use off, warn, or enforce", m.Federation.Verify)
+	}
 	for _, p := range m.Federation.Peers {
 		switch p.EffectiveMode() {
 		case PeerModeSync, PeerModePaused:
 		default:
 			return fmt.Errorf("federation.peers[%s].mode %q is not valid; use sync or paused", p.Name, p.Mode)
+		}
+		// A hard-pinned key must be a well-formed "ed25519:<base64>" public
+		// key. Catching a typo here fails fast at startup rather than turning
+		// every handshake with this peer into a confusing mid-sync rejection.
+		if p.PubKey != "" {
+			if _, err := eventsig.ParsePublic(p.PubKey); err != nil {
+				return fmt.Errorf("federation.peers[%s].pubkey is not a valid signing key: %w", p.Name, err)
+			}
 		}
 	}
 	return nil
@@ -1110,6 +1172,19 @@ noema resolve <divergence-id> --custom "<merged body>"    # apply a custom merge
 
 Either choice updates the original trace, federates the resolution, and trashes
 the divergence trace. The MCP equivalent is the ` + "`resolve_divergence`" + ` tool.
+
+## Federation Event Signing
+
+If this Cortex has run ` + "`noema keygen`" + `, it signs every event it emits with an
+Ed25519 key, and peers verify those signatures. The ` + "`federation.verify`" + ` setting in
+` + "`cortex.md`" + ` controls how incoming events are checked: ` + "`off`" + ` (default), ` + "`warn`" + `
+(log problems but accept), or ` + "`enforce`" + ` (reject anything not correctly signed by its
+owning cortex). Under ` + "`enforce`" + `, source-locking is also enforced on replay — a
+source-locked trace can only be changed by the cortex that owns it.
+
+As an agent you do not handle keys; ` + "`noema keygen`" + ` is an operator step. Just be
+aware that under ` + "`enforce`" + ` a federated mutation you make to another cortex's
+source-locked trace will be rejected by that cortex.
 `
 }
 
@@ -1142,16 +1217,30 @@ func Open(name, dir string) (*Cortex, error) {
 		cx.ID = m.ID
 
 		// Copied-directory detection (Gotcha #3 in the design doc).
-		// If the manifest claims an ID but the events table has rows under
-		// a *different* cortex_id (and none under this one), the directory
-		// was copied from another machine and would silently corrupt vector
-		// clocks if allowed to run. Refuse with a clear escape hatch.
+		// If the manifest claims an ID but events this cortex *authored* are
+		// recorded under a different cortex_id, the directory was copied or
+		// re-identified and would silently corrupt vector clocks if allowed to
+		// run. Peer events replayed via federation are excluded — see
+		// detectCopiedDirectory. Refuse with a clear escape hatch.
 		if cx.ID != "" {
 			if err := cx.detectCopiedDirectory(); err != nil {
 				conn.Close()
 				return nil, err
 			}
 		}
+
+		// Load federation signing material. A configured-but-broken key is
+		// a hard error rather than a silent downgrade to unsigned: an
+		// operator who ran `noema keygen` expects their events to be signed,
+		// and emitting unsigned events that enforce-mode peers will reject is
+		// a worse, quieter failure than refusing to start.
+		sk, skErr := LoadSigningKey(dir, m.Signing)
+		if skErr != nil {
+			conn.Close()
+			return nil, fmt.Errorf("loading signing key for cortex %q: %w", name, skErr)
+		}
+		cx.signKey = sk
+		cx.verifyMode = m.Federation.EffectiveVerify()
 	}
 
 	// Auto-purge expired trash. Best-effort: errors are silently ignored.
@@ -1257,41 +1346,42 @@ func (c *Cortex) backfillTraceUsage() error {
 	return nil
 }
 
-// detectCopiedDirectory refuses to start if the events table contains rows
-// from a different cortex ID than the one declared in cortex.md, and zero
-// rows under the declared ID. That signature only happens when a Cortex
-// directory has been copied wholesale from another machine — the new
-// "instance" inherits the original's ULID but has none of its own writes.
-// Allowing this would create two physical Cortexes claiming the same
-// identity in any federation they joined.
+// detectCopiedDirectory refuses to start when events this cortex *authored*
+// (origin == its display name) are recorded under a cortex_id other than the
+// one cortex.md now declares. That is the signature of a directory copied or
+// re-identified from another instance: its own history lives under a stale
+// identity, and running it would create two physical Cortexes claiming the same
+// id in any federation they joined, silently merging vector clocks.
+//
+// Crucially, the check keys on origin, NOT on "any foreign cortex_id". Events
+// replayed from peers via federation legitimately carry the originating
+// cortex's id, so a receiver or subscribe cortex normally holds many
+// foreign-id events with none of its own — that is expected, not a copy. The
+// earlier id-only heuristic flagged exactly that case, making such a cortex
+// unopenable (serve restart and every CLI command, including the reset-peer
+// recovery) after its first sync. Scoping to origin matches precisely the rows
+// `noema migrate cortex-id --reset` re-keys, so the guard and its remedy agree.
 func (c *Cortex) detectCopiedDirectory() error {
-	var distinctIDs, ownRows int
+	var ownUnderForeignID int
 	if err := c.DB.QueryRow(
-		`SELECT COUNT(DISTINCT cortex_id) FROM events WHERE cortex_id != ''`,
-	).Scan(&distinctIDs); err != nil {
-		return nil // table missing or empty — fresh cortex, fine
+		`SELECT COUNT(*) FROM events WHERE origin = ? AND cortex_id != '' AND cortex_id != ?`,
+		c.Name, c.ID,
+	).Scan(&ownUnderForeignID); err != nil {
+		return nil // table missing or unreadable — treat as fresh, don't block
 	}
-	if distinctIDs == 0 {
-		return nil // never written; fresh or pre-migration
-	}
-	if err := c.DB.QueryRow(
-		`SELECT COUNT(*) FROM events WHERE cortex_id = ?`, c.ID,
-	).Scan(&ownRows); err != nil {
-		return nil
-	}
-	if ownRows > 0 {
-		return nil // we have our own writes — legitimate
+	if ownUnderForeignID == 0 {
+		return nil // no locally-authored events under a stale id — legitimate
 	}
 	return fmt.Errorf(
 		"cortex %q at %s appears to be a copy of another Cortex.\n"+
-			"Its cortex.md declares id=%s but the event log contains no rows under that id\n"+
-			"(it has %d distinct other id(s)). Two Cortexes cannot share an identity in a\n"+
-			"federation — vector clocks would silently merge and concurrent edits would be\n"+
-			"clobbered. To make this directory a distinct Cortex, run:\n"+
+			"Its cortex.md declares id=%s but %d event(s) it authored are recorded under a\n"+
+			"different cortex_id. Two Cortexes cannot share an identity in a federation —\n"+
+			"vector clocks would silently merge and concurrent edits would be clobbered.\n"+
+			"To make this directory a distinct Cortex, run:\n"+
 			"    noema migrate cortex-id --cortex %s --reset\n"+
 			"That will assign a fresh id and re-key the local event log. If this is not a\n"+
 			"copy and you expected the events to be present, restore from backup instead",
-		c.Name, c.Dir, c.ID, distinctIDs, c.Name,
+		c.Name, c.Dir, c.ID, ownUnderForeignID, c.Name,
 	)
 }
 
@@ -2869,6 +2959,19 @@ func (c *Cortex) emitEvent(tx *sql.Tx, action event.Action, traceID, timestamp s
 		Data:      data,
 		VClock:    vc,
 	}
+	// Sign the finalized event (all authenticated fields are set above) so
+	// peers can verify it came from this cortex, and attach our public key so
+	// peers that have never handshaked us directly (transitive relay) can
+	// still verify it. Only local emissions are signed here; replayed remote
+	// events keep their origin's signature and key.
+	if c.signKey.Signing() {
+		sig, err := eventsig.Sign(c.signKey.Private, *e)
+		if err != nil {
+			return fmt.Errorf("signing event %s: %w", e.ID, err)
+		}
+		e.Signature = sig
+		e.PubKey = c.signKey.Public
+	}
 	if err := event.Append(tx, e); err != nil {
 		return err
 	}
@@ -2905,6 +3008,20 @@ func setClockTx(tx *sql.Tx, vc federation.VClock) error {
 // ReplayEvent materializes a remote event locally without emitting a new event.
 // The remote event is stored in the local log with its original ID and origin.
 func (c *Cortex) ReplayEvent(e event.Event) error {
+	// Authenticate the event against its signature before anything else, so a
+	// forged or tampered event is rejected (enforce) or flagged (warn) before
+	// it can touch the event log, the trace table, or the filesystem. A no-op
+	// in the default "off" mode and for cortexes without signing configured.
+	if err := c.verifyReplayEvent(e); err != nil {
+		return err
+	}
+	// With cortex_id now authenticated, enforce source-locking on replay: a
+	// locked trace may only be mutated by its owning cortex. This is the
+	// federation half of CheckSourceLock and the reason signing exists.
+	if err := c.checkReplaySourceLock(e); err != nil {
+		return err
+	}
+
 	// Coordination events (consolidation Claim/Success/Fail) carry a
 	// synthetic window ID as trace_id, not a real trace ID. They only
 	// need to land in the event log — no trace-table side effect, no

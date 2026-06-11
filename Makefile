@@ -1,7 +1,7 @@
 # Noema build targets.
 #
 # Dev builds live at the repo root as ./noema (matching the convention in
-# CLAUDE.md and .gitignore). Release builds land in ./dist/ with an
+# AGENTS.md and .gitignore). Release builds land in ./dist/ with an
 # explicit <os>-<arch> suffix so cross-compiled artifacts are self-
 # identifying when scp'd onto a peer host.
 #

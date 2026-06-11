@@ -33,6 +33,12 @@ Noema gives AI agents — and the humans working alongside them — a persistent
 | **Trace** | A single memory — one markdown file + its database row |
 | **Cortex** | A named collection of Traces, stored in a directory you control |
 
+Contributor and architecture notes:
+
+- [Repository Guidelines](AGENTS.md)
+- [Architecture](docs/architecture.md)
+- [Development Guide](docs/development.md)
+
 A Trace has a **type** that describes its intent:
 
 | Type | Meaning |
@@ -214,7 +220,8 @@ noema search <query> [flags]              Full-text search (FTS5). --semantic / 
                                           rank by embedding similarity (needs a search: block + backfill)
 noema similar <id> [--limit N]            Find traces related to <id> (BM25; --semantic / --hybrid for embeddings)
 noema embeddings status                   Show semantic-search embedding coverage (embedded / stale / missing)
-noema embeddings backfill [--force]       Embed traces that are missing or stale (for semantic search)
+noema embeddings backfill [--force] [--limit N]
+                                          Embed traces that are missing or stale (for semantic search)
 
 noema archive <id>                        Archive a Trace
 noema unarchive <id>                      Restore an archived Trace
@@ -659,6 +666,33 @@ noema verify cortex           # validate manifest, config, db, access, federatio
 noema verify drift            # check federated traces against source hashes
 noema edit <id> --force       # override source-lock
 ```
+
+Locally, source-locking is enforced by refusing foreign-origin mutations. Across a federation, that guarantee is only as strong as the events that carry it — which is what **event signing** (below) protects.
+
+### Federation event signing
+
+Content hashing proves a body matches its hash; it does not prove *who* wrote the event. On a shared-key federation, any peer holding the key could otherwise forge events under another cortex's identity, overwrite source-locked traces, or rewrite `source_hash` so drift checks still pass. Event signing closes that gap by authenticating the originating cortex with an Ed25519 signature.
+
+```bash
+noema keygen                  # generate this cortex's Ed25519 signing key
+noema keygen --force          # rotate the key (peers must re-pin)
+```
+
+Once a cortex has a key, it signs every event it emits. Peers learn its public key through the `cortex_identity` handshake and pin it per cortex id (trust-on-first-use); a later key change is refused until you run `noema federation reset-peer`. Verification of *incoming* events is staged so a mixed-version ring never hard-partitions, controlled by `federation.verify` in `cortex.md`:
+
+| `federation.verify` | Behavior on a bad/unsigned event |
+|---|---|
+| `off` (default) | accept — no change for cortexes that haven't enabled signing |
+| `warn` | accept, but log every unsigned/forged/unverifiable event |
+| `enforce` | reject — only correctly-signed events from their owning cortex are replayed |
+
+> **Signing only protects you under `enforce`.** Generating a key and signing emitted events changes nothing about what a cortex *accepts*: in the default `off` mode no signature is checked, and `warn` logs problems but still applies the event. Until every cortex you trust is set to `verify: enforce`, the forgery and source-lock-bypass risks above remain fully open — `off`/`warn` are a rollout on-ramp, not protection. Move to `enforce` once you have confirmed the peers it talks to are signing.
+
+Under `enforce`, source-lock enforcement extends to replay: a locked trace can only be mutated by the cortex that owns it.
+
+Trust-on-first-use has a first-contact window. For a high-assurance peer you can skip it by hard-pinning the peer's key out-of-band — add `pubkey: ed25519:<base64>` to that peer's entry under `federation.peers` in `cortex.md`. The peer must then advertise exactly that key at the handshake or the sync is refused (overriding TOFU); to rotate, edit the pinned value.
+
+**Rotating a key.** `noema keygen --force` retires the old key and signs future events with the new one. Peers that pinned the old key refuse the rotated cortex until they re-pin. For a peer that was already caught up, recover with `noema federation reset-peer <name> --key-rotated`: it drops only the pinned key (re-pinned on the next handshake) while keeping the cursor, so the peer pulls only post-rotation events. **Limitation under `enforce`:** a *from-scratch* resync of a rotated cortex — a brand-new peer, or a full `reset-peer` — cannot replay that cortex's **pre-rotation** events, because they were signed with the now-retired key and there is no key history. The peer pins the new key and rejects the older events. Rotate only when forfeiting verifiable replay of pre-rotation history to peers that resync from zero is acceptable; existing caught-up peers recovered with `--key-rotated` are unaffected.
 
 ### Authentication
 

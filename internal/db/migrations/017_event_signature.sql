@@ -1,0 +1,28 @@
+-- Adds the per-event Ed25519 signature that authenticates the originating
+-- cortex per the federation signing wire spec (algorithm, canonical preimage,
+-- "ed25519:<base64>" encoding, verification modes).
+--
+-- Before signing, an event's authenticity rested entirely on the shared
+-- bearer key at the transport hop, so any key-holding peer in a federation
+-- could forge events as any cortex and overwrite or delete source-locked
+-- traces. The signature moves the trust anchor to the originating cortex:
+-- replay verifies each event under that cortex's pinned public key.
+--
+-- The columns are NOT NULL DEFAULT '' rather than nullable so existing rows
+-- backfill cleanly to the empty (= unsigned) sentinel and scans never have
+-- to special-case NULL. An empty signature means "produced before signing
+-- was configured"; how that is treated on replay is governed by the
+-- federation verify mode (off | warn | enforce), not by this schema. These
+-- are pure index/audit columns on the local event log and are never the
+-- basis for federation identity decisions on their own -- they authenticate
+-- the event body that is already synced, so a mixed-version ring degrades
+-- gracefully: older peers omit the fields and are treated as unsigned.
+--
+-- pubkey carries the signer's "ed25519:<base64>" public key with the event.
+-- Federation gossips events transitively (peer A relays peer B's events to
+-- peer C, which never handshakes B directly), so the signing key has to
+-- travel with the event for a verifier to check a cortex_id it has not
+-- directly pinned. It is stored so relayed events keep the key when this
+-- cortex re-serves them via sync_events.
+ALTER TABLE events ADD COLUMN signature TEXT NOT NULL DEFAULT '';
+ALTER TABLE events ADD COLUMN pubkey TEXT NOT NULL DEFAULT '';

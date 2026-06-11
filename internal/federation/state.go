@@ -168,3 +168,26 @@ func (s *State) SetPeerSeen(name, timestamp string) error {
 func (s *State) SetPeerCortexID(name, cortexID string) error {
 	return s.Set(PeerCortexIDKey(name), cortexID)
 }
+
+// CortexPubKeyKey returns the federation_state key under which a cortex's
+// pinned Ed25519 public key is stored. It is keyed on cortex_id rather than
+// peer name on purpose: events gossip transitively, so the verifier must be
+// able to look up the signing key for any originating cortex_id it sees,
+// including third parties it has no direct peer entry for.
+func CortexPubKeyKey(cortexID string) string {
+	return "cortexkey:" + cortexID
+}
+
+// GetCortexPubKey returns the pinned public key for a cortex_id, or "" if none
+// is pinned yet.
+func (s *State) GetCortexPubKey(cortexID string) (string, error) {
+	return s.Get(CortexPubKeyKey(cortexID))
+}
+
+// SetCortexPubKey pins (or overwrites) the public key for a cortex_id. Callers
+// own the trust policy — whether an overwrite is allowed (rotation), refused
+// (handshake identity-change), or flagged (replay conflict) — and call this
+// only once they have decided to (re-)pin.
+func (s *State) SetCortexPubKey(cortexID, pubkey string) error {
+	return s.Set(CortexPubKeyKey(cortexID), pubkey)
+}

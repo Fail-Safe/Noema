@@ -761,7 +761,7 @@ func startSyncer(cx *cortex.Cortex, sharedKey string, fc *cortex.FederationConfi
 	var peers []federation.PeerConfig
 	for _, p := range fc.Peers {
 		peers = append(peers, federation.PeerConfig{
-			Name: p.Name, Endpoint: p.Endpoint, CA: p.CA, Mode: p.Mode,
+			Name: p.Name, Endpoint: p.Endpoint, CA: p.CA, Mode: p.Mode, PubKey: p.PubKey,
 		})
 	}
 
