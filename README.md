@@ -261,6 +261,9 @@ noema federation resume-peer <name>       Resume syncing with a paused peer
 noema federation key fingerprint          Print the SHA-256 fingerprint of the active MCP shared key (safe to
                                           say aloud over an out-of-band channel to confirm a pairing)
 
+noema keygen [--force]                    Generate this cortex's Ed25519 federation signing key so it can sign
+                                          the events it emits (--force rotates it; peers must re-pin)
+
 noema serve [--transport stdio|http] [--host <addr>] [--tls-cert <file> --tls-key <file>]
                                           Start the MCP server (http requires --host; endpoint is /mcp)
 noema serve --print-config                Print a ready-to-use .mcp.json snippet and exit
