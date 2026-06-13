@@ -280,6 +280,38 @@ func TestOpen_AllowsFederatedReceiver(t *testing.T) {
 	cx2.Close()
 }
 
+func TestOpen_AllowsPinnedPeerWithSameDisplayName(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := cortex.Create("agentbrain", dir); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	root := filepath.Join(dir, "agentbrain")
+
+	cx, err := cortex.Open("agentbrain", root)
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	peerID := "01PEERCORTEX0000000000000A"
+	if err := federation.NewState(cx.DB.DB).SetPeerCortexID("peer-a", peerID); err != nil {
+		t.Fatalf("pin peer cortex id: %v", err)
+	}
+	// Multiple machines may intentionally use the same human-readable cortex
+	// name. The authenticated cortex_id, not origin, is the peer identity.
+	if _, err := cx.DB.Exec(
+		`INSERT INTO events (id, action, trace_id, cortex_id, origin, timestamp) VALUES (?, ?, ?, ?, ?, ?)`,
+		"01EVPEER0000000000000000B", "create", "20260610-peer-same-name", peerID, "agentbrain", "2026-06-10T00:00:00Z",
+	); err != nil {
+		t.Fatalf("seed same-name peer event: %v", err)
+	}
+	cx.Close()
+
+	cx2, err := cortex.Open("agentbrain", root)
+	if err != nil {
+		t.Fatalf("reopening with a pinned same-name peer event must succeed, got: %v", err)
+	}
+	cx2.Close()
+}
+
 // TestOpen_RejectsReIdentifiedCopy keeps the real copy detection: when events
 // THIS cortex authored (origin == its name) are recorded under a cortex_id that
 // differs from the one cortex.md now declares, the directory was copied or

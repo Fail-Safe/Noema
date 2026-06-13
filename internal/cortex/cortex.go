@@ -1346,25 +1346,31 @@ func (c *Cortex) backfillTraceUsage() error {
 	return nil
 }
 
-// detectCopiedDirectory refuses to start when events this cortex *authored*
-// (origin == its display name) are recorded under a cortex_id other than the
-// one cortex.md now declares. That is the signature of a directory copied or
-// re-identified from another instance: its own history lives under a stale
-// identity, and running it would create two physical Cortexes claiming the same
-// id in any federation they joined, silently merging vector clocks.
+// detectCopiedDirectory refuses to start when events that appear locally
+// authored are recorded under a cortex_id other than the one cortex.md now
+// declares. That is the signature of a directory copied or re-identified from
+// another instance: its own history lives under a stale identity, and running
+// it would create two physical Cortexes claiming the same id in any federation
+// they joined, silently merging vector clocks.
 //
-// Crucially, the check keys on origin, NOT on "any foreign cortex_id". Events
-// replayed from peers via federation legitimately carry the originating
-// cortex's id, so a receiver or subscribe cortex normally holds many
-// foreign-id events with none of its own — that is expected, not a copy. The
-// earlier id-only heuristic flagged exactly that case, making such a cortex
-// unopenable (serve restart and every CLI command, including the reset-peer
-// recovery) after its first sync. Scoping to origin matches precisely the rows
-// `noema migrate cortex-id --reset` re-keys, so the guard and its remedy agree.
+// The check cannot rely on origin alone. It is a display label, and real
+// federations may contain multiple distinct cortex IDs with the same name. A
+// peer event with origin == c.Name is legitimate when the foreign cortex_id is
+// one of our pinned peers, so those IDs are excluded from the copy count.
 func (c *Cortex) detectCopiedDirectory() error {
 	var ownUnderForeignID int
 	if err := c.DB.QueryRow(
-		`SELECT COUNT(*) FROM events WHERE origin = ? AND cortex_id != '' AND cortex_id != ?`,
+		`SELECT COUNT(*)
+		   FROM events
+		  WHERE origin = ?
+		    AND cortex_id != ''
+		    AND cortex_id != ?
+		    AND cortex_id NOT IN (
+		        SELECT value
+		          FROM federation_state
+		         WHERE key LIKE 'peer:%:cortex_id'
+		           AND value != ''
+		    )`,
 		c.Name, c.ID,
 	).Scan(&ownUnderForeignID); err != nil {
 		return nil // table missing or unreadable — treat as fresh, don't block
