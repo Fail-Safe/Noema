@@ -6,6 +6,7 @@ import { readTraceMetadata, tierGlyph, tierLabel } from "./tier-status";
 import { CreateTraceModal } from "./create-modal";
 import { ImmutableWarning } from "./immutable-warning";
 import { openAppendModalFromActive } from "./append-modal";
+import { SearchModal } from "./search-modal";
 
 const STATUS_PING_INTERVAL_MS = 30_000;
 
@@ -80,6 +81,14 @@ export default class NoemaPlugin extends Plugin {
 			name: "New trace",
 			callback: () => {
 				new CreateTraceModal(this.app, this).open();
+			},
+		});
+
+		this.addCommand({
+			id: "search-traces",
+			name: "Search traces",
+			callback: () => {
+				new SearchModal(this.app, this).open();
 			},
 		});
 

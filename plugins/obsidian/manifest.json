@@ -1,9 +1,9 @@
 {
   "id": "noema",
   "name": "Noema",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "minAppVersion": "1.4.0",
-  "description": "Lineage view and tier visibility for Noema cortex traces. Connects to a `noema serve --transport http` endpoint.",
+  "description": "Lineage view, tier visibility, and Noema-backed search for Noema cortex traces. Connects to a `noema serve --transport http` endpoint.",
   "author": "Mark Baker (https://github.com/Fail-Safe)",
   "authorUrl": "https://github.com/Fail-Safe/Noema",
   "fundingUrl": "",

@@ -28,7 +28,7 @@ LDFLAGS_RELEASE := -s -w -X $(VERSION_PKG).Version=$(VERSION)
 HOST_OS   := $(shell go env GOOS)
 HOST_ARCH := $(shell go env GOARCH)
 
-.PHONY: help build release release-linux test vet clean
+.PHONY: help build release release-linux test vet obsidian-publish clean
 
 help:
 	@echo "Noema build targets:"
@@ -38,6 +38,8 @@ help:
 	@echo "  make release-linux   Stripped build for linux/amd64 -> $(DIST_DIR)/$(BIN)-linux-amd64"
 	@echo "  make test            go test ./..."
 	@echo "  make vet             go vet ./..."
+	@echo "  make obsidian-publish"
+	@echo "                       Build and copy Obsidian plugin into the active cortex vault"
 	@echo "  make clean           Remove ./$(BIN) and ./$(DIST_DIR)/"
 	@echo ""
 	@echo "Version string for the next build: $(VERSION)"
@@ -68,6 +70,24 @@ test:
 
 vet:
 	go vet ./...
+
+obsidian-publish:
+	npm --prefix plugins/obsidian run build
+	@set -eu; \
+	cortex_dir="$(OBSIDIAN_CORTEX_DIR)"; \
+	if [ -z "$$cortex_dir" ]; then \
+		cortex_dir="$$(noema cortex list | sed -n 's/^[^[:space:]][^[:space:]]*[[:space:]][[:space:]]*\(.*\)[[:space:]][[:space:]]*\*$$/\1/p' | sed 's/[[:space:]]*$$//' | head -n 1)"; \
+	fi; \
+	if [ -z "$$cortex_dir" ]; then \
+		echo "error: no active cortex found; run 'noema use <name>' or pass OBSIDIAN_CORTEX_DIR=/path/to/cortex" >&2; \
+		exit 1; \
+	fi; \
+	dest="$$cortex_dir/.obsidian/plugins/noema"; \
+	install -d "$$dest"; \
+	install -m 0644 plugins/obsidian/main.js "$$dest/main.js"; \
+	install -m 0644 plugins/obsidian/manifest.json "$$dest/manifest.json"; \
+	install -m 0644 plugins/obsidian/styles.css "$$dest/styles.css"; \
+	echo "Obsidian plugin published to $$dest"
 
 clean:
 	rm -f $(BIN)
