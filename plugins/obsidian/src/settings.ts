@@ -6,6 +6,7 @@ export interface NoemaSettings {
 	bearerKey: string;
 	tracesFolder: string;
 	defaultAuthor: string;
+	searchMode: "lexical" | "semantic" | "hybrid";
 }
 
 // DEFAULT_SETTINGS deliberately leave endpoint and bearerKey empty so
@@ -21,6 +22,7 @@ export const DEFAULT_SETTINGS: NoemaSettings = {
 	bearerKey: "",
 	tracesFolder: "traces",
 	defaultAuthor: "",
+	searchMode: "hybrid",
 };
 
 export class NoemaSettingTab extends PluginSettingTab {
@@ -112,6 +114,22 @@ export class NoemaSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.defaultAuthor)
 					.onChange(async (value) => {
 						this.plugin.settings.defaultAuthor = value.trim();
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Noema search mode")
+			.setDesc("Used by the 'Search traces' command. Hybrid uses the cortex's server-side hybrid_weight.")
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption("hybrid", "Hybrid")
+					.addOption("semantic", "Semantic")
+					.addOption("lexical", "Lexical")
+					.setValue(this.plugin.settings.searchMode)
+					.onChange(async (value) => {
+						this.plugin.settings.searchMode =
+							value as NoemaSettings["searchMode"];
 						await this.plugin.saveSettings();
 					})
 			);

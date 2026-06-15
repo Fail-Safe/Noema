@@ -7,8 +7,9 @@ Lineage view and tier visibility for [Noema](https://github.com/Fail-Safe/Noema)
 - **Lineage sidebar.** When you open a trace, the sidebar shows its `derived_from` ancestors and the traces derived from it, both clickable. Useful for navigating "where did this come from / what came out of this" without leaving the editor.
 - **Tier badge in the status bar.** Shows `[s]` / `[m]` / `[L]` for the currently-open trace and a tooltip note that long-tier traces are immutable.
 - **Connection status.** The same status bar item shows whether the plugin is connected to a `noema serve --transport http` endpoint. A keyed-mode server that rejects (or requires) the bearer key shows `noema: unauthorized` instead of `noema: disconnected`, and pops a one-time notice pointing you at the bearer-key setting — so a wrong key reads as a credential problem, not an unreachable server.
+- **Noema-backed trace search.** `Noema: Search traces` calls the connected cortex's `search_traces` MCP tool and opens the selected trace in Obsidian. The plugin setting chooses `hybrid`, `semantic`, or `lexical`; the modal can show 5 or 10 results. Server-side `cortex.md` still owns embedding configuration and `hybrid_weight`.
 
-That's intentionally the whole feature set for v0.1. File-explorer decorations, trace creation UI, and FTS5-backed search are reasonable next-version additions but aren't here yet.
+That's intentionally the whole feature set for v0.3. File-explorer decorations and federation status panels are reasonable next-version additions but aren't here yet.
 
 ## Setup
 
@@ -20,6 +21,7 @@ That's intentionally the whole feature set for v0.1. File-explorer decorations, 
    - **HTTP endpoint** — e.g. `https://noema.local:3000`
    - **Bearer key** — required if the server is in keyed mode (`NOEMA_MCP_KEY` or `access.shared_key_file`); leave empty for open-mode (loopback only).
    - **Test connection** — click to probe the endpoint immediately and get a notice telling you whether it connected, was rejected (HTTP 401, fix the key), or was unreachable.
+   - **Noema search mode** — used by `Noema: Search traces`; defaults to `Hybrid`.
 6. Open the lineage sidebar via the command palette: `Noema: Open lineage view`.
 
 The status bar will show `noema: <cortex-name>` once the connection succeeds.
@@ -46,6 +48,6 @@ Produces `main.js` next to `manifest.json`. For development, `npm run dev` watch
 
 ## Why so small
 
-Noema is intentionally lightweight infrastructure — markdown files plus a SQLite index, no opinion about your editor. This plugin matches that spirit: it adds the two pieces of UI that genuinely benefit from being inside Obsidian (lineage navigation and tier visibility) and stays out of the way for everything else. Editing happens in Obsidian's native editor, search uses Obsidian's native search, file management uses Obsidian's native file explorer.
+Noema is intentionally lightweight infrastructure — markdown files plus a SQLite index, no opinion about your editor. This plugin matches that spirit: it adds the pieces of UI that genuinely benefit from being inside Obsidian (lineage navigation, tier visibility, trace creation, appends, and Noema-ranked trace search) and stays out of the way for everything else. Editing happens in Obsidian's native editor and file management uses Obsidian's native file explorer.
 
-If you want richer integration (FTS5-backed search, trace creation modals, federation status panel), file an issue against the main repo with the use case — they're easy to add as separate, opt-in commands.
+If you want richer integration (file-explorer decorations, saved search views, federation status panel), file an issue against the main repo with the use case — they're easy to add as separate, opt-in commands.

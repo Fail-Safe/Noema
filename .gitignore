@@ -1,6 +1,7 @@
 # Build output
 /noema
 /dist/
+/noema-*-plugin.tar.gz
 
 # SQLite databases
 *.db
@@ -17,6 +18,7 @@
 # Caches
 **/__pycache__
 .pytest_cache
+.gocache
 
 # Editor
 *.swp

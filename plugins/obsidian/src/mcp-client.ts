@@ -85,6 +85,16 @@ export const TRACE_TYPES = [
 	"note",
 ] as const;
 export type TraceType = (typeof TRACE_TYPES)[number];
+export type SearchMode = "lexical" | "semantic" | "hybrid";
+
+export interface SearchResult {
+	id: string;
+	title: string;
+	type: string;
+	author: string;
+	tags: string;
+	created: string;
+}
 
 // CreateTraceParams is the input shape for McpClient.createTrace.
 // tags and derivedFrom are arrays at this layer for caller ergonomics;
@@ -199,6 +209,11 @@ export class McpClient {
 		return match[1];
 	}
 
+	async searchTraces(query: string, mode: SearchMode): Promise<SearchResult[]> {
+		const text = await this.callToolText("search_traces", { query, mode });
+		return parseSearchResults(text);
+	}
+
 	// callToolText invokes a tool and returns the concatenated text
 	// content, or throws JsonRpcError if the protocol-layer call
 	// failed. Most noema tools return a single text block; we
@@ -279,7 +294,7 @@ export class McpClient {
 			params: {
 				protocolVersion: MCP_PROTOCOL_VERSION,
 				capabilities: {},
-				clientInfo: { name: "noema-obsidian", version: "0.2.1" },
+				clientInfo: { name: "noema-obsidian", version: "0.3.0" },
 			},
 		};
 		const resp = await fetch(url, {
@@ -430,6 +445,45 @@ export function parseLineage(text: string, fallbackId: string): Lineage {
 		}
 	}
 	return { traceId, derivedFrom, derivedBy };
+}
+
+export function parseSearchResults(text: string): SearchResult[] {
+	const rows: SearchResult[] = [];
+	const lines = text.split(/\r?\n/);
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		const mcpRow = line.match(
+			/^\[[^\]]+\]\s+\[([^\]]+)\]\s+(\S+)\s+\((\d{4}-\d{2}-\d{2})\)(?:\s+—\s+([^\[]+?))?(?:\s+\[(.*)\])?$/
+		);
+		if (mcpRow) {
+			const titleLine = lines[i + 1]?.startsWith("  ")
+				? lines[++i].trim()
+				: "";
+			rows.push({
+				id: mcpRow[2],
+				title: titleLine,
+				type: mcpRow[1],
+				author: mcpRow[4]?.trim() ?? "",
+				tags: mcpRow[5]?.trim() ?? "",
+				created: mcpRow[3],
+			});
+			continue;
+		}
+
+		const id = line.trimStart().split(/\s+/, 1)[0];
+		if (!/^\d{8}-[a-z0-9][a-z0-9-]*$/.test(id)) continue;
+		const parts = line.split(/\s{2,}/).map((s) => s.trim());
+		if (parts.length < 2 || parts[0] !== id) continue;
+		rows.push({
+			id: parts[0],
+			title: parts[1] ?? "",
+			type: parts[2] ?? "",
+			author: parts[3] ?? "",
+			tags: parts[4] ?? "",
+			created: parts[5] ?? "",
+		});
+	}
+	return rows;
 }
 
 function parseIdList(s: string): string[] {
