@@ -51,6 +51,10 @@ func TestScoreCandidate_BlendedFormula(t *testing.T) {
 		// Lineage credit is gated at >= 2 sources. A single derived_from
 		// is provenance, not consolidation — see MinLineageSourcesForCredit.
 		{"1 lineage ref earns no credit", cortex.PromotionCandidate{DerivedFromCount: 1}, 0},
+		{"1 lineage ref + search hits earns no passive credit", cortex.PromotionCandidate{SearchHitCount: 5, DerivedFromCount: 1}, 0},
+		{"1 lineage ref + deliberate reads still counts", cortex.PromotionCandidate{ReadCount: 5, DerivedFromCount: 1}, 5},
+		{"1 lineage ref + modify unlocks search-hit credit", cortex.PromotionCandidate{SearchHitCount: 3, ModifyCount: 1, DerivedFromCount: 1}, 5},
+		{"1 lineage ref + vote unlocks search-hit credit", cortex.PromotionCandidate{SearchHitCount: 1, TierVotes: 1, DerivedFromCount: 1}, 6},
 		{"2 lineage refs earn full credit", cortex.PromotionCandidate{DerivedFromCount: 2}, 6},
 		{"3 lineage refs scale linearly", cortex.PromotionCandidate{DerivedFromCount: 3}, 9},
 		{"1 vote", cortex.PromotionCandidate{TierVotes: 1}, 5},
@@ -75,10 +79,10 @@ func TestScoreCandidate_BlendedFormula(t *testing.T) {
 func TestHeuristicPass_PromotesAboveThreshold(t *testing.T) {
 	cx := &fakeHeuristicCortex{
 		candidates: []cortex.PromotionCandidate{
-			{ID: "hot", Tier: trace.TierShort, ReadCount: 10},            // score 10 - promote
-			{ID: "meh", Tier: trace.TierShort, ReadCount: 2},             // score 2  - skip
-			{ID: "voted", Tier: trace.TierShort, TierVotes: 1},           // score 5  - promote (at threshold)
-			{ID: "cold", Tier: trace.TierShort},                           // score 0  - skip
+			{ID: "hot", Tier: trace.TierShort, ReadCount: 10},              // score 10 - promote
+			{ID: "meh", Tier: trace.TierShort, ReadCount: 2},               // score 2  - skip
+			{ID: "voted", Tier: trace.TierShort, TierVotes: 1},             // score 5  - promote (at threshold)
+			{ID: "cold", Tier: trace.TierShort},                            // score 0  - skip
 			{ID: "referenced", Tier: trace.TierShort, DerivedFromCount: 2}, // score 6  - promote (real consolidation)
 			// Regression guard: a 1-source provenance link with low
 			// engagement must not glide past the threshold. This is the
@@ -87,6 +91,10 @@ func TestHeuristicPass_PromotesAboveThreshold(t *testing.T) {
 			// silently inflating mid-tier before MinLineageSourcesForCredit
 			// landed. Score: 1*1 (read) + 0 (lineage gated) = 1.
 			{ID: "session-summary-shaped", Tier: trace.TierShort, ReadCount: 1, DerivedFromCount: 1},
+			// Regression guard for the 1-source mid leak detector: passive
+			// search hits alone must not promote a Hermes session-summary
+			// shaped trace.
+			{ID: "session-summary-search-hit", Tier: trace.TierShort, SearchHitCount: 10, DerivedFromCount: 1},
 		},
 	}
 	pass := HeuristicPass(cx, PassConfig{}, nil)
@@ -102,7 +110,7 @@ func TestHeuristicPass_PromotesAboveThreshold(t *testing.T) {
 			t.Errorf("expected %q to be promoted, promoted=%v", want, cx.promoted)
 		}
 	}
-	for _, shouldSkip := range []string{"meh", "cold", "session-summary-shaped"} {
+	for _, shouldSkip := range []string{"meh", "cold", "session-summary-shaped", "session-summary-search-hit"} {
 		if got[shouldSkip] {
 			t.Errorf("unexpected promotion of %q", shouldSkip)
 		}
