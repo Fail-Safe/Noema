@@ -1311,8 +1311,24 @@ func Open(name, dir string) (*Cortex, error) {
 			fmt.Fprintf(os.Stderr, "[cortex] trace_usage backfill warning: %v\n", err)
 		}
 	}
+	if err := cx.pruneLegacyVectorClockBuckets(); err != nil {
+		fmt.Fprintf(os.Stderr, "[cortex] vector-clock cleanup warning: %v\n", err)
+	}
 
 	return cx, nil
+}
+
+func (c *Cortex) pruneLegacyVectorClockBuckets() error {
+	state := federation.NewState(c.DB.DB)
+	vc, err := state.GetClock()
+	if err != nil {
+		return err
+	}
+	clean := federation.KeepCortexIDKeys(vc)
+	if len(clean) == len(vc) {
+		return nil
+	}
+	return state.SetClock(clean)
 }
 
 // backfillTraceUsage populates trace_usage from the legacy per-trace
@@ -2953,6 +2969,7 @@ func (c *Cortex) emitEvent(tx *sql.Tx, action event.Action, traceID, timestamp s
 	if err != nil {
 		vc = make(federation.VClock)
 	}
+	vc = federation.KeepCortexIDKeys(vc)
 	vc.Increment(c.ID)
 
 	e := &event.Event{
@@ -3257,10 +3274,12 @@ func (c *Cortex) replayUpdate(e event.Event) error {
 	if len(e.VClock) > 0 {
 		localEvents, _ := event.ForTrace(c.DB.DB, e.TraceID)
 		if lastLocal := lastMutationEvent(localEvents); lastLocal != nil && len(lastLocal.VClock) > 0 {
-			rel := federation.Compare(lastLocal.VClock, e.VClock)
+			localClock := federation.KeepCortexIDKeys(lastLocal.VClock)
+			remoteClock := federation.KeepCortexIDKeys(e.VClock)
+			rel := federation.Compare(localClock, remoteClock)
 			if rel == 0 {
 				// Concurrent — neither clock dominates. Create a divergence trace.
-				return c.createDivergence(r, e, data.Body, lastLocal.VClock, e.VClock)
+				return c.createDivergence(r, e, data.Body, localClock, remoteClock)
 			}
 		}
 	}
@@ -3862,7 +3881,10 @@ func (c *Cortex) MergeClock(remote federation.VClock) error {
 	if err != nil {
 		return err
 	}
-	merged, err := federation.MergeCapped(local, remote)
+	merged, err := federation.MergeCapped(
+		federation.KeepCortexIDKeys(local),
+		federation.KeepCortexIDKeys(remote),
+	)
 	if err != nil {
 		return err
 	}
