@@ -27,6 +27,25 @@ func TestVClock_Clone(t *testing.T) {
 	}
 }
 
+func TestKeepCortexIDKeys_DropsLegacyNameBuckets(t *testing.T) {
+	vc := VClock{
+		"01TESTCORTEXIDXXXXXXXXXXXX": 12,
+		"mycortex":                   3,
+		"peer-a":                     7,
+	}
+
+	clean := KeepCortexIDKeys(vc)
+	if clean["01TESTCORTEXIDXXXXXXXXXXXX"] != 12 {
+		t.Errorf("ULID bucket missing from cleaned clock: %v", clean)
+	}
+	if _, ok := clean["mycortex"]; ok {
+		t.Errorf("legacy local-name bucket survived: %v", clean)
+	}
+	if _, ok := clean["peer-a"]; ok {
+		t.Errorf("legacy peer-name bucket survived: %v", clean)
+	}
+}
+
 func TestMerge(t *testing.T) {
 	a := VClock{"a": 10, "b": 7, "c": 3}
 	b := VClock{"a": 9, "b": 8, "c": 3}

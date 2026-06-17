@@ -130,13 +130,12 @@ const MinLineageSourcesForCredit = 2
 // Exported for tests; package-private callers don't need it because
 // HeuristicPass is the single consumer.
 //
-// search_hit_count is folded into the reads bucket at the same weight
-// because both signals describe passive/weak consumption — the read
-// either came from a deliberate get_trace or from being one of the
-// top-N hits an agent's search returned. Auto-injection providers like
-// Hermes only ever generate search hits, and without this fold-in
-// short-tier traces in those cortexes would never accumulate enough
-// signal to promote.
+// search_hit_count is normally folded into the reads bucket at the same
+// weight because both signals describe consumption — the read either came
+// from a deliberate get_trace or from being one of the top-N hits an agent's
+// search returned. Auto-injection providers like Hermes only ever generate
+// search hits, and without this fold-in short-tier traces in those cortexes
+// would never accumulate enough signal to promote.
 //
 // Lineage credit is gated by MinLineageSourcesForCredit: a trace with
 // only one derived_from gets zero lineage points, regardless of the
@@ -145,12 +144,22 @@ const MinLineageSourcesForCredit = 2
 // single session trace it was extracted from) from gliding past the
 // promotion threshold purely on the lineage head start. Multi-source
 // traces still earn the full weight per source.
+//
+// One-source traces also do not get passive search-hit credit unless they
+// have stronger intent (an edit or an explicit tier vote). This keeps
+// auto-retrieved Hermes session summaries from leaking into mid-tier just
+// because they appeared in search results, while still allowing deliberate
+// reads, edits, votes, and real multi-source distillations to promote.
 func scoreCandidate(pc cortex.PromotionCandidate, cfg PassConfig) int {
 	lineageCredit := 0
 	if pc.DerivedFromCount >= MinLineageSourcesForCredit {
 		lineageCredit = pc.DerivedFromCount * cfg.WeightLineage
 	}
-	return (pc.ReadCount+pc.SearchHitCount)*cfg.WeightReads +
+	searchHitCredit := pc.SearchHitCount
+	if pc.DerivedFromCount == 1 && pc.ModifyCount == 0 && pc.TierVotes == 0 {
+		searchHitCredit = 0
+	}
+	return (pc.ReadCount+searchHitCredit)*cfg.WeightReads +
 		pc.ModifyCount*cfg.WeightModifies +
 		lineageCredit +
 		pc.TierVotes*cfg.WeightVotes
