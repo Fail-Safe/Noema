@@ -312,6 +312,47 @@ func TestOpen_AllowsPinnedPeerWithSameDisplayName(t *testing.T) {
 	cx2.Close()
 }
 
+func TestOpen_PrunesLegacyVectorClockNameBuckets(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := cortex.Create("mycortex", dir); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	root := filepath.Join(dir, "mycortex")
+
+	cx, err := cortex.Open("mycortex", root)
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	state := federation.NewState(cx.DB.DB)
+	if err := state.SetClock(federation.VClock{
+		cx.ID:       4,
+		"mycortex":  19,
+		"legacy-p2": 8,
+	}); err != nil {
+		t.Fatalf("SetClock: %v", err)
+	}
+	cx.Close()
+
+	cx2, err := cortex.Open("mycortex", root)
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer cx2.Close()
+
+	vc, err := cx2.GetClock()
+	if err != nil {
+		t.Fatalf("GetClock: %v", err)
+	}
+	if vc[cx2.ID] != 4 {
+		t.Errorf("local ULID bucket = %d, want 4 in %v", vc[cx2.ID], vc)
+	}
+	for _, legacy := range []string{"mycortex", "legacy-p2"} {
+		if _, ok := vc[legacy]; ok {
+			t.Errorf("legacy bucket %q survived Open cleanup: %v", legacy, vc)
+		}
+	}
+}
+
 // TestOpen_RejectsReIdentifiedCopy keeps the real copy detection: when events
 // THIS cortex authored (origin == its name) are recorded under a cortex_id that
 // differs from the one cortex.md now declares, the directory was copied or
@@ -1786,6 +1827,43 @@ func TestVectorClockIncrements(t *testing.T) {
 	// display name. See docs/design/cortex-uuid-plan.md.
 	if vc[cx.ID] != 3 {
 		t.Errorf("clock[%s] = %d, want 3", cx.ID, vc[cx.ID])
+	}
+}
+
+func TestMergeClock_DropsLegacyNameBuckets(t *testing.T) {
+	cx := setup(t)
+	state := federation.NewState(cx.DB.DB)
+	if err := state.SetClock(federation.VClock{
+		cx.ID:       4,
+		"mycortex":  19,
+		"legacy-p2": 8,
+	}); err != nil {
+		t.Fatalf("SetClock: %v", err)
+	}
+
+	remoteID := "01REMOTE000000000000000000"
+	if err := cx.MergeClock(federation.VClock{
+		remoteID:    7,
+		"mycortex":  19,
+		"legacy-p3": 2,
+	}); err != nil {
+		t.Fatalf("MergeClock: %v", err)
+	}
+
+	vc, err := cx.GetClock()
+	if err != nil {
+		t.Fatalf("GetClock: %v", err)
+	}
+	if vc[cx.ID] != 4 {
+		t.Errorf("local ULID bucket = %d, want 4 in %v", vc[cx.ID], vc)
+	}
+	if vc[remoteID] != 7 {
+		t.Errorf("remote ULID bucket = %d, want 7 in %v", vc[remoteID], vc)
+	}
+	for _, legacy := range []string{"mycortex", "legacy-p2", "legacy-p3"} {
+		if _, ok := vc[legacy]; ok {
+			t.Errorf("legacy bucket %q survived merge: %v", legacy, vc)
+		}
 	}
 }
 

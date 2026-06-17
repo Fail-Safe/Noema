@@ -13,6 +13,27 @@ const MaxVClockEntries = 256
 // VClock is a vector clock: one counter per known peer.
 type VClock map[string]uint64
 
+// CortexIDKey reports whether key is shaped like a stable cortex identity.
+// Cortex IDs are ULIDs, represented as 26-character strings. Older Noema
+// releases used display names as vector-clock keys; those legacy buckets must
+// not influence current federation causality.
+func CortexIDKey(key string) bool {
+	return len(key) == 26
+}
+
+// KeepCortexIDKeys returns a copy of vc containing only stable cortex-ID
+// buckets. It is used on production federation paths to stop pre-migration
+// name-keyed buckets from surviving forever in new event snapshots.
+func KeepCortexIDKeys(vc VClock) VClock {
+	clean := make(VClock, len(vc))
+	for k, v := range vc {
+		if CortexIDKey(k) {
+			clean[k] = v
+		}
+	}
+	return clean
+}
+
 // Increment bumps the counter for the given peer.
 func (vc VClock) Increment(peer string) {
 	vc[peer]++
