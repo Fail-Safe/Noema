@@ -197,6 +197,17 @@ func ParseFile(path string) (*Trace, error) {
 
 func (t *Trace) Write(path string) error {
 	t.Frontmatter.Updated = time.Now().UTC().Format(time.RFC3339)
+	return t.write(path)
+}
+
+// WritePreservingUpdated writes the trace without restamping the updated
+// frontmatter field. Use this for metadata changes that must not mutate the
+// trace's immutable timestamp semantics.
+func (t *Trace) WritePreservingUpdated(path string) error {
+	return t.write(path)
+}
+
+func (t *Trace) write(path string) error {
 	fmData, err := yaml.Marshal(t.Frontmatter)
 	if err != nil {
 		return fmt.Errorf("encoding frontmatter: %w", err)

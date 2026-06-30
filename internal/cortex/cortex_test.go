@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1783,6 +1784,106 @@ func TestUpdateEmitsEvent(t *testing.T) {
 	}
 	if events[1].Action != event.ActionUpdate {
 		t.Errorf("events[1].Action = %q, want %q", events[1].Action, event.ActionUpdate)
+	}
+}
+
+func TestSetTraceTags_LongTierPreservesImmutableFields(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Long tag metadata", "note", "agent", []string{"old"}, "Body about a durable thing.")
+	tr.Tier = trace.TierLong
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	before, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get before: %v", err)
+	}
+
+	if err := cx.SetTraceTags(tr.ID, []string{"curated", "retrieval"}); err != nil {
+		t.Fatalf("SetTraceTags: %v", err)
+	}
+
+	after, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get after: %v", err)
+	}
+	if after.UpdatedAt != before.UpdatedAt {
+		t.Fatalf("UpdatedAt changed: got %q, want %q", after.UpdatedAt, before.UpdatedAt)
+	}
+	if after.ContentHash != before.ContentHash {
+		t.Fatalf("ContentHash changed: got %q, want %q", after.ContentHash, before.ContentHash)
+	}
+	if !reflect.DeepEqual(after.Tags, []string{"curated", "retrieval"}) {
+		t.Fatalf("tags = %v, want [curated retrieval]", after.Tags)
+	}
+
+	parsed, err := trace.ParseFile(cx.TraceFile(tr.ID, false))
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if parsed.Updated != before.UpdatedAt {
+		t.Fatalf("file updated changed: got %q, want %q", parsed.Updated, before.UpdatedAt)
+	}
+	if !reflect.DeepEqual(parsed.Tags, []string{"curated", "retrieval"}) {
+		t.Fatalf("file tags = %v, want [curated retrieval]", parsed.Tags)
+	}
+
+	rows, err := cx.Search("curated", cortex.ListOptions{})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(rows) != 1 || rows[0].ID != tr.ID {
+		t.Fatalf("search by new tag returned %+v, want %s", rows, tr.ID)
+	}
+
+	events, err := cx.Events(tr.ID)
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if got := events[len(events)-1].Action; got != event.ActionTagUpdate {
+		t.Fatalf("last event action = %q, want %q", got, event.ActionTagUpdate)
+	}
+}
+
+func TestReplayTagUpdate_LongTierPreservesImmutableFields(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Remote long tag metadata", "note", "agent", []string{"old"}, "Body.")
+	tr.Tier = trace.TierLong
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	before, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get before: %v", err)
+	}
+
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionTagUpdate,
+		TraceID:   tr.ID,
+		CortexID:  "01J00000000000000000000000",
+		Origin:    "remote",
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Data:      json.RawMessage(`{"tags":["remote","curated"]}`),
+	}
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent tag_update: %v", err)
+	}
+
+	after, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get after: %v", err)
+	}
+	if after.UpdatedAt != before.UpdatedAt {
+		t.Fatalf("UpdatedAt changed: got %q, want %q", after.UpdatedAt, before.UpdatedAt)
+	}
+	if after.ContentHash != before.ContentHash {
+		t.Fatalf("ContentHash changed: got %q, want %q", after.ContentHash, before.ContentHash)
+	}
+	if !reflect.DeepEqual(after.Tags, []string{"curated", "remote"}) {
+		t.Fatalf("tags = %v, want [curated remote]", after.Tags)
 	}
 }
 

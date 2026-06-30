@@ -8,6 +8,7 @@ type Action string
 const (
 	ActionCreate    Action = "create"
 	ActionUpdate    Action = "update"
+	ActionTagUpdate Action = "tag_update"
 	ActionArchive   Action = "archive"
 	ActionUnarchive Action = "unarchive"
 	ActionTrash     Action = "trash"

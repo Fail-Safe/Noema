@@ -312,12 +312,15 @@ Noema can run as an [MCP](https://modelcontextprotocol.io) server, giving any MC
 
 | Tool | Purpose |
 |---|---|
-| `get_instructions` | Live reference guide for this Cortex (call first in any new session) |
+| `get_instructions` | Concise Markdown guidance for agent use of this Cortex |
+| `cortex_usage` | MCP structured content for clients: Cortex identity, trace semantics, startup pattern, runtime posture, and constraints, with a JSON text fallback |
 | `list_traces` | List traces, filterable by `type`, `author`, `tag`, `origin`, `archived`, `all` |
 | `get_trace` | Fetch a trace's full body, origin, and lineage |
 | `create_trace` | Create a new trace (supports `derived_from`, `origin`) |
 | `update_trace` | Update any subset of fields on an existing trace |
 | `append_trace` | Append content to an existing trace without reading it first (fire-and-forget logging) |
+| `set_trace_tags` | Replace a trace's retrieval tags without touching title, body, type, or lineage |
+| `append_trace_tags` | Add retrieval tags idempotently without touching title, body, type, or lineage |
 | `search_traces` | Search traces. `mode`: `lexical` (FTS5, default), `semantic` (embedding similarity), or `hybrid` (RRF fusion); semantic/hybrid need a configured `search:` block and fall back to lexical otherwise |
 | `find_similar_traces` | Surface traces related to one you hold. Default ranks by BM25 vocabulary overlap; `mode=semantic`/`hybrid` ranks by embedding similarity to the source trace's vector |
 | `archive_trace` / `unarchive_trace` | Archive a trace or restore it |
@@ -331,7 +334,7 @@ Noema can run as an [MCP](https://modelcontextprotocol.io) server, giving any MC
 
 `delete_trace` moves a trace to trash (soft-delete, recoverable). Use `recover_trace` to restore it.
 
-Call `get_instructions` first in any new session — it returns a live reference guide covering Trace types, field definitions, filtering options, and tool usage, with the active Cortex's name and purpose already filled in.
+Call `get_instructions` first in any new agent session for concise Markdown guidance. Use `cortex_usage` when a client needs structured JSON context. MCP tool discovery and each tool's schema remain the authoritative callable tool reference.
 
 ### stdio (Claude Desktop, Claude Code, any MCP client)
 
@@ -805,7 +808,7 @@ Noema supports three access patterns, depending on what tooling an agent has ava
 
 ### MCP (preferred)
 
-Connect via `noema serve` and use the MCP tools. Call `get_instructions` at the start of a session for a live reference guide — it includes the Cortex name, purpose, Trace type definitions, and a full tool reference. Changes are indexed immediately; no manual sync needed.
+Connect via `noema serve` and use the MCP tools. Call `get_instructions` at the start of an agent session for concise Markdown guidance; call `cortex_usage` for structured JSON context such as Cortex identity, trace semantics, startup preference retrieval, and runtime posture. Use MCP tool discovery for the full callable tool reference. Changes are indexed immediately; no manual sync needed.
 
 ### `noema` binary
 

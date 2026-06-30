@@ -102,7 +102,7 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 	}
 
 	s.AddTool(mcp.NewTool("get_instructions",
-		mcp.WithDescription("Returns a reference guide for working with this Cortex: terminology, trace types, field definitions, filtering options, and tool usage. Call this first if you are unfamiliar with Noema."),
+		mcp.WithDescription("Returns concise Markdown guidance for agent use of this Cortex. Call this first if you are unfamiliar with Noema; use cortex_usage for structured MCP/client context."),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		m, err := cortex.ReadManifest(cx.Dir)
 		if err != nil {
@@ -110,6 +110,22 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 			m = cortex.Manifest{Name: cx.Name}
 		}
 		return mcp.NewToolResultText(renderInstructions(m, noemaVersion)), nil
+	})
+
+	s.AddTool(mcp.NewTool("cortex_usage",
+		mcp.WithDescription("Returns structured JSON context for MCP clients: active Cortex identity, trace semantics, startup preference pattern, runtime posture, and operational constraints. Tool discovery remains authoritative for callable tools."),
+		mcp.WithRawOutputSchema(cortexUsageOutputSchema),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		m, err := cortex.ReadManifest(cx.Dir)
+		if err != nil {
+			m = cortex.Manifest{Name: cx.Name}
+		}
+		payload := buildCortexUsage(cx, m, noemaVersion, federationMode)
+		data, err := json.MarshalIndent(payload, "", "  ")
+		if err != nil {
+			return nil, fmt.Errorf("marshaling cortex usage: %w", err)
+		}
+		return mcp.NewToolResultStructured(payload, string(data)), nil
 	})
 
 	s.AddTool(mcp.NewTool("list_traces",
@@ -201,14 +217,7 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 			return nil, err
 		}
 		author := req.GetString("author", "")
-		var tags []string
-		if raw := req.GetString("tags", ""); raw != "" {
-			for _, t := range strings.Split(raw, ",") {
-				if tag := strings.TrimSpace(t); tag != "" {
-					tags = append(tags, tag)
-				}
-			}
-		}
+		tags := parseTagList(req.GetString("tags", ""))
 		t := trace.New(title, traceType, author, tags, body)
 		if raw := req.GetString("derived_from", ""); raw != "" {
 			for _, id := range strings.Split(raw, ",") {
@@ -429,13 +438,7 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 			t.Author = v
 		}
 		if v := req.GetString("tags", ""); v != "" {
-			var tags []string
-			for _, tag := range strings.Split(v, ",") {
-				if tag := strings.TrimSpace(tag); tag != "" {
-					tags = append(tags, tag)
-				}
-			}
-			t.Tags = tags
+			t.Tags = parseTagList(v)
 		}
 		if v := req.GetString("body", ""); v != "" {
 			t.Body = v
@@ -459,6 +462,52 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 			return nil, err
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("Trace %s updated.", id)), nil
+	}))
+
+	s.AddTool(mcp.NewTool("set_trace_tags",
+		mcp.WithDescription("Replace a trace's tags with the provided comma-separated list. Use for metadata hygiene; do not use vote_trace as a substitute for tag cleanup."),
+		mcp.WithRawOutputSchema(tagMutationOutputSchema),
+		mcp.WithString("id", mcp.Description("Trace ID"), mcp.Required()),
+		mcp.WithString("tags", mcp.Description("Comma-separated tags. Empty string clears all tags."), mcp.Required()),
+	), readOnlyGuard(func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id, err := req.RequireString("id")
+		if err != nil {
+			return nil, err
+		}
+		rawTags, err := req.RequireString("tags")
+		if err != nil {
+			return nil, err
+		}
+		tags := parseTagList(rawTags)
+		if err := setTraceTags(cx, id, tags); err != nil {
+			return nil, err
+		}
+		return tagMutationResult("set", id, tags), nil
+	}))
+
+	s.AddTool(mcp.NewTool("append_trace_tags",
+		mcp.WithDescription("Add tags to a trace idempotently. Use for retrieval metadata; do not use vote_trace as a substitute for tag cleanup."),
+		mcp.WithRawOutputSchema(tagMutationOutputSchema),
+		mcp.WithString("id", mcp.Description("Trace ID"), mcp.Required()),
+		mcp.WithString("tags", mcp.Description("Comma-separated tags to add"), mcp.Required()),
+	), readOnlyGuard(func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id, err := req.RequireString("id")
+		if err != nil {
+			return nil, err
+		}
+		rawTags, err := req.RequireString("tags")
+		if err != nil {
+			return nil, err
+		}
+		tr, err := traceForMutation(cx, id)
+		if err != nil {
+			return nil, err
+		}
+		tags := appendUniqueTags(tr.Tags, parseTagList(rawTags))
+		if err := setTraceTags(cx, id, tags); err != nil {
+			return nil, err
+		}
+		return tagMutationResult("append", id, tags), nil
 	}))
 
 	s.AddTool(mcp.NewTool("vote_trace",
@@ -1015,6 +1064,260 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 	return s
 }
 
+var cortexUsageOutputSchema = json.RawMessage(`{
+  "type": "object",
+  "required": ["schema_version", "cortex", "contract", "startup", "trace_model", "runtime"],
+  "properties": {
+    "schema_version": {"type": "integer"},
+    "cortex": {"type": "object"},
+    "contract": {
+      "type": "object",
+      "required": ["tool_discovery_authoritative", "markdown_instructions_tool", "structured_usage_tool"],
+      "properties": {
+        "tool_discovery_authoritative": {"type": "boolean"},
+        "markdown_instructions_tool": {"type": "string"},
+        "structured_usage_tool": {"type": "string"},
+        "callable_tools_policy": {"type": "string"}
+      }
+    },
+    "startup": {"type": "object"},
+    "trace_model": {"type": "object"},
+    "search": {"type": "object"},
+    "workflows": {"type": "object"},
+    "runtime": {"type": "object"},
+    "authoring_tips": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": true
+}`)
+
+var tagMutationOutputSchema = json.RawMessage(`{
+  "type": "object",
+  "required": ["id", "action", "tags"],
+  "properties": {
+    "id": {"type": "string"},
+    "action": {"type": "string", "enum": ["set", "append"]},
+    "tags": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": false
+}`)
+
+func buildCortexUsage(cx *cortex.Cortex, m cortex.Manifest, noemaVersion string, federationMode string) map[string]any {
+	name := m.Name
+	if name == "" {
+		name = cx.Name
+	}
+	id := m.ID
+	if id == "" {
+		id = cx.ID
+	}
+	mode := federationMode
+	if mode == "" {
+		mode = m.Federation.EffectiveMode()
+	}
+
+	access := map[string]any{
+		"mode":                    "open",
+		"tls_required_when_keyed": true,
+	}
+	if key, err := cortex.LoadAccessKey(cx.Dir, m.Access); err != nil {
+		access["mode"] = "error"
+		access["error"] = err.Error()
+	} else if key.Keyed() {
+		access["mode"] = "keyed"
+		access["source"] = key.Source
+		access["fingerprint"] = key.Fingerprint
+	}
+
+	watchEnabled := true
+	if m.Watch != nil && m.Watch.Enabled != nil {
+		watchEnabled = *m.Watch.Enabled
+	}
+
+	traceTypes := make([]map[string]string, 0, len(trace.ValidTypes))
+	for _, tt := range trace.ValidTypes {
+		traceTypes = append(traceTypes, map[string]string{
+			"name":        string(tt),
+			"description": traceTypeDescription(tt),
+		})
+	}
+
+	return map[string]any{
+		"schema_version": 1,
+		"cortex": map[string]any{
+			"id":               id,
+			"name":             name,
+			"purpose":          m.Purpose,
+			"owner":            m.Owner,
+			"created":          m.Created,
+			"manifest_version": m.Version,
+			"noema_version":    noemaVersion,
+		},
+		"contract": map[string]any{
+			"tool_discovery_authoritative": true,
+			"markdown_instructions_tool":   "get_instructions",
+			"structured_usage_tool":        "cortex_usage",
+			"callable_tools_policy":        "Use MCP tool discovery and each tool schema as the source of truth for callable operations in this client session.",
+		},
+		"startup": map[string]any{
+			"preference_sequence": []map[string]any{
+				{"tool": "list_traces", "arguments": map[string]any{"tag": "user-preference"}},
+				{"tool": "get_trace", "for_each_result": true, "body_policy": "binding durable preference content"},
+				{"tool": "list_traces", "arguments": map[string]any{"type": "preference"}, "optional": true, "purpose": "find untagged preferences"},
+			},
+			"failure_policy": "If preference retrieval fails because of transport, auth, or schema issues, surface the failure explicitly and proceed with ordinary defaults.",
+		},
+		"trace_model": map[string]any{
+			"types": traceTypes,
+			"id": map[string]any{
+				"format":       "YYYYMMDD-slugified-title",
+				"slug_max_len": trace.MaxSlugLen,
+				"generated_by": "create_trace",
+			},
+			"title_rules": []string{
+				"Aim for titles under 80 characters.",
+				"Do not include a date in the title; create_trace prepends today's date automatically.",
+				"Leading YYYYMMDD- and YYYY-MM-DD- prefixes are stripped, but mid-title date fragments survive.",
+				"If a trace is about a specific date, put it in a tag such as event-2026-04-02 or in the body.",
+			},
+			"required_fields":  []string{"id", "title", "type", "created", "updated"},
+			"optional_fields":  []string{"author", "tags", "derived_from", "origin", "source_hash", "source_locked"},
+			"generated_fields": []string{"content_hash"},
+			"tier_glyphs": map[string]string{
+				"s": trace.TierShort,
+				"m": trace.TierMid,
+				"L": trace.TierLong,
+			},
+		},
+		"search": map[string]any{
+			"modes":                         []string{cortex.SearchModeLexical, cortex.SearchModeSemantic, cortex.SearchModeHybrid},
+			"default_mode":                  m.Search.EffectiveDefaultMode(),
+			"semantic_enabled":              m.Search.SemanticOn(),
+			"embedding_endpoint_configured": m.ResolvedEmbeddingEndpoint() != "",
+			"embedding_model_configured":    m.Search != nil && m.Search.EmbeddingModel != "",
+			"hybrid_weight":                 m.Search.EffectiveHybridWeight(),
+			"max_chars":                     m.Search.EffectiveMaxChars(),
+		},
+		"workflows": map[string]any{
+			"read": []string{
+				"list_traces lists active traces by default; archived=true shows archived only; all=true shows active and archived.",
+				"get_trace returns full body and metadata.",
+				"search_traces searches by text and may support semantic or hybrid ranking when configured.",
+				"find_similar_traces starts from an existing trace ID.",
+			},
+			"write": []string{
+				"create_trace creates a new trace when exposed.",
+				"update_trace changes selected fields when exposed.",
+				"append_trace appends content without reading the full trace first.",
+				"set_trace_tags replaces retrieval tags without touching title, body, type, or lineage.",
+				"append_trace_tags adds retrieval tags idempotently without touching title, body, type, or lineage.",
+				"archive_trace hides without deleting; delete_trace moves to trash; recover_trace restores from trash.",
+			},
+			"audit_federation": []string{
+				"trace_history shows immutable mutation history.",
+				"trace_lineage shows derived_from and derived_by relationships.",
+				"resolve_divergence resolves federation conflicts by accepting a peer version or supplying a merge.",
+			},
+		},
+		"runtime": map[string]any{
+			"federation_mode":            mode,
+			"federation_verify":          m.Federation.EffectiveVerify(),
+			"access":                     access,
+			"filesystem_watch_enabled":   watchEnabled,
+			"long_tier_content_mutable":  false,
+			"trash_visible_through_mcp":  false,
+			"source_locking_description": "Source-locked foreign traces refuse update, delete, and remove outside their origin; archive and unarchive remain local visibility choices.",
+		},
+		"authoring_tips": []string{
+			"Prefer specific types over note.",
+			"Use tags for cross-cutting retrieval.",
+			"Use set_trace_tags or append_trace_tags for tag cleanup; vote_trace is only a tier-preference signal.",
+			"Set author to the human or agent responsible for the memory.",
+			"Keep public-facing content free of private hostnames, personal identifiers, cortex names, and secret-bearing output unless explicitly approved.",
+		},
+	}
+}
+
+func traceTypeDescription(tt trace.Type) string {
+	switch tt {
+	case trace.TypeFact:
+		return "discrete thing that is true"
+	case trace.TypeDecision:
+		return "choice made and why"
+	case trace.TypePreference:
+		return "behavioral or stylistic lean"
+	case trace.TypeContext:
+		return "situational background"
+	case trace.TypeSkill:
+		return "learned capability or procedure"
+	case trace.TypeIntent:
+		return "something that needs to happen"
+	case trace.TypeObservation:
+		return "witnessed but not yet verified"
+	case trace.TypeDivergence:
+		return "concurrent edit conflict, created by federation"
+	default:
+		return "fallback for anything else"
+	}
+}
+
+func parseTagList(raw string) []string {
+	out := []string{}
+	seen := map[string]struct{}{}
+	for _, part := range strings.Split(raw, ",") {
+		tag := strings.TrimSpace(part)
+		if tag == "" {
+			continue
+		}
+		if _, ok := seen[tag]; ok {
+			continue
+		}
+		seen[tag] = struct{}{}
+		out = append(out, tag)
+	}
+	return out
+}
+
+func appendUniqueTags(current, additions []string) []string {
+	out := append([]string{}, current...)
+	seen := map[string]struct{}{}
+	for _, tag := range out {
+		seen[tag] = struct{}{}
+	}
+	for _, tag := range additions {
+		if _, ok := seen[tag]; ok {
+			continue
+		}
+		seen[tag] = struct{}{}
+		out = append(out, tag)
+	}
+	return out
+}
+
+func traceForMutation(cx *cortex.Cortex, id string) (*trace.Trace, error) {
+	row, err := cx.Get(id)
+	if err != nil {
+		return nil, fmt.Errorf("trace %q not found", id)
+	}
+	path := cx.TraceFile(id, row.ArchivedAt != "")
+	return trace.ParseFile(path)
+}
+
+func setTraceTags(cx *cortex.Cortex, id string, tags []string) error {
+	if _, err := cx.Get(id); err != nil {
+		return fmt.Errorf("trace %q not found", id)
+	}
+	return cx.SetTraceTagsAs(id, tags, cortex.ActorAgent)
+}
+
+func tagMutationResult(action, id string, tags []string) *mcp.CallToolResult {
+	payload := map[string]any{
+		"id":     id,
+		"action": action,
+		"tags":   tags,
+	}
+	return mcp.NewToolResultStructured(payload, fmt.Sprintf("Trace %s tags: %s", id, strings.Join(tags, ", ")))
+}
+
 // formatRank renders a federation.RankEntry for federation_status
 // output. Empty / ineligible entries become "(ineligible)"; live
 // entries show the numeric rank plus the observation timestamp so
@@ -1041,305 +1344,76 @@ func renderInstructions(m cortex.Manifest, noemaVersion string) string {
 	if m.Owner != "" {
 		ownerLine = fmt.Sprintf("Owner:    %s\n", m.Owner)
 	}
-	return fmt.Sprintf(`# Noema — Agent Reference
+	return fmt.Sprintf(`# Noema Agent Instructions
 
 ## Active Cortex
 Name:     %s
 Version:  noema %s (manifest v%d)
 %s%s
-## Terminology
-- Cortex: a named collection of Traces (this instance: %q)
-- Trace:  a single memory unit — one markdown file with YAML frontmatter +
-          a corresponding row in the SQLite index
+## Agent Startup
+Before establishing user or project defaults, fetch durable preferences from
+this Cortex:
 
-## Trace Types
-Choose the type that best reflects the intent of the memory:
+1. list_traces with tag="user-preference".
+2. get_trace for each relevant result; the body is the binding content.
+3. Optionally list_traces with type="preference" to find untagged preferences.
 
-  fact        — a discrete thing that is true
-  decision    — a choice made and why
-  preference  — a behavioral or stylistic lean
-  context     — situational background
-  skill       — a learned capability or procedure
-  intent      — something that needs to happen (autonomous pickup)
-  observation — something witnessed but not yet verified
-  note        — anything else
-  divergence  — concurrent edit conflict (auto-created by federation sync)
+If preference retrieval fails because of transport, auth, or schema issues,
+surface that failure explicitly and proceed with ordinary defaults.
 
-## Trace Fields
-  id            required  YYYYMMDD-slugified-title  (e.g. 20260330-why-we-chose-go)
-  title         required  short, descriptive
-  type          required  one of the types above
-  created       required  RFC3339 UTC timestamp (set on creation, never changed)
-  updated       required  RFC3339 UTC timestamp (update on every edit)
-  author        optional  human username or agent name
-  tags          optional  list of keyword strings
-  derived_from  optional  list of trace IDs this trace was derived from
-  origin        optional  cortex name that created this trace (auto-set)
-  content_hash  auto      SHA-256 of body (sha256:<hex>), recomputed on every write
-  source_hash   optional  origin's content_hash at publish time (immutable on consumer)
-  source_locked optional  when true, consumer-side mutations are refused
+## MCP Usage
+Use MCP tool discovery and each tool's input schema as the source of truth for
+what this client can call right now. Some Noema deployments expose read-only,
+federated, or client-filtered tool sets.
 
-## Tools
+Call cortex_usage when you need structured JSON context for MCP clients:
+runtime posture, trace semantics, startup sequence, search configuration, and
+operational constraints.
 
-  get_instructions               → this document
-  list_traces [type] [author] [tag] [origin] [archived] [all]
-                                 → list traces; defaults to active only
-  get_trace id                   → full content including body, origin, lineage
-  create_trace title type body [author] [tags] [derived_from] [origin] [source_locked] [source_hash]
-                                 → create a new trace; tags/derived_from = comma-separated.
-                                   Aim for short descriptive titles (under 80 chars); the ID
-                                   slug is capped at 100 chars and longer titles are silently
-                                   truncated. Do NOT include a date in the title — the ID
-                                   generator prepends today's date automatically, and leading
-                                   YYYYMMDD- or YYYY-MM-DD- prefixes in the title are stripped
-                                   to prevent doubled IDs like 20260402-20260402-foo. Avoid
-                                   mid-title dates too (e.g. "session 20260416 142000") —
-                                   only leading prefixes are stripped, so mid-title date
-                                   fragments survive. If a trace is *about* a specific date,
-                                   put it in a tag (e.g. tags=event-2026-04-02) or the body
-  update_trace id [title] [type] [author] [tags] [derived_from] [body]
-                                 → update any subset of fields
-  append_trace id content        → append content to an existing trace's body
-                                   without reading the full trace first; ideal
-                                   for running logs and fire-and-forget writes
-  search_traces query [all] [mode]
-                                 → full-text (lexical, default) or embedding
-                                   (mode=semantic) search; semantic needs a
-                                   configured search: block, else falls back
-  find_similar_traces trace_id [limit] [include_archived] [mode]
-                                 → related traces by BM25 vocabulary overlap,
-                                   or mode=semantic for embedding similarity
-                                   match). Useful when you have one
-                                   trace in hand and want to surface
-                                   related ones without crafting a query
-  archive_trace id               → move to archive (reversible)
-  unarchive_trace id             → restore from archive
-  delete_trace id                → move to trash (soft-delete, recoverable)
-  recover_trace id               → restore a trashed trace to active
-  trace_history id               → event log (audit trail) for a trace
-  trace_lineage id               → derivation graph: derived_from + derived_by
-  resolve_divergence id [accept] [body]
-                                 → resolve a concurrent edit conflict by
-                                   accepting an origin's version, or by
-                                   supplying a custom merged body
-  cortex_identity                → return this cortex's stable ULID + name +
-                                   manifest version (used by federation peers
-                                   to verify identity on every sync)
-  consolidation_health [since]   → daily consolidation activity (success/fail/
-                                   promote/distill) over the window, plus
-                                   short→mid and mid→long latency percentiles
-                                   and the 1-source mid leak detector. since
-                                   accepts Go duration syntax plus d/w (e.g.
-                                   24h, 7d). Defaults to 24h.
-  search_activity [top]          → top-N traces by federation-wide search
-                                   popularity, plus top-N tags by aggregate
-                                   engagement (hits + reads + modifies). Use
-                                   this to surface what's worth reading or to
-                                   discover which topics are hot. top defaults
-                                   to 10, capped at 100.
-  sync_events [since] [limit]    → pull events for federation (JSON array)
-  federation_status              → MCP access posture, federation config,
-                                   peer states, vector clock
-  announce_peer name endpoint    → accept a peer announcement for discovery
+## Memory Semantics
+A Cortex is a named collection of Traces; this instance is %q. A Trace is one
+memory unit with a markdown body, YAML frontmatter, and SQLite index row.
 
-## Filtering
-  default              active traces only (not archived, not trashed)
-  archived=true        archived traces only
-  all=true             active + archived (excludes trash)
-  origin=<name>        traces from a specific cortex
-  (no trashed filter via MCP — use the CLI for trash operations)
+Choose the most specific trace type:
 
-## Errors with structured payloads
+- fact: discrete thing that is true.
+- decision: choice made and why.
+- preference: behavioral or stylistic lean.
+- context: situational background.
+- skill: learned capability or procedure.
+- intent: something that needs to happen.
+- observation: witnessed but not yet verified.
+- note: fallback for anything else.
+- divergence: concurrent edit conflict, created by federation.
 
-Some create_trace failures return an error result whose text body is a
-JSON object rather than a plain string. Currently:
+## Creating Traces
+When create_trace is exposed, pass title, type, and body plus optional author,
+tags, derived_from, origin, source_locked, and source_hash per the tool schema.
 
-  trace_id_collision   create_trace's would-be id (YYYYMMDD-slug form)
-                       is already held by an existing row. Fields:
-                         kind="trace_id_collision"
-                         id=<the colliding id>
-                         existing_state=active|archived|trashed|purged
-                         archived_at, trashed_at, purged_at (RFC3339, may be empty)
-                         fix=[<remediation strings>]
-                         summary=<human-readable rendering>
-                       The (1555) you may see in the underlying SQLite
-                       error string is SQLITE_CONSTRAINT_PRIMARYKEY (a
-                       constant), NOT a rowid — do not chase
-                       AUTOINCREMENT / sqlite_sequence remediations.
-                       The fix array names the right command for
-                       existing_state (recover, unarchive, or
-                       memory purge --hard).
+Aim for titles under 80 characters. Do NOT include a date in the title — the ID
+generator prepends today's date automatically, and leading YYYYMMDD- or
+YYYY-MM-DD- prefixes in the title are stripped to prevent doubled IDs like
+20260402-20260402-foo. Avoid mid-title dates too, such as "session 20260416
+142000"; only leading prefixes are stripped, so mid-title date fragments survive.
+If a trace is about a specific date, put it in a tag such as event-2026-04-02 or
+in the body.
 
-## Provenance
-- origin is auto-set to the current cortex name on creation. Override it when
-  replaying events from a remote peer.
-- derived_from records which traces informed this one — use it when synthesizing
-  conclusions from multiple sources. trace_lineage shows both directions.
-- trace_history shows every mutation (create, update, archive, etc.) as an
-  immutable event log with timestamps and origin attribution.
+Search before creating a durable trace when duplication would matter. Use
+derived_from when synthesizing conclusions from existing traces.
 
-## Conflict Resolution
-- When federated peers edit the same trace concurrently, a "divergence" trace is
-  auto-created containing every conflicting version. It has type=divergence,
-  tags=[divergence, needs-resolution], and derived_from=[original-trace-id].
-- The divergence body lists "**Conflicting origins:** <labels>" and one
-  "### Version from <name> (<id-prefix>)" section per version, where id-prefix
-  is the first 8 chars of the peer's cortex ULID. Sections are sorted by
-  cortex id (not name) so every replica produces byte-identical content.
-- Use resolve_divergence to resolve: pass accept=<peer-name> or accept=<id-prefix>
-  to apply that version cluster-wide, or pass body=<merged content> to apply a
-  custom merge.
-- Use list_traces with type filter or tag=needs-resolution to find unresolved divergences.
-- federation_status shows the count of unresolved divergences.
+append_trace is useful for running logs and fire-and-forget writes because it
+appends content without reading the full trace first.
 
-## Access Posture
-- The HTTP MCP endpoint runs either "open" (no auth) or "keyed" (bearer key required).
-  federation_status reports the active posture as "Access: open" or
-  "Access: keyed (source=env|file, fingerprint=SHA256:...)".
-- Keyed mode is mandatory for any non-loopback deployment and for federation rings.
-  In keyed mode the server also requires TLS — it refuses to start over plaintext HTTP.
-- The fingerprint is a non-secret SHA-256 of the key; every host in a federation ring
-  must report the same fingerprint or peers will 401 each other on sync.
-- Key configuration is operator-side: NOEMA_MCP_KEY environment variable, or an
-  access.shared_key_file sidecar path in cortex.md pointing at a 0600 file. Env wins
-  if both are set. As an agent you do not read, write, or rotate the key yourself —
-  your client either has it configured and every tool call works, or it doesn't and
-  you'll see a 401 from the transport layer.
-- Stdio is unaffected by this posture: stdio implies local-process trust.
-- TLS cert paths can also live in cortex.md as access.tls_cert_path / access.tls_key_path,
-  giving --tls-cert/--tls-key sane defaults for restarts and a static target for
-  noema verify cortex to audit. The serve command refuses to start on an expired
-  or not-yet-valid cert (override: --insecure-allow-expired), warns at startup when
-  the cert expires within 7 days, and runs an hourly background cert monitor that
-  logs [cert-monitor] band transitions at 90 / 30 / 7 / expired.
+Use set_trace_tags or append_trace_tags for retrieval metadata hygiene. Do not
+use vote_trace to compensate for missing or excessive tags; voting is only a
+tier-preference signal.
 
-## Federation Modes
-The cortex-level federation mode controls how this instance participates in a ring:
-
-  sync        (default) Bidirectional: pull events from peers and serve events to them.
-  publish     Outbound only: serve events via sync_events, but never pull. Write tools
-              (create/update/delete/archive/recover/resolve) are blocked on HTTP — use
-              a local stdio transport for content management.
-  subscribe   Inbound only: pull events from peers normally. sync_events refuses to
-              serve — remote peers cannot pull from this cortex.
-
-Each peer can also be paused individually (mode=paused in cortex.md) without affecting
-the rest of the ring. A paused peer keeps its cursor and identity pin intact.
-
-cortex_identity reports the active mode. federation_status shows both the cortex mode
-and per-peer modes.
-
-## Tier Graduation (short → mid → long)
-The long tier accumulates base truths — traces that have proven durable via stable,
-repeat usage. An automatic graduation pass runs on the consolidation schedule and
-promotes every mid-tier trace that clears four AND-gated criteria:
-
-  - age >= 14 days (configurable via consolidation.graduation.min_age_days)
-  - (read_count + search_hit_count) >= 3 (configurable via consolidation.graduation.min_read_count)
-  - modify_count == 0 (unless require_unmodified is false)
-  - tier_votes >= 0 (no active downvotes)
-
-read_count bumps on get_trace; search_hit_count bumps on search_traces /
-find_similar_traces top-N hits. Both contribute equally to the read gate so
-auto-injection providers (Hermes, etc.) that consume search output without
-ever calling get_trace can still drive traces to long tier.
-
-Traces at the long tier are DB-level immutable: content / identity fields are
-frozen, tier cannot change except via the admin-purge ceremony, and routine
-Update/Delete is refused. Archive / trash / vote still work — visibility and
-preference signals remain mutable.
-
-Operators promote manually via 'noema memory promote <id>' / 'demote <id>'.
-Agents don't directly promote — vote_trace is the signal to influence the
-automatic pass. The ceremony for removing a long trace is 'noema memory
-purge --tier long' (add '--hard' for full deletion; default tombstones).
-
-## Consolidation Coordination
-When multiple federated peers have consolidation.enabled + consolidation.llm_enabled
-with a reachable local_llm_endpoint, exactly one peer runs each consolidation cycle:
-
-  - Every peer advertises a random rank (1..99) via cortex_identity on each sync.
-  - At trigger time, the peer with the highest rank (cortex_id breaks ties) runs
-    the pass; the rest silently skip. Subscribe-mode cortexes advertise rank=0
-    and never win.
-  - The winner emits consolidation_claim → runs → consolidation_success|fail
-    events that replicate through the standard event log.
-
-federation_status displays each peer's current rank. No configuration required
-beyond the existing consolidation block — coordination is automatic when peers
-are present.
-
-Setting consolidation.auto_distillation_enabled=true folds the LLM distillation
-pipeline into every scheduled trigger (distillation → heuristic → graduation on
-the elected peer). Requires llm_enabled + local_llm_endpoint + model_name, and
-degrades to heuristic+graduation when the LLM endpoint is unreachable.
-
-## Source-Locking
-Traces can be source-locked by setting source_locked=true on creation. A source-locked
-trace refuses update, delete, and remove when the local cortex is not the trace's origin.
-This enforces publisher authority: consumers receive the trace via federation but cannot
-modify it. archive/unarchive remain allowed (non-destructive).
-
-content_hash is auto-computed (SHA-256 of the body) on every write and carried through
-federation events. source_hash records the origin's content_hash at publish time so
-consumers can detect drift.
-
-get_trace shows Source Locked, Source Hash, and Content Hash fields when present.
-Both list_traces and search_traces prefix each row with a tier glyph (s=short,
-m=mid, L=long) so you can see the tier without a second lookup. get_trace surfaces
-the full tier name on a dedicated "Tier:" line in the metadata block.
-
-## Federation Event Signing
-content_hash proves a body matches its hash but not which cortex authored an event.
-Run noema keygen (CLI) to give a cortex an Ed25519 signing key; it then signs every
-event it emits and advertises its public key through the cortex_identity handshake.
-Peers pin that key per cortex id on first contact and refuse a later change until
-noema federation reset-peer clears it.
-
-Incoming events are checked according to federation.verify in cortex.md: off (default,
-no change), warn (log unsigned/forged events but accept), or enforce (reject anything
-that is not correctly signed by its owning cortex). Under enforce, source-locking is
-also enforced on replay: a locked trace can only be mutated by the cortex that owns it,
-so a peer cannot overwrite, trash, or purge another cortex's locked trace.
-
-## External Filesystem Edits
-Whenever noema serve is running (stdio OR http), a background watcher
-observes the traces/, archive/traces/, and trash/traces/ directories.
-External changes (Obsidian, VS Code, Finder drags, rm, iCloud sync from
-another device, a second noema process on the same cortex) are treated
-as first-class mutations:
-
-  edit a trace's .md file      → update event
-  drop a new valid .md in      → create event (frontmatter must be complete)
-  move traces/ → archive/      → archive event
-  move archive/ → traces/      → unarchive event
-  move to trash/               → trash event
-  move out of trash/           → recover event
-  delete from traces/          → trash event; body is restored to trash/
-                                 from the event log so recover_trace works
-  delete from trash/           → purge event; trace is permanently removed
-
-Source-locked foreign traces are refused on external edit (watcher logs a
-warning and skips). Malformed frontmatter is skipped with a warning —
-drop-in files must carry a valid id, title, type, created, updated.
-
-The watcher is on by default; opt out by setting watch.enabled=false in
-cortex.md. A short per-path debounce (default 300ms) collapses editor
-save bursts into a single event. Federation propagation is HTTP-only
-(peers need a network endpoint), but external-edit events land in the
-local log under stdio too and flow outward the next time an HTTP serve
-runs.
-
-## Tips
-- Prefer specific types over "note" — it helps retrieval and reasoning later.
-- Use tags to group related traces across types.
-- author should be your agent name so traces are attributable in multi-agent systems.
-- Use derived_from when creating traces based on other traces — it builds a knowledge graph.
-- search_traces supports FTS5 syntax: quoted phrases, AND/OR/NOT, prefix* matching.
-- search_traces / find_similar_traces accept mode=semantic or mode=hybrid for
-  embedding-based ranking when this cortex has a search: block configured and
-  embeddings backfilled (noema embeddings backfill); they fall back to lexical
-  otherwise. Use semantic when a query matches by concept rather than wording.
+## Guardrails
+- Prefer specific types over note.
+- Use tags for cross-cutting retrieval.
+- Set author to the human or agent responsible for the memory.
+- Keep public-facing content free of private hostnames, personal identifiers,
+  cortex names, and secret-bearing output unless explicitly approved.
 `, m.Name, noemaVersion, m.Version, purposeLine, ownerLine, m.Name)
 }
 
