@@ -1135,11 +1135,15 @@ they keep the database in sync automatically:
 
 | Tool | Purpose |
 |---|---|
+| ` + "`get_instructions`" + ` | Concise Markdown guidance for agent use of this Cortex |
+| ` + "`cortex_usage`" + ` | Structured JSON context for MCP clients |
 | ` + "`list_traces`" + ` | List traces with optional type/author/tag/origin filters |
 | ` + "`get_trace`" + ` | Fetch full content of a trace by ID |
 | ` + "`create_trace`" + ` | Create a new trace (supports derived_from, origin) |
 | ` + "`update_trace`" + ` | Update fields of an existing trace |
 | ` + "`append_trace`" + ` | Append content to a trace body (fire-and-forget) |
+| ` + "`set_trace_tags`" + ` | Replace retrieval tags without touching title, body, type, or lineage |
+| ` + "`append_trace_tags`" + ` | Add retrieval tags idempotently without touching title, body, type, or lineage |
 | ` + "`search_traces`" + ` | Search across titles and bodies. ` + "`mode`" + `: ` + "`lexical`" + ` (FTS5, default), ` + "`semantic`" + ` (embedding similarity), or ` + "`hybrid`" + ` (RRF fusion). Semantic/hybrid need a configured ` + "`search:`" + ` block; they fall back to lexical otherwise |
 | ` + "`find_similar_traces`" + ` | Surface traces related to one you have in hand. Default ranks by BM25 vocabulary overlap; ` + "`mode=semantic`" + `/` + "`hybrid`" + ` ranks by embedding similarity to the source trace's own vector |
 | ` + "`archive_trace`" + ` | Archive a trace |
@@ -2132,6 +2136,54 @@ func (c *Cortex) UpdateFromFile(id string) error {
 	return c.updateFromFile(id, false)
 }
 
+// SetTraceTags replaces a trace's retrieval tags without mutating immutable
+// trace fields such as updated_at or content_hash. Tags live outside the
+// guarded traces row, so this remains legal for long-tier traces while still
+// keeping the tag index, FTS, file frontmatter, and federation event log in
+// sync.
+func (c *Cortex) SetTraceTags(id string, tags []string) error {
+	if err := c.CheckSourceLock(id); err != nil {
+		return err
+	}
+	r, err := c.Get(id)
+	if err != nil {
+		return err
+	}
+	path := c.filePath(r)
+	t, err := trace.ParseFile(path)
+	if err != nil {
+		return err
+	}
+
+	t.Tags = tags
+	t.Tier = r.Tier
+	t.Updated = r.UpdatedAt
+	t.ContentHash = r.ContentHash
+	t.SourceLocked = r.SourceLocked
+	t.SourceHash = r.SourceHash
+	if err := t.WritePreservingUpdated(path); err != nil {
+		return fmt.Errorf("rewriting trace file tags: %w", err)
+	}
+
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := replaceTraceTagsTx(tx, id, tags); err != nil {
+		return err
+	}
+	if err := upsertFTS(tx, id, r.Title, t.Body, tags); err != nil {
+		return err
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := c.emitEvent(tx, event.ActionTagUpdate, id, now, marshalTagData(tags)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (c *Cortex) updateFromFile(id string, rewriteFile bool) error {
 	if err := c.CheckSourceLock(id); err != nil {
 		return err
@@ -3090,6 +3142,8 @@ func (c *Cortex) ReplayEvent(e event.Event) error {
 		replayErr = c.replayCreate(e)
 	case event.ActionUpdate:
 		replayErr = c.replayUpdate(e)
+	case event.ActionTagUpdate:
+		replayErr = c.replayTagUpdate(e)
 	case event.ActionArchive:
 		replayErr = c.replayArchive(e)
 	case event.ActionUnarchive:
@@ -3338,6 +3392,52 @@ func (c *Cortex) replayUpdate(e event.Event) error {
 		}
 	}
 	if err := upsertFTS(tx, e.TraceID, t.Title, t.Body, t.Tags); err != nil {
+		return err
+	}
+	if err := event.Append(tx, &e); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (c *Cortex) replayTagUpdate(e event.Event) error {
+	var data struct {
+		Tags []string `json:"tags"`
+	}
+	if err := json.Unmarshal(e.Data, &data); err != nil {
+		return fmt.Errorf("parsing tag_update event data: %w", err)
+	}
+
+	r, err := c.Get(e.TraceID)
+	if err != nil {
+		return fmt.Errorf("trace %s not found for replay tag_update: %w", e.TraceID, err)
+	}
+	path := c.filePath(r)
+	t, err := trace.ParseFile(path)
+	if err != nil {
+		return err
+	}
+
+	t.Tags = data.Tags
+	t.Tier = r.Tier
+	t.Updated = r.UpdatedAt
+	t.ContentHash = r.ContentHash
+	t.SourceLocked = r.SourceLocked
+	t.SourceHash = r.SourceHash
+	if err := t.WritePreservingUpdated(path); err != nil {
+		return fmt.Errorf("rewriting replayed trace tags: %w", err)
+	}
+
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := replaceTraceTagsTx(tx, e.TraceID, data.Tags); err != nil {
+		return err
+	}
+	if err := upsertFTS(tx, e.TraceID, r.Title, t.Body, data.Tags); err != nil {
 		return err
 	}
 	if err := event.Append(tx, &e); err != nil {
@@ -4048,6 +4148,16 @@ func marshalTraceData(t *trace.Trace) json.RawMessage {
 	return data
 }
 
+func marshalTagData(tags []string) json.RawMessage {
+	payload := struct {
+		Tags []string `json:"tags"`
+	}{
+		Tags: tags,
+	}
+	data, _ := json.Marshal(payload)
+	return data
+}
+
 // ftsTagText joins a trace's tags into one space-delimited string for
 // FTS5 indexing. The porter/ascii tokenizer splits on whitespace and
 // indexes each tag as an independent token, so tagging a trace with
@@ -4078,6 +4188,18 @@ func upsertFTS(tx *sql.Tx, id, title, body string, tags []string) error {
 		return err
 	}
 	return insertFTS(tx, id, title, body, tags)
+}
+
+func replaceTraceTagsTx(tx *sql.Tx, id string, tags []string) error {
+	if _, err := tx.Exec(`DELETE FROM trace_tags WHERE trace_id = ?`, id); err != nil {
+		return err
+	}
+	for _, tag := range tags {
+		if _, err := tx.Exec(`INSERT INTO trace_tags (trace_id, tag) VALUES (?, ?)`, id, tag); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ensureFTSSchema checks that traces_fts has the four expected columns

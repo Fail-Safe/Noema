@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -158,6 +159,235 @@ func TestRenderInstructions_ManifestVersionReflectsInput(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("manifest v%d not reflected:\nlooking for %q\nfull:\n%s", v, want, out)
 		}
+	}
+}
+
+func TestRenderInstructions_PointsToMCPDiscoveryAndCortexUsage(t *testing.T) {
+	out := renderInstructions(cortex.Manifest{Name: "test", Version: 2}, "dev")
+
+	for _, want := range []string{
+		"Use MCP tool discovery and each tool's input schema as the source of truth",
+		"Call cortex_usage when you need structured JSON context",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("instructions missing MCP usage guidance %q\nfull output:\n%s", want, out)
+		}
+	}
+}
+
+func TestRenderInstructions_IncludesPreferenceStartupPattern(t *testing.T) {
+	out := renderInstructions(cortex.Manifest{Name: "test", Version: 2}, "dev")
+
+	for _, want := range []string{
+		`list_traces with tag="user-preference"`,
+		"get_trace for each relevant result",
+		`list_traces with type="preference"`,
+		"surface that failure explicitly",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("instructions missing preference startup guidance %q\nfull output:\n%s", want, out)
+		}
+	}
+}
+
+func TestCortexUsage_ReturnsStructuredMCPContext(t *testing.T) {
+	cx := newTestCortex(t)
+	s := NewServer(cx, "usage-test", cortex.FederationModePublish)
+	initServer(t, s)
+
+	result := callToolResult(t, s, "cortex_usage", nil)
+	if result.IsError {
+		t.Fatalf("cortex_usage returned error: %s", toolResultText(result))
+	}
+
+	var payload map[string]any
+	text := toolResultText(result)
+	if err := json.Unmarshal([]byte(text), &payload); err != nil {
+		t.Fatalf("cortex_usage returned invalid JSON: %v\n%s", err, text)
+	}
+	if result.StructuredContent == nil {
+		t.Fatal("cortex_usage missing structuredContent")
+	}
+	structured, ok := result.StructuredContent.(map[string]any)
+	if !ok {
+		t.Fatalf("structuredContent = %T, want map[string]any", result.StructuredContent)
+	}
+	if structured["schema_version"] != float64(1) {
+		t.Fatalf("structuredContent.schema_version = %v, want 1", structured["schema_version"])
+	}
+	if payload["schema_version"] != float64(1) {
+		t.Fatalf("schema_version = %v, want 1", payload["schema_version"])
+	}
+
+	cortexObj, ok := payload["cortex"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing cortex object: %#v", payload["cortex"])
+	}
+	if cortexObj["name"] != "test" {
+		t.Errorf("cortex.name = %v, want test", cortexObj["name"])
+	}
+	if cortexObj["noema_version"] != "usage-test" {
+		t.Errorf("cortex.noema_version = %v, want usage-test", cortexObj["noema_version"])
+	}
+
+	contract, ok := payload["contract"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing contract object: %#v", payload["contract"])
+	}
+	if contract["tool_discovery_authoritative"] != true {
+		t.Errorf("tool_discovery_authoritative = %v, want true", contract["tool_discovery_authoritative"])
+	}
+	if contract["structured_usage_tool"] != "cortex_usage" {
+		t.Errorf("structured_usage_tool = %v, want cortex_usage", contract["structured_usage_tool"])
+	}
+
+	runtime, ok := payload["runtime"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing runtime object: %#v", payload["runtime"])
+	}
+	if runtime["federation_mode"] != cortex.FederationModePublish {
+		t.Errorf("runtime.federation_mode = %v, want publish", runtime["federation_mode"])
+	}
+
+	traceModel, ok := payload["trace_model"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing trace_model object: %#v", payload["trace_model"])
+	}
+	id, ok := traceModel["id"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing trace_model.id object: %#v", traceModel["id"])
+	}
+	if id["slug_max_len"] != float64(trace.MaxSlugLen) {
+		t.Errorf("slug_max_len = %v, want %d", id["slug_max_len"], trace.MaxSlugLen)
+	}
+}
+
+func TestSetTraceTags_ReplacesAndReturnsStructuredResult(t *testing.T) {
+	cx := newTestCortex(t)
+	tr := trace.New("Tag replacement", "note", "agent", []string{"old", "stale"}, "Body.")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	s := NewServer(cx, "test", "")
+	initServer(t, s)
+
+	result := callToolResult(t, s, "set_trace_tags", map[string]any{
+		"id":   tr.ID,
+		"tags": "new, retrieval, new,  ",
+	})
+	if result.IsError {
+		t.Fatalf("set_trace_tags returned error: %s", toolResultText(result))
+	}
+	row, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	want := []string{"new", "retrieval"}
+	if !reflect.DeepEqual(row.Tags, want) {
+		t.Fatalf("tags = %v, want %v", row.Tags, want)
+	}
+	structured, ok := result.StructuredContent.(map[string]any)
+	if !ok {
+		t.Fatalf("structuredContent = %T, want map[string]any", result.StructuredContent)
+	}
+	gotTags, ok := structured["tags"].([]any)
+	if !ok {
+		t.Fatalf("structuredContent.tags = %T, want []any", structured["tags"])
+	}
+	if len(gotTags) != 2 || gotTags[0] != "new" || gotTags[1] != "retrieval" {
+		t.Fatalf("structuredContent.tags = %v, want [new retrieval]", gotTags)
+	}
+}
+
+func TestAppendTraceTags_AddsIdempotentlyPreservingOrder(t *testing.T) {
+	cx := newTestCortex(t)
+	tr := trace.New("Tag append", "note", "agent", []string{"alpha", "beta"}, "Body.")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	s := NewServer(cx, "test", "")
+	initServer(t, s)
+
+	text, isErr := callTool(t, s, "append_trace_tags", map[string]any{
+		"id":   tr.ID,
+		"tags": "beta, gamma, alpha, delta",
+	})
+	if isErr {
+		t.Fatalf("append_trace_tags returned error: %s", text)
+	}
+	row, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	wantRow := []string{"alpha", "beta", "delta", "gamma"}
+	if !reflect.DeepEqual(row.Tags, wantRow) {
+		t.Fatalf("row tags = %v, want DB-sorted %v", row.Tags, wantRow)
+	}
+	parsed, err := trace.ParseFile(cx.TraceFile(tr.ID, false))
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	wantFile := []string{"alpha", "beta", "gamma", "delta"}
+	if !reflect.DeepEqual(parsed.Tags, wantFile) {
+		t.Fatalf("file tags = %v, want append order %v", parsed.Tags, wantFile)
+	}
+}
+
+func TestSetTraceTags_CanClearTags(t *testing.T) {
+	cx := newTestCortex(t)
+	tr := trace.New("Tag clear", "note", "agent", []string{"alpha"}, "Body.")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	s := NewServer(cx, "test", "")
+	initServer(t, s)
+
+	text, isErr := callTool(t, s, "set_trace_tags", map[string]any{
+		"id":   tr.ID,
+		"tags": "",
+	})
+	if isErr {
+		t.Fatalf("set_trace_tags returned error: %s", text)
+	}
+	row, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if len(row.Tags) != 0 {
+		t.Fatalf("tags = %v, want none", row.Tags)
+	}
+}
+
+func TestSetTraceTags_LongTierDoesNotTripImmutability(t *testing.T) {
+	cx := newTestCortex(t)
+	tr := trace.New("Long tag MCP", "note", "agent", []string{"old"}, "Body.")
+	tr.Tier = trace.TierLong
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	before, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get before: %v", err)
+	}
+	s := NewServer(cx, "test", "")
+	initServer(t, s)
+
+	text, isErr := callTool(t, s, "set_trace_tags", map[string]any{
+		"id":   tr.ID,
+		"tags": "long, retrieval",
+	})
+	if isErr {
+		t.Fatalf("set_trace_tags returned error: %s", text)
+	}
+	row, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get after: %v", err)
+	}
+	if row.UpdatedAt != before.UpdatedAt {
+		t.Fatalf("UpdatedAt changed: got %q, want %q", row.UpdatedAt, before.UpdatedAt)
+	}
+	if !reflect.DeepEqual(row.Tags, []string{"long", "retrieval"}) {
+		t.Fatalf("tags = %v, want [long retrieval]", row.Tags)
 	}
 }
 
@@ -323,6 +553,12 @@ func TestNewServer_EmptyVersionNormalizesToDev(t *testing.T) {
 // and returns the result text + whether it was an error result.
 func callTool(t *testing.T, s *server.MCPServer, toolName string, args map[string]any) (string, bool) {
 	t.Helper()
+	result := callToolResult(t, s, toolName, args)
+	return toolResultText(result), result.IsError
+}
+
+func callToolResult(t *testing.T, s *server.MCPServer, toolName string, args map[string]any) mcp.CallToolResult {
+	t.Helper()
 	if args == nil {
 		args = map[string]any{}
 	}
@@ -350,23 +586,26 @@ func callTool(t *testing.T, s *server.MCPServer, toolName string, args map[strin
 		if err := json.Unmarshal(data, &toolResult); err != nil {
 			t.Fatalf("unmarshal CallToolResult for %s: %v", toolName, err)
 		}
-		text := ""
-		if len(toolResult.Content) > 0 {
-			if tc, ok := toolResult.Content[0].(mcp.TextContent); ok {
-				text = tc.Text
-			}
-		}
-		return text, toolResult.IsError
+		return toolResult
 	case mcp.JSONRPCError:
 		// Handlers that return `nil, err` surface as protocol-level
 		// JSON-RPC errors rather than tool-result errors. Treat both
 		// as error outcomes so tests can assert on failure modes
 		// uniformly regardless of which path the handler took.
-		return r.Error.Message, true
+		return *mcp.NewToolResultError(r.Error.Message)
 	default:
 		t.Fatalf("unexpected response type for %s: %T", toolName, result)
-		return "", false
+		return mcp.CallToolResult{}
 	}
+}
+
+func toolResultText(result mcp.CallToolResult) string {
+	if len(result.Content) > 0 {
+		if tc, ok := result.Content[0].(mcp.TextContent); ok {
+			return tc.Text
+		}
+	}
+	return ""
 }
 
 // initServer drives the MCP initialize handshake so tools can be called.
@@ -404,6 +643,8 @@ func TestPublishMode_BlocksMutatingTools(t *testing.T) {
 		{"create_trace", map[string]any{"title": "x", "type": "note", "body": "y"}},
 		{"update_trace", map[string]any{"id": "nonexistent", "title": "x"}},
 		{"append_trace", map[string]any{"id": "nonexistent", "content": "x"}},
+		{"set_trace_tags", map[string]any{"id": "nonexistent", "tags": "x"}},
+		{"append_trace_tags", map[string]any{"id": "nonexistent", "tags": "x"}},
 		{"delete_trace", map[string]any{"id": "nonexistent"}},
 		{"recover_trace", map[string]any{"id": "nonexistent"}},
 		{"archive_trace", map[string]any{"id": "nonexistent"}},

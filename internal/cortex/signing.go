@@ -132,7 +132,7 @@ func (c *Cortex) checkReplaySourceLock(e event.Event) error {
 		return nil
 	}
 	switch e.Action {
-	case event.ActionUpdate, event.ActionTrash, event.ActionPurge:
+	case event.ActionUpdate, event.ActionTagUpdate, event.ActionTrash, event.ActionPurge:
 	default:
 		return nil // create/archive/vote/tier/etc. don't overwrite locked content
 	}
