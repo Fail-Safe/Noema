@@ -62,6 +62,29 @@ func TestGetTrace_IncludesTierLine(t *testing.T) {
 	}
 }
 
+func TestGetTrace_UsageSignalRequiresExplicitOptIn(t *testing.T) {
+	cx := newTestCortex(t)
+	tr := trace.New("startup pref", "preference", "agent", []string{"user-preference"}, "body")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	s := NewServer(cx, "test-version", "")
+	if text, isErr := callTool(t, s, "get_trace", map[string]any{"id": tr.ID}); isErr {
+		t.Fatalf("get_trace default returned error: %s", text)
+	}
+	if got := aggregateReadCount(t, cx, tr.ID); got != 0 {
+		t.Fatalf("read_count after default get_trace = %d, want 0", got)
+	}
+
+	if text, isErr := callTool(t, s, "get_trace", map[string]any{"id": tr.ID, "record_usage": true}); isErr {
+		t.Fatalf("get_trace record_usage=true returned error: %s", text)
+	}
+	if got := aggregateReadCount(t, cx, tr.ID); got != 1 {
+		t.Fatalf("read_count after record_usage=true = %d, want 1", got)
+	}
+}
+
 func TestTierGlyph(t *testing.T) {
 	cases := map[string]string{
 		trace.TierShort: "s",
@@ -180,13 +203,34 @@ func TestRenderInstructions_IncludesPreferenceStartupPattern(t *testing.T) {
 
 	for _, want := range []string{
 		`list_traces with tag="user-preference"`,
-		"get_trace for each relevant result",
-		`list_traces with type="preference"`,
+		"get_trace for each relevant result with record_usage=false",
+		`Do not broad-scan type="preference" during normal startup`,
 		"surface that failure explicitly",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("instructions missing preference startup guidance %q\nfull output:\n%s", want, out)
 		}
+	}
+}
+
+func TestCortexUsage_StartupGetTraceDoesNotRecordUsage(t *testing.T) {
+	cx := newTestCortex(t)
+	s := NewServer(cx, "usage-test", cortex.FederationModePublish)
+	initServer(t, s)
+
+	result := callToolResult(t, s, "cortex_usage", nil)
+	if result.IsError {
+		t.Fatalf("cortex_usage returned error: %s", toolResultText(result))
+	}
+	text := toolResultText(result)
+	if !strings.Contains(text, `"record_usage": false`) {
+		t.Fatalf("cortex_usage startup sequence missing record_usage=false:\n%s", text)
+	}
+	if strings.Contains(text, `"type": "preference"`) {
+		t.Fatalf("cortex_usage startup sequence should not broad-scan type=preference:\n%s", text)
+	}
+	if !strings.Contains(text, "Do not broad-scan type=preference during normal startup") {
+		t.Fatalf("cortex_usage missing task-scoped preference discovery guidance:\n%s", text)
 	}
 }
 
@@ -606,6 +650,18 @@ func toolResultText(result mcp.CallToolResult) string {
 		}
 	}
 	return ""
+}
+
+func aggregateReadCount(t *testing.T, cx *cortex.Cortex, traceID string) int {
+	t.Helper()
+	var reads int
+	if err := cx.DB.QueryRow(
+		`SELECT COALESCE(SUM(read_count), 0) FROM trace_usage WHERE trace_id = ?`,
+		traceID,
+	).Scan(&reads); err != nil {
+		t.Fatalf("reading aggregate read_count: %v", err)
+	}
+	return reads
 }
 
 // initServer drives the MCP initialize handshake so tools can be called.

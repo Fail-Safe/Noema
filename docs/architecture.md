@@ -100,3 +100,7 @@ embeddings are stored locally as a derived index and are never federated.
 Noema supports short, mid, and long memory tiers. Consolidation can promote
 short-term traces heuristically or through an optional local LLM pipeline; a
 separate graduation pass promotes durable mid-tier traces to long-term memory.
+Preference traces are excluded from automatic mid-to-long graduation because
+startup reads and mutable user defaults are not enough evidence to lock a trace
+into the immutable long tier. Operators can still promote a preference manually
+when they intend to curate it as long-term policy.

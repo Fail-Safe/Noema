@@ -13,7 +13,9 @@ import (
 // criterion below is an AND-gate: a trace graduates only when it
 // clears every threshold simultaneously. Defaults derive from the
 // consolidation-plan §15 design: 14 days + 3 reads + unmodified +
-// no active downvotes.
+// no active downvotes. Preference traces are excluded because repeated
+// startup loading is not evidence that a mutable preference should be
+// locked into the immutable long tier.
 type GraduationConfig struct {
 	// MinAge is the minimum age a mid-tier trace must reach before it
 	// can be considered for graduation. Zero defaults to 14 days.
@@ -115,6 +117,9 @@ func GraduatePass(cx GraduationProvider, cfg GraduationConfig, log func(format s
 // only ever generate search_hit_count, so insisting on raw read_count
 // alone would lock those cortexes out of long-tier graduation entirely.
 func shouldGraduate(pc cortex.PromotionCandidate, cfg GraduationConfig) bool {
+	if pc.Type == string(trace.TypePreference) {
+		return false
+	}
 	if pc.ReadCount+pc.SearchHitCount < cfg.MinReadCount {
 		return false
 	}
