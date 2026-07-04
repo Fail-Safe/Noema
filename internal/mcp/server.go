@@ -154,12 +154,17 @@ func NewServer(cx *cortex.Cortex, noemaVersion string, federationMode string) *s
 	s.AddTool(mcp.NewTool("get_trace",
 		mcp.WithDescription("Get a trace by ID, including its full body"),
 		mcp.WithString("id", mcp.Description("Trace ID"), mcp.Required()),
+		mcp.WithBoolean("record_usage", mcp.Description("Record this as an agent read for memory-tier promotion signals (default false). Pass true for task-driven retrieval where the read should count toward durability.")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id, err := req.RequireString("id")
 		if err != nil {
 			return nil, err
 		}
-		row, err := cx.GetAs(id, cortex.ActorAgent)
+		actor := cortex.ActorSystem
+		if req.GetBool("record_usage", false) {
+			actor = cortex.ActorAgent
+		}
+		row, err := cx.GetAs(id, actor)
 		if err != nil {
 			return nil, fmt.Errorf("trace %q not found", id)
 		}
@@ -1161,10 +1166,10 @@ func buildCortexUsage(cx *cortex.Cortex, m cortex.Manifest, noemaVersion string,
 		"startup": map[string]any{
 			"preference_sequence": []map[string]any{
 				{"tool": "list_traces", "arguments": map[string]any{"tag": "user-preference"}},
-				{"tool": "get_trace", "for_each_result": true, "body_policy": "binding durable preference content"},
-				{"tool": "list_traces", "arguments": map[string]any{"type": "preference"}, "optional": true, "purpose": "find untagged preferences"},
+				{"tool": "get_trace", "for_each_result": true, "arguments": map[string]any{"record_usage": false}, "body_policy": "binding durable preference content"},
 			},
-			"failure_policy": "If preference retrieval fails because of transport, auth, or schema issues, surface the failure explicitly and proceed with ordinary defaults.",
+			"preference_discovery": "Do not broad-scan type=preference during normal startup. Use type=preference only for task-scoped discovery when the current task needs preference search beyond active startup rules.",
+			"failure_policy":       "If preference retrieval fails because of transport, auth, or schema issues, surface the failure explicitly and proceed with ordinary defaults.",
 		},
 		"trace_model": map[string]any{
 			"types": traceTypes,
@@ -1355,8 +1360,11 @@ Before establishing user or project defaults, fetch durable preferences from
 this Cortex:
 
 1. list_traces with tag="user-preference".
-2. get_trace for each relevant result; the body is the binding content.
-3. Optionally list_traces with type="preference" to find untagged preferences.
+2. get_trace for each relevant result with record_usage=false; the body is the binding content.
+
+Do not broad-scan type="preference" during normal startup. Use type="preference"
+only for task-scoped discovery when the current task needs preference search
+beyond active startup rules.
 
 If preference retrieval fails because of transport, auth, or schema issues,
 surface that failure explicitly and proceed with ordinary defaults.
