@@ -69,7 +69,7 @@ func TestEngagementStats_EmptyCortex(t *testing.T) {
 // TestMidLineageBreakdown_BucketsBySourceCount pins that mids are
 // classified by their derived_from count. The 1-source bucket is the
 // signal we care about — a growing count there is a smell, since
-// MinLineageSourcesForCredit means new traces shouldn't promote on
+// The one-source promotion gate means new traces shouldn't promote on
 // lineage alone anymore.
 func TestMidLineageBreakdown_BucketsBySourceCount(t *testing.T) {
 	cx := setup(t)

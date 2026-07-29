@@ -251,7 +251,7 @@ func (c *Cortex) lexicalRanked(query string, includeArchived bool) ([]Row, error
 		return nil, nil
 	}
 	q := `SELECT t.id, t.title, t.type, t.tier, t.author, t.origin,
-	             t.archived_at, t.trashed_at, t.created_at, t.updated_at,
+	             t.cortex_id, t.archived_at, t.trashed_at, t.created_at, t.updated_at,
 	             t.content_hash, t.source_locked, t.source_hash
 	      FROM traces t
 	      JOIN traces_fts ON traces_fts.id = t.id
@@ -285,7 +285,7 @@ func (c *Cortex) lexicalRanked(query string, includeArchived bool) ([]Row, error
 // stored vectors are read.
 func (c *Cortex) loadEmbeddedCandidates(model string, includeArchived bool, excludeID string) ([]vectorCand, error) {
 	q := `SELECT t.id, t.title, t.type, t.tier, t.author, t.origin,
-	             t.archived_at, t.trashed_at, t.created_at, t.updated_at,
+	             t.cortex_id, t.archived_at, t.trashed_at, t.created_at, t.updated_at,
 	             t.content_hash, t.source_locked, t.source_hash,
 	             te.embedding
 	      FROM trace_embeddings te
@@ -314,7 +314,7 @@ func (c *Cortex) loadEmbeddedCandidates(model string, includeArchived bool, excl
 		var blob []byte
 		if err := rows.Scan(
 			&r.ID, &r.Title, &r.Type, &r.Tier, &r.Author, &r.Origin,
-			&archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt,
+			&r.CortexID, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt,
 			&contentHash, &sourceLocked, &sourceHash, &blob,
 		); err != nil {
 			return nil, err
@@ -329,7 +329,7 @@ func (c *Cortex) loadEmbeddedCandidates(model string, includeArchived bool, excl
 	return out, rows.Err()
 }
 
-// scanRowWithNullable scans the standard 13-column trace projection (no
+// scanRowWithNullable scans the standard 14-column trace projection (no
 // embedding) into a Row, handling the nullable columns.
 func scanRowWithNullable(rows *sql.Rows) (Row, error) {
 	var r Row
@@ -337,7 +337,7 @@ func scanRowWithNullable(rows *sql.Rows) (Row, error) {
 	var sourceLocked int
 	if err := rows.Scan(
 		&r.ID, &r.Title, &r.Type, &r.Tier, &r.Author, &r.Origin,
-		&archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt,
+		&r.CortexID, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt,
 		&contentHash, &sourceLocked, &sourceHash,
 	); err != nil {
 		return r, err

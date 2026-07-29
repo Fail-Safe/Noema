@@ -116,15 +116,10 @@ func HeuristicPass(cx HeuristicProvider, cfg PassConfig, log func(format string,
 	}
 }
 
-// MinLineageSourcesForCredit is the minimum derived_from count that
-// earns the lineage weight in the heuristic score. A single derived_from
-// is provenance metadata (this trace was extracted from / supersedes /
-// annotates one other trace), not consolidation, and shouldn't tilt the
-// promotion threshold on its own. Two-or-more is the same bar
-// CreateDistilledTrace enforces (cortex.ErrDistillSourcesInsufficient at
-// internal/cortex/distill.go:76), so the heuristic agrees with the
-// distillation entry point on what counts as a real synthesis.
-const MinLineageSourcesForCredit = 2
+// MinInboundReferencesForCredit is the minimum number of child traces that
+// must derive from a candidate before those references earn lineage credit.
+// Outbound provenance is tracked separately in PromotionCandidate.SourceCount.
+const MinInboundReferencesForCredit = 2
 
 // scoreCandidate computes the blended signal for a single trace.
 // Exported for tests; package-private callers don't need it because
@@ -137,13 +132,9 @@ const MinLineageSourcesForCredit = 2
 // search hits, and without this fold-in short-tier traces in those cortexes
 // would never accumulate enough signal to promote.
 //
-// Lineage credit is gated by MinLineageSourcesForCredit: a trace with
-// only one derived_from gets zero lineage points, regardless of the
-// configured WeightLineage. This stops 1-source provenance links (e.g.
-// the Hermes session-summary pattern, which sets derived_from to the
-// single session trace it was extracted from) from gliding past the
-// promotion threshold purely on the lineage head start. Multi-source
-// traces still earn the full weight per source.
+// Lineage credit is gated by MinInboundReferencesForCredit. A candidate
+// referenced by only one child gets no lineage points; two or more children
+// are a stronger durability signal.
 //
 // One-source traces also do not get passive search-hit credit unless they
 // have stronger intent (an edit or an explicit tier vote). This keeps
@@ -152,11 +143,11 @@ const MinLineageSourcesForCredit = 2
 // reads, edits, votes, and real multi-source distillations to promote.
 func scoreCandidate(pc cortex.PromotionCandidate, cfg PassConfig) int {
 	lineageCredit := 0
-	if pc.DerivedFromCount >= MinLineageSourcesForCredit {
+	if pc.DerivedFromCount >= MinInboundReferencesForCredit {
 		lineageCredit = pc.DerivedFromCount * cfg.WeightLineage
 	}
 	searchHitCredit := pc.SearchHitCount
-	if pc.DerivedFromCount == 1 && pc.ModifyCount == 0 && pc.TierVotes == 0 {
+	if pc.SourceCount == 1 && pc.ModifyCount == 0 && pc.TierVotes == 0 {
 		searchHitCredit = 0
 	}
 	return (pc.ReadCount+searchHitCredit)*cfg.WeightReads +

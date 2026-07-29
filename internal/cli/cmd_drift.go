@@ -27,7 +27,7 @@ func verifyDriftCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "drift",
 		Short: "Check federated traces for drift from their source hash",
-		Long: `Walks all traces with a foreign origin and compares the current body hash
+		Long: `Walks all traces owned by a foreign cortex and compares the current body hash
 against the source_hash recorded in the frontmatter. Reports traces whose
 local content has diverged from the publisher's version.
 
@@ -54,7 +54,7 @@ func runVerifyDrift(cmd *cobra.Command, cx *cortex.Cortex) error {
 	var checked, drifted int
 
 	for _, r := range rows {
-		if r.Origin == cx.Name || r.Origin == "" {
+		if r.CortexID == cx.ID || r.CortexID == "" {
 			continue // local-origin
 		}
 		if r.SourceHash == "" {

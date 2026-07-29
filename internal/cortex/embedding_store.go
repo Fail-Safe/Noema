@@ -94,7 +94,7 @@ func (c *Cortex) EmbedBackfill(ctx context.Context, e Embedder, model string, op
 	      WHERE t.trashed_at IS NULL`
 	var args []any
 	if !opts.Force {
-		q += ` AND (te.trace_id IS NULL OR te.embedding_model != ? OR te.source_hash != t.content_hash)`
+		q += ` AND (te.trace_id IS NULL OR te.embedding_model != ? OR te.source_hash != t.content_hash OR t.content_hash IS NULL OR t.content_hash = '')`
 		args = append(args, model)
 	}
 	q += ` ORDER BY t.created_at`
@@ -111,9 +111,13 @@ func (c *Cortex) EmbedBackfill(ctx context.Context, e Embedder, model string, op
 	var cands []cand
 	for rows.Next() {
 		var ce cand
-		if err := rows.Scan(&ce.id, &ce.contentHash); err != nil {
+		var contentHash *string
+		if err := rows.Scan(&ce.id, &contentHash); err != nil {
 			rows.Close()
 			return res, fmt.Errorf("scan candidate: %w", err)
+		}
+		if contentHash != nil {
+			ce.contentHash = *contentHash
 		}
 		cands = append(cands, ce)
 	}
@@ -143,9 +147,23 @@ func (c *Cortex) EmbedBackfill(ctx context.Context, e Embedder, model string, op
 			if err != nil {
 				continue // unreadable/malformed; skip
 			}
+			sourceHash := ce.contentHash
+			if sourceHash == "" {
+				// The markdown body is authoritative. Older indexes could
+				// contain a NULL content_hash, which previously aborted the
+				// entire backfill scan. Reconstruct the derived index value
+				// so this trace becomes stably up-to-date after embedding.
+				sourceHash = trace.ContentHash(t.Body)
+				if _, err := c.DB.Exec(
+					`UPDATE traces SET content_hash = ? WHERE id = ? AND (content_hash IS NULL OR content_hash = '')`,
+					sourceHash, ce.id,
+				); err != nil {
+					return res, fmt.Errorf("repair content hash for %s: %w", ce.id, err)
+				}
+			}
 			texts = append(texts, embeddingText(r.Title, t.Body, maxChars))
 			ids = append(ids, ce.id)
-			hashes = append(hashes, ce.contentHash)
+			hashes = append(hashes, sourceHash)
 		}
 		if len(texts) == 0 {
 			continue
