@@ -7,15 +7,15 @@ Skip with: pytest -m "not integration"
 """
 
 import json
-import shutil
+import os
 import subprocess
-import tempfile
 import time
+from pathlib import Path
 
 import pytest
 
-from plugins.hermes.transport import find_binary, reset_binary_cache, StdioTransport
 from plugins.hermes import NoemaMemoryProvider
+from plugins.hermes.transport import StdioTransport
 
 # Mark every test in this module as integration.
 pytestmark = pytest.mark.integration
@@ -24,37 +24,38 @@ pytestmark = pytest.mark.integration
 # Fixtures
 # ---------------------------------------------------------------------------
 
-NOEMA_BINARY = None
-
-
-def _find_noema():
-    global NOEMA_BINARY
-    if NOEMA_BINARY is None:
-        reset_binary_cache()
-        NOEMA_BINARY = find_binary()
-    return NOEMA_BINARY
-
-
-@pytest.fixture(scope="module")
-def noema_binary():
-    binary = _find_noema()
-    if not binary:
-        pytest.skip("noema binary not found — skipping integration tests")
-    return binary
+@pytest.fixture(scope="session")
+def noema_binary(tmp_path_factory):
+    """Build the current checkout so integration tests never use an installed binary."""
+    repo_root = Path(__file__).resolve().parents[3]
+    binary = tmp_path_factory.mktemp("noema-bin") / "noema"
+    result = subprocess.run(
+        ["go", "build", "-o", str(binary), "./cmd/noema"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, f"noema build failed: {result.stderr}"
+    return str(binary)
 
 
 @pytest.fixture()
-def cortex_dir(noema_binary):
-    """Create a throwaway cortex and return its path. Cleaned up after the test."""
-    tmpdir = tempfile.mkdtemp(prefix="noema-test-")
+def cortex_dir(noema_binary, tmp_path, monkeypatch):
+    """Create a cortex with all user-level paths redirected into the test directory."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
     name = "hermes-test"
     result = subprocess.run(
-        [noema_binary, "init", "--name", name, "--path", tmpdir],
-        capture_output=True, text=True,
+        [noema_binary, "init", "--name", name, "--path", str(tmp_path / "cortex")],
+        capture_output=True,
+        text=True,
+        env=os.environ.copy(),
+        check=False,
     )
     assert result.returncode == 0, f"noema init failed: {result.stderr}"
-    yield name
-    shutil.rmtree(tmpdir, ignore_errors=True)
+    return name
 
 
 # ---------------------------------------------------------------------------
