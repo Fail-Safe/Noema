@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -33,6 +35,7 @@ func serveCmd() *cobra.Command {
 	var (
 		transport            string
 		hosts                []string
+		dynamicHosts         []string
 		port                 int
 		tlsCert              string
 		tlsKey               string
@@ -50,13 +53,13 @@ func serveCmd() *cobra.Command {
 		Aliases: []string{"server"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if printConfig {
-				return runPrintMCPConfig(cmd.OutOrStdout(), transport, hosts, port, tlsCert, tlsKey)
+				return runPrintMCPConfigWithDynamic(cmd.OutOrStdout(), transport, hosts, dynamicHosts, port, tlsCert, tlsKey)
 			}
 			if printSystemdUnit {
-				return runPrintSystemdUnit(cmd.OutOrStdout(), transport, hosts, port, tlsCert, tlsKey)
+				return runPrintSystemdUnitWithDynamic(cmd.OutOrStdout(), transport, hosts, dynamicHosts, port, tlsCert, tlsKey)
 			}
 			if printLaunchdPlist {
-				return runPrintLaunchdPlist(cmd.OutOrStdout(), transport, hosts, port, tlsCert, tlsKey)
+				return runPrintLaunchdPlistWithDynamic(cmd.OutOrStdout(), transport, hosts, dynamicHosts, port, tlsCert, tlsKey)
 			}
 
 			// HTTP-only flags (--host/--port/--tls-cert/--tls-key) are
@@ -75,6 +78,7 @@ func serveCmd() *cobra.Command {
 					f.Changed("port"),
 					f.Changed("tls-cert"),
 					f.Changed("tls-key"),
+					f.Changed("host-dynamic"),
 				); err != nil {
 					return err
 				}
@@ -312,7 +316,7 @@ func serveCmd() *cobra.Command {
 					}
 				}
 
-				if err := validateHTTPServe(hosts, tlsCert, tlsKey, cx.Name, cortexFlag != ""); err != nil {
+				if err := validateHTTPServeWithDynamic(hosts, dynamicHosts, tlsCert, tlsKey, cx.Name, cortexFlag != ""); err != nil {
 					return err
 				}
 				useTLS := tlsCert != "" && tlsKey != ""
@@ -391,7 +395,7 @@ func serveCmd() *cobra.Command {
 					scheme = "https"
 				}
 
-				// Start one HTTP listener per --host address. All
+				// Start one HTTP listener per required --host address. All
 				// share the same mux (same auth, same handler). The
 				// first fatal error from any listener stops the
 				// process; remaining listeners are closed on the way
@@ -404,19 +408,12 @@ func serveCmd() *cobra.Command {
 						hostForAddr = "[" + h + "]"
 					}
 					addr := fmt.Sprintf("%s:%d", hostForAddr, port)
-					srv := &http.Server{
-						Addr:              addr,
-						Handler:           mux,
-						ReadTimeout:       60 * time.Second,
-						ReadHeaderTimeout: 30 * time.Second,
-						WriteTimeout:      120 * time.Second,
-						IdleTimeout:       120 * time.Second,
-					}
+					srv := newHTTPServer(addr, mux)
 					servers = append(servers, srv)
 					fmt.Fprintf(os.Stderr, "Starting Streamable HTTP server on %s://%s/mcp\n", scheme, addr)
 				}
 
-				errCh := make(chan error, len(servers))
+				errCh := make(chan error, len(servers)+len(dynamicHosts))
 				for _, srv := range servers {
 					go func() {
 						if useTLS {
@@ -426,7 +423,12 @@ func serveCmd() *cobra.Command {
 						}
 					}()
 				}
+				dynamicDone := make(chan struct{})
+				if len(dynamicHosts) > 0 {
+					go reconcileDynamicListeners(dynamicDone, dynamicHosts, port, mux, tlsCert, tlsKey, scheme, errCh)
+				}
 				err = <-errCh
+				close(dynamicDone)
 				for _, srv := range servers {
 					srv.Close()
 				}
@@ -474,6 +476,7 @@ func serveCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&transport, "transport", "stdio", "transport: stdio or http (Streamable HTTP, MCP 2025-03-26)")
 	cmd.Flags().StringArrayVar(&hosts, "host", nil, "listen address for HTTP transport (repeatable, e.g. --host 10.0.0.1 --host 192.168.1.1)")
+	cmd.Flags().StringArrayVar(&dynamicHosts, "host-dynamic", nil, "optional address or hostname that is added and removed as it resolves locally (repeatable)")
 	cmd.Flags().IntVar(&port, "port", 3000, "port for HTTP transport")
 	cmd.Flags().StringVar(&tlsCert, "tls-cert", "", "path to TLS certificate file (enables HTTPS)")
 	cmd.Flags().StringVar(&tlsKey, "tls-key", "", "path to TLS private key file")
@@ -851,6 +854,178 @@ func requireTLSForKeyedMode(access cortex.AccessKey, useTLS bool) error {
 	)
 }
 
+const dynamicHostRetryInterval = 5 * time.Second
+
+type dynamicListenerRuntime struct {
+	resolve func(string) (string, bool)
+	listen  func(string, string) (net.Listener, error)
+	retry   <-chan time.Time
+}
+
+// reconcileDynamicListeners keeps optional address listeners aligned with the
+// machine's active addresses. A dynamic address is intentionally distinct
+// from --host: inability to bind a dynamic address is normal only when the
+// address is absent, while all other bind failures remain fatal.
+func reconcileDynamicListeners(done <-chan struct{}, hosts []string, port int, handler http.Handler, tlsCert, tlsKey, scheme string, fatal chan<- error) {
+	ticker := time.NewTicker(dynamicHostRetryInterval)
+	defer ticker.Stop()
+	reconcileDynamicListenersWithRuntime(done, hosts, port, handler, tlsCert, tlsKey, scheme, fatal, dynamicListenerRuntime{
+		resolve: resolveDynamicAddress,
+		listen:  net.Listen,
+		retry:   ticker.C,
+	})
+}
+
+func reconcileDynamicListenersWithRuntime(done <-chan struct{}, hosts []string, port int, handler http.Handler, tlsCert, tlsKey, scheme string, fatal chan<- error, runtime dynamicListenerRuntime) {
+	type activeListener struct {
+		address string
+		server  *http.Server
+	}
+	active := make(map[string]activeListener, len(hosts))
+	absent := make(map[string]bool, len(hosts))
+	defer func() {
+		for _, listener := range active {
+			_ = listener.server.Close()
+		}
+	}()
+
+	reconcile := func() bool {
+		for _, host := range hosts {
+			address, available := runtime.resolve(host)
+			listener, listening := active[host]
+			if listening && (!available || listener.address != address) {
+				fmt.Fprintf(os.Stderr, "[serve] dynamic address %s disappeared or changed; stopping listener\n", host)
+				_ = listener.server.Close()
+				delete(active, host)
+				absent[host] = true
+			}
+			if _, listening = active[host]; listening {
+				continue
+			}
+			if !available {
+				if !absent[host] {
+					fmt.Fprintf(os.Stderr, "[serve] dynamic address %s does not resolve to a local address; will retry\n", host)
+					absent[host] = true
+				}
+				continue
+			}
+
+			netListener, err := runtime.listen("tcp", listenAddress(address, port))
+			if err != nil {
+				if isAddressNotAvailable(err) {
+					if !absent[host] {
+						fmt.Fprintf(os.Stderr, "[serve] dynamic address %s is not available; will retry\n", host)
+						absent[host] = true
+					}
+					continue
+				}
+				select {
+				case fatal <- fmt.Errorf("binding dynamic address %s: %w", host, err):
+				case <-done:
+				}
+				return false
+			}
+
+			absent[host] = false
+			srv := newHTTPServer(listenAddress(address, port), handler)
+			active[host] = activeListener{address: address, server: srv}
+			fmt.Fprintf(os.Stderr, "Starting Streamable HTTP server on %s://%s/mcp (dynamic: %s)\n", scheme, listenAddress(address, port), host)
+			go func(host string, srv *http.Server, netListener net.Listener) {
+				var serveErr error
+				if tlsCert != "" {
+					serveErr = srv.ServeTLS(netListener, tlsCert, tlsKey)
+				} else {
+					serveErr = srv.Serve(netListener)
+				}
+				if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+					select {
+					case fatal <- fmt.Errorf("serving dynamic address %s: %w", host, serveErr):
+					case <-done:
+					}
+				}
+			}(host, srv, netListener)
+		}
+		return true
+	}
+
+	if !reconcile() {
+		return
+	}
+	for {
+		select {
+		case <-done:
+			return
+		case <-runtime.retry:
+			if !reconcile() {
+				return
+			}
+		}
+	}
+}
+
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadTimeout:       60 * time.Second,
+		ReadHeaderTimeout: 30 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+}
+
+func listenAddress(host string, port int) string {
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		host = "[" + host + "]"
+	}
+	return fmt.Sprintf("%s:%d", host, port)
+}
+
+func dynamicAddressAvailable(host string) bool {
+	target := net.ParseIP(host)
+	if target == nil {
+		return false
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, addr := range addrs {
+		if network, ok := addr.(*net.IPNet); ok && network.IP.Equal(target) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveDynamicAddress resolves host and returns one resolved address that
+// currently belongs to this machine. Hostnames make dynamic binds useful for
+// DHCP and split-horizon DNS; absent or off-network DNS answers simply leave
+// the listener inactive until the next reconciliation pass.
+func resolveDynamicAddress(host string) (string, bool) {
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsUnspecified() || !dynamicAddressAvailable(ip.String()) {
+			return "", false
+		}
+		return ip.String(), true
+	}
+
+	addresses, err := net.LookupIP(host)
+	if err != nil {
+		return "", false
+	}
+	for _, ip := range addresses {
+		if !ip.IsUnspecified() && dynamicAddressAvailable(ip.String()) {
+			return ip.String(), true
+		}
+	}
+	return "", false
+}
+
+func isAddressNotAvailable(err error) bool {
+	return errors.Is(err, syscall.EADDRNOTAVAIL)
+}
+
 // guardStdioFlags returns an error when any HTTP-only flag was explicitly
 // passed on the command line while transport is stdio. It exists because
 // the default transport is stdio, and an operator who forgets --transport
@@ -864,10 +1039,13 @@ func requireTLSForKeyedMode(access cortex.AccessKey, useTLS bool) error {
 // the flag values themselves: --port has a non-zero default (3000), so a
 // value check would fire on every stdio invocation. Only flags the user
 // actually typed count as a conflict.
-func guardStdioFlags(hostSet, portSet, tlsCertSet, tlsKeySet bool) error {
+func guardStdioFlags(hostSet, portSet, tlsCertSet, tlsKeySet bool, dynamicHostSet ...bool) error {
 	var flags []string
 	if hostSet {
 		flags = append(flags, "--host")
+	}
+	if len(dynamicHostSet) > 0 && dynamicHostSet[0] {
+		flags = append(flags, "--host-dynamic")
 	}
 	if portSet {
 		flags = append(flags, "--port")
@@ -910,12 +1088,21 @@ func guardStdioFlags(hostSet, portSet, tlsCertSet, tlsKeySet bool) error {
 // but only logs the failure on the OTHER host, which is the diagnostic
 // asymmetry this guard exists to prevent.
 func validateHTTPServe(hosts []string, tlsCert, tlsKey, cortexName string, cortexExplicit bool) error {
+	return validateHTTPServeWithDynamic(hosts, nil, tlsCert, tlsKey, cortexName, cortexExplicit)
+}
+
+func validateHTTPServeWithDynamic(hosts, dynamicHosts []string, tlsCert, tlsKey, cortexName string, cortexExplicit bool) error {
 	if len(hosts) == 0 {
 		return fmt.Errorf("--host is required for HTTP transport (e.g. --host 10.0.0.1 or --host 127.0.0.1)")
 	}
 	for _, host := range hosts {
 		if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
 			return fmt.Errorf("binding to %s is not allowed — it may expose your cortex to the network.\n  Use an explicit address: --host 127.0.0.1 (local only) or --host <your-lan-ip> (federation)", host)
+		}
+	}
+	for _, host := range dynamicHosts {
+		if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+			return fmt.Errorf("binding to %s is not allowed — it may expose your cortex to the network", host)
 		}
 	}
 	if (tlsCert == "") != (tlsKey == "") {
@@ -925,6 +1112,9 @@ func validateHTTPServe(hosts []string, tlsCert, tlsKey, cortexName string, corte
 		var hostFlags string
 		for _, h := range hosts {
 			hostFlags += " --host " + h
+		}
+		for _, h := range dynamicHosts {
+			hostFlags += " --host-dynamic " + h
 		}
 		return fmt.Errorf(
 			"refusing to start HTTP server on cortex %q without an explicit --cortex flag.\n"+
@@ -945,9 +1135,16 @@ func validateHTTPServe(hosts []string, tlsCert, tlsKey, cortexName string, corte
 // identical arguments, and so the unit/plist reflects every flag the
 // operator actually passed on the command line that generated it.
 func buildServeArgs(cortexName, transport string, hosts []string, port int, tlsCert, tlsKey string) []string {
+	return buildServeArgsWithDynamic(cortexName, transport, hosts, nil, port, tlsCert, tlsKey)
+}
+
+func buildServeArgsWithDynamic(cortexName, transport string, hosts, dynamicHosts []string, port int, tlsCert, tlsKey string) []string {
 	args := []string{"serve", "--cortex", cortexName, "--transport", transport}
 	for _, h := range hosts {
 		args = append(args, "--host", h)
+	}
+	for _, h := range dynamicHosts {
+		args = append(args, "--host-dynamic", h)
 	}
 	if port != 0 {
 		args = append(args, "--port", fmt.Sprintf("%d", port))
@@ -969,13 +1166,17 @@ func buildServeArgs(cortexName, transport string, hosts []string, port int, tlsC
 // validateHTTPServe so a broken config is caught at preview time rather
 // than on first `systemctl start`.
 func runPrintSystemdUnit(out io.Writer, transport string, hosts []string, port int, tlsCert, tlsKey string) error {
+	return runPrintSystemdUnitWithDynamic(out, transport, hosts, nil, port, tlsCert, tlsKey)
+}
+
+func runPrintSystemdUnitWithDynamic(out io.Writer, transport string, hosts, dynamicHosts []string, port int, tlsCert, tlsKey string) error {
 	if cortexFlag == "" {
 		return fmt.Errorf("--print-systemd-unit requires an explicit --cortex flag (the unit file pins one cortex to supervise)")
 	}
 	if transport != "http" {
 		return fmt.Errorf("--print-systemd-unit requires --transport http (stdio has no network endpoint to supervise)")
 	}
-	if err := validateHTTPServe(hosts, tlsCert, tlsKey, cortexFlag, true); err != nil {
+	if err := validateHTTPServeWithDynamic(hosts, dynamicHosts, tlsCert, tlsKey, cortexFlag, true); err != nil {
 		return err
 	}
 
@@ -992,7 +1193,7 @@ func runPrintSystemdUnit(out io.Writer, transport string, hosts []string, port i
 		Cortex:    cortexFlag,
 		User:      u.Username,
 		Exe:       exe,
-		ServeArgs: buildServeArgs(cortexFlag, transport, hosts, port, tlsCert, tlsKey),
+		ServeArgs: buildServeArgsWithDynamic(cortexFlag, transport, hosts, dynamicHosts, port, tlsCert, tlsKey),
 	})
 	_, err = io.WriteString(out, unit)
 	return err
@@ -1011,13 +1212,17 @@ func runPrintSystemdUnit(out io.Writer, transport string, hosts []string, port i
 // well-formed while still showing operators the install steps when they
 // run the command interactively.
 func runPrintLaunchdPlist(out io.Writer, transport string, hosts []string, port int, tlsCert, tlsKey string) error {
+	return runPrintLaunchdPlistWithDynamic(out, transport, hosts, nil, port, tlsCert, tlsKey)
+}
+
+func runPrintLaunchdPlistWithDynamic(out io.Writer, transport string, hosts, dynamicHosts []string, port int, tlsCert, tlsKey string) error {
 	if cortexFlag == "" {
 		return fmt.Errorf("--print-launchd-plist requires an explicit --cortex flag (the plist pins one cortex to supervise)")
 	}
 	if transport != "http" {
 		return fmt.Errorf("--print-launchd-plist requires --transport http (stdio has no network endpoint to supervise)")
 	}
-	if err := validateHTTPServe(hosts, tlsCert, tlsKey, cortexFlag, true); err != nil {
+	if err := validateHTTPServeWithDynamic(hosts, dynamicHosts, tlsCert, tlsKey, cortexFlag, true); err != nil {
 		return err
 	}
 
@@ -1030,7 +1235,7 @@ func runPrintLaunchdPlist(out io.Writer, transport string, hosts []string, port 
 		return fmt.Errorf("resolving user home dir: %w", err)
 	}
 
-	serveArgs := buildServeArgs(cortexFlag, transport, hosts, port, tlsCert, tlsKey)
+	serveArgs := buildServeArgsWithDynamic(cortexFlag, transport, hosts, dynamicHosts, port, tlsCert, tlsKey)
 	label := "com.fail-safe.noema." + cortexFlag
 
 	// Install hint to stderr so `--print-launchd-plist > foo.plist`
@@ -1241,6 +1446,10 @@ func xmlEscape(s string) string {
 // remote client would need, including the URL scheme that matches the
 // --tls-cert/--tls-key pair.
 func runPrintMCPConfig(out io.Writer, transport string, hosts []string, port int, tlsCert, tlsKey string) error {
+	return runPrintMCPConfigWithDynamic(out, transport, hosts, nil, port, tlsCert, tlsKey)
+}
+
+func runPrintMCPConfigWithDynamic(out io.Writer, transport string, hosts, dynamicHosts []string, port int, tlsCert, tlsKey string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("resolving executable path: %w", err)
@@ -1272,12 +1481,17 @@ func runPrintMCPConfig(out io.Writer, transport string, hosts []string, port int
 		if len(hosts) == 0 {
 			return fmt.Errorf("--print-config --transport http requires --host (the address a client will dial, e.g. 10.0.0.1 or my.lan)")
 		}
-		// Use the first host for the client URL. When multiple hosts
-		// are configured (e.g. a TB ring + LAN), the client config
-		// points at whichever the operator listed first.
+		// A dynamic host is the externally dialable address in the common
+		// loopback-plus-roaming-LAN setup, so prefer it when present.
+		// Otherwise retain the existing first-required-host behavior.
 		host := hosts[0]
+		hostFlag := "--host"
+		if len(dynamicHosts) > 0 {
+			host = dynamicHosts[0]
+			hostFlag = "--host-dynamic"
+		}
 		if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
-			return fmt.Errorf("--host %s is a wildcard bind address; pass the address clients should dial instead", host)
+			return fmt.Errorf("%s %s is a wildcard bind address; pass the address clients should dial instead", hostFlag, host)
 		}
 		if (tlsCert == "") != (tlsKey == "") {
 			return fmt.Errorf("--tls-cert and --tls-key must be provided together")

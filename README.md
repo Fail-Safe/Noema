@@ -264,7 +264,7 @@ noema federation key fingerprint          Print the SHA-256 fingerprint of the a
 noema keygen [--force]                    Generate this cortex's Ed25519 federation signing key so it can sign
                                           the events it emits (--force rotates it; peers must re-pin)
 
-noema serve [--transport stdio|http] [--host <addr>] [--tls-cert <file> --tls-key <file>]
+noema serve [--transport stdio|http] [--host <addr>] [--host-dynamic <addr>] [--tls-cert <file> --tls-key <file>]
                                           Start the MCP server (http requires --host; endpoint is /mcp)
 noema serve --print-config                Print a ready-to-use .mcp.json snippet and exit
 noema serve ... --print-systemd-unit      Print a systemd service unit for the current serve flags
@@ -369,12 +369,18 @@ noema serve --cortex my-cortex --transport http --host 127.0.0.1 --port 3000
 # LAN-reachable listener (for federation peers)
 noema serve --cortex my-cortex --transport http --host 10.0.0.5 --port 3000
 
+# Always serve locally; add the home-LAN listener whenever that address exists
+noema serve --cortex my-cortex --transport http --host 127.0.0.1 \
+            --host-dynamic 192.168.1.42 --port 3000
+
 # HTTPS
 noema serve --cortex my-cortex --transport http --host 10.0.0.5 --port 3000 \
             --tls-cert /path/server.crt --tls-key /path/server.key
 ```
 
-`--host` is **required** in HTTP mode and must be an explicit address — `0.0.0.0`/`::` are rejected to avoid accidentally exposing a Cortex on every interface. Pair `--tls-cert` with `--tls-key` to serve over HTTPS. The endpoint is `/mcp` (not configurable).
+`--host` is **required** in HTTP mode and must be an explicit address — `0.0.0.0`/`::` are rejected to avoid accidentally exposing a Cortex on every interface. `--host-dynamic` accepts an IP address or hostname and rechecks it every five seconds: it adds the listener when an address it resolves to belongs to the machine and removes it when it no longer does, while required `--host` listeners remain available. Pair `--tls-cert` with `--tls-key` to serve over HTTPS. The endpoint is `/mcp` (not configurable).
+
+When `--print-config` is used with HTTP transport, the generated client URL uses the first `--host-dynamic` value when one is present; otherwise it uses the first `--host` value. This keeps a loopback listener available to local clients while producing a configuration that remote clients can dial on the conditional network.
 
 #### Connecting from Zed
 
@@ -471,7 +477,7 @@ nohup noema serve --cortex mycortex --transport http --host 127.0.0.1 \
 disown
 ```
 
-For a real federation host you probably want a process supervisor — restart on crash, start at boot, logs aggregated. Noema can print a ready-to-install unit/plist that mirrors the serve command you've already validated:
+For a real federation host you probably want a process supervisor — restart on crash, start at boot, logs aggregated. This is particularly useful on a roaming or DHCP-dependent machine: keep a stable loopback listener for local clients, then use `--host-dynamic` to expose the same server to federation only while its designated LAN address is assigned. Noema can print a ready-to-install unit/plist that mirrors the serve command you've already validated:
 
 **Linux (systemd)**
 
@@ -482,6 +488,14 @@ sudo systemctl enable --now noema-mycortex
 sudo journalctl -u noema-mycortex -f
 ```
 
+For a machine that is not always on that LAN, retain local access and make the LAN listener conditional:
+
+```bash
+noema serve --cortex mycortex --transport http --host 127.0.0.1 \
+  --host-dynamic 192.168.1.42 --port 3000 --print-systemd-unit \
+  | sudo tee /etc/systemd/system/noema-mycortex.service
+```
+
 **macOS (launchd)**
 
 ```bash
@@ -490,7 +504,16 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fail-safe.noema.myco
 tail -f ~/Library/Logs/noema-mycortex.log
 ```
 
-Both flags require `--transport http` (stdio has no endpoint to supervise) and an explicit `--cortex` (the unit/plist pins exactly one cortex — NOEMA_CORTEX and the config default aren't carried into the service environment). All the usual HTTP flag invariants (`--host` not `0.0.0.0`, TLS pair symmetry) are validated at preview time, so you catch misconfigurations before installing.
+The same pattern works for a LaunchAgent:
+
+```bash
+noema serve --cortex mycortex --transport http --host 127.0.0.1 \
+  --host-dynamic 192.168.1.42 --port 3000 \
+  --print-launchd-plist > ~/Library/LaunchAgents/com.fail-safe.noema.mycortex.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fail-safe.noema.mycortex.plist
+```
+
+Both flags require `--transport http` (stdio has no endpoint to supervise) and an explicit `--cortex` (the unit/plist pins exactly one cortex — NOEMA_CORTEX and the config default aren't carried into the service environment). `--host-dynamic` never replaces `--host`: at least one required listener is still needed, and the optional listener disappears if its address is no longer local. All the usual HTTP flag invariants (`--host` not `0.0.0.0`, TLS pair symmetry) are validated at preview time, so you catch misconfigurations before installing.
 
 The emitted unit filename convention is `noema-<cortex>.service` / `com.fail-safe.noema.<cortex>.plist`, so running multiple cortexes on one host never collides.
 
