@@ -157,6 +157,41 @@ func TestEmbedBackfill_ForceAndLimit(t *testing.T) {
 	}
 }
 
+func TestEmbedBackfill_RepairsNullContentHash(t *testing.T) {
+	cx := setup(t)
+	ids := seedTraces(t, cx, 2)
+	if _, err := cx.DB.Exec(`UPDATE traces SET content_hash = NULL WHERE id = ?`, ids[0]); err != nil {
+		t.Fatalf("clear content_hash: %v", err)
+	}
+
+	res, err := cx.EmbedBackfill(
+		context.Background(),
+		&stubEmbedder{dim: 4},
+		"m",
+		cortex.EmbedBackfillOpts{},
+	)
+	if err != nil {
+		t.Fatalf("EmbedBackfill: %v", err)
+	}
+	if res.Considered != 2 || res.Embedded != 2 {
+		t.Fatalf("backfill result = %+v, want considered=2 embedded=2", res)
+	}
+
+	var contentHash, sourceHash string
+	if err := cx.DB.QueryRow(`SELECT content_hash FROM traces WHERE id = ?`, ids[0]).Scan(&contentHash); err != nil {
+		t.Fatalf("read repaired content_hash: %v", err)
+	}
+	if err := cx.DB.QueryRow(`SELECT source_hash FROM trace_embeddings WHERE trace_id = ?`, ids[0]).Scan(&sourceHash); err != nil {
+		t.Fatalf("read embedding source_hash: %v", err)
+	}
+	if contentHash == "" || sourceHash != contentHash {
+		t.Errorf("content_hash=%q source_hash=%q, want matching non-empty hashes", contentHash, sourceHash)
+	}
+	if st, err := cx.EmbeddingStatus("m"); err != nil || st.Embedded != 2 || st.Missing != 0 || st.Stale != 0 {
+		t.Errorf("EmbeddingStatus = %+v, %v; want 2 embedded and no gaps", st, err)
+	}
+}
+
 // TestEmbedBackfill_WithRealHTTPClient runs the backfill through the actual
 // consolidation.HTTPLLMClient against an httptest /embeddings server,
 // proving the real client satisfies cortex.Embedder and the end-to-end

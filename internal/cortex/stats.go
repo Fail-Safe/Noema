@@ -38,7 +38,7 @@ type EngagementStats struct {
 //   - NoSources:   stand-alone mids (heuristic-promoted, manually
 //     curated, etc.) — neither bad nor good, just not synthesis.
 //   - SingleSource: one derived_from. After
-//     MinLineageSourcesForCredit landed in the heuristic, no NEW
+//     the one-source promotion gate landed in the heuristic, no NEW
 //     traces in this bucket should be promoting via the lineage
 //     bonus alone. A growing count here is still a smell because it
 //     usually points at a writeback pattern emitting "summary"

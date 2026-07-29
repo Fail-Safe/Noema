@@ -76,7 +76,7 @@ func (c *Cortex) FindSimilar(traceID string, opts SimilarOpts) ([]SimilarMatch, 
 
 	q := `
 		SELECT t.id, t.title, t.type, t.tier, t.author, t.origin,
-		       t.archived_at, t.trashed_at, t.created_at, t.updated_at,
+		       t.cortex_id, t.archived_at, t.trashed_at, t.created_at, t.updated_at,
 		       t.content_hash, t.source_locked, t.source_hash,
 		       bm25(traces_fts) AS score
 		FROM traces t
@@ -105,7 +105,7 @@ func (c *Cortex) FindSimilar(traceID string, opts SimilarOpts) ([]SimilarMatch, 
 		var sourceLocked int
 		if err := rows.Scan(
 			&m.ID, &m.Title, &m.Type, &m.Tier, &m.Author, &m.Origin,
-			&archivedAt, &trashedAt, &m.CreatedAt, &m.UpdatedAt,
+			&m.CortexID, &archivedAt, &trashedAt, &m.CreatedAt, &m.UpdatedAt,
 			&contentHash, &sourceLocked, &sourceHash, &m.Score,
 		); err != nil {
 			return nil, err

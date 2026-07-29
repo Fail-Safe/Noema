@@ -17,7 +17,8 @@ type PromotionCandidate struct {
 	ModifyCount      int
 	SearchHitCount   int
 	TierVotes        int
-	DerivedFromCount int
+	DerivedFromCount int // inbound references: how many traces derive from this one
+	SourceCount      int // outbound provenance: how many sources this trace derives from
 	CreatedAt        string
 }
 
@@ -40,6 +41,7 @@ func (c *Cortex) GraduationCandidates(minAge time.Duration) ([]PromotionCandidat
 			COALESCE(u.total_search_hits, 0)  AS search_hit_count,
 			t.tier_votes,
 			COALESCE(v.n, 0) AS derived_from_count,
+			COALESCE(s.n, 0) AS source_count,
 			t.created_at
 		FROM traces t
 		LEFT JOIN (
@@ -51,6 +53,11 @@ func (c *Cortex) GraduationCandidates(minAge time.Duration) ([]PromotionCandidat
 			GROUP BY trace_id
 		) u ON u.trace_id = t.id
 		LEFT JOIN v_derived_from_count v ON v.trace_id = t.id
+		LEFT JOIN (
+			SELECT trace_id, COUNT(*) AS n
+			FROM trace_lineage
+			GROUP BY trace_id
+		) s ON s.trace_id = t.id
 		WHERE t.tier = 'mid'
 		  AND t.archived_at IS NULL
 		  AND t.trashed_at IS NULL
@@ -70,7 +77,7 @@ func (c *Cortex) GraduationCandidates(minAge time.Duration) ([]PromotionCandidat
 		var pc PromotionCandidate
 		if err := rows.Scan(
 			&pc.ID, &pc.Tier, &pc.Type, &pc.ReadCount, &pc.ModifyCount,
-			&pc.SearchHitCount, &pc.TierVotes, &pc.DerivedFromCount, &pc.CreatedAt,
+			&pc.SearchHitCount, &pc.TierVotes, &pc.DerivedFromCount, &pc.SourceCount, &pc.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -105,6 +112,7 @@ func (c *Cortex) LLMCandidates(window time.Duration) ([]PromotionCandidate, erro
 			COALESCE(u.total_search_hits, 0)  AS search_hit_count,
 			t.tier_votes,
 			COALESCE(v.n, 0) AS derived_from_count,
+			COALESCE(s.n, 0) AS source_count,
 			t.created_at
 		FROM traces t
 		LEFT JOIN (
@@ -116,6 +124,11 @@ func (c *Cortex) LLMCandidates(window time.Duration) ([]PromotionCandidate, erro
 			GROUP BY trace_id
 		) u ON u.trace_id = t.id
 		LEFT JOIN v_derived_from_count v ON v.trace_id = t.id
+		LEFT JOIN (
+			SELECT trace_id, COUNT(*) AS n
+			FROM trace_lineage
+			GROUP BY trace_id
+		) s ON s.trace_id = t.id
 		WHERE t.tier = 'short'
 		  AND t.archived_at IS NULL
 		  AND t.trashed_at IS NULL
@@ -140,7 +153,7 @@ func (c *Cortex) LLMCandidates(window time.Duration) ([]PromotionCandidate, erro
 		var pc PromotionCandidate
 		if err := rows.Scan(
 			&pc.ID, &pc.Tier, &pc.Type, &pc.ReadCount, &pc.ModifyCount,
-			&pc.SearchHitCount, &pc.TierVotes, &pc.DerivedFromCount, &pc.CreatedAt,
+			&pc.SearchHitCount, &pc.TierVotes, &pc.DerivedFromCount, &pc.SourceCount, &pc.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -156,9 +169,11 @@ func (c *Cortex) LLMCandidates(window time.Duration) ([]PromotionCandidate, erro
 // excluded — only memory currently in use is a candidate for
 // promotion.
 //
-// derived_from_count joins the lineage view added in migration 008
-// so the scorer can weight "others reference this" alongside reads
-// and modifies without an extra round-trip per candidate.
+// derived_from_count joins the inbound lineage view so the scorer can
+// weight "others reference this" alongside reads and modifies. source_count
+// separately counts this trace's outbound provenance links; keeping the two
+// dimensions distinct prevents single-source summaries from being mistaken
+// for traces that have one child.
 func (c *Cortex) PromotionCandidates(tier string, window time.Duration) ([]PromotionCandidate, error) {
 	cutoff := time.Now().UTC().Add(-window).Format(time.RFC3339)
 	q := `
@@ -171,6 +186,7 @@ func (c *Cortex) PromotionCandidates(tier string, window time.Duration) ([]Promo
 			COALESCE(u.total_search_hits, 0)  AS search_hit_count,
 			t.tier_votes,
 			COALESCE(v.n, 0) AS derived_from_count,
+			COALESCE(s.n, 0) AS source_count,
 			t.created_at
 		FROM traces t
 		LEFT JOIN (
@@ -182,6 +198,11 @@ func (c *Cortex) PromotionCandidates(tier string, window time.Duration) ([]Promo
 			GROUP BY trace_id
 		) u ON u.trace_id = t.id
 		LEFT JOIN v_derived_from_count v ON v.trace_id = t.id
+		LEFT JOIN (
+			SELECT trace_id, COUNT(*) AS n
+			FROM trace_lineage
+			GROUP BY trace_id
+		) s ON s.trace_id = t.id
 		WHERE t.tier = ?
 		  AND t.archived_at IS NULL
 		  AND t.trashed_at IS NULL
@@ -201,7 +222,7 @@ func (c *Cortex) PromotionCandidates(tier string, window time.Duration) ([]Promo
 		var pc PromotionCandidate
 		if err := rows.Scan(
 			&pc.ID, &pc.Tier, &pc.Type, &pc.ReadCount, &pc.ModifyCount,
-			&pc.SearchHitCount, &pc.TierVotes, &pc.DerivedFromCount, &pc.CreatedAt,
+			&pc.SearchHitCount, &pc.TierVotes, &pc.DerivedFromCount, &pc.SourceCount, &pc.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
