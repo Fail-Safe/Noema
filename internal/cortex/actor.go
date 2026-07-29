@@ -80,6 +80,23 @@ func (c *Cortex) UpdateAs(id string, actor ReadActor) error {
 	return c.bumpModifyCount(id)
 }
 
+// SetTraceTagsAs is the actor-aware counterpart to SetTraceTags. It keeps
+// metadata cleanup on the narrow tag mutation path while preserving the same
+// agent modify-count signal used by UpdateAs for mutable tiers.
+func (c *Cortex) SetTraceTagsAs(id string, tags []string, actor ReadActor) error {
+	row, err := c.Get(id)
+	if err != nil {
+		return err
+	}
+	if err := c.SetTraceTags(id, tags); err != nil {
+		return err
+	}
+	if actor != ActorAgent || row.Tier == trace.TierLong {
+		return nil
+	}
+	return c.bumpModifyCount(id)
+}
+
 // DefaultSearchHitTopN is how many of a search's top-ranked results bump
 // search_hit_count when an agent runs the query. Auto-injection providers
 // (Hermes-style) typically fit 1–3 trace summaries into their memory

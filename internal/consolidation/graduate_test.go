@@ -34,7 +34,7 @@ func (f *fakeGraduationProvider) Promote(id, newTier string) error {
 func TestGraduatePass_AllCriteriaMet(t *testing.T) {
 	provider := &fakeGraduationProvider{
 		candidates: []cortex.PromotionCandidate{
-			{ID: "a", Tier: "mid", ReadCount: 5, ModifyCount: 0, TierVotes: 0},
+			{ID: "a", Tier: "mid", Type: "fact", ReadCount: 5, ModifyCount: 0, TierVotes: 0},
 		},
 	}
 	pass := consolidation.GraduatePass(provider, consolidation.GraduationConfig{
@@ -46,6 +46,21 @@ func TestGraduatePass_AllCriteriaMet(t *testing.T) {
 	}
 	if len(provider.promoted) != 1 || provider.promoted[0] != "a" {
 		t.Errorf("promoted = %v, want [a]", provider.promoted)
+	}
+}
+
+func TestGraduatePass_PreferenceTraceBlocked(t *testing.T) {
+	provider := &fakeGraduationProvider{
+		candidates: []cortex.PromotionCandidate{
+			{ID: "pref", Tier: "mid", Type: "preference", ReadCount: 99, SearchHitCount: 99, ModifyCount: 0, TierVotes: 5},
+		},
+	}
+	pass := consolidation.GraduatePass(provider, consolidation.GraduationConfig{
+		MinReadCount: 3, AllowModified: false,
+	}, nil)
+	_ = pass(context.Background(), "cron")
+	if len(provider.promoted) != 0 {
+		t.Errorf("promoted = %v, want empty (preference traces require manual long-tier curation)", provider.promoted)
 	}
 }
 
