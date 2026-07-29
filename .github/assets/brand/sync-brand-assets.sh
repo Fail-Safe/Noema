@@ -13,40 +13,50 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/../../.." && pwd)"
 DESIGN_REPO_RAW="${NOEMA_DESIGN_REPO:-$REPO_ROOT/../Noema-design}"
-
-if [[ ! -d "$DESIGN_REPO_RAW" ]]; then
-  echo "error: Noema-design checkout not found at $DESIGN_REPO_RAW" >&2
-  echo "       set NOEMA_DESIGN_REPO to your Noema-design checkout, or" >&2
-  echo "       clone it as a sibling of this repo at $REPO_ROOT/../Noema-design" >&2
-  exit 1
-fi
-
-DESIGN_REPO="$(cd -- "$DESIGN_REPO_RAW" && pwd)"
-SRC="$DESIGN_REPO/graphics/name"
+SRC=""
 DST="$REPO_ROOT/.github/assets/brand"
 
-if [[ ! -d "$SRC" ]]; then
-  echo "error: source dir $SRC not found — regenerate via scripts/compose_brand_text.py first" >&2
-  exit 1
-fi
-
-mkdir -p "$DST"
-
-# Published variants (add more here if the README ever references them).
-FILES=(
-  "noema-dark.svg"
-  "noema-light.svg"
-)
-
-for f in "${FILES[@]}"; do
-  if [[ ! -f "$SRC/$f" ]]; then
-    echo "error: $SRC/$f missing — regenerate via compose_brand_text.py first" >&2
+main() {
+  if [[ ! -d "$DESIGN_REPO_RAW" ]]; then
+    echo "error: Noema-design checkout not found at $DESIGN_REPO_RAW" >&2
+    echo "       set NOEMA_DESIGN_REPO to your Noema-design checkout, or" >&2
+    echo "       clone it as a sibling of this repo at $REPO_ROOT/../Noema-design" >&2
     exit 1
   fi
-  cp "$SRC/$f" "$DST/$f"
-  echo "synced $f"
-done
 
-echo "done. .github/assets/brand/ now matches $SRC"
+  local design_repo
+  design_repo="$(cd -- "$DESIGN_REPO_RAW" && pwd)"
+  SRC="$design_repo/graphics/name"
+
+  if [[ ! -d "$SRC" ]]; then
+    echo "error: source dir $SRC not found — regenerate via scripts/compose_brand_text.py first" >&2
+    exit 1
+  fi
+
+  mkdir -p "$DST"
+
+  # Published variants (add more here if the README ever references them).
+  local files=(
+    "noema-dark.svg"
+    "noema-light.svg"
+  )
+
+  local f
+  for f in "${files[@]}"; do
+    if [[ ! -f "$SRC/$f" ]]; then
+      echo "error: $SRC/$f missing — regenerate via compose_brand_text.py first" >&2
+      exit 1
+    fi
+    cp "$SRC/$f" "$DST/$f"
+    echo "synced $f"
+  done
+
+  echo "done. .github/assets/brand/ now matches $SRC"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
