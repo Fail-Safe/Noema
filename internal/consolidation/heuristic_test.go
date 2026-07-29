@@ -48,21 +48,22 @@ func TestScoreCandidate_BlendedFormula(t *testing.T) {
 		{"5 search hits", cortex.PromotionCandidate{SearchHitCount: 5}, 5},
 		{"3 reads + 2 search hits sums into reads bucket", cortex.PromotionCandidate{ReadCount: 3, SearchHitCount: 2}, 5},
 		{"1 modify", cortex.PromotionCandidate{ModifyCount: 1}, 2},
-		// Lineage credit is gated at >= 2 sources. A single derived_from
-		// is provenance, not consolidation — see MinLineageSourcesForCredit.
-		{"1 lineage ref earns no credit", cortex.PromotionCandidate{DerivedFromCount: 1}, 0},
-		{"1 lineage ref + search hits earns no passive credit", cortex.PromotionCandidate{SearchHitCount: 5, DerivedFromCount: 1}, 0},
-		{"1 lineage ref + deliberate reads still counts", cortex.PromotionCandidate{ReadCount: 5, DerivedFromCount: 1}, 5},
-		{"1 lineage ref + modify unlocks search-hit credit", cortex.PromotionCandidate{SearchHitCount: 3, ModifyCount: 1, DerivedFromCount: 1}, 5},
-		{"1 lineage ref + vote unlocks search-hit credit", cortex.PromotionCandidate{SearchHitCount: 1, TierVotes: 1, DerivedFromCount: 1}, 6},
-		{"2 lineage refs earn full credit", cortex.PromotionCandidate{DerivedFromCount: 2}, 6},
-		{"3 lineage refs scale linearly", cortex.PromotionCandidate{DerivedFromCount: 3}, 9},
+		// Inbound references earn lineage credit; outbound source count gates
+		// passive search hits. They are intentionally separate dimensions.
+		{"1 inbound ref earns no credit", cortex.PromotionCandidate{DerivedFromCount: 1}, 0},
+		{"1 inbound ref does not suppress search hits", cortex.PromotionCandidate{SearchHitCount: 5, DerivedFromCount: 1}, 5},
+		{"1 outbound source suppresses passive search hits", cortex.PromotionCandidate{SearchHitCount: 5, SourceCount: 1}, 0},
+		{"1 outbound source + deliberate reads still counts", cortex.PromotionCandidate{ReadCount: 5, SourceCount: 1}, 5},
+		{"1 outbound source + modify unlocks search-hit credit", cortex.PromotionCandidate{SearchHitCount: 3, ModifyCount: 1, SourceCount: 1}, 5},
+		{"1 outbound source + vote unlocks search-hit credit", cortex.PromotionCandidate{SearchHitCount: 1, TierVotes: 1, SourceCount: 1}, 6},
+		{"2 inbound refs earn full credit", cortex.PromotionCandidate{DerivedFromCount: 2}, 6},
+		{"3 inbound refs scale linearly", cortex.PromotionCandidate{DerivedFromCount: 3}, 9},
 		{"1 vote", cortex.PromotionCandidate{TierVotes: 1}, 5},
 		{"mix: 2 reads + 1 modify + 1 vote", cortex.PromotionCandidate{ReadCount: 2, ModifyCount: 1, TierVotes: 1}, 2 + 2 + 5},
 		// 1-source lineage doesn't push a low-engagement trace over the
 		// threshold — exactly the regression we want this gate to prevent
 		// (Hermes session-summary mids glided past on lineage alone).
-		{"1 lineage + 1 read stays sub-threshold", cortex.PromotionCandidate{ReadCount: 1, DerivedFromCount: 1}, 1},
+		{"1 source + 1 read stays sub-threshold", cortex.PromotionCandidate{ReadCount: 1, SourceCount: 1}, 1},
 		{"negative vote counts against", cortex.PromotionCandidate{TierVotes: -1}, -5},
 	}
 	for _, tc := range tests {
@@ -88,13 +89,13 @@ func TestHeuristicPass_PromotesAboveThreshold(t *testing.T) {
 			// engagement must not glide past the threshold. This is the
 			// exact pattern (Hermes session-summary writes one
 			// derived_from pointing at the session trace) that was
-			// silently inflating mid-tier before MinLineageSourcesForCredit
+			// silently inflating mid-tier before the one-source gate
 			// landed. Score: 1*1 (read) + 0 (lineage gated) = 1.
-			{ID: "session-summary-shaped", Tier: trace.TierShort, ReadCount: 1, DerivedFromCount: 1},
+			{ID: "session-summary-shaped", Tier: trace.TierShort, ReadCount: 1, SourceCount: 1},
 			// Regression guard for the 1-source mid leak detector: passive
 			// search hits alone must not promote a Hermes session-summary
 			// shaped trace.
-			{ID: "session-summary-search-hit", Tier: trace.TierShort, SearchHitCount: 10, DerivedFromCount: 1},
+			{ID: "session-summary-search-hit", Tier: trace.TierShort, SearchHitCount: 10, SourceCount: 1},
 		},
 	}
 	pass := HeuristicPass(cx, PassConfig{}, nil)

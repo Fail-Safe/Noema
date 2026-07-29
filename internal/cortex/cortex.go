@@ -1530,6 +1530,7 @@ type Row struct {
 	Tier         string
 	Author       string
 	Origin       string
+	CortexID     string
 	Tags         []string
 	DerivedFrom  []string
 	ArchivedAt   string
@@ -1553,7 +1554,7 @@ type ListOptions struct {
 }
 
 func (c *Cortex) List(opts ListOptions) ([]Row, error) {
-	q := `SELECT id, title, type, tier, author, origin, archived_at, trashed_at, created_at, updated_at, content_hash, source_locked, source_hash FROM traces WHERE 1=1`
+	q := `SELECT id, title, type, tier, author, origin, cortex_id, archived_at, trashed_at, created_at, updated_at, content_hash, source_locked, source_hash FROM traces WHERE 1=1`
 	var args []any
 
 	switch {
@@ -1606,7 +1607,7 @@ func (c *Cortex) Search(query string, opts ListOptions) ([]Row, error) {
 	}
 	ftsQuery := SanitizeFTS5Query(query)
 	q := `
-		SELECT t.id, t.title, t.type, t.tier, t.author, t.origin, t.archived_at, t.trashed_at, t.created_at, t.updated_at, t.content_hash, t.source_locked, t.source_hash
+		SELECT t.id, t.title, t.type, t.tier, t.author, t.origin, t.cortex_id, t.archived_at, t.trashed_at, t.created_at, t.updated_at, t.content_hash, t.source_locked, t.source_hash
 		FROM traces t
 		WHERE t.id IN (SELECT id FROM traces_fts WHERE traces_fts MATCH ?)`
 	args := []any{ftsQuery}
@@ -1656,8 +1657,8 @@ func (c *Cortex) Get(id string) (*Row, error) {
 	var archivedAt, trashedAt, contentHash, sourceHash *string
 	var sourceLocked int
 	err := c.DB.QueryRow(
-		`SELECT id, title, type, tier, author, origin, archived_at, trashed_at, created_at, updated_at, content_hash, source_locked, source_hash FROM traces WHERE id = ?`, id,
-	).Scan(&r.ID, &r.Title, &r.Type, &r.Tier, &r.Author, &r.Origin, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt, &contentHash, &sourceLocked, &sourceHash)
+		`SELECT id, title, type, tier, author, origin, cortex_id, archived_at, trashed_at, created_at, updated_at, content_hash, source_locked, source_hash FROM traces WHERE id = ?`, id,
+	).Scan(&r.ID, &r.Title, &r.Type, &r.Tier, &r.Author, &r.Origin, &r.CortexID, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt, &contentHash, &sourceLocked, &sourceHash)
 	if err != nil {
 		return nil, err
 	}
@@ -2090,6 +2091,7 @@ func (c *Cortex) restoreBodyToTrash(id string, r *Row) (bool, error) {
 			Tags:         data.Tags,
 			DerivedFrom:  data.DerivedFrom,
 			Origin:       data.Origin,
+			Tier:         r.Tier,
 			Created:      r.CreatedAt,
 			Updated:      last.Timestamp,
 			ContentHash:  data.ContentHash,
@@ -2098,7 +2100,7 @@ func (c *Cortex) restoreBodyToTrash(id string, r *Row) (bool, error) {
 		},
 		Body: data.Body,
 	}
-	if err := t.Write(c.TrashFile(id)); err != nil {
+	if err := t.WritePreservingUpdated(c.TrashFile(id)); err != nil {
 		return false, fmt.Errorf("writing recovered body: %w", err)
 	}
 	return true, nil
@@ -2308,7 +2310,7 @@ func (c *Cortex) scanRows(rows *sql.Rows) ([]Row, error) { //nolint:govet
 		var r Row
 		var archivedAt, trashedAt, contentHash, sourceHash *string
 		var sourceLocked int
-		if err := rows.Scan(&r.ID, &r.Title, &r.Type, &r.Tier, &r.Author, &r.Origin, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt, &contentHash, &sourceLocked, &sourceHash); err != nil {
+		if err := rows.Scan(&r.ID, &r.Title, &r.Type, &r.Tier, &r.Author, &r.Origin, &r.CortexID, &archivedAt, &trashedAt, &r.CreatedAt, &r.UpdatedAt, &contentHash, &sourceLocked, &sourceHash); err != nil {
 			return nil, err
 		}
 		if archivedAt != nil {
@@ -2370,12 +2372,9 @@ type SyncOptions struct {
 // with the migration: a new locked field added to the trigger MUST also
 // be added here, otherwise the Drifted counter under-reports.
 //
-// existingCortexID is the DB's current cortex_id for the row (not on the
-// Row struct, so the caller queries it separately). The most common
-// real-world drift is federation-inherited rows where the file's origin
-// name matches the local cortex's display name but the DB's cortex_id
-// was correctly captured from the originating peer — Sync's resolver
-// would otherwise overwrite that ID, which the trigger blocks.
+// existingCortexID is the DB's current cortex_id for the row. Sync preserves
+// that stable identity for existing rows because origin is only a display
+// name and may be shared by every cortex in a federation.
 //
 // Tags and lineage aren't on this list: they live in separate tables
 // (trace_tags, trace_lineage) that the trigger doesn't guard. Sync
@@ -2450,6 +2449,18 @@ func (c *Cortex) SyncWithOptions(opts SyncOptions) (SyncResult, error) {
 		seenIDs[t.ID] = true
 
 		existing, dbErr := c.Get(t.ID)
+		if dbErr == nil && t.Tier != existing.Tier {
+			// Tier changes are event-driven and the database is their
+			// materialized state. Legacy create events omitted tier, leaving
+			// replayed files at the implicit short default even after migration
+			// 018 repairs the row. Promotions also used to leave long-tier
+			// files stamped as mid. Stamp the authoritative tier back onto the
+			// file without changing its immutable updated timestamp.
+			t.Tier = existing.Tier
+			if err := t.WritePreservingUpdated(e.path); err != nil {
+				return result, fmt.Errorf("repairing tier for %s: %w", t.ID, err)
+			}
+		}
 
 		// Determine what archived_at and trashed_at should be.
 		var archivedAt, trashedAt *string
@@ -2473,12 +2484,14 @@ func (c *Cortex) SyncWithOptions(opts SyncOptions) (SyncResult, error) {
 			return result, err
 		}
 
-		// Resolve the cortex_id for this trace. Local-origin traces use the
-		// local ID; remote-origin traces look up the most recent event for
-		// the trace ID (which carries the writing cortex's ID). If neither
-		// applies, leave it empty — the next replay will fill it in.
+		// Preserve the stable cortex_id already materialized by federation.
+		// Origin is only a display name, so using it to re-resolve an
+		// existing row aliases peers when several cortexes share a name.
+		// New rows still fall back to origin/event-log resolution.
 		cortexID := ""
-		if t.Origin == c.Name || t.Origin == "" {
+		if dbErr == nil && existing != nil && existing.CortexID != "" {
+			cortexID = existing.CortexID
+		} else if t.Origin == c.Name || t.Origin == "" {
 			cortexID = c.ID
 		} else {
 			cortexID = c.lookupCortexIDForTrace(t.ID)
@@ -2500,9 +2513,17 @@ func (c *Cortex) SyncWithOptions(opts SyncOptions) (SyncResult, error) {
 		}
 		if dbErr != nil {
 			// Not in DB — insert.
+			tier := t.Tier
+			if tier == "" {
+				tier = trace.TierShort
+			}
+			if !trace.IsValidTier(tier) {
+				tx.Rollback()
+				return result, fmt.Errorf("inserting %s: invalid tier %q", t.ID, tier)
+			}
 			_, err = tx.Exec(
-				`INSERT INTO traces (id, title, type, author, origin, cortex_id, created_at, updated_at, archived_at, trashed_at, content_hash, source_locked, source_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				t.ID, t.Title, t.Type, t.Author, t.Origin, cortexID, t.Created, t.Updated, archivedAt, trashedAt, contentHash, boolToInt(t.SourceLocked), nullIfEmpty(t.SourceHash),
+				`INSERT INTO traces (id, title, type, tier, author, origin, cortex_id, created_at, updated_at, archived_at, trashed_at, content_hash, source_locked, source_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				t.ID, t.Title, t.Type, tier, t.Author, t.Origin, cortexID, t.Created, t.Updated, archivedAt, trashedAt, contentHash, boolToInt(t.SourceLocked), nullIfEmpty(t.SourceHash),
 			)
 			if err != nil {
 				tx.Rollback()
@@ -2516,12 +2537,10 @@ func (c *Cortex) SyncWithOptions(opts SyncOptions) (SyncResult, error) {
 			// path below is never safe here: even an apparently-no-op
 			// SET on a locked column trips trg_long_term_immutable
 			// when the OLD and NEW values disagree on a column we
-			// didn't think to check (the live regression was
-			// federation-inherited rows where the file's origin name
-			// matches the local cortex but the DB's cortex_id was
-			// correctly captured from the originating peer — Sync's
-			// resolver would overwrite that, the trigger aborts, and
-			// the entire run dies).
+			// didn't think to check. The original live regression was
+			// a federation-inherited row whose display-name origin
+			// matched the local cortex while its stable cortex_id did
+			// not; existing rows now preserve that stable identity.
 			//
 			// Detect drift separately so the Drifted counter is right.
 			// The narrow UPDATE runs the same way either way; drift
@@ -2538,7 +2557,7 @@ func (c *Cortex) SyncWithOptions(opts SyncOptions) (SyncResult, error) {
 				// is mid-migration).
 				existingCortexID = ""
 			}
-			drifted := longTierDrifted(existing, existingCortexID, t, contentHash, cortexID)
+			drifted := longTierDrifted(existing, existing.CortexID, t, contentHash, cortexID)
 
 			_, err = tx.Exec(
 				`UPDATE traces SET archived_at=?, trashed_at=? WHERE id=?`,
@@ -2688,6 +2707,7 @@ func (c *Cortex) recoverOrphanFromEventLog(id string) (bool, error) {
 			Tags:         data.Tags,
 			DerivedFrom:  data.DerivedFrom,
 			Origin:       data.Origin,
+			Tier:         r.Tier,
 			Created:      r.CreatedAt,
 			Updated:      last.Timestamp,
 			ContentHash:  data.ContentHash,
@@ -2706,7 +2726,7 @@ func (c *Cortex) recoverOrphanFromEventLog(id string) (bool, error) {
 	default:
 		path = c.TraceFile(id, false)
 	}
-	if err := t.Write(path); err != nil {
+	if err := t.WritePreservingUpdated(path); err != nil {
 		return false, fmt.Errorf("writing recovered file: %w", err)
 	}
 	return true, nil
@@ -3117,12 +3137,14 @@ func (c *Cortex) ReplayEvent(e event.Event) error {
 				return nil
 			}
 		}
-		return c.storeRemoteEvent(e)
-	}
-
-	// Guard: reject trace IDs that could escape the cortex directory.
-	if !trace.IsValidID(e.TraceID) {
-		return fmt.Errorf("rejecting remote event %s: %w: %q", e.ID, trace.ErrInvalidTraceID, e.TraceID)
+		replayErr := c.storeRemoteEvent(e)
+		// Full-mesh peers can deliver the same coordination event at the
+		// same time. Both goroutines may pass the read-side check above;
+		// the event-ID uniqueness constraint is the final idempotency gate.
+		if replayErr != nil && strings.Contains(replayErr.Error(), "UNIQUE constraint failed") {
+			return nil
+		}
+		return replayErr
 	}
 
 	// Idempotency: skip if already in local log.
@@ -3134,6 +3156,18 @@ func (c *Cortex) ReplayEvent(e event.Event) error {
 		if ex.ID == e.ID {
 			return nil // already replayed
 		}
+	}
+
+	// Purge is the only replay action that can safely accept a legacy trace
+	// ID which no longer passes current validation. Old cortexes admitted
+	// uppercase IDs; rejecting their tombstones permanently pins every peer's
+	// cursor. Keep this path database-only so even a malicious path-shaped ID
+	// can never reach TraceFile or TrashFile.
+	if !trace.IsValidID(e.TraceID) {
+		if e.Action == event.ActionPurge {
+			return c.replayPurgeDBOnly(e)
+		}
+		return fmt.Errorf("rejecting remote event %s: %w: %q", e.ID, trace.ErrInvalidTraceID, e.TraceID)
 	}
 
 	var replayErr error
@@ -3161,8 +3195,9 @@ func (c *Cortex) ReplayEvent(e event.Event) error {
 		replayErr = c.replayTierChange(e)
 	case event.ActionVote:
 		replayErr = c.replayVote(e)
-	case event.ActionConsolidate,
-		event.ActionConsolidateFallback,
+	case event.ActionConsolidate:
+		replayErr = c.replayConsolidate(e)
+	case event.ActionConsolidateFallback,
 		event.ActionDivergenceLongTerm:
 		// Telemetry-only events — the trace-level state change (new
 		// distilled trace, divergence trace) rides a separate
@@ -3192,6 +3227,7 @@ func (c *Cortex) replayCreate(e event.Event) error {
 		Tags         []string `json:"tags"`
 		DerivedFrom  []string `json:"derived_from"`
 		Origin       string   `json:"origin"`
+		Tier         string   `json:"tier"`
 		Body         string   `json:"body"`
 		ContentHash  string   `json:"content_hash"`
 		SourceHash   string   `json:"source_hash"`
@@ -3199,6 +3235,14 @@ func (c *Cortex) replayCreate(e event.Event) error {
 	}
 	if err := json.Unmarshal(e.Data, &data); err != nil {
 		return fmt.Errorf("parsing create event data: %w", err)
+	}
+	if data.Tier == "" {
+		data.Tier = trace.TierShort
+	} else if !trace.IsValidTier(data.Tier) {
+		return fmt.Errorf("create event %s has invalid tier %q", e.ID, data.Tier)
+	}
+	if pending, err := event.ForTrace(c.DB.DB, e.TraceID); err == nil {
+		data.Tier = foldPendingTier(data.Tier, e.ID, pending)
 	}
 
 	// Verify content hash integrity: the peer-supplied hash must match the
@@ -3223,6 +3267,7 @@ func (c *Cortex) replayCreate(e event.Event) error {
 			Tags:         data.Tags,
 			DerivedFrom:  data.DerivedFrom,
 			Origin:       data.Origin,
+			Tier:         data.Tier,
 			Created:      e.Timestamp,
 			Updated:      e.Timestamp,
 			ContentHash:  data.ContentHash,
@@ -3254,8 +3299,8 @@ func (c *Cortex) replayCreate(e event.Event) error {
 	defer tx.Rollback()
 
 	_, err = tx.Exec(
-		`INSERT INTO traces (id, title, type, author, origin, cortex_id, created_at, updated_at, content_hash, source_locked, source_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.Title, t.Type, t.Author, t.Origin, e.CortexID, t.Created, t.Updated, t.ContentHash, boolToInt(t.SourceLocked), nullIfEmpty(t.SourceHash),
+		`INSERT INTO traces (id, title, type, tier, author, origin, cortex_id, created_at, updated_at, content_hash, source_locked, source_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.Title, t.Type, t.Tier, t.Author, t.Origin, e.CortexID, t.Created, t.Updated, t.ContentHash, boolToInt(t.SourceLocked), nullIfEmpty(t.SourceHash),
 	)
 	if err != nil {
 		cleanupFile(err)
@@ -3324,9 +3369,11 @@ func (c *Cortex) replayUpdate(e event.Event) error {
 		}
 	}
 
+	localEvents, _ := event.ForTrace(c.DB.DB, e.TraceID)
+	retroactiveLongUpdate := r.Tier == trace.TierLong && hasLaterLongPromotion(localEvents, e.ID)
+
 	// Conflict detection: compare vector clocks with last local mutation.
 	if len(e.VClock) > 0 {
-		localEvents, _ := event.ForTrace(c.DB.DB, e.TraceID)
 		if lastLocal := lastMutationEvent(localEvents); lastLocal != nil && len(lastLocal.VClock) > 0 {
 			localClock := federation.KeepCortexIDKeys(lastLocal.VClock)
 			remoteClock := federation.KeepCortexIDKeys(e.VClock)
@@ -3336,6 +3383,15 @@ func (c *Cortex) replayUpdate(e event.Event) error {
 				return c.createDivergence(r, e, data.Body, localClock, remoteClock)
 			}
 		}
+	}
+
+	// Long-tier content is immutable. The one safe replay exception is a
+	// causally older update that arrived after its already-recorded mid→long
+	// promotion through another full-mesh path. Materialize that historical
+	// update below by temporarily restoring the pre-promotion tier inside the
+	// transaction. Other late updates are retained in the audit log only.
+	if r.Tier == trace.TierLong && !retroactiveLongUpdate {
+		return c.storeRemoteEvent(e)
 	}
 
 	sourceLocked := data.SourceLocked && e.CortexID != c.ID
@@ -3349,6 +3405,7 @@ func (c *Cortex) replayUpdate(e event.Event) error {
 			Tags:         data.Tags,
 			DerivedFrom:  data.DerivedFrom,
 			Origin:       data.Origin,
+			Tier:         r.Tier,
 			Created:      r.CreatedAt,
 			Updated:      e.Timestamp,
 			ContentHash:  data.ContentHash,
@@ -3359,7 +3416,7 @@ func (c *Cortex) replayUpdate(e event.Event) error {
 	}
 
 	path := c.filePath(r)
-	if err := t.Write(path); err != nil {
+	if err := t.WritePreservingUpdated(path); err != nil {
 		return err
 	}
 
@@ -3369,6 +3426,11 @@ func (c *Cortex) replayUpdate(e event.Event) error {
 	}
 	defer tx.Rollback()
 
+	if retroactiveLongUpdate {
+		if _, err := tx.Exec(`UPDATE traces SET tier = ? WHERE id = ?`, trace.TierMid, e.TraceID); err != nil {
+			return err
+		}
+	}
 	if _, err := tx.Exec(
 		`UPDATE traces SET title=?, type=?, author=?, origin=?, updated_at=?, content_hash=?, source_locked=?, source_hash=? WHERE id=?`,
 		t.Title, t.Type, t.Author, t.Origin, t.Updated, t.ContentHash, boolToInt(t.SourceLocked), nullIfEmpty(t.SourceHash), e.TraceID,
@@ -3392,6 +3454,97 @@ func (c *Cortex) replayUpdate(e event.Event) error {
 		}
 	}
 	if err := upsertFTS(tx, e.TraceID, t.Title, t.Body, t.Tags); err != nil {
+		return err
+	}
+	if retroactiveLongUpdate {
+		if _, err := tx.Exec(`UPDATE traces SET tier = ? WHERE id = ?`, trace.TierLong, e.TraceID); err != nil {
+			return err
+		}
+	}
+	if err := event.Append(tx, &e); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func hasLaterLongPromotion(events []event.Event, updateID string) bool {
+	for _, e := range events {
+		if e.ID <= updateID || e.Action != event.ActionPromote {
+			continue
+		}
+		var data struct {
+			To string `json:"to"`
+		}
+		if json.Unmarshal(e.Data, &data) == nil && data.To == trace.TierLong {
+			return true
+		}
+	}
+	return false
+}
+
+func foldPendingTier(baseTier, createID string, events []event.Event) string {
+	tier := baseTier
+	for _, e := range events {
+		if e.ID <= createID {
+			continue
+		}
+		switch e.Action {
+		case event.ActionConsolidate:
+			if tier == trace.TierShort {
+				tier = trace.TierMid
+			}
+		case event.ActionPromote, event.ActionDemote:
+			var data struct {
+				To string `json:"to"`
+			}
+			if json.Unmarshal(e.Data, &data) == nil && trace.IsValidTier(data.To) {
+				tier = data.To
+			}
+		}
+	}
+	return tier
+}
+
+func (c *Cortex) replayConsolidate(e event.Event) error {
+	var data struct {
+		DistilledID string `json:"distilled_id"`
+	}
+	if len(e.Data) > 0 {
+		_ = json.Unmarshal(e.Data, &data)
+	}
+	traceID := data.DistilledID
+	if traceID == "" {
+		traceID = e.TraceID
+	}
+
+	r, err := c.Get(traceID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.storeRemoteEvent(e)
+		}
+		return err
+	}
+	if r.Tier != trace.TierShort {
+		return c.storeRemoteEvent(e)
+	}
+
+	path := c.filePath(r)
+	t, err := trace.ParseFile(path)
+	if err != nil {
+		return err
+	}
+	t.Tier = trace.TierMid
+	t.Updated = r.UpdatedAt
+	if err := t.WritePreservingUpdated(path); err != nil {
+		return fmt.Errorf("rewriting consolidated trace tier: %w", err)
+	}
+
+	tx, err := c.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE traces SET tier = ? WHERE id = ?`, trace.TierMid, traceID); err != nil {
 		return err
 	}
 	if err := event.Append(tx, &e); err != nil {
@@ -3715,13 +3868,19 @@ func (c *Cortex) replayRecover(e event.Event) error {
 func (c *Cortex) replayPurge(e event.Event) error {
 	// Just store the event — the trace may already be gone locally.
 	_ = os.Remove(c.TrashFile(e.TraceID))
+	return c.replayPurgeDBOnly(e)
+}
+
+func (c *Cortex) replayPurgeDBOnly(e event.Event) error {
 	tx, err := c.DB.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	// Best-effort delete; trace may not exist locally.
-	tx.Exec(`DELETE FROM traces WHERE id = ?`, e.TraceID)
+	if _, err := tx.Exec(`DELETE FROM traces WHERE id = ?`, e.TraceID); err != nil {
+		return err
+	}
 	if err := event.Append(tx, &e); err != nil {
 		return err
 	}
@@ -3744,11 +3903,22 @@ func (c *Cortex) replayTierChange(e event.Event) error {
 	if data.To == "" {
 		return fmt.Errorf("tier-change event %s missing 'to' field", e.ID)
 	}
-	if _, err := c.Get(e.TraceID); err != nil {
+	r, err := c.Get(e.TraceID)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return c.storeRemoteEvent(e)
 		}
 		return err
+	}
+	path := c.filePath(r)
+	t, err := trace.ParseFile(path)
+	if err != nil {
+		return err
+	}
+	t.Tier = data.To
+	t.Updated = r.UpdatedAt
+	if err := t.WritePreservingUpdated(path); err != nil {
+		return fmt.Errorf("rewriting replayed trace tier: %w", err)
 	}
 	tx, err := c.DB.Begin()
 	if err != nil {
@@ -4128,6 +4298,7 @@ func marshalTraceData(t *trace.Trace) json.RawMessage {
 		Tags         []string `json:"tags,omitempty"`
 		DerivedFrom  []string `json:"derived_from,omitempty"`
 		Origin       string   `json:"origin,omitempty"`
+		Tier         string   `json:"tier,omitempty"`
 		Body         string   `json:"body"`
 		ContentHash  string   `json:"content_hash,omitempty"`
 		SourceHash   string   `json:"source_hash,omitempty"`
@@ -4139,6 +4310,7 @@ func marshalTraceData(t *trace.Trace) json.RawMessage {
 		Tags:         t.Tags,
 		DerivedFrom:  t.DerivedFrom,
 		Origin:       t.Origin,
+		Tier:         t.Tier,
 		Body:         t.Body,
 		ContentHash:  t.ContentHash,
 		SourceHash:   t.SourceHash,

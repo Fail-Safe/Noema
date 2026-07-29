@@ -1100,6 +1100,7 @@ func TestSync_RecoverRebuildsFromEventLog(t *testing.T) {
 	cx := setup(t)
 
 	tr := trace.New("Will be recovered", "note", "agent-1", []string{"x"}, "Original body.")
+	tr.Tier = trace.TierMid
 	if err := cx.Add(tr); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
@@ -1132,6 +1133,101 @@ func TestSync_RecoverRebuildsFromEventLog(t *testing.T) {
 	}
 	if rebuilt.Author != "agent-1" {
 		t.Errorf("Author: got %q, want %q", rebuilt.Author, "agent-1")
+	}
+	if rebuilt.Tier != trace.TierMid {
+		t.Errorf("Tier: got %q, want %q", rebuilt.Tier, trace.TierMid)
+	}
+	row, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get recovered row: %v", err)
+	}
+	if rebuilt.Updated != row.UpdatedAt {
+		t.Errorf("Updated: got %q, want preserved DB timestamp %q", rebuilt.Updated, row.UpdatedAt)
+	}
+}
+
+func TestSync_RepairsExistingFileTierFromDatabase(t *testing.T) {
+	cx := setup(t)
+	tr := trace.New("legacy replay", "observation", "", nil, "body")
+	tr.Tier = trace.TierMid
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	path := cx.TraceFile(tr.ID, false)
+	parsed, err := trace.ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	parsed.Tier = ""
+	if err := parsed.WritePreservingUpdated(path); err != nil {
+		t.Fatalf("clear file tier: %v", err)
+	}
+
+	if _, err := cx.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	repaired, err := trace.ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile repaired: %v", err)
+	}
+	if repaired.Tier != trace.TierMid {
+		t.Errorf("file tier = %q, want %q", repaired.Tier, trace.TierMid)
+	}
+	row, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if row.Tier != trace.TierMid {
+		t.Errorf("database tier = %q, want %q", row.Tier, trace.TierMid)
+	}
+}
+
+func TestSync_RepairsLongFileTierFromDatabase(t *testing.T) {
+	cx := setup(t)
+	tr := trace.New("long tier stamp", "observation", "", nil, "body")
+	tr.Tier = trace.TierLong
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	path := cx.TraceFile(tr.ID, false)
+	parsed, err := trace.ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	parsed.Tier = trace.TierMid
+	if err := parsed.WritePreservingUpdated(path); err != nil {
+		t.Fatalf("seed stale file tier: %v", err)
+	}
+
+	if _, err := cx.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	repaired, err := trace.ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile repaired: %v", err)
+	}
+	if repaired.Tier != trace.TierLong {
+		t.Errorf("file tier = %q, want %q", repaired.Tier, trace.TierLong)
+	}
+}
+
+func TestSync_NewFileHonorsExplicitTier(t *testing.T) {
+	cx := setup(t)
+	tr := trace.New("external mid", "observation", "", nil, "body")
+	tr.Tier = trace.TierMid
+	if err := tr.Write(cx.TraceFile(tr.ID, false)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	if _, err := cx.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	row, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if row.Tier != trace.TierMid {
+		t.Errorf("database tier = %q, want %q", row.Tier, trace.TierMid)
 	}
 }
 
@@ -1344,7 +1440,7 @@ func TestSync_LongTierWithoutDriftStillUpdatesVisibility(t *testing.T) {
 //
 // Real-world setup: file frontmatter says `origin: mycortex` (matches
 // local cortex name); DB row's cortex_id is a foreign ULID. Sync must
-// report drift, leave cortex_id alone, and not abort.
+// preserve that stable ID, avoid false drift, and not abort.
 func TestSync_LongTierForeignCortexIDDoesNotAbort(t *testing.T) {
 	cx := setup(t)
 
@@ -1369,8 +1465,11 @@ func TestSync_LongTierForeignCortexIDDoesNotAbort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sync must not error on foreign cortex_id: %v", err)
 	}
-	if result.Drifted != 1 {
-		t.Errorf("Drifted = %d, want 1 (cortex_id mismatch is drift)", result.Drifted)
+	if result.Drifted != 0 {
+		t.Errorf("Drifted = %d, want 0 (display-name alias is not file drift)", result.Drifted)
+	}
+	if result.Updated != 1 {
+		t.Errorf("Updated = %d, want 1", result.Updated)
 	}
 
 	// cortex_id must remain the foreign value — that's the whole point
@@ -2304,6 +2403,9 @@ func TestReplayEvent_Create(t *testing.T) {
 	if row.Origin != "peer-alpha" {
 		t.Errorf("Origin = %q, want %q", row.Origin, "peer-alpha")
 	}
+	if row.Tier != trace.TierShort {
+		t.Errorf("Tier = %q, want backward-compatible default %q", row.Tier, trace.TierShort)
+	}
 
 	// Event should be in the log with the original ID.
 	events, err := cx.Events("20260405-remote-trace")
@@ -2317,6 +2419,64 @@ func TestReplayEvent_Create(t *testing.T) {
 	// File should exist on disk.
 	if _, err := os.Stat(cx.TraceFile("20260405-remote-trace", false)); err != nil {
 		t.Errorf("trace file missing: %v", err)
+	}
+}
+
+func TestReplayEvent_CreatePreservesTier(t *testing.T) {
+	source := setup(t)
+	peer := setup(t)
+
+	tr := trace.New("distilled summary", "observation", "", nil, "summary")
+	tr.Tier = trace.TierMid
+	if err := source.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	events, err := source.Events(tr.ID)
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if len(events) != 1 || events[0].Action != event.ActionCreate {
+		t.Fatalf("create events = %v", events)
+	}
+	if err := peer.ReplayEvent(events[0]); err != nil {
+		t.Fatalf("ReplayEvent: %v", err)
+	}
+
+	row, err := peer.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get replayed trace: %v", err)
+	}
+	if row.Tier != trace.TierMid {
+		t.Errorf("Tier = %q, want %q", row.Tier, trace.TierMid)
+	}
+	parsed, err := trace.ParseFile(peer.TraceFile(tr.ID, false))
+	if err != nil {
+		t.Fatalf("ParseFile replayed trace: %v", err)
+	}
+	if parsed.Tier != trace.TierMid {
+		t.Errorf("file tier = %q, want %q", parsed.Tier, trace.TierMid)
+	}
+}
+
+func TestReplayEvent_CreateRejectsInvalidTier(t *testing.T) {
+	cx := setup(t)
+	data, _ := json.Marshal(map[string]any{
+		"title": "bad tier",
+		"type":  "note",
+		"tier":  "forever",
+		"body":  "body",
+	})
+	err := cx.ReplayEvent(event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionCreate,
+		TraceID:   "20260405-bad-tier",
+		CortexID:  "01REMOTEABCDEF",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-04-05T12:00:00Z",
+		Data:      data,
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid tier") {
+		t.Fatalf("ReplayEvent error = %v, want invalid tier", err)
 	}
 }
 
@@ -2529,6 +2689,127 @@ func TestReplayUpdate_CausallyOrdered_NoConflict(t *testing.T) {
 	}
 	if updated.Body != "Causally ordered remote update." {
 		t.Errorf("body = %q, want remote version", updated.Body)
+	}
+}
+
+func TestReplayUpdate_BeforeRecordedLongPromotionAppliesRetroactively(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Historical update target", "note", "local", nil, "original body")
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := cx.Promote(tr.ID, trace.TierMid); err != nil {
+		t.Fatalf("Promote to mid: %v", err)
+	}
+
+	updateID := "01JR0000000000000000000001"
+	if err := cx.Promote(tr.ID, trace.TierLong); err != nil {
+		t.Fatalf("Promote to long: %v", err)
+	}
+
+	body := "historical body that arrived after promotion"
+	data, _ := json.Marshal(map[string]any{
+		"title":        "Historical update target",
+		"type":         "note",
+		"author":       "remote",
+		"origin":       "agentbrain",
+		"body":         body,
+		"content_hash": trace.ContentHash(body),
+	})
+	e := event.Event{
+		ID:        updateID,
+		Action:    event.ActionUpdate,
+		TraceID:   tr.ID,
+		CortexID:  remotePeerID,
+		Origin:    "agentbrain",
+		Timestamp: "2026-06-25T21:47:22Z",
+		Data:      data,
+	}
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent historical update: %v", err)
+	}
+
+	row, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if row.Tier != trace.TierLong {
+		t.Errorf("Tier = %q, want %q", row.Tier, trace.TierLong)
+	}
+	if row.ContentHash != trace.ContentHash(body) {
+		t.Errorf("ContentHash = %q, want historical body hash", row.ContentHash)
+	}
+	parsed, err := trace.ParseFile(cx.TraceFile(tr.ID, false))
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if parsed.Body != body {
+		t.Errorf("Body = %q, want %q", parsed.Body, body)
+	}
+	if parsed.Tier != trace.TierLong {
+		t.Errorf("file Tier = %q, want %q", parsed.Tier, trace.TierLong)
+	}
+	if parsed.Updated != e.Timestamp {
+		t.Errorf("file Updated = %q, want %q", parsed.Updated, e.Timestamp)
+	}
+}
+
+func TestReplayUpdate_LongWithoutLaterPromotionIsAuditOnly(t *testing.T) {
+	cx := setup(t)
+
+	tr := trace.New("Immutable target", "note", "local", nil, "authoritative body")
+	tr.Tier = trace.TierLong
+	if err := cx.Add(tr); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	rowBefore, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get before: %v", err)
+	}
+
+	body := "late mutation"
+	data, _ := json.Marshal(map[string]any{
+		"title":        tr.Title,
+		"type":         tr.Type,
+		"author":       "remote",
+		"origin":       "agentbrain",
+		"body":         body,
+		"content_hash": trace.ContentHash(body),
+	})
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionUpdate,
+		TraceID:   tr.ID,
+		CortexID:  remotePeerID,
+		Origin:    "agentbrain",
+		Timestamp: "2026-07-01T00:00:00Z",
+		Data:      data,
+	}
+
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent late long update: %v", err)
+	}
+	rowAfter, err := cx.Get(tr.ID)
+	if err != nil {
+		t.Fatalf("Get after: %v", err)
+	}
+	if rowAfter.ContentHash != rowBefore.ContentHash {
+		t.Errorf("long-tier content hash changed: got %q, want %q", rowAfter.ContentHash, rowBefore.ContentHash)
+	}
+	events, err := cx.Events(tr.ID)
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	found := false
+	for _, stored := range events {
+		if stored.ID == e.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("late long-tier update was not retained in the audit log")
 	}
 }
 
@@ -3157,6 +3438,109 @@ func TestReplayEvent_Promote_MissingTrace_StoresOnly(t *testing.T) {
 	}
 }
 
+func TestReplayCreate_FoldsPromotionStoredBeforeCreate(t *testing.T) {
+	cx := setup(t)
+	traceID := "20260725-pending-promotion"
+
+	promoteData, _ := json.Marshal(map[string]any{"from": "short", "to": "mid"})
+	promote := event.Event{
+		ID:        "01JR0000000000000000000002",
+		Action:    event.ActionPromote,
+		TraceID:   traceID,
+		CortexID:  remotePeerID,
+		Origin:    "agentbrain",
+		Timestamp: "2026-07-25T00:00:02Z",
+		Data:      promoteData,
+	}
+	if err := cx.ReplayEvent(promote); err != nil {
+		t.Fatalf("ReplayEvent promote before create: %v", err)
+	}
+
+	body := "body"
+	createData, _ := json.Marshal(map[string]any{
+		"title":        "Pending promotion",
+		"type":         "note",
+		"origin":       "agentbrain",
+		"body":         body,
+		"content_hash": trace.ContentHash(body),
+	})
+	create := event.Event{
+		ID:        "01JR0000000000000000000001",
+		Action:    event.ActionCreate,
+		TraceID:   traceID,
+		CortexID:  remotePeerID,
+		Origin:    "agentbrain",
+		Timestamp: "2026-07-25T00:00:01Z",
+		Data:      createData,
+	}
+	if err := cx.ReplayEvent(create); err != nil {
+		t.Fatalf("ReplayEvent create: %v", err)
+	}
+
+	row, err := cx.Get(traceID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if row.Tier != trace.TierMid {
+		t.Errorf("Tier = %q, want %q", row.Tier, trace.TierMid)
+	}
+	parsed, err := trace.ParseFile(cx.TraceFile(traceID, false))
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if parsed.Tier != trace.TierMid {
+		t.Errorf("file Tier = %q, want %q", parsed.Tier, trace.TierMid)
+	}
+}
+
+func TestReplayCreate_FoldsConsolidationStoredBeforeCreate(t *testing.T) {
+	cx := setup(t)
+	traceID := "20260725-pending-consolidation"
+
+	consolidateData, _ := json.Marshal(map[string]any{"distilled_id": traceID})
+	consolidate := event.Event{
+		ID:        "01JR0000000000000000000004",
+		Action:    event.ActionConsolidate,
+		TraceID:   traceID,
+		CortexID:  remotePeerID,
+		Origin:    "agentbrain",
+		Timestamp: "2026-07-25T00:00:04Z",
+		Data:      consolidateData,
+	}
+	if err := cx.ReplayEvent(consolidate); err != nil {
+		t.Fatalf("ReplayEvent consolidate before create: %v", err)
+	}
+
+	body := "distilled body"
+	createData, _ := json.Marshal(map[string]any{
+		"title":        "Pending consolidation",
+		"type":         "note",
+		"origin":       "agentbrain",
+		"body":         body,
+		"content_hash": trace.ContentHash(body),
+	})
+	create := event.Event{
+		ID:        "01JR0000000000000000000003",
+		Action:    event.ActionCreate,
+		TraceID:   traceID,
+		CortexID:  remotePeerID,
+		Origin:    "agentbrain",
+		Timestamp: "2026-07-25T00:00:03Z",
+		Data:      createData,
+	}
+	if err := cx.ReplayEvent(create); err != nil {
+		t.Fatalf("ReplayEvent create: %v", err)
+	}
+
+	row, err := cx.Get(traceID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if row.Tier != trace.TierMid {
+		t.Errorf("Tier = %q, want %q", row.Tier, trace.TierMid)
+	}
+}
+
 func TestReplayEvent_Vote(t *testing.T) {
 	cx := setup(t)
 
@@ -3411,6 +3795,65 @@ func TestReplayEvent_RejectsPathTraversal(t *testing.T) {
 		if !strings.Contains(err.Error(), "invalid trace ID") {
 			t.Errorf("expected invalid trace ID error for %q, got: %v", id, err)
 		}
+	}
+}
+
+func TestReplayEvent_PurgeAcceptsLegacyInvalidIDDatabaseOnly(t *testing.T) {
+	cx := setup(t)
+	legacyID := "20260423-Security-Reviewer-Persona-Definition"
+	if _, err := cx.DB.Exec(
+		`INSERT INTO traces (id, title, type, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
+		legacyID, "legacy", "note", "2026-04-23T00:00:00Z", "2026-04-23T00:00:00Z",
+	); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionPurge,
+		TraceID:   legacyID,
+		CortexID:  "01REMOTEABCDEF",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-06-20T00:00:00Z",
+	}
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent purge: %v", err)
+	}
+	var count int
+	if err := cx.DB.QueryRow(`SELECT COUNT(*) FROM traces WHERE id = ?`, legacyID).Scan(&count); err != nil {
+		t.Fatalf("count legacy row: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("legacy row count = %d, want 0", count)
+	}
+	events, err := cx.Events(legacyID)
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if len(events) != 1 || events[0].ID != e.ID {
+		t.Errorf("purge event not stored: %v", events)
+	}
+}
+
+func TestReplayEvent_InvalidIDPurgeCannotEscapeTrashDirectory(t *testing.T) {
+	cx := setup(t)
+	id := "../../../sentinel"
+	target := filepath.Clean(cx.TrashFile(id))
+	if err := os.WriteFile(target, []byte("keep"), 0o600); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+	e := event.Event{
+		ID:        event.NewULID(),
+		Action:    event.ActionPurge,
+		TraceID:   id,
+		CortexID:  "01REMOTEABCDEF",
+		Origin:    "peer-alpha",
+		Timestamp: "2026-06-20T00:00:00Z",
+	}
+	if err := cx.ReplayEvent(e); err != nil {
+		t.Fatalf("ReplayEvent purge: %v", err)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("sentinel was touched by invalid-ID purge: %v", err)
 	}
 }
 

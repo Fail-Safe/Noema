@@ -70,15 +70,37 @@ func (d *DB) migrate() error {
 		if err != nil {
 			return fmt.Errorf("reading migration %s: %w", base, err)
 		}
-		for _, stmt := range splitSQL(string(content)) {
-			if _, err := d.Exec(stmt); err != nil {
-				return fmt.Errorf("migration %s: %w\n  statement: %s", base, err, stmt)
-			}
+		if err := d.applyMigration(base, version, content); err != nil {
+			return err
 		}
+	}
+	return nil
+}
 
-		if _, err := d.Exec(`INSERT INTO schema_migrations (version) VALUES (?)`, version); err != nil {
-			return fmt.Errorf("recording migration %s: %w", base, err)
+func (d *DB) applyMigration(base string, version int, content []byte) (err error) {
+	tx, err := d.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning migration %s: %w", base, err)
+	}
+	defer func() {
+		if err == nil {
+			return
 		}
+		if rollbackErr := tx.Rollback(); rollbackErr != nil {
+			err = fmt.Errorf("%v; rolling back migration: %w", err, rollbackErr)
+		}
+	}()
+
+	for _, stmt := range splitSQL(string(content)) {
+		if _, err = tx.Exec(stmt); err != nil {
+			return fmt.Errorf("migration %s: %w\n  statement: %s", base, err, stmt)
+		}
+	}
+	if _, err = tx.Exec(`INSERT INTO schema_migrations (version) VALUES (?)`, version); err != nil {
+		return fmt.Errorf("recording migration %s: %w", base, err)
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("committing migration %s: %w", base, err)
 	}
 	return nil
 }

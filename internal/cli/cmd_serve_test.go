@@ -4,8 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
+	"net"
+	"net/http"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/Fail-Safe/Noema/internal/cortex"
 )
@@ -129,6 +135,233 @@ func TestValidateHTTPServe(t *testing.T) {
 	}
 }
 
+func TestValidateHTTPServeWithDynamic(t *testing.T) {
+	if err := validateHTTPServeWithDynamic(
+		[]string{"127.0.0.1"}, []string{"192.168.1.42"}, "", "", "local", true,
+	); err != nil {
+		t.Fatalf("valid dynamic IP rejected: %v", err)
+	}
+
+	if err := validateHTTPServeWithDynamic(
+		[]string{"127.0.0.1"}, []string{"home.example.com"}, "", "", "local", true,
+	); err != nil {
+		t.Fatalf("valid dynamic hostname rejected: %v", err)
+	}
+
+	for _, host := range []string{"0.0.0.0", "::"} {
+		err := validateHTTPServeWithDynamic(
+			[]string{"127.0.0.1"}, []string{host}, "", "", "local", true,
+		)
+		if err == nil {
+			t.Errorf("dynamic host %q: expected validation error", host)
+		}
+	}
+}
+
+type dynamicResolution struct {
+	address   string
+	available bool
+}
+
+type blockingTestListener struct {
+	addr       net.Addr
+	accepting  chan struct{}
+	closed     chan struct{}
+	acceptOnce sync.Once
+	closeOnce  sync.Once
+}
+
+type testNetAddr string
+
+func (a testNetAddr) Network() string { return "tcp" }
+func (a testNetAddr) String() string  { return string(a) }
+
+func newBlockingTestListener(address string) *blockingTestListener {
+	return &blockingTestListener{
+		addr:      testNetAddr(address),
+		accepting: make(chan struct{}),
+		closed:    make(chan struct{}),
+	}
+}
+
+func (l *blockingTestListener) Accept() (net.Conn, error) {
+	l.acceptOnce.Do(func() { close(l.accepting) })
+	<-l.closed
+	return nil, net.ErrClosed
+}
+
+func (l *blockingTestListener) Close() error {
+	l.closeOnce.Do(func() { close(l.closed) })
+	return nil
+}
+
+func (l *blockingTestListener) Addr() net.Addr { return l.addr }
+
+func waitForTestSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+func waitForTestListener(t *testing.T, listeners <-chan *blockingTestListener, description string) *blockingTestListener {
+	t.Helper()
+	select {
+	case listener := <-listeners:
+		return listener
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+		return nil
+	}
+}
+
+func TestReconcileDynamicListenersLifecycle(t *testing.T) {
+	resolutions := make(chan dynamicResolution, 5)
+	resolved := make(chan struct{}, 5)
+	retries := make(chan time.Time, 1)
+	listeners := make(chan *blockingTestListener, 3)
+	done := make(chan struct{})
+	fatal := make(chan error, 1)
+	returned := make(chan struct{})
+
+	runtime := dynamicListenerRuntime{
+		resolve: func(string) (string, bool) {
+			resolution := <-resolutions
+			resolved <- struct{}{}
+			return resolution.address, resolution.available
+		},
+		listen: func(_, address string) (net.Listener, error) {
+			listener := newBlockingTestListener(address)
+			listeners <- listener
+			return listener, nil
+		},
+		retry: retries,
+	}
+
+	resolutions <- dynamicResolution{}
+	go func() {
+		defer close(returned)
+		reconcileDynamicListenersWithRuntime(
+			done, []string{"roaming.example.com"}, 3000, http.NotFoundHandler(), "", "", "http", fatal, runtime,
+		)
+	}()
+	waitForTestSignal(t, resolved, "initial absent resolution")
+
+	resolutions <- dynamicResolution{address: "127.0.0.1", available: true}
+	retries <- time.Now()
+	waitForTestSignal(t, resolved, "first available resolution")
+	first := waitForTestListener(t, listeners, "first listener")
+	waitForTestSignal(t, first.accepting, "first listener to serve")
+
+	resolutions <- dynamicResolution{address: "127.0.0.2", available: true}
+	retries <- time.Now()
+	waitForTestSignal(t, resolved, "changed resolution")
+	second := waitForTestListener(t, listeners, "replacement listener")
+	waitForTestSignal(t, first.closed, "first listener cleanup after address change")
+	waitForTestSignal(t, second.accepting, "replacement listener to serve")
+
+	resolutions <- dynamicResolution{}
+	retries <- time.Now()
+	waitForTestSignal(t, resolved, "disappeared resolution")
+	waitForTestSignal(t, second.closed, "replacement listener cleanup after disappearance")
+
+	resolutions <- dynamicResolution{address: "127.0.0.1", available: true}
+	retries <- time.Now()
+	waitForTestSignal(t, resolved, "reappeared resolution")
+	third := waitForTestListener(t, listeners, "recreated listener")
+	waitForTestSignal(t, third.accepting, "recreated listener to serve")
+
+	close(done)
+	waitForTestSignal(t, third.closed, "listener cleanup on shutdown")
+	waitForTestSignal(t, returned, "reconciler shutdown")
+	select {
+	case err := <-fatal:
+		t.Fatalf("unexpected fatal error: %v", err)
+	default:
+	}
+}
+
+func TestReconcileDynamicListenersRetriesAddressNotAvailable(t *testing.T) {
+	retries := make(chan time.Time, 1)
+	listenResults := make(chan struct {
+		listener net.Listener
+		err      error
+	}, 2)
+	listenCalled := make(chan struct{}, 2)
+	done := make(chan struct{})
+	fatal := make(chan error, 1)
+	returned := make(chan struct{})
+	listener := newBlockingTestListener("127.0.0.1:3000")
+
+	listenResults <- struct {
+		listener net.Listener
+		err      error
+	}{err: syscall.EADDRNOTAVAIL}
+	listenResults <- struct {
+		listener net.Listener
+		err      error
+	}{listener: listener}
+
+	runtime := dynamicListenerRuntime{
+		resolve: func(string) (string, bool) { return "127.0.0.1", true },
+		listen: func(_, _ string) (net.Listener, error) {
+			result := <-listenResults
+			listenCalled <- struct{}{}
+			return result.listener, result.err
+		},
+		retry: retries,
+	}
+
+	go func() {
+		defer close(returned)
+		reconcileDynamicListenersWithRuntime(
+			done, []string{"127.0.0.1"}, 3000, http.NotFoundHandler(), "", "", "http", fatal, runtime,
+		)
+	}()
+	waitForTestSignal(t, listenCalled, "initial unavailable bind")
+
+	retries <- time.Now()
+	waitForTestSignal(t, listenCalled, "retried bind")
+	waitForTestSignal(t, listener.accepting, "listener after retry")
+	close(done)
+	waitForTestSignal(t, listener.closed, "retried listener cleanup")
+	waitForTestSignal(t, returned, "reconciler shutdown")
+	select {
+	case err := <-fatal:
+		t.Fatalf("EADDRNOTAVAIL should not be fatal: %v", err)
+	default:
+	}
+}
+
+func TestReconcileDynamicListenersReportsFatalBindError(t *testing.T) {
+	fatal := make(chan error, 1)
+	reconcilerReturned := make(chan struct{})
+	runtime := dynamicListenerRuntime{
+		resolve: func(string) (string, bool) { return "127.0.0.1", true },
+		listen:  func(_, _ string) (net.Listener, error) { return nil, syscall.EADDRINUSE },
+		retry:   make(chan time.Time),
+	}
+
+	go func() {
+		defer close(reconcilerReturned)
+		reconcileDynamicListenersWithRuntime(
+			make(chan struct{}), []string{"127.0.0.1"}, 3000, http.NotFoundHandler(), "", "", "http", fatal, runtime,
+		)
+	}()
+
+	select {
+	case err := <-fatal:
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			t.Fatalf("fatal error = %v, want EADDRINUSE", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for fatal bind error")
+	}
+	waitForTestSignal(t, reconcilerReturned, "reconciler return after fatal bind")
+}
+
 // --------- guardStdioFlags ---------
 
 // TestGuardStdioFlags pins the footgun short-circuit: an operator who
@@ -139,9 +372,9 @@ func TestValidateHTTPServe(t *testing.T) {
 // conflict on its own.
 func TestGuardStdioFlags(t *testing.T) {
 	cases := []struct {
-		name                                         string
+		name                                    string
 		hostSet, portSet, tlsCertSet, tlsKeySet bool
-		wantErrSubstrs                               []string // empty = expect nil
+		wantErrSubstrs                          []string // empty = expect nil
 	}{
 		{
 			name: "nothing set — fine",
@@ -249,6 +482,21 @@ func TestBuildServeArgs_OmitsEmptyOptionals(t *testing.T) {
 	}
 	if !equalSlices(got, want) {
 		t.Errorf("multi-host args: got %v, want %v", got, want)
+	}
+}
+
+func TestBuildServeArgsWithDynamic(t *testing.T) {
+	got := buildServeArgsWithDynamic(
+		"mycortex", "http", []string{"127.0.0.1"}, []string{"192.168.1.42"}, 3000, "", "",
+	)
+	want := []string{
+		"serve", "--cortex", "mycortex", "--transport", "http",
+		"--host", "127.0.0.1",
+		"--host-dynamic", "192.168.1.42",
+		"--port", "3000",
+	}
+	if !equalSlices(got, want) {
+		t.Errorf("dynamic args: got %v, want %v", got, want)
 	}
 }
 
@@ -873,6 +1121,46 @@ func TestRunPrintMCPConfig_HTTPShape(t *testing.T) {
 	}
 }
 
+func TestRunPrintMCPConfig_HTTPPrefersDynamicHost(t *testing.T) {
+	var buf bytes.Buffer
+	if err := runPrintMCPConfigWithDynamic(
+		&buf,
+		"http",
+		[]string{"127.0.0.1"},
+		[]string{"roaming.example.com", "192.168.1.42"},
+		3443,
+		"/tls.crt",
+		"/tls.key",
+	); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(buf.String(), "https://roaming.example.com:3443/mcp") {
+		t.Errorf("dynamic host should be the generated client URL:\n%s", buf.String())
+	}
+	if strings.Contains(buf.String(), "https://127.0.0.1:3443/mcp") {
+		t.Errorf("required loopback host must not replace the dynamic client URL:\n%s", buf.String())
+	}
+}
+
+func TestRunPrintMCPConfig_HTTPRejectsWildcardDynamicHost(t *testing.T) {
+	var buf bytes.Buffer
+	err := runPrintMCPConfigWithDynamic(
+		&buf,
+		"http",
+		[]string{"127.0.0.1"},
+		[]string{"0.0.0.0"},
+		3000,
+		"",
+		"",
+	)
+	if err == nil {
+		t.Fatal("expected error for wildcard dynamic host, got nil")
+	}
+	if !strings.Contains(err.Error(), "--host-dynamic 0.0.0.0") {
+		t.Errorf("error does not identify the invalid dynamic host: %v", err)
+	}
+}
+
 // TestRunPrintMCPConfig_HTTPNoTLS pins that http (without --tls-cert)
 // produces an http:// URL, not https://. Getting this wrong would
 // point the generated client config at the wrong scheme and every
@@ -944,10 +1232,10 @@ func TestValidateHTTPServe_ImplicitCortexErrorMessage(t *testing.T) {
 	}
 	msg := err.Error()
 	for _, want := range []string{
-		`"peer-a"`,                             // names the bound cortex
-		"--cortex peer-a",                      // suggests the exact fix
+		`"peer-a"`,                           // names the bound cortex
+		"--cortex peer-a",                    // suggests the exact fix
 		"--transport http",                   // includes the transport flag
-		"--host peer-a.example.com",            // includes the host
+		"--host peer-a.example.com",          // includes the host
 		"silent failures on the peer side",   // explains *why*
 		"NOEMA_CORTEX or the config default", // names the implicit paths
 	} {

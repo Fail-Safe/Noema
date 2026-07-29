@@ -16,11 +16,8 @@ import (
 // legitimate long-term exit). Emits ActionPromote with {from, to}
 // so federation peers replicate the same transition.
 //
-// Only the DB tier column is updated; the on-disk frontmatter keeps
-// whatever tier value was last written to it and re-syncs to DB state
-// on the next legitimate Cortex.Update (see Phase 1's file-drift rail).
-// Body bytes are untouched, so content_hash stays valid and the
-// filesystem watcher's loopback detection skips the rewrite.
+// The DB tier and on-disk tier frontmatter are updated together. The file
+// rewrite preserves updated and body bytes, so content_hash stays valid.
 func (c *Cortex) Promote(id, newTier string) error {
 	row, err := c.Get(id)
 	if err != nil {
@@ -117,6 +114,21 @@ func (c *Cortex) Vote(id string, delta int, actor ReadActor) error {
 }
 
 func (c *Cortex) applyTierChange(id, oldTier, newTier string, action event.Action) error {
+	row, err := c.Get(id)
+	if err != nil {
+		return err
+	}
+	path := c.filePath(row)
+	t, err := trace.ParseFile(path)
+	if err != nil {
+		return err
+	}
+	t.Tier = newTier
+	t.Updated = row.UpdatedAt
+	if err := t.WritePreservingUpdated(path); err != nil {
+		return fmt.Errorf("rewriting trace tier: %w", err)
+	}
+
 	tx, err := c.DB.Begin()
 	if err != nil {
 		return err

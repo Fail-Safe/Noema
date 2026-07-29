@@ -112,6 +112,24 @@ func TestPromotionCandidates_SignalsSurfaced(t *testing.T) {
 	if parentCandidate.DerivedFromCount != 1 {
 		t.Errorf("DerivedFromCount = %d, want 1 (child references parent)", parentCandidate.DerivedFromCount)
 	}
+	if parentCandidate.SourceCount != 0 {
+		t.Errorf("SourceCount = %d, want 0 (parent has no outbound sources)", parentCandidate.SourceCount)
+	}
+	var childCandidate *cortex.PromotionCandidate
+	for i := range got {
+		if got[i].ID == child.ID {
+			childCandidate = &got[i]
+		}
+	}
+	if childCandidate == nil {
+		t.Fatalf("child not in candidates: %v", got)
+	}
+	if childCandidate.DerivedFromCount != 0 {
+		t.Errorf("child DerivedFromCount = %d, want 0", childCandidate.DerivedFromCount)
+	}
+	if childCandidate.SourceCount != 1 {
+		t.Errorf("child SourceCount = %d, want 1 (child derives from parent)", childCandidate.SourceCount)
+	}
 }
 
 func TestListOptions_TiersFilter(t *testing.T) {

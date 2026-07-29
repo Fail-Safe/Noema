@@ -94,7 +94,7 @@ func runVerifyTraces(cmd *cobra.Command, cx *cortex.Cortex, backfill bool) error
 			if t.ContentHash == "" {
 				if backfill {
 					t.ContentHash = computed
-					if err := t.Write(path); err != nil {
+					if err := t.WritePreservingUpdated(path); err != nil {
 						return fmt.Errorf("backfilling %s: %w", t.ID, err)
 					}
 					backfilled++
@@ -110,7 +110,7 @@ func runVerifyTraces(cmd *cobra.Command, cx *cortex.Cortex, backfill bool) error
 				fmt.Fprintf(cmd.OutOrStdout(), "           actual:   %s\n", computed)
 				if backfill {
 					t.ContentHash = computed
-					if err := t.Write(path); err != nil {
+					if err := t.WritePreservingUpdated(path); err != nil {
 						return fmt.Errorf("backfilling %s: %w", t.ID, err)
 					}
 					backfilled++

@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["../.."]
+markers = [
+    "integration: exercises the plugin against a freshly built Noema binary",
+]
