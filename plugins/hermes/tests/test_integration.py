@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from plugins.hermes import NoemaMemoryProvider
-from plugins.hermes.transport import StdioTransport
+from plugins.hermes.transport import StdioTransport, reset_binary_cache
 
 # Mark every test in this module as integration.
 pytestmark = pytest.mark.integration
@@ -29,11 +29,14 @@ def noema_binary(tmp_path_factory):
     """Build the current checkout so integration tests never use an installed binary."""
     repo_root = Path(__file__).resolve().parents[3]
     binary = tmp_path_factory.mktemp("noema-bin") / "noema"
+    build_env = os.environ.copy()
+    build_env["GOCACHE"] = str(tmp_path_factory.mktemp("go-cache"))
     result = subprocess.run(
         ["go", "build", "-o", str(binary), "./cmd/noema"],
         cwd=repo_root,
         capture_output=True,
         text=True,
+        env=build_env,
         check=False,
     )
     assert result.returncode == 0, f"noema build failed: {result.stderr}"
@@ -46,6 +49,8 @@ def cortex_dir(noema_binary, tmp_path, monkeypatch):
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    monkeypatch.setenv("NOEMA_BINARY", noema_binary)
+    reset_binary_cache()
     name = "hermes-test"
     result = subprocess.run(
         [noema_binary, "init", "--name", name, "--path", str(tmp_path / "cortex")],
@@ -55,7 +60,8 @@ def cortex_dir(noema_binary, tmp_path, monkeypatch):
         check=False,
     )
     assert result.returncode == 0, f"noema init failed: {result.stderr}"
-    return name
+    yield name
+    reset_binary_cache()
 
 
 # ---------------------------------------------------------------------------
