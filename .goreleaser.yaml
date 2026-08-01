@@ -47,7 +47,7 @@ before:
     # Node + npm are preinstalled on ubuntu-latest GitHub runners; we
     # add a setup-node step in release.yml regardless to pin the
     # version and keep CI immune to runner-image drift.
-    - bash -c "cd plugins/obsidian && npm ci --silent && npm run build"
+    - bash -c "cd plugins/obsidian && npm ci --silent && npm run build && git diff --exit-code -- main.js"
     - bash -c "rm -rf .release-obsidian && mkdir -p .release-obsidian/noema && cp plugins/obsidian/manifest.json plugins/obsidian/main.js plugins/obsidian/styles.css plugins/obsidian/README.md .release-obsidian/noema/ && tar -czf noema-obsidian-plugin.tar.gz -C .release-obsidian noema && rm -rf .release-obsidian"
 
 builds:

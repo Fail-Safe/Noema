@@ -223,6 +223,16 @@ noema embeddings status                   Show semantic-search embedding coverag
 noema embeddings backfill [--force] [--limit N]
                                           Embed traces that are missing or stale (for semantic search)
 
+noema plugin list                         List plugins embedded in this binary
+noema plugin status [--check] [--hermes-home PATH] [--vault PATH]
+                                          Check installed plugins for drift
+noema plugin hermes status [--check] [--hermes-home PATH]
+noema plugin hermes install [--check] [--force] [--hermes-home PATH]
+                                          Inspect or install the embedded Hermes runtime files
+noema plugin obsidian status [--check] --vault PATH
+noema plugin obsidian install [--check] [--force] --vault PATH
+                                          Inspect or install the embedded Obsidian runtime files
+
 noema archive <id>                        Archive a Trace
 noema unarchive <id>                      Restore an archived Trace
 noema sync [--recover]                    Re-index trace files; --recover rebuilds missing files from the event log
@@ -854,14 +864,21 @@ Noema ships a [Hermes](https://hermes-agent.nousresearch.com/) memory provider p
 **Quick setup:**
 
 ```bash
-# Download the plugin from the latest release
-curl -LO https://github.com/Fail-Safe/Noema/releases/latest/download/noema-hermes-plugin.tar.gz
-mkdir -p <hermes-install>/plugins/memory/noema
-tar -xzf noema-hermes-plugin.tar.gz -C <hermes-install>/plugins/memory/noema/
+# Install the runtime files embedded in this Noema binary
+noema plugin hermes install --hermes-home <hermes-install>
 
 # Configure
 hermes memory setup    # select "noema", provide your cortex name
 ```
+
+The install is local and network-free. It creates only the `noema` plugin
+directory, skips matching files, and refuses to replace changed managed files
+unless you pass `--force`. Check an installation without changing it with
+`noema plugin hermes status --check --hermes-home <hermes-install>`.
+
+For manual or offline installation, download
+`noema-hermes-plugin.tar.gz` from the matching Noema release and extract it
+into `<hermes-install>/plugins/memory/noema/`.
 
 The plugin exposes six tools to the agent (`noema_search`, `noema_remember`, `noema_recall`, `noema_list`, `noema_update`, `noema_lineage`), manages a session log trace across turns, creates a summary trace at session end, and mirrors Hermes built-in memory writes as Noema traces.
 

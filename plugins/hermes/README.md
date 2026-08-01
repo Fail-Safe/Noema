@@ -22,20 +22,22 @@ Cortexes.
    noema init --name my-cortex
    ```
 
-3. Download the plugin and copy it into your Hermes plugins folder:
+3. Install the plugin files embedded in the Noema binary:
 
    ```
-   # Download from the latest GitHub Release
-   curl -LO https://github.com/Fail-Safe/Noema/releases/latest/download/noema-hermes-plugin.tar.gz
-   mkdir -p <hermes-install>/plugins/memory/noema
-   tar -xzf noema-hermes-plugin.tar.gz -C <hermes-install>/plugins/memory/noema/
+   noema plugin hermes install --hermes-home <hermes-install>
    ```
 
-   Or, if you cloned the Noema repo:
+   This is local and network-free. Matching files are skipped; changed managed
+   files are preserved unless you explicitly pass `--force`. To check for
+   drift without changing anything:
 
    ```
-   cp -r plugins/hermes/ <hermes-install>/plugins/memory/noema/
+   noema plugin hermes status --check --hermes-home <hermes-install>
    ```
+
+   The matching release's `noema-hermes-plugin.tar.gz` remains available for
+   manual/offline installation.
 
 4. Run the Hermes memory setup wizard:
 

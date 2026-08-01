@@ -121,3 +121,4 @@ jobs:
           npm ci --silent
           npm run build
           npx tsc --noEmit
+          git diff --exit-code -- main.js
