@@ -283,12 +283,12 @@ func TestOpen_AllowsFederatedReceiver(t *testing.T) {
 
 func TestOpen_AllowsPinnedPeerWithSameDisplayName(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := cortex.Create("agentbrain", dir); err != nil {
+	if _, err := cortex.Create("peer-a", dir); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	root := filepath.Join(dir, "agentbrain")
+	root := filepath.Join(dir, "peer-a")
 
-	cx, err := cortex.Open("agentbrain", root)
+	cx, err := cortex.Open("peer-a", root)
 	if err != nil {
 		t.Fatalf("first Open: %v", err)
 	}
@@ -300,13 +300,13 @@ func TestOpen_AllowsPinnedPeerWithSameDisplayName(t *testing.T) {
 	// name. The authenticated cortex_id, not origin, is the peer identity.
 	if _, err := cx.DB.Exec(
 		`INSERT INTO events (id, action, trace_id, cortex_id, origin, timestamp) VALUES (?, ?, ?, ?, ?, ?)`,
-		"01EVPEER0000000000000000B", "create", "20260610-peer-same-name", peerID, "agentbrain", "2026-06-10T00:00:00Z",
+		"01EVPEER0000000000000000B", "create", "20260610-peer-same-name", peerID, "peer-a", "2026-06-10T00:00:00Z",
 	); err != nil {
 		t.Fatalf("seed same-name peer event: %v", err)
 	}
 	cx.Close()
 
-	cx2, err := cortex.Open("agentbrain", root)
+	cx2, err := cortex.Open("peer-a", root)
 	if err != nil {
 		t.Fatalf("reopening with a pinned same-name peer event must succeed, got: %v", err)
 	}
@@ -2713,7 +2713,7 @@ func TestReplayUpdate_BeforeRecordedLongPromotionAppliesRetroactively(t *testing
 		"title":        "Historical update target",
 		"type":         "note",
 		"author":       "remote",
-		"origin":       "agentbrain",
+		"origin":       "peer-a",
 		"body":         body,
 		"content_hash": trace.ContentHash(body),
 	})
@@ -2722,7 +2722,7 @@ func TestReplayUpdate_BeforeRecordedLongPromotionAppliesRetroactively(t *testing
 		Action:    event.ActionUpdate,
 		TraceID:   tr.ID,
 		CortexID:  remotePeerID,
-		Origin:    "agentbrain",
+		Origin:    "peer-a",
 		Timestamp: "2026-06-25T21:47:22Z",
 		Data:      data,
 	}
@@ -2774,7 +2774,7 @@ func TestReplayUpdate_LongWithoutLaterPromotionIsAuditOnly(t *testing.T) {
 		"title":        tr.Title,
 		"type":         tr.Type,
 		"author":       "remote",
-		"origin":       "agentbrain",
+		"origin":       "peer-a",
 		"body":         body,
 		"content_hash": trace.ContentHash(body),
 	})
@@ -2783,7 +2783,7 @@ func TestReplayUpdate_LongWithoutLaterPromotionIsAuditOnly(t *testing.T) {
 		Action:    event.ActionUpdate,
 		TraceID:   tr.ID,
 		CortexID:  remotePeerID,
-		Origin:    "agentbrain",
+		Origin:    "peer-a",
 		Timestamp: "2026-07-01T00:00:00Z",
 		Data:      data,
 	}
@@ -3448,7 +3448,7 @@ func TestReplayCreate_FoldsPromotionStoredBeforeCreate(t *testing.T) {
 		Action:    event.ActionPromote,
 		TraceID:   traceID,
 		CortexID:  remotePeerID,
-		Origin:    "agentbrain",
+		Origin:    "peer-a",
 		Timestamp: "2026-07-25T00:00:02Z",
 		Data:      promoteData,
 	}
@@ -3460,7 +3460,7 @@ func TestReplayCreate_FoldsPromotionStoredBeforeCreate(t *testing.T) {
 	createData, _ := json.Marshal(map[string]any{
 		"title":        "Pending promotion",
 		"type":         "note",
-		"origin":       "agentbrain",
+		"origin":       "peer-a",
 		"body":         body,
 		"content_hash": trace.ContentHash(body),
 	})
@@ -3469,7 +3469,7 @@ func TestReplayCreate_FoldsPromotionStoredBeforeCreate(t *testing.T) {
 		Action:    event.ActionCreate,
 		TraceID:   traceID,
 		CortexID:  remotePeerID,
-		Origin:    "agentbrain",
+		Origin:    "peer-a",
 		Timestamp: "2026-07-25T00:00:01Z",
 		Data:      createData,
 	}
@@ -3503,7 +3503,7 @@ func TestReplayCreate_FoldsConsolidationStoredBeforeCreate(t *testing.T) {
 		Action:    event.ActionConsolidate,
 		TraceID:   traceID,
 		CortexID:  remotePeerID,
-		Origin:    "agentbrain",
+		Origin:    "peer-a",
 		Timestamp: "2026-07-25T00:00:04Z",
 		Data:      consolidateData,
 	}
@@ -3515,7 +3515,7 @@ func TestReplayCreate_FoldsConsolidationStoredBeforeCreate(t *testing.T) {
 	createData, _ := json.Marshal(map[string]any{
 		"title":        "Pending consolidation",
 		"type":         "note",
-		"origin":       "agentbrain",
+		"origin":       "peer-a",
 		"body":         body,
 		"content_hash": trace.ContentHash(body),
 	})
@@ -3524,7 +3524,7 @@ func TestReplayCreate_FoldsConsolidationStoredBeforeCreate(t *testing.T) {
 		Action:    event.ActionCreate,
 		TraceID:   traceID,
 		CortexID:  remotePeerID,
-		Origin:    "agentbrain",
+		Origin:    "peer-a",
 		Timestamp: "2026-07-25T00:00:03Z",
 		Data:      createData,
 	}
