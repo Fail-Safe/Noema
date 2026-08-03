@@ -52,7 +52,12 @@ cd plugins/obsidian
 npm ci
 npm run build
 npx tsc --noEmit
+git diff --exit-code -- main.js
 ```
+
+`main.js` is generated and committed because the Noema binary embeds it. The
+final check ensures the tracked runtime bundle matches the TypeScript source
+while keeping ordinary Go builds independent of Node.
 
 Validate the Hermes plugin when changing `plugins/hermes/`:
 

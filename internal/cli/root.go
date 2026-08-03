@@ -125,7 +125,7 @@ func init() {
 		verifyCmd(),
 	)
 	addGrouped(groupIface,
-		serveCmd(), tuiCmd(), completionCmd(),
+		serveCmd(), tuiCmd(), pluginCmd(), completionCmd(),
 	)
 
 	// driftCmd is a hidden top-level alias for `noema verify drift`,

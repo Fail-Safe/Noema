@@ -15,7 +15,17 @@ That's intentionally the whole feature set for v0.3. File-explorer decorations a
 
 1. Open the cortex directory (the one with `cortex.md`) as an Obsidian vault.
 2. Run `noema serve --transport http` somewhere that Obsidian can reach. For a local-only setup, that can be the same machine: `noema serve --transport http --host 127.0.0.1 --port 3000`. For multi-host, point at any peer's HTTPS endpoint.
-3. Drop this plugin's `main.js`, `manifest.json`, and `styles.css` into `<vault>/.obsidian/plugins/noema/`.
+3. Install the plugin files embedded in the Noema binary:
+
+   ```sh
+   noema plugin obsidian install --vault <vault>
+   ```
+
+   This is local and network-free. Matching files are skipped; changed managed
+   files are preserved unless you explicitly pass `--force`. Use
+   `noema plugin obsidian status --check --vault <vault>` for a read-only drift
+   check. The matching release's `noema-obsidian-plugin.tar.gz` remains the
+   manual/offline fallback.
 4. Enable the plugin in Obsidian's Community Plugins settings.
 5. Open the plugin's settings tab and set:
    - **HTTP endpoint** — e.g. `https://noema.local:3000`

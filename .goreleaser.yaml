@@ -29,8 +29,10 @@ project_name: noema
 before:
   hooks:
     - go mod tidy
-    # Bundle the Hermes memory provider plugin as a release asset.
-    - tar -czf noema-hermes-plugin.tar.gz -C plugins hermes
+    # Bundle only the Hermes files needed for manual installation. Keep them
+    # at the archive root so extracting directly into plugins/memory/noema/
+    # produces the same layout as `noema plugin hermes install`.
+    - tar -czf noema-hermes-plugin.tar.gz -C plugins/hermes __init__.py transport.py plugin.yaml README.md
     # Build and bundle the Obsidian plugin as a release asset. The
     # tarball contains only the runtime artifacts the user drops into
     # <vault>/.obsidian/plugins/noema/ — manifest.json, main.js,
@@ -47,7 +49,7 @@ before:
     # Node + npm are preinstalled on ubuntu-latest GitHub runners; we
     # add a setup-node step in release.yml regardless to pin the
     # version and keep CI immune to runner-image drift.
-    - bash -c "cd plugins/obsidian && npm ci --silent && npm run build"
+    - bash -c "cd plugins/obsidian && npm ci --silent && npm run build && git diff --exit-code -- main.js"
     - bash -c "rm -rf .release-obsidian && mkdir -p .release-obsidian/noema && cp plugins/obsidian/manifest.json plugins/obsidian/main.js plugins/obsidian/styles.css plugins/obsidian/README.md .release-obsidian/noema/ && tar -czf noema-obsidian-plugin.tar.gz -C .release-obsidian noema && rm -rf .release-obsidian"
 
 builds:
