@@ -15,7 +15,8 @@ an MCP 2025-03-26 initialization exchange.
 process-level ingest, full-text search, filtered list, sync, verification, and
 release binary size. `mcp_benchmark.py` keeps each stdio MCP server alive and
 reports steady-state lexical-search throughput plus median, p95, and maximum
-latency. Defaults are intentionally quick; set
+latency, along with sampled RSS and CPU use. It alternates implementation order
+and defaults to five runs. Defaults are intentionally quick; set
 `NOEMA_BENCH_TRACES` and `NOEMA_BENCH_READS` for longer runs.
 
 ```sh

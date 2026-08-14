@@ -1,9 +1,15 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::{LazyLock, Mutex},
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::trace::now_rfc3339;
+
+static EVENT_IDS: LazyLock<Mutex<ulid::Generator>> =
+    LazyLock::new(|| Mutex::new(ulid::Generator::new()));
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Event {
@@ -33,7 +39,12 @@ impl Event {
         vclock: BTreeMap<String, u64>,
     ) -> Self {
         Self {
-            id: ulid::Ulid::new().to_string(),
+            id: EVENT_IDS
+                .lock()
+                .expect("event ID generator mutex poisoned")
+                .generate()
+                .unwrap_or_else(|_| ulid::Ulid::new())
+                .to_string(),
             action: action.into(),
             trace_id: trace_id.into(),
             cortex_id: cortex_id.into(),
@@ -61,4 +72,30 @@ fn empty_object() -> Value {
 
 fn is_empty_object(value: &Value) -> bool {
     value.as_object().is_some_and(serde_json::Map::is_empty)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_ids_are_lexically_monotonic() {
+        let first = Event::new(
+            "create",
+            "20260814-first",
+            "c",
+            "c",
+            serde_json::json!({}),
+            BTreeMap::new(),
+        );
+        let second = Event::new(
+            "update",
+            "20260814-first",
+            "c",
+            "c",
+            serde_json::json!({}),
+            BTreeMap::new(),
+        );
+        assert!(first.id < second.id);
+    }
 }

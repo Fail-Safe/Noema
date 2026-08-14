@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use rmcp::{
@@ -12,6 +12,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::{
     VERSION,
@@ -19,24 +20,26 @@ use crate::{
     trace::Trace,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NoemaServer {
     name: String,
-    path: PathBuf,
+    cortex: Arc<Mutex<Cortex>>,
     tool_router: ToolRouter<Self>,
 }
 
 impl NoemaServer {
-    pub fn new(name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
-        Self {
-            name: name.into(),
-            path: path.into(),
+    pub fn new(name: impl Into<String>, path: impl Into<PathBuf>) -> Result<Self> {
+        let name = name.into();
+        let cortex = Cortex::open(&name, path.into())?;
+        Ok(Self {
+            name,
+            cortex: Arc::new(Mutex::new(cortex)),
             tool_router: Self::tool_router(),
-        }
+        })
     }
 
-    fn open(&self) -> Result<Cortex, ErrorData> {
-        Cortex::open(&self.name, &self.path).map_err(mcp_error)
+    async fn open(&self) -> Result<OwnedMutexGuard<Cortex>, ErrorData> {
+        Ok(self.cortex.clone().lock_owned().await)
     }
 }
 
@@ -200,7 +203,7 @@ impl NoemaServer {
         &self,
         Parameters(p): Parameters<ListParams>,
     ) -> Result<String, ErrorData> {
-        let cx = self.open()?;
+        let cx = self.open().await?;
         let rows = cx
             .list(&ListOptions {
                 trace_type: p.trace_type,
@@ -217,7 +220,7 @@ impl NoemaServer {
 
     #[tool(description = "Get a trace by ID, including its full body")]
     async fn get_trace(&self, Parameters(p): Parameters<IdParam>) -> Result<String, ErrorData> {
-        let cx = self.open()?;
+        let cx = self.open().await?;
         let (row, trace) = cx.get_trace(&p.id).map_err(mcp_error)?;
         cx.bump_read(&p.id).map_err(mcp_error)?;
         Ok(json_text(
@@ -230,7 +233,7 @@ impl NoemaServer {
         &self,
         Parameters(p): Parameters<CreateParams>,
     ) -> Result<String, ErrorData> {
-        let cx = self.open()?;
+        let cx = self.open().await?;
         let mut trace = Trace::new(p.title, p.trace_type, p.author, csv(&p.tags), p.body);
         trace.frontmatter.derived_from = csv(&p.derived_from);
         trace.frontmatter.origin = p.origin;
@@ -247,7 +250,7 @@ impl NoemaServer {
         &self,
         Parameters(p): Parameters<SearchParams>,
     ) -> Result<String, ErrorData> {
-        let cx = self.open()?;
+        let cx = self.open().await?;
         let rows = cx
             .search(
                 &p.query,
@@ -267,7 +270,7 @@ impl NoemaServer {
         &self,
         Parameters(p): Parameters<SimilarParams>,
     ) -> Result<String, ErrorData> {
-        let cx = self.open()?;
+        let cx = self.open().await?;
         let (_row, trace) = cx.get_trace(&p.trace_id).map_err(mcp_error)?;
         let query = trace
             .body
@@ -293,17 +296,17 @@ impl NoemaServer {
 
     #[tool(description = "Move a trace to trash")]
     async fn delete_trace(&self, Parameters(p): Parameters<IdParam>) -> Result<String, ErrorData> {
-        self.open()?.trash(&p.id).map_err(mcp_error)?;
+        self.open().await?.trash(&p.id).map_err(mcp_error)?;
         Ok("Trace moved to trash".into())
     }
     #[tool(description = "Restore a trace from trash")]
     async fn recover_trace(&self, Parameters(p): Parameters<IdParam>) -> Result<String, ErrorData> {
-        self.open()?.recover(&p.id).map_err(mcp_error)?;
+        self.open().await?.recover(&p.id).map_err(mcp_error)?;
         Ok("Trace recovered".into())
     }
     #[tool(description = "Archive a trace")]
     async fn archive_trace(&self, Parameters(p): Parameters<IdParam>) -> Result<String, ErrorData> {
-        self.open()?.archive(&p.id).map_err(mcp_error)?;
+        self.open().await?.archive(&p.id).map_err(mcp_error)?;
         Ok("Trace archived".into())
     }
     #[tool(description = "Restore an archived trace")]
@@ -311,7 +314,7 @@ impl NoemaServer {
         &self,
         Parameters(p): Parameters<IdParam>,
     ) -> Result<String, ErrorData> {
-        self.open()?.unarchive(&p.id).map_err(mcp_error)?;
+        self.open().await?.unarchive(&p.id).map_err(mcp_error)?;
         Ok("Trace unarchived".into())
     }
 
@@ -320,7 +323,7 @@ impl NoemaServer {
         &self,
         Parameters(p): Parameters<UpdateParams>,
     ) -> Result<String, ErrorData> {
-        let cx = self.open()?;
+        let cx = self.open().await?;
         let (_, mut trace) = cx.get_trace(&p.id).map_err(mcp_error)?;
         if let Some(v) = p.title {
             trace.frontmatter.title = v;
@@ -351,7 +354,8 @@ impl NoemaServer {
         Parameters(p): Parameters<TagsParam>,
     ) -> Result<String, ErrorData> {
         let tags = csv(&p.tags);
-        self.open()?
+        self.open()
+            .await?
             .set_tags(&p.id, tags.clone(), true)
             .map_err(mcp_error)?;
         Ok(json_text(json!({"id":p.id,"action":"set","tags":tags})))
@@ -362,7 +366,8 @@ impl NoemaServer {
         Parameters(p): Parameters<TagsParam>,
     ) -> Result<String, ErrorData> {
         let tags = self
-            .open()?
+            .open()
+            .await?
             .append_tags(&p.id, csv(&p.tags), true)
             .map_err(mcp_error)?;
         Ok(json_text(json!({"id":p.id,"action":"append","tags":tags})))
@@ -379,7 +384,8 @@ impl NoemaServer {
                 ));
             }
         };
-        self.open()?
+        self.open()
+            .await?
             .vote(&p.id, delta, "agent")
             .map_err(mcp_error)?;
         Ok("Vote recorded".into())
@@ -391,7 +397,8 @@ impl NoemaServer {
         _: Parameters<CandidateParam>,
     ) -> Result<String, ErrorData> {
         let rows = self
-            .open()?
+            .open()
+            .await?
             .list(&ListOptions {
                 tiers: vec!["short".into()],
                 ..Default::default()
@@ -414,7 +421,8 @@ impl NoemaServer {
         Parameters(p): Parameters<TopParam>,
     ) -> Result<String, ErrorData> {
         let mut rows = self
-            .open()?
+            .open()
+            .await?
             .list(&ListOptions::default())
             .map_err(mcp_error)?;
         rows.truncate(p.top.unwrap_or(10));
@@ -425,7 +433,7 @@ impl NoemaServer {
         &self,
         Parameters(p): Parameters<ConsolidateParam>,
     ) -> Result<String, ErrorData> {
-        let cx = self.open()?;
+        let cx = self.open().await?;
         let mut trace = Trace::new(
             p.title,
             "note",
@@ -445,18 +453,21 @@ impl NoemaServer {
         &self,
         Parameters(p): Parameters<AppendParam>,
     ) -> Result<String, ErrorData> {
-        self.open()?
+        self.open()
+            .await?
             .append(&p.id, &p.content, true)
             .map_err(mcp_error)?;
         Ok("Content appended".into())
     }
     #[tool(description = "Show the event log for a trace")]
     async fn trace_history(&self, Parameters(p): Parameters<IdParam>) -> Result<String, ErrorData> {
-        Ok(json_text(self.open()?.history(&p.id).map_err(mcp_error)?))
+        Ok(json_text(
+            self.open().await?.history(&p.id).map_err(mcp_error)?,
+        ))
     }
     #[tool(description = "Show the derivation graph for a trace")]
     async fn trace_lineage(&self, Parameters(p): Parameters<IdParam>) -> Result<String, ErrorData> {
-        let (from, by) = self.open()?.lineage(&p.id).map_err(mcp_error)?;
+        let (from, by) = self.open().await?.lineage(&p.id).map_err(mcp_error)?;
         Ok(json_text(
             json!({"id":p.id,"derived_from":from,"derived_by":by}),
         ))
@@ -477,7 +488,7 @@ impl NoemaServer {
     }
     #[tool(description = "Return this cortex stable identity")]
     async fn cortex_identity(&self, _: Parameters<Empty>) -> Result<String, ErrorData> {
-        let cx = self.open()?;
+        let cx = self.open().await?;
         Ok(json_text(
             json!({"id":cx.id,"name":cx.name,"manifest_version":cx.manifest.version,"version":VERSION,"public_key":cx.manifest.signing.as_ref().map(|signing| signing.public_key.as_str()).unwrap_or("")}),
         ))
@@ -488,7 +499,8 @@ impl NoemaServer {
         Parameters(p): Parameters<SinceParam>,
     ) -> Result<String, ErrorData> {
         Ok(json_text(
-            self.open()?
+            self.open()
+                .await?
                 .events_since(
                     p.since.as_deref().unwrap_or(""),
                     p.limit.unwrap_or(100).min(1000),
@@ -502,7 +514,7 @@ impl NoemaServer {
     }
     #[tool(description = "Show federation configuration and vector clock")]
     async fn federation_status(&self, _: Parameters<Empty>) -> Result<String, ErrorData> {
-        let cx = self.open()?;
+        let cx = self.open().await?;
         Ok(json_text(
             json!({"mode":cx.manifest.federation.as_ref().map(|f|f.mode.clone()).unwrap_or_else(||"sync".into()),"peers":cx.manifest.federation.as_ref().map(|f|f.peers.clone()).unwrap_or_default(),"vclock":cx.get_clock().map_err(mcp_error)?}),
         ))
@@ -512,7 +524,7 @@ impl NoemaServer {
         &self,
         Parameters(p): Parameters<AnnounceParam>,
     ) -> Result<String, ErrorData> {
-        let mut cx = self.open()?;
+        let mut cx = self.open().await?;
         let federation = cx.manifest.federation.get_or_insert_with(Default::default);
         if !federation.peers.iter().any(|peer| peer.name == p.name) {
             federation.peers.push(PeerEntry {
@@ -527,7 +539,7 @@ impl NoemaServer {
 }
 
 pub async fn serve_stdio(name: String, path: PathBuf) -> Result<()> {
-    NoemaServer::new(name, path)
+    NoemaServer::new(name, path)?
         .serve(rmcp::transport::stdio())
         .await?
         .waiting()
@@ -536,9 +548,10 @@ pub async fn serve_stdio(name: String, path: PathBuf) -> Result<()> {
 }
 
 pub async fn serve_http(name: String, path: PathBuf, host: String, port: u16) -> Result<()> {
+    let server = NoemaServer::new(name, path)?;
     let service: StreamableHttpService<NoemaServer, LocalSessionManager> =
         StreamableHttpService::new(
-            move || Ok(NoemaServer::new(name.clone(), path.clone())),
+            move || Ok(server.clone()),
             Default::default(),
             StreamableHttpServerConfig::default().with_allowed_hosts([
                 host.clone(),

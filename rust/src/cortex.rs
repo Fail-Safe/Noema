@@ -18,6 +18,7 @@ use crate::{
     db,
     event::Event,
     eventsig,
+    federation::{self, Relation},
     trace::{self, Trace},
 };
 
@@ -610,6 +611,273 @@ impl Cortex {
         Ok(events)
     }
 
+    pub fn replay_event(&self, event: &Event) -> Result<()> {
+        self.verify_replay_event(event)?;
+        let exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE id=?1)",
+            [&event.id],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Ok(());
+        }
+        if !trace::is_valid_id(&event.trace_id) {
+            bail!(
+                "rejecting remote event with invalid trace ID {:?}",
+                event.trace_id
+            );
+        }
+        match event.action.as_str() {
+            "create" => {
+                if self.get(&event.trace_id).is_ok() {
+                    self.store_remote_event(event)
+                } else {
+                    self.materialize_remote_snapshot(event, None)
+                }
+            }
+            "update" => self.replay_update(event),
+            action => bail!("federation experiment does not replay action {action:?}"),
+        }
+    }
+
+    fn verify_replay_event(&self, event: &Event) -> Result<()> {
+        let mode = self
+            .manifest
+            .federation
+            .as_ref()
+            .map(|config| config.verify.as_str())
+            .filter(|mode| !mode.is_empty())
+            .unwrap_or("off");
+        if mode == "off" {
+            return Ok(());
+        }
+        let key_name = format!("cortexkey:{}", event.cortex_id);
+        let pinned: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT value FROM federation_state WHERE key=?1",
+                [&key_name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let local_public = self
+            .manifest
+            .signing
+            .as_ref()
+            .map(|signing| signing.public_key.as_str())
+            .unwrap_or("");
+        let expected = if event.cortex_id == self.id {
+            local_public
+        } else {
+            pinned.as_deref().unwrap_or(&event.pubkey)
+        };
+        let problem = if expected.is_empty() {
+            Some(anyhow::anyhow!(
+                "no signing key is available for event origin"
+            ))
+        } else if event.signature.is_empty() {
+            Some(anyhow::anyhow!("remote event is unsigned"))
+        } else if pinned
+            .as_deref()
+            .is_some_and(|key| !event.pubkey.is_empty() && key.trim() != event.pubkey.trim())
+        {
+            Some(anyhow::anyhow!(
+                "event public key conflicts with pinned key"
+            ))
+        } else {
+            eventsig::verify(expected, event, &event.signature).err()
+        };
+        if let Some(problem) = problem {
+            if mode == "enforce" {
+                return Err(problem).context(format!(
+                    "rejecting event {} from cortex {}",
+                    event.id, event.cortex_id
+                ));
+            }
+            eprintln!(
+                "federation signature warning for event {}: {problem:#}",
+                event.id
+            );
+            return Ok(());
+        }
+        if event.cortex_id != self.id && pinned.is_none() {
+            self.connection.execute(
+                "INSERT INTO federation_state(key,value) VALUES (?1,?2)",
+                params![key_name, event.pubkey],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn replay_update(&self, event: &Event) -> Result<()> {
+        let Ok(row) = self.get(&event.trace_id) else {
+            return self.materialize_remote_snapshot(event, None);
+        };
+        if let Some(local) = self
+            .history(&event.trace_id)?
+            .into_iter()
+            .rev()
+            .find(|candidate| matches!(candidate.action.as_str(), "create" | "update"))
+            && !local.vclock.is_empty()
+            && !event.vclock.is_empty()
+        {
+            match federation::compare(&local.vclock, &event.vclock) {
+                Relation::Concurrent => return self.create_divergence(&row, event),
+                Relation::After | Relation::Equal => return self.store_remote_event(event),
+                Relation::Before => {}
+            }
+        }
+        self.materialize_remote_snapshot(event, Some(row))
+    }
+
+    fn materialize_remote_snapshot(&self, event: &Event, existing: Option<Row>) -> Result<()> {
+        let data: TraceEventData = serde_json::from_value(event.data.clone())?;
+        let content_hash = trace::content_hash(&data.body);
+        if !data.content_hash.is_empty() && data.content_hash != content_hash {
+            bail!("content hash mismatch in remote event {}", event.id);
+        }
+        let tier = existing
+            .as_ref()
+            .map(|row| row.tier.clone())
+            .or_else(|| (!data.tier.is_empty()).then(|| data.tier.clone()))
+            .unwrap_or_else(|| "short".into());
+        let created = existing
+            .as_ref()
+            .map(|row| row.created_at.clone())
+            .unwrap_or_else(|| event.timestamp.clone());
+        let trace = Trace {
+            frontmatter: trace::Frontmatter {
+                id: event.trace_id.clone(),
+                title: data.title,
+                trace_type: data.trace_type,
+                tier,
+                author: data.author,
+                tags: dedupe(data.tags),
+                derived_from: dedupe(data.derived_from),
+                origin: if data.origin.is_empty() {
+                    event.origin.clone()
+                } else {
+                    data.origin
+                },
+                created,
+                updated: event.timestamp.clone(),
+                content_hash,
+                source_hash: data.source_hash,
+                source_locked: data.source_locked && event.cortex_id != self.id,
+            },
+            body: data.body,
+        };
+        trace.validate()?;
+        let path = existing
+            .as_ref()
+            .map(|row| self.file_path(row))
+            .unwrap_or_else(|| self.trace_file(&event.trace_id, false));
+        trace.write_preserving_updated(&path)?;
+        let tx = self.connection.unchecked_transaction()?;
+        let f = &trace.frontmatter;
+        if existing.is_some() {
+            tx.execute(
+                "UPDATE traces SET title=?1,type=?2,author=?3,origin=?4,updated_at=?5,content_hash=?6,source_locked=?7,source_hash=?8 WHERE id=?9",
+                params![f.title,f.trace_type,f.author,f.origin,f.updated,f.content_hash,i64::from(f.source_locked),nullable(&f.source_hash),f.id],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO traces(id,title,type,tier,author,origin,cortex_id,created_at,updated_at,content_hash,source_locked,source_hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                params![f.id,f.title,f.trace_type,f.tier,f.author,f.origin,event.cortex_id,f.created,f.updated,f.content_hash,i64::from(f.source_locked),nullable(&f.source_hash)],
+            )?;
+        }
+        replace_tags(&tx, &f.id, &f.tags)?;
+        replace_lineage(&tx, &f.id, &f.derived_from)?;
+        upsert_fts(&tx, &f.id, &f.title, &trace.body, &f.tags)?;
+        self.store_remote_event_tx(&tx, event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn create_divergence(&self, local: &Row, remote: &Event) -> Result<()> {
+        let (_, local_trace) = self.get_trace(&local.id)?;
+        let data: TraceEventData = serde_json::from_value(remote.data.clone())?;
+        let local_event = self
+            .history(&local.id)?
+            .into_iter()
+            .rev()
+            .find(|event| matches!(event.action.as_str(), "create" | "update"))
+            .ok_or_else(|| anyhow::anyhow!("local trace has no mutation event"))?;
+        let mut versions = vec![
+            (
+                self.id.clone(),
+                self.name.clone(),
+                local_event.vclock,
+                local_trace.body,
+            ),
+            (
+                remote.cortex_id.clone(),
+                remote.origin.clone(),
+                remote.vclock.clone(),
+                data.body,
+            ),
+        ];
+        versions.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut body = format!(
+            "## Concurrent edits detected\n\n**Trace:** {}\n**Conflicting origins:** {}\n",
+            local.id,
+            versions
+                .iter()
+                .map(|(id, name, _, _)| format!("{} ({})", name, &id[..id.len().min(8)]))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for (id, name, clock, version_body) in versions {
+            body.push_str(&format!(
+                "\n### Version from {} ({})\n**Vector clock:** {}\n\n{}\n",
+                name,
+                &id[..id.len().min(8)],
+                serde_json::to_string(&clock)?,
+                version_body.trim_end()
+            ));
+        }
+        let mut divergence = Trace::new(
+            format!("Divergence: {}", local.title),
+            "divergence",
+            "system",
+            vec!["divergence".into(), "needs-resolution".into()],
+            body.trim_end(),
+        );
+        divergence.frontmatter.derived_from = vec![local.id.clone()];
+        self.add(&mut divergence)?;
+        self.store_remote_event(remote)
+    }
+
+    fn store_remote_event(&self, event: &Event) -> Result<()> {
+        let tx = self.connection.unchecked_transaction()?;
+        self.store_remote_event_tx(&tx, event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn store_remote_event_tx(&self, tx: &Transaction<'_>, event: &Event) -> Result<()> {
+        tx.execute(
+            "INSERT INTO events(id,action,trace_id,cortex_id,origin,timestamp,data,vclock,signature,pubkey) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![event.id,event.action,event.trace_id,event.cortex_id,event.origin,event.timestamp,serde_json::to_string(&event.data)?,serde_json::to_string(&event.vclock)?,event.signature,event.pubkey],
+        )?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT value FROM federation_state WHERE key='vclock'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let mut clock: BTreeMap<String, u64> = current
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default();
+        federation::merge(&mut clock, &event.vclock);
+        tx.execute(
+            "INSERT INTO federation_state(key,value) VALUES ('vclock',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [serde_json::to_string(&clock)?],
+        )?;
+        Ok(())
+    }
+
     pub fn lineage(&self, id: &str) -> Result<(Vec<String>, Vec<String>)> {
         self.get(id)?;
         let parents = self.lineage_for(id)?;
@@ -876,6 +1144,30 @@ fn load_signing_key(dir: &Path, manifest: &Manifest) -> Result<Option<SigningKey
     Ok(Some(key))
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+struct TraceEventData {
+    title: String,
+    #[serde(rename = "type")]
+    trace_type: String,
+    #[serde(default)]
+    author: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    derived_from: Vec<String>,
+    #[serde(default)]
+    origin: String,
+    #[serde(default)]
+    tier: String,
+    body: String,
+    #[serde(default)]
+    content_hash: String,
+    #[serde(default)]
+    source_hash: String,
+    #[serde(default)]
+    source_locked: bool,
+}
+
 enum Visibility {
     Active,
     Archive,
@@ -1130,6 +1422,37 @@ fn agents_md(manifest: &Manifest) -> String {
 mod tests {
     use super::*;
 
+    fn signed_cortex(parent: &Path, name: &str) -> Cortex {
+        let mut manifest = Cortex::create(name, parent).unwrap();
+        let root = parent.join(name);
+        let (_, public, seed) = eventsig::generate().unwrap();
+        let key_path = root.join("noema-signing.key");
+        fs::write(&key_path, format!("{seed}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        manifest.signing = Some(SigningConfig {
+            public_key: public,
+            private_key_file: "noema-signing.key".into(),
+        });
+        manifest.federation = Some(FederationConfig {
+            verify: "enforce".into(),
+            ..Default::default()
+        });
+        write_manifest(&root, &manifest).unwrap();
+        Cortex::open(name, root).unwrap()
+    }
+
+    fn event_for(cx: &Cortex, trace_id: &str, action: &str, cortex_id: &str) -> Event {
+        cx.history(trace_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.action == action && event.cortex_id == cortex_id)
+            .unwrap()
+    }
+
     fn cortex() -> (tempfile::TempDir, Cortex) {
         let temp = tempfile::tempdir().unwrap();
         Cortex::create("test", temp.path()).unwrap();
@@ -1203,6 +1526,78 @@ mod tests {
             .unwrap();
         assert_eq!(event.pubkey, public);
         eventsig::verify(&event.pubkey, &event, &event.signature).unwrap();
+    }
+
+    #[test]
+    fn signed_two_node_replay_handles_ordering_divergence_and_tampering() {
+        let temp = tempfile::tempdir().unwrap();
+        let alpha = signed_cortex(temp.path(), "alpha");
+        let beta = signed_cortex(temp.path(), "beta");
+
+        let mut shared = Trace::new("Shared replay", "fact", "", vec![], "initial");
+        alpha.add(&mut shared).unwrap();
+        let shared_id = shared.frontmatter.id.clone();
+        let create = event_for(&alpha, &shared_id, "create", &alpha.id);
+        beta.replay_event(&create).unwrap();
+        beta.replay_event(&create).unwrap();
+        assert_eq!(beta.get_trace(&shared_id).unwrap().1.body, "initial");
+        assert_eq!(beta.history(&shared_id).unwrap().len(), 1);
+
+        let mut tampered = create.clone();
+        tampered.data["body"] = json!("tampered");
+        assert!(beta.replay_event(&tampered).is_err());
+        assert_eq!(beta.get_trace(&shared_id).unwrap().1.body, "initial");
+
+        shared.body = "causal update".into();
+        alpha.update_trace(&shared_id, &mut shared, false).unwrap();
+        let causal = event_for(&alpha, &shared_id, "update", &alpha.id);
+        beta.replay_event(&causal).unwrap();
+        assert_eq!(beta.get_trace(&shared_id).unwrap().1.body, "causal update");
+
+        let mut reordered = Trace::new("Reordered replay", "fact", "", vec![], "old");
+        alpha.add(&mut reordered).unwrap();
+        let reordered_id = reordered.frontmatter.id.clone();
+        let older_create = event_for(&alpha, &reordered_id, "create", &alpha.id);
+        reordered.body = "newest snapshot".into();
+        alpha
+            .update_trace(&reordered_id, &mut reordered, false)
+            .unwrap();
+        let newer_update = event_for(&alpha, &reordered_id, "update", &alpha.id);
+        beta.replay_event(&newer_update).unwrap();
+        beta.replay_event(&older_create).unwrap();
+        assert_eq!(
+            beta.get_trace(&reordered_id).unwrap().1.body,
+            "newest snapshot"
+        );
+
+        shared.body = "alpha concurrent version".into();
+        alpha.update_trace(&shared_id, &mut shared, false).unwrap();
+        let (_, mut beta_shared) = beta.get_trace(&shared_id).unwrap();
+        beta_shared.body = "beta concurrent version".into();
+        beta.update_trace(&shared_id, &mut beta_shared, false)
+            .unwrap();
+        let beta_update = event_for(&beta, &shared_id, "update", &beta.id);
+        alpha.replay_event(&beta_update).unwrap();
+        let divergences = alpha
+            .list(&ListOptions {
+                trace_type: "divergence".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(divergences.len(), 1);
+        let divergence = alpha.get_trace(&divergences[0].id).unwrap().1;
+        assert!(divergence.body.contains("alpha concurrent version"));
+        assert!(divergence.body.contains("beta concurrent version"));
+
+        let mut locked = Trace::new("Locked replay", "fact", "", vec![], "owned");
+        locked.frontmatter.source_locked = true;
+        alpha.add(&mut locked).unwrap();
+        let locked_id = locked.frontmatter.id.clone();
+        let locked_create = event_for(&alpha, &locked_id, "create", &alpha.id);
+        beta.replay_event(&locked_create).unwrap();
+        let (_, mut foreign) = beta.get_trace(&locked_id).unwrap();
+        foreign.body = "unauthorized".into();
+        assert!(beta.update_trace(&locked_id, &mut foreign, false).is_err());
     }
 
     #[test]
