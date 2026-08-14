@@ -28,7 +28,9 @@ LDFLAGS_RELEASE := -s -w -X $(VERSION_PKG).Version=$(VERSION)
 HOST_OS   := $(shell go env GOOS)
 HOST_ARCH := $(shell go env GOARCH)
 
-.PHONY: help build release release-linux test vet obsidian-publish clean
+.PHONY: help build release release-linux test vet obsidian-publish clean \
+	rust-build rust-release rust-test comparison-release compare-rust benchmark-rust \
+	benchmark-mcp-rust
 
 help:
 	@echo "Noema build targets:"
@@ -38,6 +40,12 @@ help:
 	@echo "  make release-linux   Stripped build for linux/amd64 -> $(DIST_DIR)/$(BIN)-linux-amd64"
 	@echo "  make test            go test ./..."
 	@echo "  make vet             go vet ./..."
+	@echo "  make rust-build      Build the Rust comparison binary"
+	@echo "  make rust-test       Run Rust formatting, lint, and tests"
+	@echo "  make compare-rust    Run Go/Rust differential compatibility tests"
+	@echo "  make benchmark-rust  Benchmark both release binaries"
+	@echo "  make benchmark-mcp-rust"
+	@echo "                       Benchmark steady-state MCP request handling"
 	@echo "  make obsidian-publish"
 	@echo "                       Build and copy Obsidian plugin into the active cortex vault"
 	@echo "  make clean           Remove ./$(BIN) and ./$(DIST_DIR)/"
@@ -70,6 +78,35 @@ test:
 
 vet:
 	go vet ./...
+
+rust-build:
+	cargo build --manifest-path rust/Cargo.toml
+
+rust-release:
+	cargo build --release --manifest-path rust/Cargo.toml
+
+rust-test:
+	cargo fmt --manifest-path rust/Cargo.toml --check
+	cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings
+	cargo test --manifest-path rust/Cargo.toml
+
+comparison-release: release rust-release
+
+compare-rust: build rust-build
+	NOEMA_GO_BIN="$(CURDIR)/noema" \
+	NOEMA_RUST_BIN="$(CURDIR)/rust/target/debug/noema-rs" \
+	./tests/rust-rewrite/compare.sh
+	NOEMA_GO_BIN="$(CURDIR)/noema" \
+	NOEMA_RUST_BIN="$(CURDIR)/rust/target/debug/noema-rs" \
+	./tests/rust-rewrite/http_smoke.sh
+
+benchmark-rust: comparison-release
+	./tests/rust-rewrite/benchmark.sh
+
+benchmark-mcp-rust: comparison-release
+	python3 ./tests/rust-rewrite/mcp_benchmark.py \
+		--go "$(CURDIR)/dist/noema-$(HOST_OS)-$(HOST_ARCH)" \
+		--rust "$(CURDIR)/rust/target/release/noema-rs"
 
 obsidian-publish:
 	npm --prefix plugins/obsidian run build

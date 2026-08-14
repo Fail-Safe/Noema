@@ -1,0 +1,50 @@
+[package]
+name = "noema-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Rust implementation of Noema for behavioral and performance comparison"
+license = "MIT"
+
+[[bin]]
+name = "noema-rs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+axum = "0.8.9"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.6.6", features = ["derive", "env", "string"] }
+clap_complete = "4.6"
+crossterm = "0.29"
+ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+fs2 = "0.4"
+include_dir = "0.7"
+notify = "8.2"
+rand = "0.9"
+ratatui = "0.30.2"
+regex = "1.12"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+rmcp = { version = "3.1.2", features = ["client", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "reqwest"] }
+rusqlite = { version = "0.40.2", features = ["backup", "bundled"] }
+schemars = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+sha2 = "0.10"
+thiserror = "2.0"
+tokio = { version = "1.49", features = ["full"] }
+tokio-util = "0.7"
+ulid = { version = "1.2", features = ["serde"] }
+
+[dev-dependencies]
+assert_cmd = "2.1"
+predicates = "3.1"
+proptest = "1.10"
+tempfile = "3.24"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
