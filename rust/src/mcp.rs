@@ -490,7 +490,7 @@ impl NoemaServer {
     async fn cortex_identity(&self, _: Parameters<Empty>) -> Result<String, ErrorData> {
         let cx = self.open().await?;
         Ok(json_text(
-            json!({"id":cx.id,"name":cx.name,"manifest_version":cx.manifest.version,"version":VERSION,"public_key":cx.manifest.signing.as_ref().map(|signing| signing.public_key.as_str()).unwrap_or("")}),
+            json!({"id":cx.id,"name":cx.name,"version":cx.manifest.version,"binary_version":VERSION,"pubkey":cx.manifest.signing.as_ref().map(|signing| signing.public_key.as_str()).unwrap_or("")}),
         ))
     }
     #[tool(description = "Return events for federation sync")]
@@ -498,15 +498,17 @@ impl NoemaServer {
         &self,
         Parameters(p): Parameters<SinceParam>,
     ) -> Result<String, ErrorData> {
-        Ok(json_text(
-            self.open()
+        serde_json::to_string(
+            &self
+                .open()
                 .await?
                 .events_since(
                     p.since.as_deref().unwrap_or(""),
                     p.limit.unwrap_or(100).min(1000),
                 )
                 .map_err(mcp_error)?,
-        ))
+        )
+        .map_err(mcp_error)
     }
     #[tool(description = "Return per-peer usage deltas")]
     async fn sync_read_signal(&self, _: Parameters<SinceParam>) -> String {

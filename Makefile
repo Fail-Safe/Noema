@@ -99,6 +99,9 @@ compare-rust: build rust-build
 	NOEMA_GO_BIN="$(CURDIR)/noema" \
 	NOEMA_RUST_BIN="$(CURDIR)/rust/target/debug/noema-rs" \
 	./tests/rust-rewrite/http_smoke.sh
+	python3 ./tests/rust-rewrite/federation_network.py \
+		--go "$(CURDIR)/noema" \
+		--rust "$(CURDIR)/rust/target/debug/noema-rs"
 
 benchmark-rust: comparison-release
 	./tests/rust-rewrite/benchmark.sh

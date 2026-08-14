@@ -266,6 +266,9 @@ enum FederationCommand {
         name: String,
         endpoint: String,
     },
+    Sync {
+        name: Option<String>,
+    },
     ResetPeer {
         names: Vec<String>,
     },
@@ -355,13 +358,13 @@ pub async fn run() -> Result<()> {
         Command::Serve(args) => serve(selected, args).await?,
         other => {
             let mut cx = Cortex::resolve(selected)?;
-            execute_cortex_command(&mut cx, other)?;
+            execute_cortex_command(&mut cx, other).await?;
         }
     }
     Ok(())
 }
 
-fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()> {
+async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()> {
     match command {
         Command::Add(args) => {
             let body = match args.body {
@@ -464,7 +467,7 @@ fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()> {
             EmbeddingCommand::Backfill => println!("No stale embeddings found."),
         },
         Command::Tui => crate::tui::run(cx)?,
-        Command::Federation { command } => federation_command(cx, command)?,
+        Command::Federation { command } => federation_command(cx, command).await?,
         Command::Keygen => keygen(cx)?,
         Command::Verify { command } => verify(cx, command)?,
         Command::Plugin { command } => plugin_command(command)?,
@@ -630,7 +633,7 @@ fn memory_command(cx: &Cortex, command: MemoryCommand) -> Result<()> {
     Ok(())
 }
 
-fn federation_command(cx: &mut Cortex, command: FederationCommand) -> Result<()> {
+async fn federation_command(cx: &mut Cortex, command: FederationCommand) -> Result<()> {
     match command {
         FederationCommand::Status | FederationCommand::Peers => {
             println!(
@@ -651,6 +654,27 @@ fn federation_command(cx: &mut Cortex, command: FederationCommand) -> Result<()>
                 ..Default::default()
             });
             write_manifest(&cx.dir, &cx.manifest)?;
+        }
+        FederationCommand::Sync { name } => {
+            let federation = cx.manifest.federation.clone().unwrap_or_default();
+            if federation.mode == "publish" {
+                bail!("publish-mode cortexes do not pull peer events")
+            }
+            let peers: Vec<_> = federation
+                .peers
+                .into_iter()
+                .filter(|peer| name.as_ref().is_none_or(|name| &peer.name == name))
+                .collect();
+            if peers.is_empty() {
+                bail!("no matching federation peer configured")
+            }
+            for peer in peers {
+                let report = crate::federation::sync_peer(cx, &peer).await?;
+                println!(
+                    "Synced {} event(s) from {} in {} batch(es); cursor {}",
+                    report.events, report.peer, report.batches, report.cursor
+                );
+            }
         }
         FederationCommand::SetMode { mode } => {
             if !["sync", "publish", "subscribe"].contains(&mode.as_str()) {
@@ -684,6 +708,20 @@ fn federation_command(cx: &mut Cortex, command: FederationCommand) -> Result<()>
         }
         FederationCommand::ResetPeer { names } => {
             for name in names {
+                let id_key = format!("peer:{name}:cortex_id");
+                let cortex_id = cx.federation_state(&id_key)?;
+                for suffix in [
+                    "last_event",
+                    "last_seen",
+                    "last_usage",
+                    "cortex_id",
+                    "health",
+                ] {
+                    cx.delete_federation_state(&format!("peer:{name}:{suffix}"))?;
+                }
+                if !cortex_id.is_empty() {
+                    cx.delete_federation_state(&format!("cortexkey:{cortex_id}"))?;
+                }
                 println!("Reset local federation state for {name}");
             }
         }

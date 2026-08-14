@@ -636,6 +636,11 @@ impl Cortex {
                 }
             }
             "update" => self.replay_update(event),
+            "tag_update" => self.replay_tag_update(event),
+            "archive" | "unarchive" | "trash" | "recover" => self.replay_visibility(event),
+            "promote" | "demote" => self.replay_tier_change(event),
+            "vote" => self.replay_vote(event),
+            "purge" => self.replay_purge(event),
             action => bail!("federation experiment does not replay action {action:?}"),
         }
     }
@@ -728,6 +733,144 @@ impl Cortex {
             }
         }
         self.materialize_remote_snapshot(event, Some(row))
+    }
+
+    fn replay_tag_update(&self, event: &Event) -> Result<()> {
+        #[derive(Deserialize)]
+        struct TagData {
+            tags: Vec<String>,
+        }
+        let data: TagData = serde_json::from_value(event.data.clone())?;
+        let row = self.get(&event.trace_id)?;
+        let (_, mut trace) = self.get_trace(&event.trace_id)?;
+        trace.frontmatter.tags = dedupe(data.tags);
+        trace.frontmatter.tier = row.tier.clone();
+        trace.frontmatter.updated = row.updated_at.clone();
+        trace.write_preserving_updated(&self.file_path(&row))?;
+        let tx = self.connection.unchecked_transaction()?;
+        replace_tags(&tx, &event.trace_id, &trace.frontmatter.tags)?;
+        upsert_fts(
+            &tx,
+            &event.trace_id,
+            &row.title,
+            &trace.body,
+            &trace.frontmatter.tags,
+        )?;
+        self.store_remote_event_tx(&tx, event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn replay_visibility(&self, event: &Event) -> Result<()> {
+        let Ok(row) = self.get(&event.trace_id) else {
+            return self.store_remote_event(event);
+        };
+        let already_applied = match event.action.as_str() {
+            "archive" => !row.archived_at.is_empty(),
+            "unarchive" => row.archived_at.is_empty(),
+            "trash" => !row.trashed_at.is_empty(),
+            "recover" => row.trashed_at.is_empty(),
+            _ => unreachable!(),
+        };
+        if already_applied {
+            return self.store_remote_event(event);
+        }
+        let (source, target, archived, trashed): (_, _, Option<String>, Option<String>) =
+            match event.action.as_str() {
+                "archive" => (
+                    self.trace_file(&event.trace_id, false),
+                    self.trace_file(&event.trace_id, true),
+                    Some(event.timestamp.clone()),
+                    nullable(&row.trashed_at).map(str::to_owned),
+                ),
+                "unarchive" => (
+                    self.trace_file(&event.trace_id, true),
+                    self.trace_file(&event.trace_id, false),
+                    None,
+                    nullable(&row.trashed_at).map(str::to_owned),
+                ),
+                "trash" => (
+                    self.file_path(&row),
+                    self.trash_dir().join(format!("{}.md", event.trace_id)),
+                    None,
+                    Some(event.timestamp.clone()),
+                ),
+                "recover" => (
+                    self.trash_dir().join(format!("{}.md", event.trace_id)),
+                    self.trace_file(&event.trace_id, false),
+                    nullable(&row.archived_at).map(str::to_owned),
+                    None,
+                ),
+                _ => unreachable!(),
+            };
+        if source != target {
+            fs::rename(&source, &target)
+                .with_context(|| format!("moving {} to {}", source.display(), target.display()))?;
+        }
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE traces SET archived_at=?1,trashed_at=?2 WHERE id=?3",
+            params![archived, trashed, event.trace_id],
+        )?;
+        self.store_remote_event_tx(&tx, event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn replay_tier_change(&self, event: &Event) -> Result<()> {
+        #[derive(Deserialize)]
+        struct TierData {
+            to: String,
+        }
+        let data: TierData = serde_json::from_value(event.data.clone())?;
+        if !matches!(data.to.as_str(), "short" | "mid" | "long") {
+            bail!("tier-change event {} has invalid target", event.id);
+        }
+        let Ok(row) = self.get(&event.trace_id) else {
+            return self.store_remote_event(event);
+        };
+        let mut trace = Trace::parse_file(&self.file_path(&row))?;
+        trace.frontmatter.tier = data.to.clone();
+        trace.frontmatter.updated = row.updated_at.clone();
+        trace.write_preserving_updated(&self.file_path(&row))?;
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE traces SET tier=?1 WHERE id=?2",
+            params![data.to, event.trace_id],
+        )?;
+        self.store_remote_event_tx(&tx, event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn replay_vote(&self, event: &Event) -> Result<()> {
+        #[derive(Deserialize)]
+        struct VoteData {
+            delta: i64,
+        }
+        let mut data: VoteData = serde_json::from_value(event.data.clone())?;
+        data.delta = data.delta.signum();
+        let Ok(_) = self.get(&event.trace_id) else {
+            return self.store_remote_event(event);
+        };
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE traces SET tier_votes=tier_votes+?1 WHERE id=?2",
+            params![data.delta, event.trace_id],
+        )?;
+        self.store_remote_event_tx(&tx, event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn replay_purge(&self, event: &Event) -> Result<()> {
+        let _ = fs::remove_file(self.trash_dir().join(format!("{}.md", event.trace_id)));
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute("DELETE FROM traces_fts WHERE id=?1", [&event.trace_id])?;
+        tx.execute("DELETE FROM traces WHERE id=?1", [&event.trace_id])?;
+        self.store_remote_event_tx(&tx, event)?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn materialize_remote_snapshot(&self, event: &Event, existing: Option<Row>) -> Result<()> {
@@ -962,6 +1105,32 @@ impl Cortex {
             .unwrap_or_default())
     }
 
+    pub fn federation_state(&self, key: &str) -> Result<String> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT value FROM federation_state WHERE key=?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    pub fn set_federation_state(&self, key: &str, value: &str) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO federation_state(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_federation_state(&self, key: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM federation_state WHERE key=?1", [key])?;
+        Ok(())
+    }
+
     pub fn bump_read(&self, id: &str) -> Result<()> {
         let row = self.get(id)?;
         if row.tier != "long" {
@@ -1168,6 +1337,7 @@ struct TraceEventData {
     source_locked: bool,
 }
 
+#[derive(Clone, Copy)]
 enum Visibility {
     Active,
     Archive,
@@ -1366,12 +1536,36 @@ fn upsert_fts(
 
 fn trace_snapshot(trace: &Trace) -> serde_json::Value {
     let f = &trace.frontmatter;
-    json!({
-        "title":f.title,"type":f.trace_type,"author":f.author,"tags":f.tags,
-        "derived_from":f.derived_from,"origin":f.origin,"tier":trace.effective_tier(),
-        "body":trace.body,"content_hash":f.content_hash,"source_hash":f.source_hash,
-        "source_locked":f.source_locked
-    })
+    let mut value = serde_json::Map::new();
+    value.insert("title".into(), json!(f.title));
+    value.insert("type".into(), json!(f.trace_type));
+    if !f.author.is_empty() {
+        value.insert("author".into(), json!(f.author));
+    }
+    if !f.tags.is_empty() {
+        value.insert("tags".into(), json!(f.tags));
+    }
+    if !f.derived_from.is_empty() {
+        value.insert("derived_from".into(), json!(f.derived_from));
+    }
+    if !f.origin.is_empty() {
+        value.insert("origin".into(), json!(f.origin));
+    }
+    let tier = trace.effective_tier();
+    if !tier.is_empty() {
+        value.insert("tier".into(), json!(tier));
+    }
+    value.insert("body".into(), json!(trace.body));
+    if !f.content_hash.is_empty() {
+        value.insert("content_hash".into(), json!(f.content_hash));
+    }
+    if !f.source_hash.is_empty() {
+        value.insert("source_hash".into(), json!(f.source_hash));
+    }
+    if f.source_locked {
+        value.insert("source_locked".into(), json!(true));
+    }
+    value.into()
 }
 
 fn nullable(value: &str) -> Option<&str> {
@@ -1598,6 +1792,99 @@ mod tests {
         let (_, mut foreign) = beta.get_trace(&locked_id).unwrap();
         foreign.body = "unauthorized".into();
         assert!(beta.update_trace(&locked_id, &mut foreign, false).is_err());
+    }
+
+    #[test]
+    fn replay_applies_metadata_visibility_tier_vote_and_purge_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let alpha = signed_cortex(temp.path(), "alpha");
+        let beta = signed_cortex(temp.path(), "beta");
+        let mut trace = Trace::new("Lifecycle", "fact", "", vec!["old".into()], "body");
+        alpha.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        beta.replay_event(&event_for(&alpha, &id, "create", &alpha.id))
+            .unwrap();
+
+        let mut tag_update = Event::new(
+            "tag_update",
+            &id,
+            &alpha.id,
+            &alpha.name,
+            json!({"tags":["new","new","federated"]}),
+            alpha.get_clock().unwrap(),
+        );
+        tag_update.pubkey = alpha.manifest.signing.as_ref().unwrap().public_key.clone();
+        tag_update.signature = eventsig::sign(alpha.signing_key.as_ref().unwrap(), &tag_update);
+        beta.replay_event(&tag_update).unwrap();
+        assert_eq!(
+            beta.get(&id).unwrap().tags,
+            vec!["federated".to_string(), "new".to_string()]
+        );
+
+        alpha.archive(&id).unwrap();
+        beta.replay_event(&event_for(&alpha, &id, "archive", &alpha.id))
+            .unwrap();
+        assert!(!beta.get(&id).unwrap().archived_at.is_empty());
+        let mut unrelated_recover = Event::new(
+            "recover",
+            &id,
+            &alpha.id,
+            &alpha.name,
+            json!({}),
+            alpha.get_clock().unwrap(),
+        );
+        unrelated_recover.pubkey = alpha.manifest.signing.as_ref().unwrap().public_key.clone();
+        unrelated_recover.signature =
+            eventsig::sign(alpha.signing_key.as_ref().unwrap(), &unrelated_recover);
+        beta.replay_event(&unrelated_recover).unwrap();
+        assert!(!beta.get(&id).unwrap().archived_at.is_empty());
+        alpha.unarchive(&id).unwrap();
+        beta.replay_event(&event_for(&alpha, &id, "unarchive", &alpha.id))
+            .unwrap();
+        assert!(beta.get(&id).unwrap().archived_at.is_empty());
+
+        alpha.promote(&id, "mid").unwrap();
+        beta.replay_event(&event_for(&alpha, &id, "promote", &alpha.id))
+            .unwrap();
+        assert_eq!(beta.get(&id).unwrap().tier, "mid");
+        alpha.vote(&id, 1, "human").unwrap();
+        beta.replay_event(&event_for(&alpha, &id, "vote", &alpha.id))
+            .unwrap();
+        let votes: i64 = beta
+            .connection
+            .query_row("SELECT tier_votes FROM traces WHERE id=?1", [&id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(votes, 1);
+
+        alpha.trash(&id).unwrap();
+        beta.replay_event(&event_for(&alpha, &id, "trash", &alpha.id))
+            .unwrap();
+        assert!(!beta.get(&id).unwrap().trashed_at.is_empty());
+        alpha.recover(&id).unwrap();
+        beta.replay_event(&event_for(&alpha, &id, "recover", &alpha.id))
+            .unwrap();
+        assert!(beta.get(&id).unwrap().trashed_at.is_empty());
+
+        let mut purge = Event::new(
+            "purge",
+            &id,
+            &alpha.id,
+            &alpha.name,
+            json!({}),
+            alpha.get_clock().unwrap(),
+        );
+        purge.pubkey = alpha.manifest.signing.as_ref().unwrap().public_key.clone();
+        purge.signature = eventsig::sign(alpha.signing_key.as_ref().unwrap(), &purge);
+        beta.replay_event(&purge).unwrap();
+        assert!(beta.get(&id).is_err());
+        assert!(
+            beta.history(&id)
+                .unwrap()
+                .iter()
+                .any(|event| event.id == purge.id)
+        );
     }
 
     #[test]

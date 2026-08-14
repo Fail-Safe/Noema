@@ -11,6 +11,12 @@ integrity, and exact MCP tool-name parity.
 `http_smoke.sh` starts each implementation's Streamable HTTP server and checks
 an MCP 2025-03-26 initialization exchange.
 
+`federation_network.py` runs signed mixed-implementation federation in both
+directions. It covers a 205-event, three-batch Go-to-Rust pull; incremental
+archive/promote/trash replay; unreachable-peer cursor pinning; endpoint identity
+replacement rejection; retry recovery; and a signed Rust-to-Go pull under
+`verify: enforce`.
+
 `benchmark.sh` creates independent but equivalent cortexes and reports TSV for
 process-level ingest, full-text search, filtered list, sync, verification, and
 release binary size. `mcp_benchmark.py` keeps each stdio MCP server alive and
