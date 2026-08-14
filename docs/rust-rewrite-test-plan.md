@@ -42,7 +42,9 @@ Any benchmark run is invalid if its corresponding correctness gate fails.
 ## Current decision gaps
 
 The branch is suitable for core-format and early performance comparison, but
-is not yet a release replacement. Federation replay/sync, semantic backfill
+is not yet a release replacement. The Rust HTTP server fails closed when a
+cortex declares shared-key or TLS settings and otherwise permits loopback
+only. Federation replay/sync, semantic backfill
 and ranking, full consolidation, TLS/shared-key HTTP security, plugin
 installation, watcher onboarding/healing, divergence resolution, and full TUI
 behavior still require ports and parity fixtures.

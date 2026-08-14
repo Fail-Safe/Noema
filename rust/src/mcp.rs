@@ -479,7 +479,7 @@ impl NoemaServer {
     async fn cortex_identity(&self, _: Parameters<Empty>) -> Result<String, ErrorData> {
         let cx = self.open()?;
         Ok(json_text(
-            json!({"id":cx.id,"name":cx.name,"manifest_version":cx.manifest.version,"version":VERSION}),
+            json!({"id":cx.id,"name":cx.name,"manifest_version":cx.manifest.version,"version":VERSION,"public_key":cx.manifest.signing.as_ref().map(|signing| signing.public_key.as_str()).unwrap_or("")}),
         ))
     }
     #[tool(description = "Return events for federation sync")]

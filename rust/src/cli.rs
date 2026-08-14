@@ -801,6 +801,7 @@ async fn serve(selected: Option<&str>, args: ServeArgs) -> Result<()> {
     match args.transport.as_str() {
         "stdio" => crate::mcp::serve_stdio(cx.name, cx.dir).await,
         "http" => {
+            validate_http_access(&cx.manifest, &args.host)?;
             if !args.no_watch
                 && cx
                     .manifest
@@ -829,6 +830,24 @@ async fn serve(selected: Option<&str>, args: ServeArgs) -> Result<()> {
         }
         other => bail!("unknown transport {other:?}"),
     }
+}
+
+fn validate_http_access(manifest: &crate::cortex::Manifest, host: &str) -> Result<()> {
+    if let Some(access) = &manifest.access
+        && (!access.shared_key_file.is_empty()
+            || !access.tls_cert_path.is_empty()
+            || !access.tls_key_path.is_empty())
+    {
+        bail!(
+            "Rust HTTP access-control parity is not complete; refusing to ignore cortex.md shared-key or TLS settings"
+        )
+    }
+    if !["127.0.0.1", "localhost", "::1"].contains(&host) {
+        bail!(
+            "unauthenticated Rust HTTP transport is restricted to loopback until shared-key and TLS support is complete"
+        )
+    }
+    Ok(())
 }
 
 fn print_trace(row: &crate::cortex::Row, trace: &Trace) {
@@ -875,4 +894,26 @@ fn read_stdin() -> Result<String> {
         .read_to_string(&mut body)
         .context("reading stdin")?;
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cortex::{AccessConfig, Manifest};
+
+    #[test]
+    fn experimental_http_transport_fails_closed() {
+        let manifest = Manifest::default();
+        validate_http_access(&manifest, "127.0.0.1").unwrap();
+        assert!(validate_http_access(&manifest, "0.0.0.0").is_err());
+
+        let protected = Manifest {
+            access: Some(AccessConfig {
+                shared_key_file: "access.key".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(validate_http_access(&protected, "127.0.0.1").is_err());
+    }
 }
