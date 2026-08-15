@@ -5,9 +5,10 @@ Updated: 2026-08-15
 ## Pause point
 
 - Branch: `experiment/rust-rewrite`
-- Latest completed milestone: MCP contract, observability, and divergence parity
-  (this handoff commit).
-- Previous milestone: `b73a089 feat(rust): add semantic search parity`.
+- Latest completed milestone: embedded-plugin lifecycle parity (this handoff
+  commit).
+- Previous milestone: `0a6e721 feat(rust): tighten MCP contract parity`.
+- Earlier semantic milestone: `b73a089 feat(rust): add semantic search parity`.
 - Earlier watcher milestone: `c0f8c8a feat(rust): add watcher parity`.
 - Earlier experiment milestone: `aa5a5ee test(rust): compare real-model consolidation`.
 - Verify the exact commit ID and signature with `git log --show-signature -2`
@@ -33,6 +34,12 @@ Updated: 2026-08-15
 - Divergence resolution accepts a named stored version or a custom merge,
   updates the original through normal source-lock and immutability checks, and
   moves the resolved conflict trace to recoverable trash.
+- The Rust binary compile-time embeds the same three Hermes and three Obsidian
+  runtime files as Go. Plugin list/status/install/check/force commands run
+  without requiring a configured cortex and use the same target resolution.
+- Plugin installation preserves unmanaged files, refuses changed managed files
+  without `--force`, performs non-mutating check runs, atomically replaces
+  regular files and symlinks, and reports matching SHA-256 drift details.
 - Signed Go-to-Rust and Rust-to-Go federation with exact event-byte
   compatibility, identity pinning, vector clocks, pagination, lifecycle replay,
   divergence creation, source locks, and duplicate-event idempotency.
@@ -132,9 +139,9 @@ Updated: 2026-08-15
 
 ## Latest validation
 
-The following passed for the MCP-contract milestone:
+The following passed for the embedded-plugin milestone:
 
-- `make rust-test` — formatting, clippy with warnings denied, and 63 Rust tests.
+- `make rust-test` — formatting, clippy with warnings denied, and 65 Rust tests.
 - `go test ./...`
 - `go test -race ./...`
 - `go vet ./...`
@@ -168,7 +175,11 @@ The following passed for the MCP-contract milestone:
   - identical MCP tool names, parameter/required/enum schemas, documented
     fields, output-schema presence, structured usage/tag results, policy-read
     accounting, tag/append/archive/search/history behavior, search activity,
-    consolidation health, and custom divergence resolution.
+    consolidation health, and custom divergence resolution; and
+  - byte-identical embedded Hermes/Obsidian payloads plus matching inventory,
+    target resolution, status/check/install/idempotency, drift refusal,
+    force-check, forced replacement, unmanaged-file preservation, symlink
+    safety, and temporary-file cleanup.
 - The expanded model-driven scenario passed five consecutive repetitions. The
   mixed three-node ring and all earlier consolidation gates retained their full
   passing coverage.
@@ -176,6 +187,11 @@ The following passed for the MCP-contract milestone:
 One sandbox-only warning appeared while Go tried to update its module-download
 stat cache outside the writable workspace. The Go build still succeeded and the
 complete comparison target exited successfully.
+
+The first post-plugin full comparison hit one timeout waiting for the existing
+consolidation watchdog fixture. The exact fixture passed immediately on retry,
+and a subsequent complete `make compare-rust` run passed, including the same
+watchdog path and the new plugin fixture.
 
 ## Performance evidence so far
 
@@ -231,6 +247,12 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
 - Rust rejects trace types outside the advertised enum. The Go runtime accepts
   them despite advertising the same enum; the fixture records this as a
   deliberate stricter-validation difference rather than weakening Rust.
+- Plugin commands are distribution operations, not cortex operations. Routing
+  them through default-cortex resolution made an otherwise valid install fail
+  on a fresh machine; Rust now dispatches them before opening a cortex.
+- Managed-plugin replacement must inspect symlinks without following them and
+  replace the directory entry atomically. Following the link would overwrite
+  operator data outside the managed plugin directory.
 
 ## Remaining replacement gaps
 
@@ -238,20 +260,19 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
    especially consolidation candidate/result paths, federation sync/status,
    and read-only mode restrictions. Discovery schema and representative core
    behavior are now automated.
-2. Plugin installation/check/force behavior and embedded-payload verification.
-3. Full TUI behavior.
-4. Broader adversarial real-model quality evaluation beyond the current bounded
+2. Full TUI behavior.
+3. Broader adversarial real-model quality evaluation beyond the current bounded
    synthetic corpus.
-5. Certificate expiry validation/monitoring, dynamic peer-worker addition without
+4. Certificate expiry validation/monitoring, dynamic peer-worker addition without
    restart, crash-atomic file rollback, lock contention, and broader fault
    injection.
 
 ## Recommended next milestone
 
-Port and compare the plugin install/check/force lifecycle and embedded payload
-verification. In parallel, extend `mcp_contract.py` across the remaining
-advanced federation/consolidation tools and read-only mode errors; preserve the
-current generic semantic fallback and stricter Rust type validation.
+Extend `mcp_contract.py` across the remaining advanced federation and
+consolidation tools, invalid-argument cases, and read-only mode restrictions.
+Preserve the current generic semantic fallback and stricter Rust type
+validation.
 
 Any new Rust packages still require explicit approval before adding them.
 
@@ -265,5 +286,5 @@ make rust-test
 make compare-rust
 ```
 
-After confirming the baseline, start from the Plugins row in
+After confirming the baseline, continue from the MCP stdio row in
 `docs/rust-rewrite-test-plan.md` and keep the Go implementation as the oracle.

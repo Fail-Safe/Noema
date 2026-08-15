@@ -354,20 +354,56 @@ enum VerifyCommand {
 #[derive(Debug, Subcommand)]
 enum PluginCommand {
     List,
-    Status,
+    Status {
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        hermes_home: Option<PathBuf>,
+        #[arg(long)]
+        vault: Option<PathBuf>,
+    },
     Hermes {
         #[command(subcommand)]
-        command: PluginAction,
+        command: HermesPluginAction,
     },
     Obsidian {
         #[command(subcommand)]
-        command: PluginAction,
+        command: ObsidianPluginAction,
     },
 }
 #[derive(Debug, Subcommand)]
-enum PluginAction {
-    Status,
-    Install,
+enum HermesPluginAction {
+    Status {
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        hermes_home: Option<PathBuf>,
+    },
+    Install {
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        hermes_home: Option<PathBuf>,
+    },
+}
+#[derive(Debug, Subcommand)]
+enum ObsidianPluginAction {
+    Status {
+        #[arg(long)]
+        check: bool,
+        #[arg(long, required = true)]
+        vault: PathBuf,
+    },
+    Install {
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        force: bool,
+        #[arg(long, required = true)]
+        vault: PathBuf,
+    },
 }
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
@@ -400,6 +436,7 @@ pub async fn run() -> Result<()> {
             generate(shell, &mut Cli::command(), "noema-rs", &mut io::stdout())
         }
         Command::Config { command } => config_command(command)?,
+        Command::Plugin { command } => plugin_command(command)?,
         Command::Serve(args) => serve(selected, args).await?,
         Command::Consolidate(args) => consolidate(selected, args).await?,
         other => {
@@ -599,7 +636,6 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
         Command::Federation { command } => federation_command(cx, command).await?,
         Command::Keygen { force } => keygen(cx, force)?,
         Command::Verify { command } => verify(cx, command)?,
-        Command::Plugin { command } => plugin_command(command)?,
         Command::Resolve { divergence_id, .. } => {
             bail!("divergence {divergence_id} requires explicit conflict-body resolution support")
         }
@@ -619,7 +655,8 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
         | Command::Serve(_)
         | Command::Completion { .. }
         | Command::Version
-        | Command::Config { .. } => unreachable!(),
+        | Command::Config { .. }
+        | Command::Plugin { .. } => unreachable!(),
     }
     Ok(())
 }
@@ -1065,18 +1102,169 @@ fn verify(cx: &Cortex, command: Option<VerifyCommand>) -> Result<()> {
 
 fn plugin_command(command: PluginCommand) -> Result<()> {
     match command {
-        PluginCommand::List => println!("hermes\nobsidian"),
-        PluginCommand::Status => {
-            println!("Plugin payloads remain shared with the Go distribution.")
+        PluginCommand::List => {
+            for definition in crate::plugin::DEFINITIONS {
+                println!(
+                    "{:<8}  {:<22}  {} managed files",
+                    definition.name,
+                    definition.description,
+                    definition.files.len()
+                );
+            }
         }
-        PluginCommand::Hermes { command } | PluginCommand::Obsidian { command } => match command {
-            PluginAction::Status => println!("Plugin status is installation-specific."),
-            PluginAction::Install => {
-                bail!("plugin installation is not yet enabled in the comparison binary")
+        PluginCommand::Status {
+            check,
+            hermes_home,
+            vault,
+        } => {
+            let hermes = resolve_hermes_target(hermes_home)?;
+            let mut failed = render_plugin_status(crate::plugin::HERMES, &hermes)?
+                != crate::plugin::State::UpToDate;
+            println!();
+            if let Some(vault) = vault {
+                let obsidian = resolve_obsidian_target(&vault)?;
+                failed |= render_plugin_status(crate::plugin::OBSIDIAN, &obsidian)?
+                    != crate::plugin::State::UpToDate;
+            } else {
+                println!("obsidian: target not specified");
+            }
+            if check && failed {
+                bail!("plugin check failed");
+            }
+        }
+        PluginCommand::Hermes { command } => match command {
+            HermesPluginAction::Status { check, hermes_home } => {
+                let target = resolve_hermes_target(hermes_home)?;
+                let state = render_plugin_status(crate::plugin::HERMES, &target)?;
+                if check && state != crate::plugin::State::UpToDate {
+                    bail!("plugin check failed");
+                }
+            }
+            HermesPluginAction::Install {
+                check,
+                force,
+                hermes_home,
+            } => {
+                let target = resolve_hermes_target(hermes_home)?;
+                require_directory(target.parent().unwrap(), "Hermes plugin parent")?;
+                render_plugin_install(crate::plugin::HERMES, &target, check, force)?;
+            }
+        },
+        PluginCommand::Obsidian { command } => match command {
+            ObsidianPluginAction::Status { check, vault } => {
+                let target = resolve_obsidian_target(&vault)?;
+                let state = render_plugin_status(crate::plugin::OBSIDIAN, &target)?;
+                if check && state != crate::plugin::State::UpToDate {
+                    bail!("plugin check failed");
+                }
+            }
+            ObsidianPluginAction::Install {
+                check,
+                force,
+                vault,
+            } => {
+                let target = resolve_obsidian_target(&vault)?;
+                require_directory(
+                    target.parent().unwrap().parent().unwrap(),
+                    "Obsidian vault configuration",
+                )?;
+                render_plugin_install(crate::plugin::OBSIDIAN, &target, check, force)?;
             }
         },
     }
     Ok(())
+}
+
+fn render_plugin_status(
+    definition: crate::plugin::Definition,
+    target: &std::path::Path,
+) -> Result<crate::plugin::State> {
+    let report = crate::plugin::inspect(definition, target)
+        .with_context(|| format!("{} status", definition.name))?;
+    println!("{}: {}", report.plugin, report.state.label());
+    println!("  target: {}", report.target.display());
+    for file in report.files {
+        println!("  {:<13} {}", file.state.label(), file.path);
+        if file.state == crate::plugin::FileState::Changed {
+            println!("    embedded:  {}", file.embedded_hash);
+            println!("    installed: {}", file.installed_hash);
+        }
+    }
+    Ok(report.state)
+}
+
+fn render_plugin_install(
+    definition: crate::plugin::Definition,
+    target: &std::path::Path,
+    check: bool,
+    force: bool,
+) -> Result<()> {
+    let report = crate::plugin::install(
+        definition,
+        target,
+        crate::plugin::InstallOptions { check, force },
+    )
+    .with_context(|| format!("{} install", definition.name))?;
+    println!(
+        "{}: {}",
+        report.plugin,
+        if check { "check" } else { "install" }
+    );
+    println!("  target: {}", report.target.display());
+    let mut counts = [0_usize; 6];
+    for file in &report.files {
+        let index = match file.action {
+            crate::plugin::InstallAction::Installed => 0,
+            crate::plugin::InstallAction::Replaced => 1,
+            crate::plugin::InstallAction::Unchanged => 2,
+            crate::plugin::InstallAction::Refused => 3,
+            crate::plugin::InstallAction::WouldInstall => 4,
+            crate::plugin::InstallAction::WouldReplace => 5,
+        };
+        counts[index] += 1;
+        println!("  {:<13} {}", file.action.label(), file.path);
+    }
+    println!(
+        "summary: installed={} replaced={} unchanged={} refused={} would_install={} would_replace={}",
+        counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]
+    );
+    if report.refused() || (check && report.pending()) {
+        bail!("plugin check failed");
+    }
+    Ok(())
+}
+
+fn resolve_hermes_target(flag: Option<PathBuf>) -> Result<PathBuf> {
+    let home = flag
+        .or_else(|| std::env::var_os("HERMES_HOME").map(PathBuf::from))
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".hermes/hermes-agent"))
+        })
+        .context("resolving home directory")?;
+    Ok(std::path::absolute(home)
+        .context("resolving Hermes home")?
+        .join("plugins/memory/noema"))
+}
+
+fn resolve_obsidian_target(vault: &std::path::Path) -> Result<PathBuf> {
+    Ok(std::path::absolute(vault)
+        .with_context(|| format!("resolving Obsidian vault {:?}", vault))?
+        .join(".obsidian/plugins/noema"))
+}
+
+fn require_directory(path: &std::path::Path, label: &str) -> Result<()> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => bail!("{label} at {} is not a directory", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("{label} not found at {}", path.display())
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("inspecting {label} at {}", path.display()))
+        }
+    }
 }
 
 fn config_command(command: ConfigCommand) -> Result<()> {

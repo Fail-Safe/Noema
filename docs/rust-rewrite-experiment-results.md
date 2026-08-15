@@ -283,6 +283,25 @@ This is representative contract parity, not exhaustive coverage of every
 successful and failing result from all 28 tools. Advanced federation and
 consolidation surfaces plus read-only mode restrictions remain to be added.
 
+## Embedded-plugin lifecycle parity
+
+The Rust binary now compile-time embeds the same six built runtime files as Go:
+three for the Hermes memory provider and three for the Obsidian vault plugin.
+Plugin commands dispatch before cortex resolution, which makes installation and
+inspection usable on a fresh machine without a Noema cortex. Inventory text,
+default and explicit target resolution, and SHA-256 drift reports match Go.
+
+The differential fixture covers missing targets, parent-directory guardrails,
+non-mutating `--check`, first install, idempotent reinstall, changed-file
+refusal, `--check --force`, forced replacement, and final status checks for both
+plugin families. It also proves unmanaged operator files survive and every
+installed artifact is byte-identical across builds.
+
+The symlink case is deliberately adversarial: a managed path points to a file
+outside the plugin directory. Both builds refuse it without force and replace
+the symlink directory entry when forced, leaving the external file unchanged.
+The fixture also checks that no atomic-write temporary files remain.
+
 ## Bounded federation soak
 
 Equivalent homogeneous three-node clusters ran 80 paced create mutations over
@@ -321,5 +340,6 @@ about half the prompt-token cost. Watcher behavior now also matches the tested
 Go outcomes, as do deterministic semantic indexing/ranking and the
 representative MCP contract. It still does not justify an all-in rewrite
 because larger-result throughput is not better and certificate-lifecycle
-checks, exhaustive advanced MCP errors, plugins, broader distillation-quality
-evaluation, and operator recovery behavior remain incomplete.
+checks, exhaustive advanced MCP errors, full TUI behavior, broader
+distillation-quality evaluation, and operator recovery behavior remain
+incomplete.
