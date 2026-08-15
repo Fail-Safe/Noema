@@ -102,12 +102,20 @@ compare-rust: build rust-build
 	python3 ./tests/rust-rewrite/federation_network.py \
 		--go "$(CURDIR)/noema" \
 		--rust "$(CURDIR)/rust/target/debug/noema-rs"
+	python3 ./tests/rust-rewrite/federation_ring.py \
+		--go "$(CURDIR)/noema" \
+		--rust "$(CURDIR)/rust/target/debug/noema-rs"
 
 benchmark-rust: comparison-release
 	./tests/rust-rewrite/benchmark.sh
 
 benchmark-mcp-rust: comparison-release
 	python3 ./tests/rust-rewrite/mcp_benchmark.py \
+		--go "$(CURDIR)/dist/noema-$(HOST_OS)-$(HOST_ARCH)" \
+		--rust "$(CURDIR)/rust/target/release/noema-rs"
+
+soak-rust: comparison-release
+	python3 ./tests/rust-rewrite/federation_soak.py \
 		--go "$(CURDIR)/dist/noema-$(HOST_OS)-$(HOST_ARCH)" \
 		--rust "$(CURDIR)/rust/target/release/noema-rs"
 

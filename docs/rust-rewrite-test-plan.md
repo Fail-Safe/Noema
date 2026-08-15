@@ -15,8 +15,8 @@ integrity, or security requirements.
 | MCP stdio | Contract | Exact tool-name set, compatible input schemas, result semantics, and errors | Tool-name parity automated; schema/result fixtures pending |
 | MCP HTTP | Integration | Both transports initialize and serve calls; auth, TLS, host validation, and shutdown match | `http_smoke.sh`; security cases pending |
 | Watcher | Integration | External create/edit/rename is debounced, onboarded, indexed once, and healed after atomic save | Pending parity fixtures |
-| Federation | Multi-process | Two nodes converge under normal, duplicate, reordered, concurrent, signed, paused, and unavailable-peer cases | `federation_network.py` covers signed bidirectional sync, batching, lifecycle, unavailable/retry, identity replacement; concurrency and multi-peer pending |
-| Memory tiers | Unit + differential | Usage counters, scoring, promotion, graduation, votes, purge, and health output match | Basic tier mutations implemented; scoring parity pending |
+| Federation | Multi-process | Multiple nodes converge under normal, duplicate, reordered, concurrent, signed, paused, and unavailable-peer cases | `federation_network.py` covers signed bidirectional batching/lifecycle; `federation_ring.py` covers three nodes, background sync, pause/recovery, concurrency, shutdown, and key-change rejection |
+| Memory tiers | Unit + differential | Usage counters, scoring, promotion, graduation, votes, purge, and health output match | Per-peer usage publication/merge implemented; scoring parity pending |
 | Semantic search | Contract + integration | Mock embedding endpoint, codec, stale detection, backfill, cosine ranking, and hybrid RRF match | Codec unit test only |
 | Consolidation | Deterministic integration | Fake LLM covers election, gating, clustering, success/failure events, and idempotency | Pending |
 | Plugins | File integration | Embedded payload hashes, install/check/force rules, target resolution, and drift reporting match | Pending |
@@ -33,6 +33,8 @@ selecting the fastest run.
 - Process-level CLI: ingest, lexical search, filtered list, sync, verify.
 - Long-lived MCP: warm-up, requests/second, median, p95, and maximum latency.
 - Resource use: binary size, idle RSS, peak RSS during ingest/search, and CPU.
+- Bounded federation soak: equal three-node mutation schedules, restart recovery,
+  exact event counts, graceful shutdown, and sampled aggregate RSS/CPU.
 - Scale: 100, 1,000, 10,000, and 100,000 traces where practical.
 - Concurrency: parallel readers, reader/writer mix, watcher activity, and
   federation replay under the race detector or equivalent stress tooling.
@@ -41,10 +43,10 @@ Any benchmark run is invalid if its corresponding correctness gate fails.
 
 ## Current decision gaps
 
-The branch is suitable for core-format and early performance comparison, but
-is not yet a release replacement. The Rust HTTP server fails closed when a
-cortex declares shared-key or TLS settings and otherwise permits loopback
-only. Production background federation scheduling, usage-signal aggregation,
-semantic backfill and ranking, full consolidation, TLS/shared-key HTTP security, plugin
-installation, watcher onboarding/healing, divergence resolution, and full TUI
-behavior still require ports and parity fixtures.
+The branch is suitable for core-format, background-federation, and early
+performance comparison, but is not yet a release replacement. The Rust HTTP
+server fails closed when a cortex declares shared-key or TLS settings and
+otherwise permits loopback only. Semantic backfill and ranking, full
+consolidation/election behavior, TLS/shared-key HTTP security, safe signing-key
+rotation recovery, plugin installation, watcher onboarding/healing, divergence
+resolution, and full TUI behavior still require ports and parity fixtures.

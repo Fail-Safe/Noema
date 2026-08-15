@@ -638,9 +638,7 @@ async fn federation_command(cx: &mut Cortex, command: FederationCommand) -> Resu
         FederationCommand::Status | FederationCommand::Peers => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(
-                    &serde_json::json!({"federation":cx.manifest.federation,"vclock":cx.get_clock()?})
-                )?
+                serde_json::to_string_pretty(&crate::federation::status(cx)?)?
             );
         }
         FederationCommand::AddPeer { name, endpoint } => {

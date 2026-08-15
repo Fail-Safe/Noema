@@ -13,6 +13,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     VERSION,
@@ -260,6 +261,7 @@ impl NoemaServer {
                 },
             )
             .map_err(mcp_error)?;
+        cx.bump_search_hits(&rows);
         Ok(json_text(
             json!({"mode":if p.mode.is_empty(){"lexical"}else{&p.mode},"results":rows}),
         ))
@@ -289,6 +291,7 @@ impl NoemaServer {
             .map_err(mcp_error)?;
         rows.retain(|row| row.id != p.trace_id);
         rows.truncate(p.limit.unwrap_or(10));
+        cx.bump_search_hits(&rows);
         Ok(json_text(
             json!({"mode":p.mode.unwrap_or_else(||"lexical".into()),"results":rows}),
         ))
@@ -498,27 +501,64 @@ impl NoemaServer {
         &self,
         Parameters(p): Parameters<SinceParam>,
     ) -> Result<String, ErrorData> {
+        let cx = self.open().await?;
+        if cx
+            .manifest
+            .federation
+            .as_ref()
+            .is_some_and(|federation| federation.mode == "subscribe")
+        {
+            return Err(ErrorData::invalid_params(
+                "this cortex is in subscribe mode and does not serve events",
+                None,
+            ));
+        }
+        let limit = p.limit.unwrap_or(100);
+        let limit = if (1..=1000).contains(&limit) {
+            limit
+        } else {
+            100
+        };
         serde_json::to_string(
-            &self
-                .open()
-                .await?
-                .events_since(
-                    p.since.as_deref().unwrap_or(""),
-                    p.limit.unwrap_or(100).min(1000),
-                )
+            &cx.events_since(p.since.as_deref().unwrap_or(""), limit)
                 .map_err(mcp_error)?,
         )
         .map_err(mcp_error)
     }
     #[tool(description = "Return per-peer usage deltas")]
-    async fn sync_read_signal(&self, _: Parameters<SinceParam>) -> String {
-        "[]".into()
+    async fn sync_read_signal(
+        &self,
+        Parameters(p): Parameters<SinceParam>,
+    ) -> Result<String, ErrorData> {
+        let cx = self.open().await?;
+        if cx
+            .manifest
+            .federation
+            .as_ref()
+            .is_some_and(|federation| federation.mode == "subscribe")
+        {
+            return Err(ErrorData::invalid_params(
+                "this cortex is in subscribe mode and does not serve read signal",
+                None,
+            ));
+        }
+        let limit = p.limit.unwrap_or(100);
+        let limit = if (1..=1000).contains(&limit) {
+            limit
+        } else {
+            100
+        };
+        serde_json::to_string(
+            &cx.local_usage_since(p.since.as_deref().unwrap_or(""), limit)
+                .map_err(mcp_error)?,
+        )
+        .map_err(mcp_error)
     }
     #[tool(description = "Show federation configuration and vector clock")]
     async fn federation_status(&self, _: Parameters<Empty>) -> Result<String, ErrorData> {
         let cx = self.open().await?;
         Ok(json_text(
-            json!({"mode":cx.manifest.federation.as_ref().map(|f|f.mode.clone()).unwrap_or_else(||"sync".into()),"peers":cx.manifest.federation.as_ref().map(|f|f.peers.clone()).unwrap_or_default(),"vclock":cx.get_clock().map_err(mcp_error)?}),
+            crate::federation::status(&cx).map_err(mcp_error)?,
         ))
     }
     #[tool(description = "Accept a peer announcement")]
@@ -541,16 +581,43 @@ impl NoemaServer {
 }
 
 pub async fn serve_stdio(name: String, path: PathBuf) -> Result<()> {
-    NoemaServer::new(name, path)?
+    let server = NoemaServer::new(&name, &path)?;
+    let federation = server
+        .cortex
+        .lock()
+        .await
+        .manifest
+        .federation
+        .clone()
+        .unwrap_or_default();
+    let cancellation = CancellationToken::new();
+    let scheduler = crate::federation::FederationScheduler::start(
+        name,
+        path,
+        federation,
+        cancellation.clone(),
+    )?;
+    let result = server
         .serve(rmcp::transport::stdio())
         .await?
         .waiting()
-        .await?;
+        .await;
+    cancellation.cancel();
+    scheduler.stop().await;
+    result?;
     Ok(())
 }
 
 pub async fn serve_http(name: String, path: PathBuf, host: String, port: u16) -> Result<()> {
-    let server = NoemaServer::new(name, path)?;
+    let server = NoemaServer::new(&name, &path)?;
+    let federation = server
+        .cortex
+        .lock()
+        .await
+        .manifest
+        .federation
+        .clone()
+        .unwrap_or_default();
     let service: StreamableHttpService<NoemaServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(server.clone()),
@@ -564,13 +631,42 @@ pub async fn serve_http(name: String, path: PathBuf, host: String, port: u16) ->
         );
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
     let address = listener.local_addr()?;
+    let cancellation = CancellationToken::new();
+    let scheduler = crate::federation::FederationScheduler::start(
+        name,
+        path,
+        federation,
+        cancellation.clone(),
+    )?;
+    let signal_cancellation = cancellation.clone();
+    let signal_task = tokio::spawn(async move {
+        shutdown_signal().await;
+        signal_cancellation.cancel();
+    });
     eprintln!("Noema MCP listening on http://{address}/mcp");
-    axum::serve(listener, axum::Router::new().nest_service("/mcp", service))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    let result = axum::serve(listener, axum::Router::new().nest_service("/mcp", service))
+        .with_graceful_shutdown(cancellation.clone().cancelled_owned())
+        .await;
+    cancellation.cancel();
+    scheduler.stop().await;
+    signal_task.abort();
+    result?;
     Ok(())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = terminate.recv() => {},
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn csv(value: &str) -> Vec<String> {

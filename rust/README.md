@@ -22,4 +22,6 @@ root:
 ```sh
 make compare-rust
 make benchmark-rust
+make benchmark-mcp-rust
+make soak-rust
 ```

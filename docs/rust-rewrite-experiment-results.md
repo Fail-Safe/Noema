@@ -31,8 +31,9 @@ steady-state throughput win has been established.
 
 ## Signed federation and mixed-process sync
 
-The Rust cortex now has direct replay plus a one-shot Streamable HTTP peer pull.
-The unit and mixed-process tests cover:
+The Rust cortex now has direct replay, a one-shot Streamable HTTP peer pull, and
+a cancellable background scheduler with per-peer exponential backoff. The unit
+and mixed-process tests cover:
 
 - Ed25519 verification before any state mutation;
 - trust-on-first-use key pinning under the Go-compatible `cortexkey:<id>` key;
@@ -47,7 +48,12 @@ The unit and mixed-process tests cover:
 - tampered signed-payload rejection; and
 - foreign source-lock enforcement;
 - metadata, archive/unarchive, trash/recover, tier, vote, and purge replay; and
-- signed Go-to-Rust and Rust-to-Go convergence under `verify: enforce`.
+- signed Go-to-Rust and Rust-to-Go convergence under `verify: enforce`;
+- independent per-peer usage cursors and monotonic `MAX` counter merges;
+- three-node background convergence with transitive duplicate delivery;
+- live pause/resume, outage classification and recovery, and graceful SIGTERM;
+- concurrent edits across two disconnected replicas; and
+- fail-closed signing-key rotation with event cursors left unchanged.
 
 The network experiment found two interoperability defects that in-process tests
 did not expose. Rust's first identity response did not use Go's `version` and
@@ -57,18 +63,42 @@ those bytes and invalidated an otherwise correct signature. The Rust build now
 preserves insertion order, omits fields exactly like Go's event snapshot, emits
 compact federation JSON, and has a Go-side signed Rust wire fixture.
 
+The three-node test found another wire edge: Go serializes an empty nil event
+slice as `null`, while the original Rust client accepted only `[]`. Rust now
+normalizes either form to an empty batch. The same tolerance applies to empty
+usage-signal results.
+
+## Bounded federation soak
+
+Equivalent homogeneous three-node clusters ran 80 paced create mutations over
+eight seconds, with one node gracefully restarted halfway through. Both builds
+converged to exactly 80 unique event rows per node and shut down gracefully.
+
+| Metric (three-server aggregate) | Go | Rust | Rust/Go |
+| --- | ---: | ---: | ---: |
+| Wall time | 9.586 s | 9.112 s | 0.950 |
+| Peak sampled RSS | 90.266 MiB | 56.469 MiB | 0.626 |
+| Median sampled RSS | 86.594 MiB | 56.172 MiB | 0.649 |
+| Mean sampled CPU | 7.913% | 6.429% | 0.812 |
+| Peak sampled CPU | 12.7% | 9.1% | 0.717 |
+
+This is a short local soak, not a stability claim. It does establish that the
+Rust scheduler retained its earlier memory advantage under active replication
+and recovery rather than only under a single-process search benchmark.
+
 This remains a complexity probe, not complete federation parity. The Rust path
-is an explicit one-shot pull rather than the production background scheduler.
-It does not yet sync usage signals, populate structured peer health/backoff,
-support shared-key auth or custom CAs, cover every consolidation/purge action,
-exercise multi-peer gossip/key rotation, or provide crash-atomic file rollback.
+does not yet support shared-key auth or custom CAs, dynamically add new workers
+without restart, recover an intentionally rotated signing key through a safe
+operator workflow, or provide crash-atomic file rollback. Federation-aware
+consolidation and election behavior also remain unported.
 
 ## Current interpretation
 
 The additional work further weakens the case for stopping immediately: Rust can
 interoperate with the Go federation wire protocol in both directions, express
 the critical signing/vector-clock rules cleanly, use materially less memory,
-and remain competitive for smaller cortexes. It still does not justify an
-all-in rewrite because larger-result throughput is not better and production
-background sync, usage aggregation, security transports, consolidation,
-semantic search, plugins, and operator behavior remain unported.
+remain competitive for smaller cortexes, and now sustain lower measured RSS and
+CPU during a short replicated workload. It still does not justify an all-in
+rewrite because larger-result throughput is not better and security transports,
+consolidation, semantic search, plugins, watcher parity, and operator recovery
+behavior remain unported.

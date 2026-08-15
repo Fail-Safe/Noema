@@ -385,6 +385,25 @@ impl Cortex {
         self.query_rows(&sql, values)
     }
 
+    pub fn bump_search_hits(&self, rows: &[Row]) {
+        for row in rows.iter().take(3).filter(|row| row.tier != "long") {
+            let now = trace::now_rfc3339();
+            if let Err(error) = self.connection.execute(
+                "INSERT INTO trace_usage(trace_id,peer_cortex_id,read_count,modify_count,search_hit_count,last_read_at,updated_at)
+                 VALUES (?1,?2,0,0,1,NULL,?3)
+                 ON CONFLICT(trace_id,peer_cortex_id) DO UPDATE SET
+                   search_hit_count=search_hit_count+1,
+                   updated_at=excluded.updated_at",
+                params![row.id, self.id, now],
+            ) {
+                eprintln!(
+                    "search-hit instrumentation warning for trace {}: {error}",
+                    row.id
+                );
+            }
+        }
+    }
+
     fn query_rows(&self, sql: &str, values: Vec<Value>) -> Result<Vec<Row>> {
         let mut statement = self.connection.prepare(sql)?;
         let mapped = statement.query_map(params_from_iter(values), scan_row)?;
@@ -1103,6 +1122,78 @@ impl Cortex {
         Ok(value
             .and_then(|value| serde_json::from_str(&value).ok())
             .unwrap_or_default())
+    }
+
+    pub fn local_usage_since(
+        &self,
+        since: &str,
+        limit: usize,
+    ) -> Result<Vec<federation::TraceUsage>> {
+        let mut statement = self.connection.prepare(
+            "SELECT trace_id,peer_cortex_id,read_count,modify_count,search_hit_count,last_read_at,updated_at
+             FROM trace_usage
+             WHERE peer_cortex_id=?1 AND updated_at>?2
+             ORDER BY updated_at ASC
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![self.id, since, limit.max(1) as i64], |row| {
+            Ok(federation::TraceUsage {
+                trace_id: row.get(0)?,
+                peer_cortex_id: row.get(1)?,
+                read_count: row.get(2)?,
+                modify_count: row.get(3)?,
+                search_hit_count: row.get(4)?,
+                last_read_at: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                updated_at: row.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn merge_remote_usage(&self, rows: &[federation::TraceUsage]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for row in rows {
+            if !trace::is_valid_id(&row.trace_id)
+                || row.peer_cortex_id.is_empty()
+                || row.updated_at.is_empty()
+                || row.read_count < 0
+                || row.modify_count < 0
+                || row.search_hit_count < 0
+            {
+                bail!("invalid remote usage row for trace {:?}", row.trace_id);
+            }
+        }
+        let tx = self.connection.unchecked_transaction()?;
+        {
+            let mut statement = tx.prepare(
+                "INSERT INTO trace_usage(trace_id,peer_cortex_id,read_count,modify_count,search_hit_count,last_read_at,updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)
+                 ON CONFLICT(trace_id,peer_cortex_id) DO UPDATE SET
+                   read_count=MAX(read_count,excluded.read_count),
+                   modify_count=MAX(modify_count,excluded.modify_count),
+                   search_hit_count=MAX(search_hit_count,excluded.search_hit_count),
+                   last_read_at=MAX(COALESCE(last_read_at,''),COALESCE(excluded.last_read_at,'')),
+                   updated_at=MAX(updated_at,excluded.updated_at)",
+            )?;
+            for row in rows {
+                if row.peer_cortex_id == self.id {
+                    continue;
+                }
+                statement.execute(params![
+                    row.trace_id,
+                    row.peer_cortex_id,
+                    row.read_count,
+                    row.modify_count,
+                    row.search_hit_count,
+                    nullable(&row.last_read_at),
+                    row.updated_at,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn federation_state(&self, key: &str) -> Result<String> {
@@ -1885,6 +1976,62 @@ mod tests {
                 .iter()
                 .any(|event| event.id == purge.id)
         );
+    }
+
+    #[test]
+    fn usage_rows_publish_only_local_contributions_and_merge_monotonically() {
+        let temp = tempfile::tempdir().unwrap();
+        let alpha = signed_cortex(temp.path(), "alpha");
+        let beta = signed_cortex(temp.path(), "beta");
+        let mut trace = Trace::new("Usage", "fact", "", vec![], "body");
+        alpha.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        beta.replay_event(&event_for(&alpha, &id, "create", &alpha.id))
+            .unwrap();
+
+        alpha.bump_read(&id).unwrap();
+        alpha.bump_search_hits(&[alpha.get(&id).unwrap()]);
+        trace.body = "modified".into();
+        alpha.update_trace(&id, &mut trace, true).unwrap();
+
+        let rows = alpha.local_usage_since("", 100).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].peer_cortex_id, alpha.id);
+        assert_eq!(rows[0].read_count, 1);
+        assert_eq!(rows[0].modify_count, 1);
+        assert_eq!(rows[0].search_hit_count, 1);
+        beta.merge_remote_usage(&rows).unwrap();
+
+        let counts: (i64, i64, i64) = beta
+            .connection
+            .query_row(
+                "SELECT read_count,modify_count,search_hit_count FROM trace_usage WHERE trace_id=?1 AND peer_cortex_id=?2",
+                params![id, alpha.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 1, 1));
+
+        let mut stale = rows[0].clone();
+        stale.read_count = 0;
+        stale.modify_count = 0;
+        stale.search_hit_count = 0;
+        stale.updated_at = "2099-01-01T00:00:00Z".into();
+        beta.merge_remote_usage(&[stale]).unwrap();
+        let counts: (i64, i64, i64) = beta
+            .connection
+            .query_row(
+                "SELECT read_count,modify_count,search_hit_count FROM trace_usage WHERE trace_id=?1 AND peer_cortex_id=?2",
+                params![id, alpha.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 1, 1));
+
+        beta.bump_read(&id).unwrap();
+        let beta_rows = beta.local_usage_since("", 100).unwrap();
+        assert_eq!(beta_rows.len(), 1);
+        assert_eq!(beta_rows[0].peer_cortex_id, beta.id);
     }
 
     #[test]
