@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     VERSION,
-    cortex::{AccessKey, Cortex, ListOptions, PeerEntry, write_manifest},
+    cortex::{AccessKey, Cortex, DistilledTraceSpec, ListOptions, PeerEntry, write_manifest},
     lock::CortexLock,
     trace::Trace,
 };
@@ -446,18 +446,20 @@ impl NoemaServer {
         Parameters(p): Parameters<ConsolidateParam>,
     ) -> Result<String, ErrorData> {
         let cx = self.open().await?;
-        let mut trace = Trace::new(
-            p.title,
-            "note",
-            p.author.unwrap_or_default(),
-            p.tags.map(|s| csv(&s)).unwrap_or_default(),
-            p.body,
-        );
-        trace.frontmatter.tier = "mid".into();
-        trace.frontmatter.derived_from = csv(&p.source_ids);
-        cx.add(&mut trace).map_err(mcp_error)?;
+        let id = cx
+            .create_distilled_trace(DistilledTraceSpec {
+                title: p.title,
+                body: p.body,
+                tags: p.tags.map(|s| csv(&s)).unwrap_or_default(),
+                author: p.author.unwrap_or_default(),
+                source_ids: csv(&p.source_ids),
+                model_name: p.model_name.clone().unwrap_or_default(),
+                model_tier_profile: p.model_tier_profile.clone().unwrap_or_default(),
+                cohesion_confidence: p.cohesion_confidence.unwrap_or_default(),
+            })
+            .map_err(mcp_error)?;
         Ok(json_text(
-            json!({"distilled_id":trace.frontmatter.id,"model_name":p.model_name,"model_tier_profile":p.model_tier_profile,"cohesion_confidence":p.cohesion_confidence}),
+            json!({"distilled_id":id,"model_name":p.model_name,"model_tier_profile":p.model_tier_profile,"cohesion_confidence":p.cohesion_confidence}),
         ))
     }
     #[tool(description = "Append content to an existing trace")]

@@ -18,7 +18,7 @@ integrity, or security requirements.
 | Federation | Multi-process | Multiple nodes converge under normal, duplicate, reordered, concurrent, signed, paused, and unavailable-peer cases | `federation_network.py` covers signed bidirectional batching/lifecycle; `federation_ring.py` covers three nodes, background sync, pause/recovery, concurrency, shutdown, and key-rotation recovery; `federation_tls.py` covers authenticated mixed-runtime TLS |
 | Memory tiers | Unit + differential | Usage counters, scoring, promotion, graduation, votes, purge, and health output match | Per-peer usage publication/merge, short-to-mid scoring/promotion, and strict mid-to-long graduation automated; detailed health parity pending |
 | Semantic search | Contract + integration | Mock embedding endpoint, codec, stale detection, backfill, cosine ranking, and hybrid RRF match | Codec unit test only |
-| Consolidation | Deterministic integration | Fake LLM covers election, gating, clustering, success/failure events, and idempotency | Rank eligibility/exchange, pass-gate rechecks and failure reasons, watchdog behavior, all three cadence triggers, heuristic promotion, graduation, endpoint failover/recovery, and signed mixed-runtime coordination automated; clustering and distillation pending |
+| Consolidation | Deterministic integration | Fake LLM covers election, gating, clustering, success/failure events, and idempotency | Rank/election/watchdog/cadence, heuristic promotion, graduation, deterministic fake-endpoint clustering, distilled lineage/telemetry, malformed/offline fallback, restart idempotency, and signed bidirectional replay automated |
 | Plugins | File integration | Embedded payload hashes, install/check/force rules, target resolution, and drift reporting match | Pending |
 | TUI | State-machine + snapshot | Navigation, filters, tier actions, themes, resize, and error recovery match | Minimal smoke implementation only |
 | Fault tolerance | Fault injection | Interrupted writes, malformed Markdown, corrupt DB, unavailable endpoints, and lock contention fail safely | Background-lock single-owner/reacquisition unit coverage; broader fault injection pending |
@@ -47,7 +47,7 @@ The branch is suitable for core-format, background-federation, and early
 performance comparison, but is not yet a release replacement. The Rust HTTP
 server serves shared-key-authenticated HTTPS, refuses authenticated plaintext,
 and otherwise permits unauthenticated HTTP only on loopback. Semantic backfill
-and ranking, consolidation clustering/distillation,
+and ranking, real-model distillation quality/resource evaluation,
 certificate-expiry monitoring, plugin installation, watcher onboarding/healing,
 divergence resolution, and full TUI behavior still require ports and parity
 fixtures.

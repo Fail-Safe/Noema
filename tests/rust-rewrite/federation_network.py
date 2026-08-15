@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import socket
@@ -87,6 +88,88 @@ def add_trace(
     return completed.stdout.strip().rsplit(": ", 1)[-1]
 
 
+def record_distillation(
+    binary: Path, env: dict[str, str], cortex: str, source_ids: list[str]
+) -> str:
+    messages = [
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "federation-test", "version": "1"},
+            },
+        },
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "record_consolidation_result",
+                "arguments": {
+                    "title": "Federated distillation",
+                    "body": "A deterministic distilled body shared across runtimes.",
+                    "source_ids": ",".join(source_ids),
+                    "tags": "federation-test,distilled",
+                    "model_name": "fixture-model",
+                    "model_tier_profile": "frontier",
+                    "cohesion_confidence": 0.9,
+                },
+            },
+        },
+    ]
+    completed = subprocess.run(
+        [
+            str(binary),
+            "--cortex",
+            cortex,
+            "serve",
+            "--transport",
+            "stdio",
+        ],
+        env=env,
+        input="".join(json.dumps(message) + "\n" for message in messages),
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    responses = [json.loads(line) for line in completed.stdout.splitlines() if line]
+    response = next(item for item in responses if item.get("id") == 2)
+    if "error" in response or response.get("result", {}).get("isError"):
+        raise RuntimeError(f"record_consolidation_result failed: {response}")
+    text = response["result"]["content"][0]["text"]
+    if text.startswith("Distilled trace created: "):
+        return text.removeprefix("Distilled trace created: ").split(" ", 1)[0]
+    return str(json.loads(text)["distilled_id"])
+
+
+def assert_distillation_replayed(
+    database: Path, distilled_id: str, source_ids: list[str]
+) -> None:
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT tier FROM traces WHERE id=?", (distilled_id,)
+        ).fetchone()
+        assert row == ("mid",)
+        lineage = {
+            str(item[0])
+            for item in connection.execute(
+                "SELECT derived_from FROM trace_lineage WHERE trace_id=?",
+                (distilled_id,),
+            )
+        }
+        assert lineage == set(source_ids)
+        count = connection.execute(
+            "SELECT count(*) FROM events WHERE trace_id=? AND action='consolidate'",
+            (distilled_id,),
+        ).fetchone()
+        assert count == (1,)
+
+
 def set_go_federation_policy(path: Path) -> None:
     source = path.read_text()
     marker = "federation:\n"
@@ -157,6 +240,23 @@ def rust_pulls_go(go: Path, rust: Path, root: Path) -> None:
         assert "205 event(s)" in synced.stdout
         assert "3 batch(es)" in synced.stdout
 
+        distilled_sources = [
+            add_trace(go, env, "go-source", f"distill-source-{index}", f"source {index}")
+            for index in range(2)
+        ]
+        distilled_id = record_distillation(
+            go, env, "go-source", distilled_sources
+        )
+        distilled_sync = run(
+            rust, env, "--cortex", "rust-target", "federation", "sync", "go-source"
+        )
+        assert "4 event(s)" in distilled_sync.stdout
+        assert_distillation_replayed(
+            cortexes / "rust-target" / "db" / "noema.db",
+            distilled_id,
+            distilled_sources,
+        )
+
         run(go, env, "--cortex", "go-source", "archive", batch_ids[0])
         run(
             go, env, "--cortex", "go-source", "memory", "promote",
@@ -218,6 +318,13 @@ def go_pulls_rust(go: Path, rust: Path, root: Path) -> None:
     trace_id = add_trace(
         rust, env, "rust-source", "rust-to-go", "signed Rust event accepted by Go"
     )
+    distilled_sources = [
+        add_trace(rust, env, "rust-source", f"rust-distill-{index}", f"source {index}")
+        for index in range(2)
+    ]
+    distilled_id = record_distillation(
+        rust, env, "rust-source", distilled_sources
+    )
     source_port = free_port()
     target_port = free_port()
     run(
@@ -231,6 +338,18 @@ def go_pulls_rust(go: Path, rust: Path, root: Path) -> None:
         target = start_server(go, env, "go-target", target_port, rust=False)
         wait_for_trace(
             go, env, "go-target", trace_id, "signed Rust event accepted by Go"
+        )
+        wait_for_trace(
+            go,
+            env,
+            "go-target",
+            distilled_id,
+            "A deterministic distilled body shared across runtimes.",
+        )
+        assert_distillation_replayed(
+            cortexes / "go-target" / "db" / "noema.db",
+            distilled_id,
+            distilled_sources,
         )
     finally:
         stop_server(target)

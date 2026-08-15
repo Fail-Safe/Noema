@@ -79,7 +79,15 @@ pub struct ConsolidationConfig {
     #[serde(default)]
     pub llm_enabled: bool,
     #[serde(default)]
+    pub auto_distillation_enabled: bool,
+    #[serde(default)]
+    pub model_tier: String,
+    #[serde(default)]
     pub local_llm_endpoint: String,
+    #[serde(default)]
+    pub model_name: String,
+    #[serde(default)]
+    pub api_key_env: String,
     #[serde(default)]
     pub watchdog_timeout: String,
     #[serde(default)]
@@ -89,6 +97,14 @@ pub struct ConsolidationConfig {
 impl ConsolidationConfig {
     pub fn has_trigger(&self) -> bool {
         !self.cron.is_empty() || self.idle_minutes != 0 || self.threshold_short != 0
+    }
+
+    pub fn effective_model_tier(&self) -> &str {
+        if self.model_tier.is_empty() {
+            "large"
+        } else {
+            &self.model_tier
+        }
     }
 }
 
@@ -133,12 +149,35 @@ impl GraduationConfig {
 
 impl Manifest {
     pub fn consolidation_config(&self) -> Result<Option<ConsolidationConfig>> {
-        self.consolidation
+        let config = self
+            .consolidation
             .as_ref()
             .map(|value| {
-                serde_yaml::from_value(value.clone()).context("parsing consolidation configuration")
+                serde_yaml::from_value::<ConsolidationConfig>(value.clone())
+                    .context("parsing consolidation configuration")
             })
-            .transpose()
+            .transpose()?;
+        if let Some(config) = &config
+            && config.enabled
+            && config.auto_distillation_enabled
+        {
+            if !config.llm_enabled {
+                bail!(
+                    "consolidation.auto_distillation_enabled requires consolidation.llm_enabled: true"
+                );
+            }
+            if config.local_llm_endpoint.is_empty() {
+                bail!(
+                    "consolidation.auto_distillation_enabled requires consolidation.local_llm_endpoint to be set"
+                );
+            }
+            if config.model_name.is_empty() {
+                bail!(
+                    "consolidation.auto_distillation_enabled requires consolidation.model_name to be set"
+                );
+            }
+        }
+        Ok(config)
     }
 }
 
@@ -327,6 +366,18 @@ pub struct PromotionCandidate {
     pub derived_from_count: i64,
     pub source_count: i64,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DistilledTraceSpec {
+    pub title: String,
+    pub body: String,
+    pub tags: Vec<String>,
+    pub author: String,
+    pub source_ids: Vec<String>,
+    pub model_name: String,
+    pub model_tier_profile: String,
+    pub cohesion_confidence: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -647,6 +698,113 @@ impl Cortex {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn llm_candidates(&self, window: std::time::Duration) -> Result<Vec<PromotionCandidate>> {
+        let window = chrono::Duration::from_std(window).context("LLM window is too large")?;
+        let cutoff = (Utc::now() - window).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let mut statement = self.connection.prepare(
+            "SELECT
+                t.id,
+                t.tier,
+                t.type,
+                COALESCE(u.total_reads, 0),
+                COALESCE(u.total_modifies, 0),
+                COALESCE(u.total_search_hits, 0),
+                t.tier_votes,
+                COALESCE(v.n, 0),
+                COALESCE(s.n, 0),
+                t.created_at
+             FROM traces t
+             LEFT JOIN (
+                SELECT trace_id,
+                       SUM(read_count) AS total_reads,
+                       SUM(modify_count) AS total_modifies,
+                       SUM(search_hit_count) AS total_search_hits
+                FROM trace_usage
+                GROUP BY trace_id
+             ) u ON u.trace_id=t.id
+             LEFT JOIN v_derived_from_count v ON v.trace_id=t.id
+             LEFT JOIN (
+                SELECT trace_id, COUNT(*) AS n
+                FROM trace_lineage
+                GROUP BY trace_id
+             ) s ON s.trace_id=t.id
+             WHERE t.tier='short'
+               AND t.archived_at IS NULL
+               AND t.trashed_at IS NULL
+               AND t.purged_at IS NULL
+               AND t.created_at>=?1
+               AND t.id!=''
+               AND t.id NOT IN (
+                   SELECT je.value
+                   FROM events e, json_each(json_extract(e.data, '$.source_ids')) je
+                   WHERE e.action='consolidate'
+               )
+             ORDER BY t.created_at DESC",
+        )?;
+        let rows = statement.query_map([cutoff], |row| {
+            Ok(PromotionCandidate {
+                id: row.get(0)?,
+                tier: row.get(1)?,
+                trace_type: row.get(2)?,
+                read_count: row.get(3)?,
+                modify_count: row.get(4)?,
+                search_hit_count: row.get(5)?,
+                tier_votes: row.get(6)?,
+                derived_from_count: row.get(7)?,
+                source_count: row.get(8)?,
+                created_at: row.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn create_distilled_trace(&self, spec: DistilledTraceSpec) -> Result<String> {
+        if spec.title.is_empty() {
+            bail!("distilled trace: title is required");
+        }
+        if spec.body.is_empty() {
+            bail!("distilled trace: body is required");
+        }
+        if spec.source_ids.len() < 2 {
+            bail!("distilled trace requires >= 2 source IDs");
+        }
+        for id in &spec.source_ids {
+            self.get(id)
+                .with_context(|| format!("source trace not found: {id}"))?;
+        }
+
+        let mut trace = Trace::new(spec.title, "observation", spec.author, spec.tags, spec.body);
+        trace.frontmatter.tier = "mid".into();
+        trace.frontmatter.derived_from = spec.source_ids.clone();
+        self.add(&mut trace)?;
+
+        let mut data = serde_json::Map::new();
+        data.insert("source_ids".into(), json!(spec.source_ids));
+        data.insert("distilled_id".into(), json!(trace.frontmatter.id));
+        if !spec.model_name.is_empty() {
+            data.insert("model_name".into(), json!(spec.model_name));
+        }
+        if !spec.model_tier_profile.is_empty() {
+            data.insert("model_tier_profile".into(), json!(spec.model_tier_profile));
+        }
+        if spec.cohesion_confidence != 0.0 {
+            data.insert(
+                "cohesion_confidence".into(),
+                json!(spec.cohesion_confidence),
+            );
+        }
+        let tx = self.connection.unchecked_transaction()?;
+        self.emit_event(
+            &tx,
+            "consolidate",
+            &trace.frontmatter.id,
+            &trace::now_rfc3339(),
+            serde_json::Value::Object(data),
+        )?;
+        tx.commit()?;
+        Ok(trace.frontmatter.id)
     }
 
     pub fn graduation_candidates(
@@ -1038,6 +1196,7 @@ impl Cortex {
             "tag_update" => self.replay_tag_update(event),
             "archive" | "unarchive" | "trash" | "recover" => self.replay_visibility(event),
             "promote" | "demote" => self.replay_tier_change(event),
+            "consolidate" => self.replay_consolidate(event),
             "vote" => self.replay_vote(event),
             "purge" => self.replay_purge(event),
             action => bail!("federation experiment does not replay action {action:?}"),
@@ -1242,6 +1401,35 @@ impl Cortex {
         Ok(())
     }
 
+    fn replay_consolidate(&self, event: &Event) -> Result<()> {
+        #[derive(Default, Deserialize)]
+        struct ConsolidateData {
+            #[serde(default)]
+            distilled_id: String,
+        }
+        let data: ConsolidateData = serde_json::from_value(event.data.clone()).unwrap_or_default();
+        let id = if data.distilled_id.is_empty() {
+            &event.trace_id
+        } else {
+            &data.distilled_id
+        };
+        let Ok(row) = self.get(id) else {
+            return self.store_remote_event(event);
+        };
+        if row.tier != "short" {
+            return self.store_remote_event(event);
+        }
+        let mut trace = Trace::parse_file(&self.file_path(&row))?;
+        trace.frontmatter.tier = "mid".into();
+        trace.frontmatter.updated = row.updated_at.clone();
+        trace.write_preserving_updated(&self.file_path(&row))?;
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute("UPDATE traces SET tier='mid' WHERE id=?1", [id])?;
+        self.store_remote_event_tx(&tx, event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn replay_vote(&self, event: &Event) -> Result<()> {
         #[derive(Deserialize)]
         struct VoteData {
@@ -1278,11 +1466,31 @@ impl Cortex {
         if !data.content_hash.is_empty() && data.content_hash != content_hash {
             bail!("content hash mismatch in remote event {}", event.id);
         }
-        let tier = existing
+        let mut tier = existing
             .as_ref()
             .map(|row| row.tier.clone())
             .or_else(|| (!data.tier.is_empty()).then(|| data.tier.clone()))
             .unwrap_or_else(|| "short".into());
+        if existing.is_none() {
+            for pending in self
+                .history(&event.trace_id)?
+                .into_iter()
+                .filter(|pending| pending.id > event.id)
+            {
+                match pending.action.as_str() {
+                    "consolidate" if tier == "short" => tier = "mid".into(),
+                    "promote" | "demote" => {
+                        if let Some(target) =
+                            pending.data.get("to").and_then(|value| value.as_str())
+                            && matches!(target, "short" | "mid" | "long")
+                        {
+                            tier = target.into();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         let created = existing
             .as_ref()
             .map(|row| row.created_at.clone())
@@ -2165,6 +2373,137 @@ mod tests {
         Cortex::create("test", temp.path()).unwrap();
         let cx = Cortex::open("test", temp.path().join("test")).unwrap();
         (temp, cx)
+    }
+
+    #[test]
+    fn distilled_trace_preserves_sources_lineage_and_telemetry() {
+        let (_temp, cx) = cortex();
+        let mut first = Trace::new("source one", "note", "", vec![], "first body");
+        let mut second = Trace::new("source two", "note", "", vec![], "second body");
+        cx.add(&mut first).unwrap();
+        cx.add(&mut second).unwrap();
+
+        let id = cx
+            .create_distilled_trace(DistilledTraceSpec {
+                title: "Distilled".into(),
+                body: "Combined body".into(),
+                tags: vec!["memory".into()],
+                source_ids: vec![first.frontmatter.id.clone(), second.frontmatter.id.clone()],
+                model_name: "fixture-model".into(),
+                model_tier_profile: "frontier".into(),
+                cohesion_confidence: 0.85,
+                ..DistilledTraceSpec::default()
+            })
+            .unwrap();
+
+        let row = cx.get(&id).unwrap();
+        assert_eq!(row.tier, "mid");
+        assert_eq!(row.derived_from.len(), 2);
+        assert_eq!(cx.get(&first.frontmatter.id).unwrap().tier, "short");
+        assert_eq!(cx.get(&second.frontmatter.id).unwrap().tier, "short");
+        let history = cx.history(&id).unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|event| event.action.as_str())
+                .collect::<Vec<_>>(),
+            vec!["create", "consolidate"]
+        );
+        assert_eq!(history[1].data["model_name"], "fixture-model");
+        assert_eq!(history[1].data["cohesion_confidence"], 0.85);
+
+        let candidates = cx
+            .llm_candidates(Duration::hours(24).to_std().unwrap())
+            .unwrap();
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn consolidate_replay_is_telemetry_only_for_materialized_mid_trace() {
+        let (_temp, cx) = cortex();
+        let id = "20260815-distilled-replay";
+        let mut trace = Trace::new("Distilled replay", "observation", "", vec![], "body");
+        trace.frontmatter.id = id.into();
+        trace.frontmatter.tier = "mid".into();
+        cx.add(&mut trace).unwrap();
+        let event = Event::new(
+            "consolidate",
+            id,
+            "01REMOTE",
+            "peer",
+            json!({"distilled_id":id,"source_ids":["20260815-source-a","20260815-source-b"]}),
+            BTreeMap::new(),
+        );
+        cx.replay_event(&event).unwrap();
+        cx.replay_event(&event).unwrap();
+        assert_eq!(cx.get(id).unwrap().tier, "mid");
+        assert_eq!(
+            cx.history(id)
+                .unwrap()
+                .into_iter()
+                .filter(|item| item.action == "consolidate")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn create_replay_folds_a_consolidation_that_arrived_first() {
+        let (_temp, cx) = cortex();
+        let id = "20260815-pending-consolidation";
+        let mut snapshot = Trace::new("Pending", "observation", "", vec![], "body");
+        snapshot.frontmatter.id = id.into();
+        let mut data = trace_snapshot(&snapshot);
+        data.as_object_mut().unwrap().remove("tier");
+
+        let mut create = Event::new("create", id, "01REMOTE", "peer", data, BTreeMap::new());
+        create.id = "01JR0000000000000000000001".into();
+        let mut consolidate = Event::new(
+            "consolidate",
+            id,
+            "01REMOTE",
+            "peer",
+            json!({"distilled_id":id}),
+            BTreeMap::new(),
+        );
+        consolidate.id = "01JR0000000000000000000002".into();
+
+        cx.replay_event(&consolidate).unwrap();
+        cx.replay_event(&create).unwrap();
+        assert_eq!(cx.get(id).unwrap().tier, "mid");
+        assert_eq!(cx.history(id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn auto_distillation_configuration_requires_the_llm_fields() {
+        let valid: serde_yaml::Value = serde_yaml::from_str(
+            "enabled: true\nauto_distillation_enabled: true\nllm_enabled: true\nlocal_llm_endpoint: http://127.0.0.1:9000/v1\nmodel_name: fixture\n",
+        )
+        .unwrap();
+        let manifest = Manifest {
+            consolidation: Some(valid),
+            ..Manifest::default()
+        };
+        assert_eq!(
+            manifest
+                .consolidation_config()
+                .unwrap()
+                .unwrap()
+                .effective_model_tier(),
+            "large"
+        );
+
+        for source in [
+            "enabled: true\nauto_distillation_enabled: true\nlocal_llm_endpoint: x\nmodel_name: m\n",
+            "enabled: true\nauto_distillation_enabled: true\nllm_enabled: true\nmodel_name: m\n",
+            "enabled: true\nauto_distillation_enabled: true\nllm_enabled: true\nlocal_llm_endpoint: x\n",
+        ] {
+            let manifest = Manifest {
+                consolidation: Some(serde_yaml::from_str(source).unwrap()),
+                ..Manifest::default()
+            };
+            assert!(manifest.consolidation_config().is_err());
+        }
     }
 
     #[test]

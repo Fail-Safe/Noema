@@ -2,6 +2,7 @@
 
 mod cadence;
 mod coordination;
+mod distillation;
 mod graduation;
 mod heuristic;
 
@@ -10,6 +11,7 @@ pub use coordination::{
     FailReason, GateResult, GateState, InFlightRegistry, PassGate, WatchdogScheduler,
     sweep_watchdog,
 };
+pub use distillation::{DistillationConfig, DistillationResult, run_distillation_pass};
 pub use graduation::{GraduationPassConfig, run_graduation_pass, should_graduate};
 pub use heuristic::{HeuristicConfig, PassResult, run_heuristic_pass, score_candidate};
 

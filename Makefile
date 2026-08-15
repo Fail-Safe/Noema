@@ -117,6 +117,9 @@ compare-rust: build rust-build
 	python3 ./tests/rust-rewrite/tier_maintenance.py \
 		--go "$(CURDIR)/noema" \
 		--rust "$(CURDIR)/rust/target/debug/noema-rs"
+	python3 ./tests/rust-rewrite/llm_distillation.py \
+		--go "$(CURDIR)/noema" \
+		--rust "$(CURDIR)/rust/target/debug/noema-rs"
 
 benchmark-rust: comparison-release
 	./tests/rust-rewrite/benchmark.sh

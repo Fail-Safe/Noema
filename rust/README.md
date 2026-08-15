@@ -29,8 +29,12 @@ identity handshake, persists peer ranks, and reports the quiet-period election
 winner through `federation status`. Signed consolidation coordination events are
 wire-compatible with Go. A reusable pass gate implements claim, quiet-period
 recheck, preemption, in-flight tracking, and terminal events; live servers also
-close stale claims with a federation-aware watchdog. The gate is not scheduled
-until Rust has a real promotion or distillation pass to run behind it.
+close stale claims with a federation-aware watchdog. Scheduled passes run
+model-driven distillation, heuristic short-to-mid promotion, and strict
+mid-to-long graduation behind that gate. Distillation supports the Go
+small/large/frontier profile shapes through an OpenAI-compatible endpoint,
+preserves source lineage, and degrades to heuristic maintenance when the
+endpoint or response is unusable.
 
 Run the cross-implementation gate and release benchmark from the repository
 root:

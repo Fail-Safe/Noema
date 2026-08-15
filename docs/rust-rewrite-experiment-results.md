@@ -136,7 +136,22 @@ A second independent Go/Rust fixture drives midnight cron and a backdated idle
 log, checking old/young, read/search, modified, downvoted, preference, and
 archived cases. It verifies exact `mid` to `long` event data, Markdown updates,
 and restart idempotency. The scenario passed five consecutive repetitions.
-Clustering and LLM distillation remain unported.
+
+Model-driven consolidation is now wired ahead of those maintenance passes. The
+Rust candidate query excludes source IDs already recorded by a prior
+`consolidate` event without promoting the sources themselves. Deterministic
+type-and-day buckets honor the small/large/frontier cluster ceilings, call an
+OpenAI-compatible endpoint with bounded retries, normalize returned tags, and
+materialize a mid-tier observation with exact `derived_from` lineage plus a
+separate telemetry event. Invalid or unreachable model responses fall back to
+the same score-gated heuristic, while cadence still reaches graduation.
+
+A controlled-endpoint fixture now compares Go and Rust success output, request
+shape, malformed-response retries, offline behavior, source-tier preservation,
+lineage, telemetry, and restart idempotency. The signed federation fixture also
+creates distilled traces through each runtime's MCP tool and proves the other
+runtime replays both the create snapshot and consolidate event exactly once.
+Actual model quality and resource consumption have not yet been measured.
 
 ## Bounded federation soak
 
@@ -160,7 +175,8 @@ This remains a complexity probe, not complete federation parity. The Rust path
 does not yet dynamically add new workers without restart, monitor certificate
 expiry, or provide crash-atomic file rollback. Its consolidation election and
 coordination wire, pass gate, watchdog recovery, full cadence, heuristic pass,
-and graduation are now present, but model-driven paths are not.
+graduation, and model-driven distillation are now present. Real-model quality
+and resource measurements remain outstanding.
 
 ## Current interpretation
 
@@ -170,5 +186,5 @@ the critical signing/vector-clock rules cleanly, use materially less memory,
 remain competitive for smaller cortexes, and now sustain lower measured RSS and
 CPU during a short replicated workload. It still does not justify an all-in
 rewrite because larger-result throughput is not better and certificate-lifecycle
-checks, consolidation clustering/distillation, semantic search, plugins, watcher
-parity, and broader operator recovery behavior remain unported.
+checks, semantic search, plugins, watcher parity, real-model distillation
+evaluation, and broader operator recovery behavior remain incomplete.

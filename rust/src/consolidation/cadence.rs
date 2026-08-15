@@ -6,8 +6,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    GraduationPassConfig, HeuristicConfig, InFlightRegistry, PassGate, run_graduation_pass,
-    run_heuristic_pass,
+    DistillationConfig, GraduationPassConfig, HeuristicConfig, InFlightRegistry, PassGate,
+    run_distillation_pass, run_graduation_pass, run_heuristic_pass,
 };
 use crate::cortex::{Cortex, read_manifest};
 
@@ -171,20 +171,41 @@ impl CadenceState {
 
 #[derive(Clone)]
 struct PipelineConfig {
+    distillation: Option<DistillationConfig>,
     heuristic: HeuristicConfig,
     graduation: Option<GraduationPassConfig>,
 }
 
-fn run_pipeline(
-    cx: &Cortex,
+async fn run_pipeline(
+    name: &str,
+    path: &std::path::Path,
     config: &PipelineConfig,
     cancellation: &CancellationToken,
 ) -> Result<()> {
-    let heuristic = run_heuristic_pass(cx, &config.heuristic, cancellation).map(|_| ());
+    if let Some(distillation) = &config.distillation {
+        let cx = Cortex::open(name, path)?;
+        match run_distillation_pass(cx, distillation, cancellation).await {
+            Ok(result) => eprintln!(
+                "consolidation auto-distillation complete considered={} attempted={} distilled={} rejected={} fallback={} skipped={}",
+                result.considered,
+                result.attempted,
+                result.distilled,
+                result.rejected,
+                result.fallback_promotions,
+                result.skipped
+            ),
+            Err(error) if cancellation.is_cancelled() => return Err(error),
+            Err(error) => eprintln!(
+                "consolidation auto-distillation skipped; continuing maintenance: {error:#}"
+            ),
+        }
+    }
+    let cx = Cortex::open(name, path)?;
+    let heuristic = run_heuristic_pass(&cx, &config.heuristic, cancellation).map(|_| ());
     let graduation = config
         .graduation
         .as_ref()
-        .map(|graduation| run_graduation_pass(cx, graduation, cancellation).map(|_| ()))
+        .map(|graduation| run_graduation_pass(&cx, graduation, cancellation).map(|_| ()))
         .unwrap_or(Ok(()));
     heuristic.and(graduation)
 }
@@ -200,14 +221,12 @@ async fn run_scheduled_pass(
     eprintln!("consolidation pass firing (trigger={trigger})");
     if let Some(gate) = gate {
         gate.run(cancellation.clone(), trigger, move |_| async move {
-            let cx = Cortex::open(name, path)?;
-            run_pipeline(&cx, &pipeline, &cancellation)
+            run_pipeline(&name, &path, &pipeline, &cancellation).await
         })
         .await
         .map(|_| ())
     } else {
-        let cx = Cortex::open(name, path)?;
-        run_pipeline(&cx, &pipeline, &cancellation)
+        run_pipeline(&name, &path, &pipeline, &cancellation).await
     }
 }
 
@@ -239,15 +258,27 @@ impl CadenceScheduler {
             .unwrap_or(Duration::from_secs(30))
             .saturating_mul(2);
         let graduation = config.graduation.clone().unwrap_or_default();
-        let pipeline = PipelineConfig {
-            heuristic: HeuristicConfig {
-                window: if config.window_hours > 0 {
-                    Duration::from_secs((config.window_hours as u64).saturating_mul(60 * 60))
-                } else {
-                    Duration::from_secs(24 * 60 * 60)
-                },
-                ..HeuristicConfig::default()
+        let heuristic = HeuristicConfig {
+            window: if config.window_hours > 0 {
+                Duration::from_secs((config.window_hours as u64).saturating_mul(60 * 60))
+            } else {
+                Duration::from_secs(24 * 60 * 60)
             },
+            ..HeuristicConfig::default()
+        };
+        let pipeline = PipelineConfig {
+            distillation: config
+                .auto_distillation_enabled
+                .then(|| DistillationConfig {
+                    window: heuristic.window,
+                    model_tier: config.effective_model_tier().into(),
+                    model_name: config.model_name.clone(),
+                    endpoint: config.local_llm_endpoint.clone(),
+                    api_key_env: config.api_key_env.clone(),
+                    max_retries: 1,
+                    heuristic: heuristic.clone(),
+                }),
+            heuristic,
             graduation: graduation
                 .effective_enabled()
                 .then(|| GraduationPassConfig {

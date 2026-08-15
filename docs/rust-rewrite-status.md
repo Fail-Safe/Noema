@@ -5,8 +5,8 @@ Updated: 2026-08-15
 ## Pause point
 
 - Branch: `experiment/rust-rewrite`
-- Latest completed milestone: `feat(rust): add consolidation cadence and graduation`.
-- Previous milestone: `1dae704 feat(rust): add heuristic promotion pass`
+- Latest completed milestone: `feat(rust): add model-driven consolidation`.
+- Previous milestone: `cfb8f0d feat(rust): add consolidation cadence and graduation`
 - Verify the exact commit ID and signature with `git log --show-signature -2`
   after resuming.
 - The Go implementation remains the behavioral oracle. The Rust build is an
@@ -72,12 +72,25 @@ Updated: 2026-08-15
 - Promotion updates both SQLite and Markdown frontmatter, emits the exact
   `{from: short, to: mid}` event data, federates across runtimes, and is
   idempotent after a trace leaves the short-tier candidate pool.
+- Scheduled model-driven consolidation now runs before heuristic promotion and
+  graduation. The Rust client supports the OpenAI-compatible request envelope,
+  bearer-key indirection, bounded retries, cancellation, and the Go
+  small/large/frontier response sequences without adding a dependency.
+- LLM candidates use the same active short-tier window and exclude source IDs
+  already consumed by a prior `consolidate` event. Sources remain short while
+  the distilled observation lands at mid with exact `derived_from` lineage.
+- Distillation emits separate create and consolidate events carrying model,
+  profile, confidence, and source telemetry. Both event orders replay safely,
+  and signed distilled traces now federate Go-to-Rust and Rust-to-Go.
+- Malformed or unavailable model responses use the same score-gated heuristic
+  fallback. Scheduled heuristic and graduation work continues when the model
+  client or pipeline fails for a non-cancellation reason.
 
 ## Latest validation
 
-The following passed for the heuristic-promotion milestone:
+The following passed for the model-driven consolidation milestone:
 
-- `make rust-test` — formatting, clippy with warnings denied, and 43 Rust tests.
+- `make rust-test` — formatting, clippy with warnings denied, and 49 Rust tests.
 - `go test ./...`
 - `go test -race ./...`
 - `go vet ./...`
@@ -96,10 +109,13 @@ The following passed for the heuristic-promotion milestone:
     filtering, lineage and single-source scoring, promotion event data,
     frontmatter mutation, and restart idempotency; and
   - identical midnight cron graduation and idle-triggered maintenance across
-    age, read/search, modification, vote, type, and archive gates.
-- The heuristic-promotion, mixed election, and tier-maintenance scenarios each
-  passed five consecutive repetitions. The mixed three-node ring retained its
-  full passing gate.
+    age, read/search, modification, vote, type, and archive gates; and
+  - identical small, large, and frontier fake-model request sequences,
+    distilled lineage/telemetry, source preservation and exclusion, malformed
+    response retries, offline fallback, and restart idempotency.
+- The expanded model-driven scenario passed five consecutive repetitions. The
+  mixed three-node ring and all earlier consolidation gates retained their full
+  passing coverage.
 
 One sandbox-only warning appeared while Go tried to update its module-download
 stat cache outside the writable workspace. The Go build still succeeded and the
@@ -145,8 +161,9 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
 
 ## Remaining replacement gaps
 
-1. Consolidation clustering and LLM distillation parity. Cron, idle, threshold,
-   heuristic promotion, graduation, election, and watchdog behavior now pass.
+1. The operator-facing `noema consolidate` CLI, including dry-run and emitted
+   JSON, plus real-model quality/resource evaluation. Scheduled small, large,
+   and frontier paths now pass a deterministic endpoint.
 2. Watcher onboarding/healing and atomic-save behavior.
 3. Semantic embedding backfill, stale detection, cosine ranking, and hybrid RRF.
 4. Exact MCP schemas, result semantics, and error parity beyond tool-name parity.
@@ -158,19 +175,11 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
 
 ## Recommended next milestone
 
-Port model-driven consolidation behind a deterministic fake endpoint. The
-entire non-LLM tier-maintenance path now matches Go; the next uncertainty is
-cluster selection, distilled-trace materialization, and failure isolation.
-
-Suggested sequence:
-
-1. Port Go's LLM candidate query, including already-consolidated source
-   exclusion without auto-promoting source traces.
-2. Exercise clustering and validation through a deterministic fake
-   OpenAI-compatible endpoint, including malformed and unavailable responses.
-3. Materialize distilled mid-tier traces with exact lineage and consolidate
-   event data, then verify Go/Rust replay and idempotency.
-4. Only afterward compare actual model-backed distillation resource use.
+Port the operator-facing `noema consolidate` command onto the tested Rust
+pipeline, including configuration/flag precedence, retries, dry-run side-effect
+suppression, and `--emit-json` output. That creates a controlled way to run the
+same fixture corpus against an actual model and compare quality, latency, CPU,
+and memory without using the background scheduler as a test harness.
 
 Any new Rust packages still require explicit approval before adding them.
 
