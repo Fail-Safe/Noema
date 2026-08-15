@@ -123,6 +123,9 @@ compare-rust: build rust-build
 	python3 ./tests/rust-rewrite/watcher_parity.py \
 		--go "$(CURDIR)/noema" \
 		--rust "$(CURDIR)/rust/target/debug/noema-rs"
+	python3 ./tests/rust-rewrite/semantic_search.py \
+		--go "$(CURDIR)/noema" \
+		--rust "$(CURDIR)/rust/target/debug/noema-rs"
 
 benchmark-rust: comparison-release
 	./tests/rust-rewrite/benchmark.sh

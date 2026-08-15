@@ -5,9 +5,9 @@ Updated: 2026-08-15
 ## Pause point
 
 - Branch: `experiment/rust-rewrite`
-- Latest completed milestone: filesystem watcher parity.
-- Previous milestone: `aa5a5ee test(rust): compare real-model consolidation`.
-- Earlier code milestone: `8e60dc9 feat(rust): add consolidate CLI parity`.
+- Latest completed milestone: semantic-search parity (this handoff commit).
+- Previous milestone: `c0f8c8a feat(rust): add watcher parity`.
+- Earlier experiment milestone: `aa5a5ee test(rust): compare real-model consolidation`.
 - Verify the exact commit ID and signature with `git log --show-signature -2`
   after resuming.
 - The Go implementation remains the behavioral oracle. The Rust build is an
@@ -103,12 +103,24 @@ Updated: 2026-08-15
   because macOS FSEvents did not deliver events in the controlled temporary-
   cortex fixture. The fallback preserves sub-second modification precision and
   avoids hashing trace bodies on every pass.
+- OpenAI-compatible embedding requests use the existing Reqwest/Rustls stack,
+  API-key environment indirection, 64-input batches, response-index ordering,
+  Unicode-safe text limits, and the exact Go vector codec/normalization bytes.
+- Embedding status, missing/stale selection, force/limit controls, content-hash
+  repair, batch commits, idempotent reruns, and model-change invalidation match
+  the deterministic Go oracle.
+- CLI and MCP semantic search use cosine ranking; hybrid search and similarity
+  use Go-compatible weighted reciprocal-rank fusion. Archived visibility,
+  source exclusion, dimension mismatches, and non-finite stored vectors match.
+- Semantic MCP failures degrade to lexical results with a generic note and no
+  endpoint detail. Both serve transports run the automatic embedding maintainer
+  under the existing single-background-owner lock.
 
 ## Latest validation
 
-The following passed for the watcher milestone:
+The following passed for the semantic-search milestone:
 
-- `make rust-test` — formatting, clippy with warnings denied, and 55 Rust tests.
+- `make rust-test` — formatting, clippy with warnings denied, and 60 Rust tests.
 - `go test ./...`
 - `go test -race ./...`
 - `go vet ./...`
@@ -134,7 +146,11 @@ The following passed for the watcher milestone:
   - identical CLI flag overrides, summary text, dry-run write suppression,
     fallback suppression, and emitted per-cluster JSON; and
   - identical external edit/reindex, debounce, create, archive/unarchive,
-    atomic-save, heal, onboarding, delete/purge, and source-lock outcomes.
+    atomic-save, heal, onboarding, delete/purge, and source-lock outcomes; and
+  - identical deterministic embedding requests, bearer indirection, codec
+    bytes, freshness transitions, bounded/idempotent backfill, cosine/RRF
+    rankings, archive rules, corrupt-vector rejection, MCP degradation, and
+    serve-time maintenance.
 - The expanded model-driven scenario passed five consecutive repetitions. The
   mixed three-node ring and all earlier consolidation gates retained their full
   passing coverage.
@@ -194,22 +210,22 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
 
 ## Remaining replacement gaps
 
-1. Semantic embedding backfill, stale detection, cosine ranking, and hybrid RRF.
-2. Exact MCP schemas, result semantics, and error parity beyond tool-name parity.
-3. Plugin installation/check/force behavior and embedded-payload verification.
-4. Full TUI behavior.
-5. Broader adversarial real-model quality evaluation beyond the current bounded
+1. Exact MCP schemas, result semantics, and error parity beyond tool-name and
+   semantic-mode parity.
+2. Plugin installation/check/force behavior and embedded-payload verification.
+3. Full TUI behavior.
+4. Broader adversarial real-model quality evaluation beyond the current bounded
    synthetic corpus.
-6. Certificate expiry validation/monitoring, dynamic peer-worker addition without
+5. Certificate expiry validation/monitoring, dynamic peer-worker addition without
    restart, crash-atomic file rollback, lock contention, and broader fault
    injection.
 
 ## Recommended next milestone
 
-Port semantic search from the embedding client outward: mock endpoint request
-parity, vector codec and content-hash freshness, bounded backfill, stale-row
-replacement, cosine ranking, and hybrid reciprocal-rank fusion. Keep the mock
-endpoint deterministic before comparing a real embedding model.
+Expand the MCP contract fixture from tool-name discovery to exact input schemas,
+successful result shapes, actor/usage side effects, invalid-argument errors, and
+read-only federation-mode restrictions. Preserve the current generic semantic
+fallback behavior while comparing every remaining tool surface.
 
 Any new Rust packages still require explicit approval before adding them.
 
@@ -223,5 +239,5 @@ make rust-test
 make compare-rust
 ```
 
-After confirming the baseline, start from the semantic-search row in
+After confirming the baseline, start from the MCP stdio row in
 `docs/rust-rewrite-test-plan.md` and keep the Go implementation as the oracle.

@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     config::{Config, CortexEntry},
     db,
+    embedding::{self, HttpEmbedder},
     event::Event,
     eventsig,
     federation::{self, Relation},
@@ -179,6 +180,30 @@ impl Manifest {
         }
         Ok(config)
     }
+
+    pub fn resolved_embedding_endpoint(&self) -> Result<String> {
+        if let Some(search) = &self.search
+            && !search.embedding_endpoint.is_empty()
+        {
+            return Ok(search.embedding_endpoint.clone());
+        }
+        Ok(self
+            .consolidation_config()?
+            .map(|config| config.local_llm_endpoint)
+            .unwrap_or_default())
+    }
+
+    pub fn resolved_embedding_api_key_env(&self) -> Result<String> {
+        if let Some(search) = &self.search
+            && !search.api_key_env.is_empty()
+        {
+            return Ok(search.api_key_env.clone());
+        }
+        Ok(self
+            .consolidation_config()?
+            .map(|config| config.api_key_env)
+            .unwrap_or_default())
+    }
 }
 
 #[derive(Clone, Default)]
@@ -332,6 +357,32 @@ pub struct SearchConfig {
     pub embed_interval_seconds: u64,
 }
 
+impl SearchConfig {
+    pub fn effective_default_mode(&self) -> &str {
+        if self.default_mode.is_empty() {
+            "lexical"
+        } else {
+            &self.default_mode
+        }
+    }
+
+    pub fn effective_hybrid_weight(&self) -> f64 {
+        if self.hybrid_weight == 0.0 {
+            0.5
+        } else {
+            self.hybrid_weight.clamp(0.0, 1.0)
+        }
+    }
+
+    pub fn effective_max_chars(&self) -> usize {
+        if self.max_chars == 0 {
+            32_000
+        } else {
+            self.max_chars
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Row {
     pub id: String,
@@ -390,6 +441,43 @@ pub struct ListOptions {
     pub archived: bool,
     pub trashed: bool,
     pub all: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct EmbeddingStatus {
+    pub model: String,
+    pub embeddable: usize,
+    pub embedded: usize,
+    pub stale: usize,
+    pub missing: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EmbedBackfillOptions {
+    pub force: bool,
+    pub limit: usize,
+    pub max_chars: usize,
+    pub batch_size: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct EmbedBackfillResult {
+    pub considered: usize,
+    pub embedded: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SemanticOptions {
+    pub model: String,
+    pub limit: usize,
+    pub include_archived: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScoredRow {
+    #[serde(flatten)]
+    pub row: Row,
+    pub score: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -618,7 +706,7 @@ impl Cortex {
     }
 
     pub fn search(&self, query: &str, options: &ListOptions) -> Result<Vec<Row>> {
-        if query.chars().count() > MAX_SEARCH_QUERY_LEN {
+        if query.len() > MAX_SEARCH_QUERY_LEN {
             bail!("search query too long");
         }
         let fts = sanitize_fts5_query(query);
@@ -627,6 +715,328 @@ impl Cortex {
         }
         let (sql, values) = list_query(options, true, Some(fts))?;
         self.query_rows(&sql, values)
+    }
+
+    pub fn embedding_status(&self, model: &str) -> Result<EmbeddingStatus> {
+        let embeddable: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM traces WHERE trashed_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let with_row: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM traces t JOIN trace_embeddings te ON te.trace_id=t.id WHERE t.trashed_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let embedded: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM traces t JOIN trace_embeddings te ON te.trace_id=t.id
+             WHERE t.trashed_at IS NULL AND te.embedding_model=?1 AND te.source_hash=t.content_hash",
+            [model],
+            |row| row.get(0),
+        )?;
+        Ok(EmbeddingStatus {
+            model: model.to_owned(),
+            embeddable: embeddable as usize,
+            embedded: embedded as usize,
+            stale: (with_row - embedded) as usize,
+            missing: (embeddable - with_row) as usize,
+        })
+    }
+
+    pub async fn embed_backfill(
+        &mut self,
+        embedder: &HttpEmbedder,
+        model: &str,
+        options: &EmbedBackfillOptions,
+    ) -> Result<EmbedBackfillResult> {
+        if model.is_empty() {
+            bail!("embedding model is empty");
+        }
+        let batch_size = if options.batch_size == 0 {
+            64
+        } else {
+            options.batch_size
+        };
+        let max_chars = if options.max_chars == 0 {
+            32_000
+        } else {
+            options.max_chars
+        };
+        let mut sql = String::from(
+            "SELECT t.id,COALESCE(t.content_hash,'') FROM traces t
+             LEFT JOIN trace_embeddings te ON te.trace_id=t.id
+             WHERE t.trashed_at IS NULL",
+        );
+        let mut values = Vec::new();
+        if !options.force {
+            sql.push_str(
+                " AND (te.trace_id IS NULL OR te.embedding_model!=? OR te.source_hash!=t.content_hash OR t.content_hash IS NULL OR t.content_hash='')",
+            );
+            values.push(Value::Text(model.to_owned()));
+        }
+        sql.push_str(" ORDER BY t.created_at");
+        if options.limit > 0 {
+            sql.push_str(" LIMIT ?");
+            values.push(Value::Integer(options.limit as i64));
+        }
+        let candidates = {
+            let mut statement = self.connection.prepare(&sql)?;
+            statement
+                .query_map(params_from_iter(values), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut result = EmbedBackfillResult {
+            considered: candidates.len(),
+            ..Default::default()
+        };
+        let updated_at = trace::now_rfc3339();
+        for batch in candidates.chunks(batch_size) {
+            let mut inputs = Vec::with_capacity(batch.len());
+            let mut ids = Vec::with_capacity(batch.len());
+            let mut hashes = Vec::with_capacity(batch.len());
+            for (id, indexed_hash) in batch {
+                let Ok((row, parsed)) = self.get_trace(id) else {
+                    continue;
+                };
+                let source_hash = if indexed_hash.is_empty() {
+                    let hash = trace::content_hash(&parsed.body);
+                    self.connection.execute(
+                        "UPDATE traces SET content_hash=?1 WHERE id=?2 AND (content_hash IS NULL OR content_hash='')",
+                        params![hash, id],
+                    )?;
+                    hash
+                } else {
+                    indexed_hash.clone()
+                };
+                inputs.push(embedding::text(&row.title, &parsed.body, max_chars));
+                ids.push(id.clone());
+                hashes.push(source_hash);
+            }
+            if inputs.is_empty() {
+                continue;
+            }
+            let vectors = embedder
+                .embed(model, &inputs)
+                .await
+                .context("embed batch")?;
+            if vectors.len() != inputs.len() {
+                bail!(
+                    "embedder returned {} vectors for {} inputs",
+                    vectors.len(),
+                    inputs.len()
+                );
+            }
+            let tx = self.connection.unchecked_transaction()?;
+            for ((id, source_hash), mut vector) in ids.iter().zip(&hashes).zip(vectors) {
+                embedding::normalize(&mut vector);
+                tx.execute(
+                    "INSERT INTO trace_embeddings(trace_id,embedding_model,dim,embedding,source_hash,updated_at)
+                     VALUES (?1,?2,?3,?4,?5,?6)
+                     ON CONFLICT(trace_id) DO UPDATE SET
+                       embedding_model=excluded.embedding_model,
+                       dim=excluded.dim,
+                       embedding=excluded.embedding,
+                       source_hash=excluded.source_hash,
+                       updated_at=excluded.updated_at",
+                    params![id, model, vector.len() as i64, embedding::encode(&vector), source_hash, updated_at],
+                )?;
+                result.embedded += 1;
+            }
+            tx.commit()?;
+        }
+        Ok(result)
+    }
+
+    pub async fn semantic_search(
+        &mut self,
+        embedder: &HttpEmbedder,
+        query: &str,
+        options: &SemanticOptions,
+    ) -> Result<Vec<ScoredRow>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        if query.len() > MAX_SEARCH_QUERY_LEN {
+            bail!("search query too long");
+        }
+        if options.model.is_empty() {
+            bail!("embedding model is empty");
+        }
+        let mut vectors = embedder
+            .embed(&options.model, &[query.to_owned()])
+            .await
+            .context("embedding query")?;
+        if vectors.len() != 1 || vectors[0].is_empty() {
+            bail!("embedder returned no query vector");
+        }
+        embedding::normalize(&mut vectors[0]);
+        let candidates =
+            self.load_embedded_candidates(&options.model, options.include_archived, "")?;
+        Ok(top_k_cosine(
+            &vectors[0],
+            candidates,
+            effective_limit(options.limit),
+        ))
+    }
+
+    pub fn semantic_similar(
+        &self,
+        trace_id: &str,
+        options: &SemanticOptions,
+    ) -> Result<Vec<ScoredRow>> {
+        let query = self.source_vector(trace_id, &options.model)?;
+        let candidates =
+            self.load_embedded_candidates(&options.model, options.include_archived, trace_id)?;
+        Ok(top_k_cosine(
+            &query,
+            candidates,
+            effective_limit(options.limit),
+        ))
+    }
+
+    pub async fn hybrid_search(
+        &mut self,
+        embedder: &HttpEmbedder,
+        query: &str,
+        options: &SemanticOptions,
+        weight: f64,
+    ) -> Result<Vec<ScoredRow>> {
+        let mut semantic_options = options.clone();
+        semantic_options.limit = usize::MAX;
+        let semantic = self
+            .semantic_search(embedder, query, &semantic_options)
+            .await?;
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let lexical = self.search(
+            query,
+            &ListOptions {
+                all: options.include_archived,
+                ..Default::default()
+            },
+        )?;
+        Ok(rrf_fuse(
+            lexical,
+            semantic,
+            weight,
+            effective_limit(options.limit),
+        ))
+    }
+
+    pub fn hybrid_similar(
+        &self,
+        trace_id: &str,
+        options: &SemanticOptions,
+        weight: f64,
+    ) -> Result<Vec<ScoredRow>> {
+        let mut semantic_options = options.clone();
+        semantic_options.limit = usize::MAX;
+        let semantic = self.semantic_similar(trace_id, &semantic_options)?;
+        let lexical = self.find_similar(trace_id, 50, options.include_archived)?;
+        Ok(rrf_fuse(
+            lexical,
+            semantic,
+            weight,
+            effective_limit(options.limit),
+        ))
+    }
+
+    pub fn find_similar(
+        &self,
+        trace_id: &str,
+        limit: usize,
+        include_archived: bool,
+    ) -> Result<Vec<Row>> {
+        let (source, parsed) = self.get_trace(trace_id)?;
+        let terms = distinctive_terms(
+            &format!("{} {} {}", source.title, parsed.body, source.tags.join(" ")),
+            25,
+        );
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = terms.join(" OR ");
+        if query.len() > MAX_SEARCH_QUERY_LEN {
+            query.truncate(MAX_SEARCH_QUERY_LEN);
+            query = query.trim_end_matches([' ', 'O', 'R']).to_owned();
+        }
+        let mut rows = self.search(
+            &query,
+            &ListOptions {
+                all: include_archived,
+                ..Default::default()
+            },
+        )?;
+        rows.retain(|row| row.id != trace_id);
+        rows.truncate(if limit == 0 { 10 } else { limit });
+        Ok(rows)
+    }
+
+    fn source_vector(&self, trace_id: &str, model: &str) -> Result<Vec<f32>> {
+        if model.is_empty() {
+            bail!("embedding model is empty");
+        }
+        let blob = self
+            .connection
+            .query_row(
+                "SELECT embedding FROM trace_embeddings WHERE trace_id=?1 AND embedding_model=?2",
+                params![trace_id, model],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .with_context(|| {
+                format!(
+                    "trace {trace_id} has no {model} embedding yet (run: noema embeddings backfill)"
+                )
+            })?;
+        embedding::decode(&blob)
+    }
+
+    fn load_embedded_candidates(
+        &self,
+        model: &str,
+        include_archived: bool,
+        exclude_id: &str,
+    ) -> Result<Vec<(Row, Vec<f32>)>> {
+        let columns = "t.id,t.title,t.type,t.tier,t.author,t.origin,t.cortex_id,t.archived_at,t.trashed_at,t.created_at,t.updated_at,t.content_hash,t.source_locked,t.source_hash";
+        let mut sql = format!(
+            "SELECT {columns},te.embedding FROM trace_embeddings te
+             JOIN traces t ON t.id=te.trace_id
+             WHERE te.embedding_model=? AND t.trashed_at IS NULL"
+        );
+        let mut values = vec![Value::Text(model.to_owned())];
+        if !include_archived {
+            sql.push_str(" AND t.archived_at IS NULL");
+        }
+        if !exclude_id.is_empty() {
+            sql.push_str(" AND t.id!=?");
+            values.push(Value::Text(exclude_id.to_owned()));
+        }
+        let mut candidates = {
+            let mut statement = self.connection.prepare(&sql)?;
+            statement
+                .query_map(params_from_iter(values), |raw| {
+                    Ok((scan_row(raw)?, raw.get::<_, Vec<u8>>(14)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut output = Vec::with_capacity(candidates.len());
+        for (mut row, blob) in candidates.drain(..) {
+            let Ok(vector) = embedding::decode(&blob) else {
+                continue;
+            };
+            if !vector.iter().all(|value| value.is_finite()) {
+                continue;
+            }
+            row.tags = self.tags_for(&row.id)?;
+            row.derived_from = self.lineage_for(&row.id)?;
+            output.push((row, vector));
+        }
+        Ok(output)
     }
 
     pub fn short_tier_count(&self) -> Result<i64> {
@@ -2249,11 +2659,32 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
             bail!("invalid federation verification mode {verify:?}");
         }
     }
-    if let Some(search) = &manifest.search
-        && !search.default_mode.is_empty()
-        && !["lexical", "semantic", "hybrid"].contains(&search.default_mode.as_str())
-    {
-        bail!("invalid search.default_mode {:?}", search.default_mode);
+    if let Some(search) = &manifest.search {
+        if !search.default_mode.is_empty()
+            && !["lexical", "semantic", "hybrid"].contains(&search.default_mode.as_str())
+        {
+            bail!("invalid search.default_mode {:?}", search.default_mode);
+        }
+        if search.semantic_enabled {
+            if !(0.0..=1.0).contains(&search.hybrid_weight) {
+                bail!(
+                    "search.hybrid_weight must be in [0,1], got {}",
+                    search.hybrid_weight
+                );
+            }
+            if search.embedding_model.is_empty() {
+                bail!(
+                    "search.semantic_enabled requires search.embedding_model to be set (no default embedding model is assumed)"
+                );
+            }
+            let endpoint = manifest.resolved_embedding_endpoint()?;
+            if endpoint.is_empty() {
+                bail!(
+                    "search.semantic_enabled requires search.embedding_endpoint (or consolidation.local_llm_endpoint) to be set"
+                );
+            }
+            reqwest::Url::parse(&endpoint).context("invalid search.embedding_endpoint")?;
+        }
     }
     Ok(())
 }
@@ -2294,6 +2725,107 @@ fn scan_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
         signature: row.get(8)?,
         pubkey: row.get(9)?,
     })
+}
+
+fn effective_limit(limit: usize) -> usize {
+    if limit == 0 { 10 } else { limit }
+}
+
+fn top_k_cosine(query: &[f32], candidates: Vec<(Row, Vec<f32>)>, limit: usize) -> Vec<ScoredRow> {
+    let mut output = candidates
+        .into_iter()
+        .filter_map(|(row, vector)| {
+            embedding::cosine(query, &vector).map(|score| ScoredRow { row, score })
+        })
+        .collect::<Vec<_>>();
+    output.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if limit != usize::MAX {
+        output.truncate(limit);
+    }
+    output
+}
+
+fn rrf_fuse(
+    lexical: Vec<Row>,
+    semantic: Vec<ScoredRow>,
+    weight: f64,
+    limit: usize,
+) -> Vec<ScoredRow> {
+    const RRF_K: f64 = 60.0;
+    let weight = weight.clamp(0.0, 1.0);
+    let mut positions = BTreeMap::<String, usize>::new();
+    let mut output = Vec::<ScoredRow>::new();
+    let mut add = |row: Row, contribution: f64| {
+        if let Some(position) = positions.get(&row.id) {
+            output[*position].score += contribution;
+        } else {
+            positions.insert(row.id.clone(), output.len());
+            output.push(ScoredRow {
+                row,
+                score: contribution,
+            });
+        }
+    };
+    for (index, row) in lexical.into_iter().enumerate() {
+        add(row, (1.0 - weight) / (RRF_K + (index + 1) as f64));
+    }
+    for (index, scored) in semantic.into_iter().enumerate() {
+        add(scored.row, weight / (RRF_K + (index + 1) as f64));
+    }
+    output.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.row.id.cmp(&right.row.id))
+    });
+    output.truncate(limit);
+    output
+}
+
+fn distinctive_terms(text: &str, limit: usize) -> Vec<String> {
+    const STOPWORDS: &[&str] = &[
+        "the", "and", "for", "are", "but", "not", "you", "all", "can", "had", "her", "was", "one",
+        "our", "out", "day", "get", "has", "him", "his", "how", "man", "new", "now", "old", "see",
+        "two", "way", "who", "boy", "did", "its", "let", "put", "say", "she", "too", "use", "any",
+        "off", "set", "yet", "that", "with", "this", "from", "they", "have", "will", "your",
+        "what", "when", "make", "like", "into", "time", "just", "know", "take", "than", "them",
+        "well", "were", "been", "more", "some", "only", "over", "such", "very", "also", "back",
+        "each", "even", "find", "give", "good", "most", "much", "must", "name", "need", "next",
+        "open", "part", "same", "seem", "show", "tell", "then", "there", "their", "would", "could",
+        "should", "about", "after", "again", "before", "being", "these", "those", "where", "which",
+        "while", "because", "between", "through", "during",
+    ];
+    let mut counts = BTreeMap::<String, usize>::new();
+    for token in text
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+    {
+        let token = token.to_lowercase();
+        if token.len() < 3
+            || token.chars().all(|character| character.is_ascii_digit())
+            || STOPWORDS.contains(&token.as_str())
+        {
+            continue;
+        }
+        *counts.entry(token).or_default() += 1;
+    }
+    let mut counts = counts.into_iter().collect::<Vec<_>>();
+    counts.sort_by(|(left_term, left_count), (right_term, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_term.cmp(right_term))
+    });
+    counts
+        .into_iter()
+        .take(limit)
+        .map(|(term, _)| term)
+        .collect()
 }
 
 fn list_query(
@@ -2987,5 +3519,86 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
             assert!(load_sidecar_line(&path, "access key file").is_err());
         }
+    }
+
+    #[test]
+    fn cosine_ranking_skips_dimension_mismatches() {
+        let candidates = vec![
+            (
+                Row {
+                    id: "a".into(),
+                    ..Default::default()
+                },
+                vec![1.0, 0.0, 0.0],
+            ),
+            (
+                Row {
+                    id: "b".into(),
+                    ..Default::default()
+                },
+                vec![0.0, 1.0, 0.0],
+            ),
+            (
+                Row {
+                    id: "c".into(),
+                    ..Default::default()
+                },
+                vec![0.7, 0.7, 0.0],
+            ),
+            (
+                Row {
+                    id: "d".into(),
+                    ..Default::default()
+                },
+                vec![1.0, 0.0],
+            ),
+        ];
+        let ranked = top_k_cosine(&[1.0, 0.0, 0.0], candidates, 2);
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|item| item.row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "c"]
+        );
+    }
+
+    #[test]
+    fn reciprocal_rank_fusion_matches_go_tie_breaks() {
+        let row = |id: &str| Row {
+            id: id.into(),
+            ..Default::default()
+        };
+        let lexical = vec![row("a"), row("b"), row("c")];
+        let semantic = vec![
+            ScoredRow {
+                row: row("c"),
+                score: 1.0,
+            },
+            ScoredRow {
+                row: row("d"),
+                score: 0.5,
+            },
+            ScoredRow {
+                row: row("a"),
+                score: 0.1,
+            },
+        ];
+        let fused = rrf_fuse(lexical, semantic, 0.5, 4);
+        assert_eq!(
+            fused
+                .iter()
+                .map(|item| item.row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "c", "b", "d"]
+        );
+    }
+
+    #[test]
+    fn distinctive_terms_match_frequency_then_alphabetical_order() {
+        assert_eq!(
+            distinctive_terms("the beta alpha beta 123 gamma alpha", 3),
+            ["alpha", "beta", "gamma"]
+        );
     }
 }

@@ -14,7 +14,8 @@ use crate::{
     VERSION,
     config::Config,
     consolidation::{DistillationConfig, HeuristicConfig, run_distillation_pass},
-    cortex::{Cortex, ListOptions, write_manifest},
+    cortex::{Cortex, EmbedBackfillOptions, ListOptions, SemanticOptions, write_manifest},
+    embedding::HttpEmbedder,
     eventsig,
     trace::Trace,
 };
@@ -66,6 +67,10 @@ enum Command {
     /// Search Traces
     Search {
         query: String,
+        #[arg(long)]
+        semantic: bool,
+        #[arg(long)]
+        hybrid: bool,
         #[command(flatten)]
         list: ListArgs,
     },
@@ -76,6 +81,10 @@ enum Command {
         limit: usize,
         #[arg(long)]
         archived: bool,
+        #[arg(long)]
+        semantic: bool,
+        #[arg(long)]
+        hybrid: bool,
     },
     /// Re-index trace files
     Sync,
@@ -267,7 +276,12 @@ enum MemoryCommand {
 #[derive(Debug, Subcommand)]
 enum EmbeddingCommand {
     Status,
-    Backfill,
+    Backfill {
+        #[arg(long)]
+        force: bool,
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+    },
 }
 #[derive(Debug, Subcommand)]
 enum CortexCommand {
@@ -449,29 +463,60 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
             println!("Trace recovered: {id}");
         }
         Command::Purge { days } => println!("Purged {} trace(s).", cx.purge_expired(days)?),
-        Command::Search { query, list } => print_rows(cx.search(&query, &list.into())?),
+        Command::Search {
+            query,
+            semantic,
+            hybrid,
+            list,
+        } => {
+            if semantic || hybrid {
+                let include_archived = list.all || list.archived;
+                let (client, model, weight) = semantic_client(cx)?;
+                let options = SemanticOptions {
+                    model,
+                    include_archived,
+                    ..Default::default()
+                };
+                let scored = if hybrid {
+                    cx.hybrid_search(&client, &query, &options, weight).await?
+                } else {
+                    cx.semantic_search(&client, &query, &options).await?
+                };
+                print_rows(scored.into_iter().map(|item| item.row).collect());
+            } else {
+                print_rows(cx.search(&query, &list.into())?);
+            }
+        }
         Command::Similar {
             trace_id,
             limit,
             archived,
+            semantic,
+            hybrid,
         } => {
-            let (_, trace) = cx.get_trace(&trace_id)?;
-            let query = trace
-                .body
-                .split_whitespace()
-                .take(25)
-                .collect::<Vec<_>>()
-                .join(" OR ");
-            let mut rows = cx.search(
-                &query,
-                &ListOptions {
-                    all: archived,
-                    ..Default::default()
-                },
-            )?;
-            rows.retain(|r| r.id != trace_id);
-            rows.truncate(limit);
-            print_rows(rows);
+            if semantic || hybrid {
+                let search = cx.manifest.search.as_ref().context(
+                    "semantic mode needs search.embedding_model in cortex.md (then: noema embeddings backfill)",
+                )?;
+                if search.embedding_model.is_empty() {
+                    bail!(
+                        "semantic mode needs search.embedding_model in cortex.md (then: noema embeddings backfill)"
+                    );
+                }
+                let options = SemanticOptions {
+                    model: search.embedding_model.clone(),
+                    limit,
+                    include_archived: archived,
+                };
+                let scored = if hybrid {
+                    cx.hybrid_similar(&trace_id, &options, search.effective_hybrid_weight())?
+                } else {
+                    cx.semantic_similar(&trace_id, &options)?
+                };
+                print_rows(scored.into_iter().map(|item| item.row).collect());
+            } else {
+                print_rows(cx.find_similar(&trace_id, limit, archived)?);
+            }
         }
         Command::Sync => {
             let result = cx.sync()?;
@@ -493,10 +538,62 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
         }
         Command::Memory { command } => memory_command(cx, command)?,
         Command::Embeddings { command } => match command {
-            EmbeddingCommand::Status => println!(
-                "Embedding storage is available; use search config to enable semantic indexing."
-            ),
-            EmbeddingCommand::Backfill => println!("No stale embeddings found."),
+            EmbeddingCommand::Status => {
+                let model = cx
+                    .manifest
+                    .search
+                    .as_ref()
+                    .map(|search| search.embedding_model.as_str())
+                    .unwrap_or("");
+                let status = cx.embedding_status(model)?;
+                if cx
+                    .manifest
+                    .search
+                    .as_ref()
+                    .is_some_and(|search| search.semantic_enabled)
+                {
+                    println!(
+                        "Semantic search: enabled (model={}, endpoint={})",
+                        model,
+                        cx.manifest.resolved_embedding_endpoint()?
+                    );
+                } else {
+                    println!(
+                        "Semantic search: disabled (set search.semantic_enabled + search.embedding_model in cortex.md)"
+                    );
+                }
+                println!("Embeddable traces: {}", status.embeddable);
+                println!("  embedded (up-to-date): {}", status.embedded);
+                println!("  stale (changed or other model): {}", status.stale);
+                println!("  missing: {}", status.missing);
+            }
+            EmbeddingCommand::Backfill { force, limit } => {
+                let (client, model, _) = semantic_client(cx)?;
+                let max_chars = cx
+                    .manifest
+                    .search
+                    .as_ref()
+                    .map(|search| search.effective_max_chars())
+                    .unwrap_or(32_000);
+                let endpoint = cx.manifest.resolved_embedding_endpoint()?;
+                println!("Backfilling embeddings (model={model}, endpoint={endpoint})...");
+                let result = cx
+                    .embed_backfill(
+                        &client,
+                        &model,
+                        &EmbedBackfillOptions {
+                            force,
+                            limit,
+                            max_chars,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                println!(
+                    "Done: {} considered, {} embedded.",
+                    result.considered, result.embedded
+                );
+            }
         },
         Command::Tui => crate::tui::run(cx)?,
         Command::Federation { command } => federation_command(cx, command).await?,
@@ -1067,6 +1164,29 @@ fn validate_http_access(
         )
     }
     Ok(tls)
+}
+
+fn semantic_client(cx: &Cortex) -> Result<(HttpEmbedder, String, f64)> {
+    let search = cx.manifest.search.as_ref().context(
+        "semantic search needs search.embedding_model in cortex.md (then: noema embeddings backfill)",
+    )?;
+    if search.embedding_model.is_empty() {
+        bail!(
+            "semantic search needs search.embedding_model in cortex.md (then: noema embeddings backfill)"
+        );
+    }
+    let endpoint = cx.manifest.resolved_embedding_endpoint()?;
+    if endpoint.is_empty() {
+        bail!(
+            "semantic search needs search.embedding_endpoint (or consolidation.local_llm_endpoint) in cortex.md"
+        );
+    }
+    let client = HttpEmbedder::new(&endpoint, &cx.manifest.resolved_embedding_api_key_env()?)?;
+    Ok((
+        client,
+        search.embedding_model.clone(),
+        search.effective_hybrid_weight(),
+    ))
 }
 
 fn print_trace(row: &crate::cortex::Row, trace: &Trace) {

@@ -12,12 +12,12 @@ integrity, or security requirements.
 | Database and migrations | Unit + integration | Exact Go migration chain through schema 19; SQLite integrity remains `ok` | Rust migration test and differential suite |
 | CRUD lifecycle | Differential | Either build can create, read, search, append, archive, trash, recover, sync, and verify the same cortex | `compare.sh` |
 | Events and signing | Unit + differential | Canonical signatures verify across languages; mutation clocks remain monotonic | Rust signing tests, Go Rust-wire fixture, mixed signed federation |
-| MCP stdio | Contract | Exact tool-name set, compatible input schemas, result semantics, and errors | Tool-name parity automated; schema/result fixtures pending |
+| MCP stdio | Contract | Exact tool-name set, compatible input schemas, result semantics, and errors | Tool-name parity plus semantic/hybrid success and fallback automated; remaining schema/result fixtures pending |
 | MCP HTTP | Integration | Both transports initialize and serve calls; auth, TLS, host validation, and shutdown match | `http_smoke.sh`; `federation_tls.py` covers authenticated HTTPS, custom CA, and plaintext refusal |
 | Watcher | Integration | External create/edit/rename is debounced, onboarded, indexed once, and healed after atomic save | `watcher_parity.py` covers edit bytes, metadata reindex, burst debounce, create, archive/unarchive, atomic save, heal, onboarding, delete/purge, and source locks |
 | Federation | Multi-process | Multiple nodes converge under normal, duplicate, reordered, concurrent, signed, paused, and unavailable-peer cases | `federation_network.py` covers signed bidirectional batching/lifecycle; `federation_ring.py` covers three nodes, background sync, pause/recovery, concurrency, shutdown, and key-rotation recovery; `federation_tls.py` covers authenticated mixed-runtime TLS |
 | Memory tiers | Unit + differential | Usage counters, scoring, promotion, graduation, votes, purge, and health output match | Per-peer usage publication/merge, short-to-mid scoring/promotion, and strict mid-to-long graduation automated; detailed health parity pending |
-| Semantic search | Contract + integration | Mock embedding endpoint, codec, stale detection, backfill, cosine ranking, and hybrid RRF match | Codec unit test only |
+| Semantic search | Contract + integration | Mock embedding endpoint, codec, stale detection, backfill, cosine ranking, and hybrid RRF match | `semantic_search.py` covers request/auth/order/text limits, exact BLOBs, freshness, bounded/idempotent backfill, ranking, archive/source rules, corrupt vectors, MCP degradation, and automatic maintenance |
 | Consolidation | Deterministic + bounded real-model integration | Fake LLM covers election, gating, clustering, success/failure events, and idempotency; real model preserves planted synthetic facts and rejects unrelated buckets | Rank/election/watchdog/cadence, heuristic promotion, graduation, all three model profiles, CLI overrides/dry-run/JSON, distilled lineage/telemetry, malformed/offline fallback, restart idempotency, signed bidirectional replay, and seven-run synthetic real-model comparison automated |
 | Plugins | File integration | Embedded payload hashes, install/check/force rules, target resolution, and drift reporting match | Pending |
 | TUI | State-machine + snapshot | Navigation, filters, tier actions, themes, resize, and error recovery match | Minimal smoke implementation only |
@@ -46,7 +46,8 @@ Any benchmark run is invalid if its corresponding correctness gate fails.
 The branch is suitable for core-format, background-federation, and early
 performance comparison, but is not yet a release replacement. The Rust HTTP
 server serves shared-key-authenticated HTTPS, refuses authenticated plaintext,
-and otherwise permits unauthenticated HTTP only on loopback. Semantic backfill
-and ranking, certificate-expiry monitoring, plugin installation, divergence
-resolution, full TUI behavior, and broader adversarial real-model quality
-evaluation still require ports and parity fixtures.
+and otherwise permits unauthenticated HTTP only on loopback. Semantic backfill,
+ranking, MCP routing, and automatic maintenance now pass the deterministic Go
+oracle. Certificate-expiry monitoring, full MCP schema/result parity, plugin
+installation, divergence resolution, full TUI behavior, and broader adversarial
+real-model quality evaluation still require ports and parity fixtures.

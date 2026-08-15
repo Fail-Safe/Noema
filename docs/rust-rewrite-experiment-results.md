@@ -227,6 +227,33 @@ seconds; a focused test pins same-second detection. A post-reconcile snapshot
 also records files created internally during recoverable delete or onboarding,
 so an immediate follow-up purge or edit remains observable.
 
+## Semantic-search parity
+
+The Rust build now uses the existing Reqwest/Rustls client for the same
+OpenAI-compatible `/embeddings` contract as Go. A deterministic three-topic
+endpoint reverses every response batch while retaining valid `index` fields,
+which proves both clients restore input order rather than trusting wire order.
+The fixture also verifies environment-based bearer authentication and the
+configured Unicode-safe 40-character input cap without recording the token.
+
+Both builds produce byte-identical version-1 little-endian float32 BLOBs after
+normalization. The lifecycle fixture covers initial missing rows, idempotent
+reruns, body-edit staleness, model-change invalidation, force and limit controls,
+source/content-hash equality, and automatic maintenance under `noema serve`.
+Malformed stored candidates with the wrong dimension or non-finite elements are
+skipped rather than allowed to poison a result set.
+
+Cosine search, stored-vector similarity, and weighted reciprocal-rank fusion
+return the same topic ordering across Go and Rust. The fixture also pins source
+exclusion and archived visibility. CLI flags and MCP modes use the same core;
+when an MCP embedding endpoint is unavailable, both return lexical results with
+a generic note that does not expose the endpoint address.
+
+This is a deterministic contract test, not a semantic-quality benchmark. A
+real-model comparison would be useful only after selecting a representative
+embedding model and query corpus; model quality and index throughput remain
+separate questions from the wire/storage/ranking parity established here.
+
 ## Bounded federation soak
 
 Equivalent homogeneous three-node clusters ran 80 paced create mutations over
@@ -262,7 +289,8 @@ remain competitive for smaller cortexes, and now sustain lower measured RSS and
 CPU during a short replicated workload. The real-model fixture also indicates
 that Rust's shorter consolidation prompt can preserve the tested information at
 about half the prompt-token cost. Watcher behavior now also matches the tested
-Go outcomes. It still does not justify an all-in rewrite because larger-result
-throughput is not better and certificate-lifecycle checks, semantic search,
-plugins, broader distillation-quality evaluation, and operator recovery
-behavior remain incomplete.
+Go outcomes, as do deterministic semantic indexing and ranking. It still does
+not justify an all-in rewrite because larger-result throughput is not better
+and certificate-lifecycle checks, exact MCP contract parity, plugins, broader
+distillation-quality evaluation, and operator recovery behavior remain
+incomplete.

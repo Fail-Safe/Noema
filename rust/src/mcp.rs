@@ -25,7 +25,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     VERSION,
-    cortex::{AccessKey, Cortex, DistilledTraceSpec, ListOptions, PeerEntry, write_manifest},
+    cortex::{
+        AccessKey, Cortex, DistilledTraceSpec, ListOptions, PeerEntry, SemanticOptions,
+        write_manifest,
+    },
+    embedding::HttpEmbedder,
     lock::CortexLock,
     trace::Trace,
 };
@@ -260,20 +264,62 @@ impl NoemaServer {
         &self,
         Parameters(p): Parameters<SearchParams>,
     ) -> Result<String, ErrorData> {
-        let cx = self.open().await?;
-        let rows = cx
-            .search(
+        let mut cx = self.open().await?;
+        let (mode, embedder, model, weight) =
+            resolve_search_mode(&cx, &p.mode).map_err(mcp_error)?;
+        let mut note = None;
+        let rows = if matches!(mode.as_str(), "semantic" | "hybrid") {
+            if let Some(embedder) = embedder {
+                let options = SemanticOptions {
+                    model,
+                    include_archived: p.all,
+                    ..Default::default()
+                };
+                let scored = if mode == "hybrid" {
+                    cx.hybrid_search(&embedder, &p.query, &options, weight)
+                        .await
+                } else {
+                    cx.semantic_search(&embedder, &p.query, &options).await
+                };
+                match scored {
+                    Ok(scored) => scored.into_iter().map(|item| item.row).collect(),
+                    Err(_) => {
+                        note = Some(format!(
+                            "{mode} search temporarily unavailable; showing lexical results"
+                        ));
+                        cx.search(
+                            &p.query,
+                            &ListOptions {
+                                all: p.all,
+                                ..Default::default()
+                            },
+                        )
+                        .map_err(mcp_error)?
+                    }
+                }
+            } else {
+                note = Some("semantic search not configured; showing lexical results".into());
+                cx.search(
+                    &p.query,
+                    &ListOptions {
+                        all: p.all,
+                        ..Default::default()
+                    },
+                )
+                .map_err(mcp_error)?
+            }
+        } else {
+            cx.search(
                 &p.query,
                 &ListOptions {
                     all: p.all,
                     ..Default::default()
                 },
             )
-            .map_err(mcp_error)?;
+            .map_err(mcp_error)?
+        };
         cx.bump_search_hits(&rows);
-        Ok(json_text(
-            json!({"mode":if p.mode.is_empty(){"lexical"}else{&p.mode},"results":rows}),
-        ))
+        Ok(json_text(json!({"mode":mode,"note":note,"results":rows})))
     }
 
     #[tool(description = "Find traces related to a given trace")]
@@ -282,28 +328,45 @@ impl NoemaServer {
         Parameters(p): Parameters<SimilarParams>,
     ) -> Result<String, ErrorData> {
         let cx = self.open().await?;
-        let (_row, trace) = cx.get_trace(&p.trace_id).map_err(mcp_error)?;
-        let query = trace
-            .body
-            .split_whitespace()
-            .take(20)
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        let mut rows = cx
-            .search(
-                &query,
-                &ListOptions {
-                    all: p.include_archived.unwrap_or(false),
-                    ..Default::default()
-                },
-            )
-            .map_err(mcp_error)?;
-        rows.retain(|row| row.id != p.trace_id);
-        rows.truncate(p.limit.unwrap_or(10));
+        let requested_mode = p.mode.as_deref().unwrap_or("");
+        let (mode, _, model, weight) =
+            resolve_search_mode(&cx, requested_mode).map_err(mcp_error)?;
+        let include_archived = p.include_archived.unwrap_or(false);
+        let limit = p.limit.unwrap_or(10);
+        let mut note = None;
+        let rows = if matches!(mode.as_str(), "semantic" | "hybrid") {
+            if model.is_empty() {
+                note = Some("semantic search not configured; showing lexical results".into());
+                cx.find_similar(&p.trace_id, limit, include_archived)
+                    .map_err(mcp_error)?
+            } else {
+                let options = SemanticOptions {
+                    model,
+                    limit,
+                    include_archived,
+                };
+                let scored = if mode == "hybrid" {
+                    cx.hybrid_similar(&p.trace_id, &options, weight)
+                } else {
+                    cx.semantic_similar(&p.trace_id, &options)
+                };
+                match scored {
+                    Ok(scored) => scored.into_iter().map(|item| item.row).collect(),
+                    Err(_) => {
+                        note = Some(format!(
+                            "{mode} similar temporarily unavailable; showing lexical results"
+                        ));
+                        cx.find_similar(&p.trace_id, limit, include_archived)
+                            .map_err(mcp_error)?
+                    }
+                }
+            }
+        } else {
+            cx.find_similar(&p.trace_id, limit, include_archived)
+                .map_err(mcp_error)?
+        };
         cx.bump_search_hits(&rows);
-        Ok(json_text(
-            json!({"mode":p.mode.unwrap_or_else(||"lexical".into()),"results":rows}),
-        ))
+        Ok(json_text(json!({"mode":mode,"note":note,"results":rows})))
     }
 
     #[tool(description = "Move a trace to trash")]
@@ -600,56 +663,64 @@ pub async fn serve_stdio(
     watcher_settings: Option<crate::watch::Settings>,
 ) -> Result<()> {
     let server = NoemaServer::new(&name, &path)?;
-    let (cortex_id, federation) = {
+    let (cortex_id, federation, manifest) = {
         let cortex = server.cortex.lock().await;
         (
             cortex.id.clone(),
             cortex.manifest.federation.clone().unwrap_or_default(),
+            cortex.manifest.clone(),
         )
     };
     let background_lock = CortexLock::try_acquire_background(&cortex_id)?;
     let cancellation = CancellationToken::new();
     let registry = Arc::new(crate::consolidation::InFlightRegistry::default());
-    let (scheduler, eligibility, cadence, watchdog, watcher) = if background_lock.is_some() {
-        (
-            Some(crate::federation::FederationScheduler::start(
-                name.clone(),
-                path.clone(),
-                federation,
-                cancellation.clone(),
-            )?),
-            crate::consolidation::EligibilityScheduler::start(
-                name.clone(),
-                path.clone(),
-                cancellation.clone(),
-            )?,
-            crate::consolidation::CadenceScheduler::start(
-                name.clone(),
-                path.clone(),
-                cancellation.clone(),
-                Arc::clone(&registry),
-            )?,
-            crate::consolidation::WatchdogScheduler::start(
-                name.clone(),
-                path.clone(),
-                cancellation.clone(),
-                registry,
-            )?,
-            watcher_settings
-                .map(|settings| {
-                    crate::watch::WatchScheduler::start(
-                        name.clone(),
-                        path.clone(),
-                        settings,
-                        cancellation.clone(),
-                    )
-                })
-                .transpose()?,
-        )
-    } else {
-        eprintln!("another process owns cortex background work; serving MCP only");
-        (None, None, None, None, None)
-    };
+    let (scheduler, eligibility, cadence, watchdog, watcher, embedder) =
+        if background_lock.is_some() {
+            (
+                Some(crate::federation::FederationScheduler::start(
+                    name.clone(),
+                    path.clone(),
+                    federation,
+                    cancellation.clone(),
+                )?),
+                crate::consolidation::EligibilityScheduler::start(
+                    name.clone(),
+                    path.clone(),
+                    cancellation.clone(),
+                )?,
+                crate::consolidation::CadenceScheduler::start(
+                    name.clone(),
+                    path.clone(),
+                    cancellation.clone(),
+                    Arc::clone(&registry),
+                )?,
+                crate::consolidation::WatchdogScheduler::start(
+                    name.clone(),
+                    path.clone(),
+                    cancellation.clone(),
+                    registry,
+                )?,
+                watcher_settings
+                    .map(|settings| {
+                        crate::watch::WatchScheduler::start(
+                            name.clone(),
+                            path.clone(),
+                            settings,
+                            cancellation.clone(),
+                        )
+                    })
+                    .transpose()?,
+                crate::embedding::Maintainer::start(
+                    name.clone(),
+                    path.clone(),
+                    &manifest,
+                    cancellation.clone(),
+                ),
+            )
+        } else {
+            eprintln!("another process owns cortex background work; serving MCP only");
+            (None, None, None, None, None, None)
+        };
     let result = server
         .serve(rmcp::transport::stdio())
         .await?
@@ -671,6 +742,9 @@ pub async fn serve_stdio(
     if let Some(watcher) = watcher {
         watcher.stop();
     }
+    if let Some(embedder) = embedder {
+        embedder.stop().await;
+    }
     result?;
     Ok(())
 }
@@ -685,11 +759,12 @@ pub async fn serve_http(
     watcher_settings: Option<crate::watch::Settings>,
 ) -> Result<()> {
     let server = NoemaServer::new(&name, &path)?;
-    let (cortex_id, federation) = {
+    let (cortex_id, federation, manifest) = {
         let cortex = server.cortex.lock().await;
         (
             cortex.id.clone(),
             cortex.manifest.federation.clone().unwrap_or_default(),
+            cortex.manifest.clone(),
         )
     };
     let background_lock = CortexLock::try_acquire_background(&cortex_id)?;
@@ -715,46 +790,53 @@ pub async fn serve_http(
     let address = listener.local_addr()?;
     let cancellation = CancellationToken::new();
     let registry = Arc::new(crate::consolidation::InFlightRegistry::default());
-    let (scheduler, eligibility, cadence, watchdog, watcher) = if background_lock.is_some() {
-        (
-            Some(crate::federation::FederationScheduler::start(
-                name.clone(),
-                path.clone(),
-                federation,
-                cancellation.clone(),
-            )?),
-            crate::consolidation::EligibilityScheduler::start(
-                name.clone(),
-                path.clone(),
-                cancellation.clone(),
-            )?,
-            crate::consolidation::CadenceScheduler::start(
-                name.clone(),
-                path.clone(),
-                cancellation.clone(),
-                Arc::clone(&registry),
-            )?,
-            crate::consolidation::WatchdogScheduler::start(
-                name.clone(),
-                path.clone(),
-                cancellation.clone(),
-                registry,
-            )?,
-            watcher_settings
-                .map(|settings| {
-                    crate::watch::WatchScheduler::start(
-                        name.clone(),
-                        path.clone(),
-                        settings,
-                        cancellation.clone(),
-                    )
-                })
-                .transpose()?,
-        )
-    } else {
-        eprintln!("another process owns cortex background work; serving MCP only");
-        (None, None, None, None, None)
-    };
+    let (scheduler, eligibility, cadence, watchdog, watcher, embedder) =
+        if background_lock.is_some() {
+            (
+                Some(crate::federation::FederationScheduler::start(
+                    name.clone(),
+                    path.clone(),
+                    federation,
+                    cancellation.clone(),
+                )?),
+                crate::consolidation::EligibilityScheduler::start(
+                    name.clone(),
+                    path.clone(),
+                    cancellation.clone(),
+                )?,
+                crate::consolidation::CadenceScheduler::start(
+                    name.clone(),
+                    path.clone(),
+                    cancellation.clone(),
+                    Arc::clone(&registry),
+                )?,
+                crate::consolidation::WatchdogScheduler::start(
+                    name.clone(),
+                    path.clone(),
+                    cancellation.clone(),
+                    registry,
+                )?,
+                watcher_settings
+                    .map(|settings| {
+                        crate::watch::WatchScheduler::start(
+                            name.clone(),
+                            path.clone(),
+                            settings,
+                            cancellation.clone(),
+                        )
+                    })
+                    .transpose()?,
+                crate::embedding::Maintainer::start(
+                    name.clone(),
+                    path.clone(),
+                    &manifest,
+                    cancellation.clone(),
+                ),
+            )
+        } else {
+            eprintln!("another process owns cortex background work; serving MCP only");
+            (None, None, None, None, None, None)
+        };
     let signal_cancellation = cancellation.clone();
     let signal_task = tokio::spawn(async move {
         shutdown_signal().await;
@@ -804,6 +886,9 @@ pub async fn serve_http(
     }
     if let Some(watcher) = watcher {
         watcher.stop();
+    }
+    if let Some(embedder) = embedder {
+        embedder.stop().await;
     }
     signal_task.abort();
     shutdown_task.abort();
@@ -865,6 +950,44 @@ async fn shutdown_signal() {
 #[cfg(not(unix))]
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+fn resolve_search_mode(
+    cortex: &Cortex,
+    requested: &str,
+) -> Result<(String, Option<HttpEmbedder>, String, f64)> {
+    let Some(search) = cortex.manifest.search.as_ref() else {
+        return Ok((
+            if requested.is_empty() {
+                "lexical".into()
+            } else {
+                requested.into()
+            },
+            None,
+            String::new(),
+            0.5,
+        ));
+    };
+    let mode = if requested.is_empty() {
+        search.effective_default_mode().to_owned()
+    } else {
+        requested.to_owned()
+    };
+    let weight = search.effective_hybrid_weight();
+    if mode == "lexical" || search.embedding_model.is_empty() {
+        return Ok((mode, None, String::new(), weight));
+    }
+    let endpoint = cortex.manifest.resolved_embedding_endpoint()?;
+    if endpoint.is_empty() {
+        return Ok((mode, None, String::new(), weight));
+    }
+    let Ok(embedder) = HttpEmbedder::new(
+        &endpoint,
+        &cortex.manifest.resolved_embedding_api_key_env()?,
+    ) else {
+        return Ok((mode, None, String::new(), weight));
+    };
+    Ok((mode, Some(embedder), search.embedding_model.clone(), weight))
 }
 
 fn csv(value: &str) -> Vec<String> {
