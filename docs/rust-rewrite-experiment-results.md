@@ -151,7 +151,11 @@ shape, malformed-response retries, offline behavior, source-tier preservation,
 lineage, telemetry, and restart idempotency. The signed federation fixture also
 creates distilled traces through each runtime's MCP tool and proves the other
 runtime replays both the create snapshot and consolidate event exactly once.
-Actual model quality and resource consumption have not yet been measured.
+The same fixture now drives each operator CLI with manifest values deliberately
+overridden by flags. It compares summary text and emitted JSON, and proves both
+successful distillation and malformed-response fallback remain write-free under
+`--dry-run`. Actual model quality and resource consumption have not yet been
+measured.
 
 ## Bounded federation soak
 

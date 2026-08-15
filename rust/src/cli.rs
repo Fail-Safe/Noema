@@ -5,12 +5,15 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     VERSION,
     config::Config,
+    consolidation::{DistillationConfig, HeuristicConfig, run_distillation_pass},
     cortex::{Cortex, ListOptions, write_manifest},
     eventsig,
     trace::Trace,
@@ -98,7 +101,7 @@ enum Command {
         command: MemoryCommand,
     },
     /// Run a consolidation pass
-    Consolidate,
+    Consolidate(ConsolidateArgs),
     /// Manage embeddings
     Embeddings {
         #[command(subcommand)]
@@ -172,6 +175,26 @@ struct AddArgs {
     tags: Vec<String>,
     #[arg(long)]
     body: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ConsolidateArgs {
+    #[arg(long)]
+    model_tier: Option<String>,
+    #[arg(long)]
+    endpoint: Option<String>,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long)]
+    api_key_env: Option<String>,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long, default_value_t = 0)]
+    window: i64,
+    #[arg(long, default_value_t = 1)]
+    retries: i64,
+    #[arg(long)]
+    emit_json: Option<PathBuf>,
 }
 
 #[derive(Debug, Args, Default)]
@@ -364,6 +387,7 @@ pub async fn run() -> Result<()> {
         }
         Command::Config { command } => config_command(command)?,
         Command::Serve(args) => serve(selected, args).await?,
+        Command::Consolidate(args) => consolidate(selected, args).await?,
         other => {
             let mut cx = Cortex::resolve(selected)?;
             execute_cortex_command(&mut cx, other).await?;
@@ -479,7 +503,6 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
         Command::Keygen { force } => keygen(cx, force)?,
         Command::Verify { command } => verify(cx, command)?,
         Command::Plugin { command } => plugin_command(command)?,
-        Command::Consolidate => println!("No eligible consolidation candidates."),
         Command::Resolve { divergence_id, .. } => {
             bail!("divergence {divergence_id} requires explicit conflict-body resolution support")
         }
@@ -495,10 +518,118 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
         Command::Init { .. }
         | Command::Use { .. }
         | Command::Cortex { .. }
+        | Command::Consolidate(_)
         | Command::Serve(_)
         | Command::Completion { .. }
         | Command::Version
         | Command::Config { .. } => unreachable!(),
+    }
+    Ok(())
+}
+
+async fn consolidate(selected: Option<&str>, args: ConsolidateArgs) -> Result<()> {
+    let cx = Cortex::resolve(selected)?;
+    let config = cx
+        .manifest
+        .consolidation_config()?
+        .context("consolidation is not enabled in cortex.md; set consolidation.enabled: true")?;
+    if !config.enabled {
+        bail!("consolidation is not enabled in cortex.md; set consolidation.enabled: true");
+    }
+    if !config.llm_enabled {
+        bail!("consolidation.llm_enabled is false; `noema consolidate` requires the LLM path");
+    }
+    let configured_profile = config.effective_model_tier().to_owned();
+    let configured_window_hours = config.window_hours;
+
+    let endpoint = args
+        .endpoint
+        .filter(|value| !value.is_empty())
+        .unwrap_or(config.local_llm_endpoint);
+    if endpoint.is_empty() {
+        bail!("consolidation.local_llm_endpoint is empty and --endpoint was not provided");
+    }
+    let model = args
+        .model
+        .filter(|value| !value.is_empty())
+        .unwrap_or(config.model_name);
+    if model.is_empty() {
+        bail!("consolidation.model_name is empty and --model was not provided");
+    }
+    let profile = args
+        .model_tier
+        .filter(|value| !value.is_empty())
+        .unwrap_or(configured_profile);
+    let api_key_env = args
+        .api_key_env
+        .filter(|value| !value.is_empty())
+        .unwrap_or(config.api_key_env);
+    let window_hours = if args.window > 0 {
+        args.window as u64
+    } else if configured_window_hours > 0 {
+        configured_window_hours as u64
+    } else {
+        24
+    };
+    let window = std::time::Duration::from_secs(window_hours.saturating_mul(60 * 60));
+    let cancellation = CancellationToken::new();
+    let signal_cancellation = cancellation.clone();
+    let signal_worker = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal_cancellation.cancel();
+        }
+    });
+
+    eprintln!(
+        "[consolidate] model={model:?} profile={profile} window={}h dry-run={}",
+        window_hours, args.dry_run
+    );
+    let result = run_distillation_pass(
+        cx,
+        &DistillationConfig {
+            window,
+            model_tier: profile.clone(),
+            model_name: model.clone(),
+            endpoint: endpoint.clone(),
+            api_key_env,
+            max_retries: args.retries.max(0) as usize,
+            dry_run: args.dry_run,
+            heuristic: HeuristicConfig {
+                window,
+                ..HeuristicConfig::default()
+            },
+        },
+        &cancellation,
+    )
+    .await;
+    signal_worker.abort();
+    let result = result.context("consolidation pass")?;
+
+    println!(
+        "Considered {} candidates, attempted {} clusters: {} distilled, {} rejected, {} fallback-promoted, {} skipped.",
+        result.considered,
+        result.attempted,
+        result.distilled,
+        result.rejected,
+        result.fallback_promotions,
+        result.skipped
+    );
+    if let Some(path) = args.emit_json {
+        let payload = serde_json::json!({
+            "endpoint": endpoint,
+            "model": model,
+            "profile": profile,
+            "window": format!("{window_hours}h0m0s"),
+            "dry_run": args.dry_run,
+            "timestamp": Utc::now(),
+            "summary": result,
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&payload)?)
+            .with_context(|| format!("writing emit-json to {}", path.display()))?;
+        eprintln!(
+            "[consolidate] emitted per-cluster JSON to {}",
+            path.display()
+        );
     }
     Ok(())
 }

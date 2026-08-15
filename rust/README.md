@@ -36,6 +36,16 @@ small/large/frontier profile shapes through an OpenAI-compatible endpoint,
 preserves source lineage, and degrades to heuristic maintenance when the
 endpoint or response is unusable.
 
+The same pipeline is available for operator-driven runs:
+
+```sh
+noema-rs consolidate --dry-run --emit-json /tmp/noema-clusters.json
+```
+
+Endpoint, model, profile, API-key environment variable, window, and retries can
+be overridden with the same flags as the Go CLI. Dry-run mode suppresses both
+distilled writes and heuristic fallback writes.
+
 Run the cross-implementation gate and release benchmark from the repository
 root:
 

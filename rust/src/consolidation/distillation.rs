@@ -15,17 +15,60 @@ pub struct DistillationConfig {
     pub endpoint: String,
     pub api_key_env: String,
     pub max_retries: usize,
+    pub dry_run: bool,
     pub heuristic: HeuristicConfig,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct DistillationResult {
+    #[serde(rename = "CandidatesConsidered")]
     pub considered: usize,
+    #[serde(rename = "ClustersAttempted")]
     pub attempted: usize,
+    #[serde(rename = "DistillationsCreated")]
     pub distilled: usize,
+    #[serde(rename = "Rejected")]
     pub rejected: usize,
+    #[serde(rename = "FallbackPromotions")]
     pub fallback_promotions: usize,
+    #[serde(rename = "Skipped")]
     pub skipped: usize,
+    #[serde(rename = "cluster_results", skip_serializing_if = "Vec::is_empty")]
+    pub cluster_results: Vec<ClusterResult>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ClusterResult {
+    pub ids: Vec<String>,
+    pub bucket: String,
+    pub profile: String,
+    pub outcome: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub body: String,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub confidence: f64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<SourceTrace>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct SourceTrace {
+    pub id: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub body: String,
+}
+
+fn is_zero(value: &f64) -> bool {
+    *value == 0.0
 }
 
 #[derive(Debug, Clone)]
@@ -230,13 +273,21 @@ pub async fn run_distillation_pass(
     let llm = HttpLlm::new(&config.endpoint, &config.api_key_env)?;
     let profile = Profile::from_name(&config.model_tier);
     let groups = group_candidates(candidates);
-    for group in groups.values() {
+    for (bucket, group) in &groups {
         for chunk in group.chunks(profile.max_cluster_size()) {
             if cancellation.is_cancelled() {
                 bail!("context canceled");
             }
             if chunk.len() < 2 {
                 result.skipped += 1;
+                result.cluster_results.push(ClusterResult {
+                    ids: ids(chunk),
+                    bucket: bucket.clone(),
+                    profile: profile.name().into(),
+                    outcome: "skipped".into(),
+                    reason: "singleton chunk after bucketing".into(),
+                    ..ClusterResult::default()
+                });
                 continue;
             }
             result.attempted += 1;
@@ -244,10 +295,19 @@ pub async fn run_distillation_pass(
                 Ok(cluster) => cluster,
                 Err(error) => {
                     result.skipped += 1;
+                    result.cluster_results.push(ClusterResult {
+                        ids: ids(chunk),
+                        bucket: bucket.clone(),
+                        profile: profile.name().into(),
+                        outcome: "error".into(),
+                        reason: format!("build cluster: {error}"),
+                        ..ClusterResult::default()
+                    });
                     eprintln!("consolidation build cluster failed: {error:#}");
                     continue;
                 }
             };
+            let sources = source_snapshot(&cluster);
             let mut distilled = None;
             let mut last_error = None;
             for _ in 0..=config.max_retries {
@@ -263,16 +323,68 @@ pub async fn run_distillation_pass(
                 if cancellation.is_cancelled() {
                     bail!("context canceled");
                 }
-                if let Some(error) = last_error {
+                let reason = last_error
+                    .map_or_else(|| "LLM request failed".into(), |error| error.to_string());
+                if config.dry_run {
                     eprintln!(
-                        "consolidation cluster failed after retries; using heuristic fallback: {error:#}"
+                        "consolidation cluster failed after retries; dry-run suppressed fallback: {reason}"
                     );
+                    result.skipped += 1;
+                    result.cluster_results.push(ClusterResult {
+                        ids: ids(chunk),
+                        bucket: bucket.clone(),
+                        profile: profile.name().into(),
+                        outcome: "skipped".into(),
+                        reason: format!("llm error (dry-run fallback suppressed): {reason}"),
+                        sources,
+                        ..ClusterResult::default()
+                    });
+                    continue;
                 }
-                result.fallback_promotions += heuristic_fallback(&cx, chunk, &config.heuristic);
+                eprintln!(
+                    "consolidation cluster failed after retries; using heuristic fallback: {reason}"
+                );
+                let promoted = heuristic_fallback(&cx, chunk, &config.heuristic);
+                result.fallback_promotions += promoted;
+                result.cluster_results.push(ClusterResult {
+                    ids: ids(chunk),
+                    bucket: bucket.clone(),
+                    profile: profile.name().into(),
+                    outcome: "fallback".into(),
+                    reason: format!("llm error, heuristic-promoted {promoted}: {reason}"),
+                    sources,
+                    ..ClusterResult::default()
+                });
                 continue;
             };
             if !distilled.cohesive {
                 result.rejected += 1;
+                result.cluster_results.push(ClusterResult {
+                    ids: ids(chunk),
+                    bucket: bucket.clone(),
+                    profile: profile.name().into(),
+                    outcome: "rejected".into(),
+                    reason: "cohesion gate returned no".into(),
+                    sources,
+                    ..ClusterResult::default()
+                });
+                continue;
+            }
+            let cluster_result = ClusterResult {
+                ids: ids(chunk),
+                bucket: bucket.clone(),
+                profile: profile.name().into(),
+                outcome: "distilled".into(),
+                title: distilled.title.clone(),
+                tags: distilled.tags.clone(),
+                body: distilled.body.clone(),
+                confidence: distilled.confidence,
+                sources,
+                ..ClusterResult::default()
+            };
+            if config.dry_run {
+                result.distilled += 1;
+                result.cluster_results.push(cluster_result);
                 continue;
             }
             let spec = DistilledTraceSpec {
@@ -286,15 +398,42 @@ pub async fn run_distillation_pass(
                 ..DistilledTraceSpec::default()
             };
             match cx.create_distilled_trace(spec) {
-                Ok(_) => result.distilled += 1,
+                Ok(_) => {
+                    result.distilled += 1;
+                    result.cluster_results.push(cluster_result);
+                }
                 Err(error) => {
                     result.skipped += 1;
+                    result.cluster_results.push(ClusterResult {
+                        outcome: "error".into(),
+                        reason: format!("submit: {error}"),
+                        ..cluster_result
+                    });
                     eprintln!("consolidation distilled trace write failed: {error:#}");
                 }
             }
         }
     }
     Ok(result)
+}
+
+fn ids(candidates: &[PromotionCandidate]) -> Vec<String> {
+    candidates
+        .iter()
+        .map(|candidate| candidate.id.clone())
+        .collect()
+}
+
+fn source_snapshot(cluster: &[TraceInput]) -> Vec<SourceTrace> {
+    cluster
+        .iter()
+        .map(|trace| SourceTrace {
+            id: trace.id.clone(),
+            title: trace.title.clone(),
+            tags: trace.tags.clone(),
+            body: trace.body.clone(),
+        })
+        .collect()
 }
 
 fn group_candidates(

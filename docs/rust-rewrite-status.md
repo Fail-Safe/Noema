@@ -5,8 +5,8 @@ Updated: 2026-08-15
 ## Pause point
 
 - Branch: `experiment/rust-rewrite`
-- Latest completed milestone: `feat(rust): add model-driven consolidation`.
-- Previous milestone: `cfb8f0d feat(rust): add consolidation cadence and graduation`
+- Latest completed milestone: `feat(rust): add consolidate CLI parity`.
+- Previous milestone: `2a326c7 feat(rust): add model-driven consolidation`
 - Verify the exact commit ID and signature with `git log --show-signature -2`
   after resuming.
 - The Go implementation remains the behavioral oracle. The Rust build is an
@@ -85,10 +85,16 @@ Updated: 2026-08-15
 - Malformed or unavailable model responses use the same score-gated heuristic
   fallback. Scheduled heuristic and graduation work continues when the model
   client or pipeline fails for a non-cancellation reason.
+- `noema-rs consolidate` now matches Go's manifest/flag precedence for endpoint,
+  model, profile, API-key environment, window, and retry budget. It handles
+  Ctrl-C through the shared cancellation path and prints the same pass summary.
+- CLI dry-run mode performs prompts and parsing but suppresses both distilled
+  writes and heuristic fallback. `--emit-json` writes the Go-compatible run
+  metadata, summary counters, per-cluster outcome, and source snapshot shape.
 
 ## Latest validation
 
-The following passed for the model-driven consolidation milestone:
+The following passed for the consolidate CLI milestone:
 
 - `make rust-test` — formatting, clippy with warnings denied, and 49 Rust tests.
 - `go test ./...`
@@ -112,7 +118,9 @@ The following passed for the model-driven consolidation milestone:
     age, read/search, modification, vote, type, and archive gates; and
   - identical small, large, and frontier fake-model request sequences,
     distilled lineage/telemetry, source preservation and exclusion, malformed
-    response retries, offline fallback, and restart idempotency.
+    response retries, offline fallback, and restart idempotency; and
+  - identical CLI flag overrides, summary text, dry-run write suppression,
+    fallback suppression, and emitted per-cluster JSON.
 - The expanded model-driven scenario passed five consecutive repetitions. The
   mixed three-node ring and all earlier consolidation gates retained their full
   passing coverage.
@@ -161,9 +169,8 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
 
 ## Remaining replacement gaps
 
-1. The operator-facing `noema consolidate` CLI, including dry-run and emitted
-   JSON, plus real-model quality/resource evaluation. Scheduled small, large,
-   and frontier paths now pass a deterministic endpoint.
+1. Real-model distillation quality/resource evaluation. Scheduled and CLI
+   small, large, and frontier protocol paths pass deterministic endpoints.
 2. Watcher onboarding/healing and atomic-save behavior.
 3. Semantic embedding backfill, stale detection, cosine ranking, and hybrid RRF.
 4. Exact MCP schemas, result semantics, and error parity beyond tool-name parity.
@@ -175,11 +182,11 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
 
 ## Recommended next milestone
 
-Port the operator-facing `noema consolidate` command onto the tested Rust
-pipeline, including configuration/flag precedence, retries, dry-run side-effect
-suppression, and `--emit-json` output. That creates a controlled way to run the
-same fixture corpus against an actual model and compare quality, latency, CPU,
-and memory without using the background scheduler as a test harness.
+Run both CLIs in dry-run/emit-JSON mode against the same non-private fixture
+corpus and an actual trusted model endpoint. Compare cluster decisions and
+distillation fidelity first, then measure wall time, CPU, peak RSS, request
+counts, and retry behavior. Keep these quality/resource results separate from
+the already-passing deterministic protocol gate.
 
 Any new Rust packages still require explicit approval before adding them.
 

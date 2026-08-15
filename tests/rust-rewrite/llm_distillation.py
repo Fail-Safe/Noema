@@ -21,6 +21,7 @@ from federation_ring import (
     database,
     environment,
     free_port,
+    run,
     start,
     stop,
     wait_until,
@@ -150,6 +151,20 @@ def configure(manifest: Path, endpoint: str, profile: str = "frontier") -> None:
     manifest.write_text("\n".join(lines) + "\n")
 
 
+def configure_cli(manifest: Path) -> None:
+    lines = manifest.read_text().splitlines()
+    boundaries = [index for index, line in enumerate(lines) if line == "---"]
+    lines[boundaries[1] : boundaries[1]] = [
+        "consolidation:",
+        "  enabled: true",
+        "  llm_enabled: true",
+        "  model_tier: small",
+        "  local_llm_endpoint: http://127.0.0.1:1/v1",
+        "  model_name: configured-but-overridden",
+    ]
+    manifest.write_text("\n".join(lines) + "\n")
+
+
 def trace_state(database_path: Path) -> list[tuple[str, str, str]]:
     with sqlite3.connect(database_path) as connection:
         return [
@@ -184,6 +199,28 @@ def set_vote(database_path: Path, trace_id: str) -> None:
         connection.execute("UPDATE traces SET tier_votes=1 WHERE id=?", (trace_id,))
 
 
+def seed_ordered_sources(
+    node: Node, env: dict[str, str], root: Path, title_prefix: str = "source"
+) -> list[str]:
+    source_ids = [
+        add_trace(
+            node,
+            env,
+            f"{title_prefix}-{index}",
+            f"fixture observation {index}",
+        )
+        for index in range(3)
+    ]
+    now = datetime.now(timezone.utc)
+    with sqlite3.connect(database(root, node)) as connection:
+        for index, source_id in enumerate(source_ids):
+            created = (now - timedelta(seconds=index)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            connection.execute(
+                "UPDATE traces SET created_at=? WHERE id=?", (created, source_id)
+            )
+    return source_ids
+
+
 def success_scenario(
     node: Node,
     env: dict[str, str],
@@ -194,17 +231,7 @@ def success_scenario(
     parent = root / "cortexes"
     initialize(node, env, parent)
     configure(cortex_dir(root, node) / "cortex.md", model.endpoint, profile)
-    source_ids = [
-        add_trace(node, env, f"source-{index}", f"fixture observation {index}")
-        for index in range(3)
-    ]
-    now = datetime.now(timezone.utc)
-    with sqlite3.connect(database(root, node)) as connection:
-        for index, source_id in enumerate(source_ids):
-            created = (now - timedelta(seconds=index)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            connection.execute(
-                "UPDATE traces SET created_at=? WHERE id=?", (created, source_id)
-            )
+    source_ids = seed_ordered_sources(node, env, root)
     try:
         start(node, env)
         wait_until(
@@ -287,6 +314,99 @@ def failure_scenario(
             raise RuntimeError(f"{node.name} did not stop gracefully")
 
 
+def cli_dry_run_scenario(
+    node: Node, env: dict[str, str], root: Path, model: FakeModel
+) -> tuple[str, dict[str, object]]:
+    parent = root / "cortexes"
+    initialize(node, env, parent)
+    configure_cli(cortex_dir(root, node) / "cortex.md")
+    source_ids = seed_ordered_sources(node, env, root, "cli-source")
+    output = root / f"{node.name}-clusters.json"
+    completed = run(
+        node,
+        env,
+        "consolidate",
+        "--endpoint",
+        model.endpoint,
+        "--model",
+        "fixture-model",
+        "--model-tier",
+        "frontier",
+        "--window",
+        "24",
+        "--retries",
+        "0",
+        "--dry-run",
+        "--emit-json",
+        str(output),
+    )
+    expected_stdout = (
+        "Considered 3 candidates, attempted 1 clusters: 1 distilled, "
+        "0 rejected, 0 fallback-promoted, 0 skipped.\n"
+    )
+    assert completed.stdout == expected_stdout
+    assert consolidated(database(root, node)) == []
+    assert all(tier == "short" for _, _, tier in trace_state(database(root, node)))
+    payload = json.loads(output.read_text())
+    assert payload["endpoint"] == model.endpoint
+    assert payload["model"] == "fixture-model"
+    assert payload["profile"] == "frontier"
+    assert payload["window"] == "24h0m0s"
+    assert payload["dry_run"] is True
+    summary = payload["summary"]
+    assert summary["CandidatesConsidered"] == 3
+    assert summary["ClustersAttempted"] == 1
+    assert summary["DistillationsCreated"] == 1
+    assert summary["FallbackPromotions"] == 0
+    assert summary["Rejected"] == 0
+    assert summary["Skipped"] == 0
+    cluster = summary["cluster_results"][0]
+    assert cluster["ids"] == source_ids
+    assert cluster["outcome"] == "distilled"
+    assert cluster["profile"] == "frontier"
+    assert cluster["tags"] == ["MCP Server", "model-test"]
+    payload.pop("timestamp")
+    payload["endpoint"] = "fixture-endpoint"
+    return completed.stdout, payload
+
+
+def cli_dry_run_failure_scenario(
+    node: Node, env: dict[str, str], root: Path, model: FakeModel
+) -> dict[str, object]:
+    parent = root / "cortexes"
+    initialize(node, env, parent)
+    configure_cli(cortex_dir(root, node) / "cortex.md")
+    source_ids = seed_ordered_sources(node, env, root, "cli-failure")
+    set_vote(database(root, node), source_ids[0])
+    output = root / f"{node.name}-failure.json"
+    run(
+        node,
+        env,
+        "consolidate",
+        "--endpoint",
+        model.endpoint,
+        "--model",
+        "fixture-model",
+        "--model-tier",
+        "frontier",
+        "--retries",
+        "0",
+        "--dry-run",
+        "--emit-json",
+        str(output),
+    )
+    assert all(tier == "short" for _, _, tier in trace_state(database(root, node)))
+    assert consolidated(database(root, node)) == []
+    summary = json.loads(output.read_text())["summary"]
+    assert summary["DistillationsCreated"] == 0
+    assert summary["FallbackPromotions"] == 0
+    assert summary["Skipped"] == 1
+    assert summary["cluster_results"][0]["outcome"] == "skipped"
+    assert "dry-run fallback suppressed" in summary["cluster_results"][0]["reason"]
+    summary["cluster_results"][0]["reason"] = "normalized model error"
+    return summary
+
+
 def exercise(go: Path, rust: Path, root: Path) -> None:
     env = environment(root)
     with FakeModel("success") as go_model:
@@ -298,6 +418,26 @@ def exercise(go: Path, rust: Path, root: Path) -> None:
             Node("rust-distill", rust, True, free_port()), env, root, rust_model
         )
     assert rust_success == go_success
+
+    with FakeModel("success") as go_model:
+        go_cli = cli_dry_run_scenario(
+            Node("go-cli-dry-run", go, False, free_port()), env, root, go_model
+        )
+    with FakeModel("success") as rust_model:
+        rust_cli = cli_dry_run_scenario(
+            Node("rust-cli-dry-run", rust, True, free_port()), env, root, rust_model
+        )
+    assert rust_cli == go_cli
+
+    with FakeModel("malformed") as go_model:
+        go_cli_failure = cli_dry_run_failure_scenario(
+            Node("go-cli-failure", go, False, free_port()), env, root, go_model
+        )
+    with FakeModel("malformed") as rust_model:
+        rust_cli_failure = cli_dry_run_failure_scenario(
+            Node("rust-cli-failure", rust, True, free_port()), env, root, rust_model
+        )
+    assert rust_cli_failure == go_cli_failure
 
     for profile in ("small", "large"):
         with FakeModel("success") as go_model:
@@ -366,7 +506,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="noema-rust-llm-distillation-") as directory:
         exercise(args.go.resolve(), args.rust.resolve(), Path(directory))
     print(
-        "Go/Rust LLM distillation: three profiles, lineage, source exclusion, malformed/offline fallback PASS"
+        "Go/Rust LLM distillation: three profiles, CLI dry-run/JSON, lineage, source exclusion, malformed/offline fallback PASS"
     )
 
 

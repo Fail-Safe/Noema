@@ -276,6 +276,7 @@ impl CadenceScheduler {
                     endpoint: config.local_llm_endpoint.clone(),
                     api_key_env: config.api_key_env.clone(),
                     max_retries: 1,
+                    dry_run: false,
                     heuristic: heuristic.clone(),
                 }),
             heuristic,
