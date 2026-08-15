@@ -953,6 +953,32 @@ impl Cortex {
         Ok(())
     }
 
+    pub fn update_from_file(&self, id: &str) -> Result<()> {
+        let existing = self.get(id)?;
+        self.check_source_lock(&existing)?;
+        if existing.tier == "long" {
+            bail!("long-term trace is immutable");
+        }
+        let mut trace = Trace::parse_file(&self.file_path(&existing))?;
+        trace.frontmatter.tier = existing.tier;
+        trace.frontmatter.updated = trace::now_rfc3339();
+        trace.frontmatter.content_hash = trace::content_hash(&trace.body);
+        trace.validate()?;
+
+        let tx = self.connection.unchecked_transaction()?;
+        let f = &trace.frontmatter;
+        tx.execute(
+            "UPDATE traces SET title=?1,type=?2,author=?3,origin=?4,updated_at=?5,content_hash=?6,source_locked=?7,source_hash=?8 WHERE id=?9",
+            params![f.title, f.trace_type, f.author, f.origin, f.updated, f.content_hash, i64::from(f.source_locked), nullable(&f.source_hash), id],
+        )?;
+        replace_tags(&tx, id, &f.tags)?;
+        replace_lineage(&tx, id, &f.derived_from)?;
+        upsert_fts(&tx, id, &f.title, &trace.body, &f.tags)?;
+        self.emit_event(&tx, "update", id, &f.updated, trace_snapshot(&trace))?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn append(&self, id: &str, content: &str, actor_agent: bool) -> Result<()> {
         let (_, mut trace) = self.get_trace(id)?;
         if !trace.body.is_empty() && !trace.body.ends_with('\n') {
@@ -996,6 +1022,113 @@ impl Cortex {
 
     pub fn recover(&self, id: &str) -> Result<()> {
         self.move_trace(id, Visibility::Active)
+    }
+
+    pub fn mark_archived_no_move(&self, id: &str) -> Result<()> {
+        let row = self.get(id)?;
+        self.check_source_lock(&row)?;
+        if !row.trashed_at.is_empty() {
+            bail!("trace {id} is in trash");
+        }
+        if row.archived_at.is_empty() {
+            self.mark_visibility(id, "archive", Some(trace::now_rfc3339()), None)?;
+        }
+        Ok(())
+    }
+
+    pub fn mark_unarchived_no_move(&self, id: &str) -> Result<()> {
+        let row = self.get(id)?;
+        self.check_source_lock(&row)?;
+        if !row.archived_at.is_empty() {
+            self.mark_visibility(id, "unarchive", None, None)?;
+        }
+        Ok(())
+    }
+
+    pub fn mark_trashed_no_move(&self, id: &str) -> Result<()> {
+        let row = self.get(id)?;
+        self.check_source_lock(&row)?;
+        if row.trashed_at.is_empty() {
+            self.mark_visibility(id, "trash", None, Some(trace::now_rfc3339()))?;
+        }
+        Ok(())
+    }
+
+    pub fn mark_recovered_no_move(&self, id: &str) -> Result<()> {
+        let row = self.get(id)?;
+        self.check_source_lock(&row)?;
+        if !row.trashed_at.is_empty() {
+            self.mark_visibility(id, "recover", None, None)?;
+        }
+        Ok(())
+    }
+
+    fn mark_visibility(
+        &self,
+        id: &str,
+        action: &str,
+        archived_at: Option<String>,
+        trashed_at: Option<String>,
+    ) -> Result<()> {
+        let now = trace::now_rfc3339();
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE traces SET archived_at=?1,trashed_at=?2 WHERE id=?3",
+            params![archived_at, trashed_at, id],
+        )?;
+        self.emit_event(&tx, action, id, &now, json!({}))?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn ingest_external_delete(&self, id: &str) -> Result<()> {
+        let row = self.get(id)?;
+        self.check_source_lock(&row)?;
+        if !row.trashed_at.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(event) = self
+            .history(id)?
+            .into_iter()
+            .rev()
+            .find(|event| matches!(event.action.as_str(), "create" | "update"))
+        {
+            let data: TraceEventData = serde_json::from_value(event.data)?;
+            let trace = Trace {
+                frontmatter: crate::trace::Frontmatter {
+                    id: id.to_owned(),
+                    title: data.title,
+                    trace_type: data.trace_type,
+                    tier: row.tier,
+                    author: data.author,
+                    tags: data.tags,
+                    derived_from: data.derived_from,
+                    origin: data.origin,
+                    created: row.created_at,
+                    updated: event.timestamp,
+                    content_hash: data.content_hash,
+                    source_hash: data.source_hash,
+                    source_locked: data.source_locked,
+                },
+                body: data.body,
+            };
+            trace.write_preserving_updated(&self.trash_dir().join(format!("{id}.md")))?;
+        }
+        self.mark_visibility(id, "trash", None, Some(trace::now_rfc3339()))
+    }
+
+    pub fn apply_external_purge(&self, id: &str) -> Result<()> {
+        let row = self.get(id)?;
+        if row.trashed_at.is_empty() {
+            bail!("trace {id} is not in trash");
+        }
+        let now = trace::now_rfc3339();
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute("DELETE FROM traces WHERE id=?1", [id])?;
+        self.emit_event(&tx, "purge", id, &now, json!({}))?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn move_trace(&self, id: &str, destination: Visibility) -> Result<()> {

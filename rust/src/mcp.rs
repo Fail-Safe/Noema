@@ -594,7 +594,11 @@ impl NoemaServer {
     }
 }
 
-pub async fn serve_stdio(name: String, path: PathBuf) -> Result<()> {
+pub async fn serve_stdio(
+    name: String,
+    path: PathBuf,
+    watcher_settings: Option<crate::watch::Settings>,
+) -> Result<()> {
     let server = NoemaServer::new(&name, &path)?;
     let (cortex_id, federation) = {
         let cortex = server.cortex.lock().await;
@@ -606,7 +610,7 @@ pub async fn serve_stdio(name: String, path: PathBuf) -> Result<()> {
     let background_lock = CortexLock::try_acquire_background(&cortex_id)?;
     let cancellation = CancellationToken::new();
     let registry = Arc::new(crate::consolidation::InFlightRegistry::default());
-    let (scheduler, eligibility, cadence, watchdog) = if background_lock.is_some() {
+    let (scheduler, eligibility, cadence, watchdog, watcher) = if background_lock.is_some() {
         (
             Some(crate::federation::FederationScheduler::start(
                 name.clone(),
@@ -626,15 +630,25 @@ pub async fn serve_stdio(name: String, path: PathBuf) -> Result<()> {
                 Arc::clone(&registry),
             )?,
             crate::consolidation::WatchdogScheduler::start(
-                name,
-                path,
+                name.clone(),
+                path.clone(),
                 cancellation.clone(),
                 registry,
             )?,
+            watcher_settings
+                .map(|settings| {
+                    crate::watch::WatchScheduler::start(
+                        name.clone(),
+                        path.clone(),
+                        settings,
+                        cancellation.clone(),
+                    )
+                })
+                .transpose()?,
         )
     } else {
         eprintln!("another process owns cortex background work; serving MCP only");
-        (None, None, None, None)
+        (None, None, None, None, None)
     };
     let result = server
         .serve(rmcp::transport::stdio())
@@ -654,6 +668,9 @@ pub async fn serve_stdio(name: String, path: PathBuf) -> Result<()> {
     if let Some(watchdog) = watchdog {
         watchdog.stop().await;
     }
+    if let Some(watcher) = watcher {
+        watcher.stop();
+    }
     result?;
     Ok(())
 }
@@ -665,6 +682,7 @@ pub async fn serve_http(
     port: u16,
     access_key: AccessKey,
     tls: Option<(PathBuf, PathBuf)>,
+    watcher_settings: Option<crate::watch::Settings>,
 ) -> Result<()> {
     let server = NoemaServer::new(&name, &path)?;
     let (cortex_id, federation) = {
@@ -697,7 +715,7 @@ pub async fn serve_http(
     let address = listener.local_addr()?;
     let cancellation = CancellationToken::new();
     let registry = Arc::new(crate::consolidation::InFlightRegistry::default());
-    let (scheduler, eligibility, cadence, watchdog) = if background_lock.is_some() {
+    let (scheduler, eligibility, cadence, watchdog, watcher) = if background_lock.is_some() {
         (
             Some(crate::federation::FederationScheduler::start(
                 name.clone(),
@@ -717,15 +735,25 @@ pub async fn serve_http(
                 Arc::clone(&registry),
             )?,
             crate::consolidation::WatchdogScheduler::start(
-                name,
-                path,
+                name.clone(),
+                path.clone(),
                 cancellation.clone(),
                 registry,
             )?,
+            watcher_settings
+                .map(|settings| {
+                    crate::watch::WatchScheduler::start(
+                        name.clone(),
+                        path.clone(),
+                        settings,
+                        cancellation.clone(),
+                    )
+                })
+                .transpose()?,
         )
     } else {
         eprintln!("another process owns cortex background work; serving MCP only");
-        (None, None, None, None)
+        (None, None, None, None, None)
     };
     let signal_cancellation = cancellation.clone();
     let signal_task = tokio::spawn(async move {
@@ -773,6 +801,9 @@ pub async fn serve_http(
     }
     if let Some(watchdog) = watchdog {
         watchdog.stop().await;
+    }
+    if let Some(watcher) = watcher {
+        watcher.stop();
     }
     signal_task.abort();
     shutdown_task.abort();

@@ -1007,36 +1007,38 @@ fn config_command(command: ConfigCommand) -> Result<()> {
 
 async fn serve(selected: Option<&str>, args: ServeArgs) -> Result<()> {
     let cx = Cortex::resolve(selected)?;
+    let watcher = (!args.no_watch
+        && cx
+            .manifest
+            .watch
+            .as_ref()
+            .and_then(|watch| watch.enabled)
+            .unwrap_or(true))
+    .then(|| crate::watch::Settings {
+        debounce: std::time::Duration::from_millis(
+            cx.manifest
+                .watch
+                .as_ref()
+                .map(|watch| watch.debounce_ms)
+                .filter(|value| *value > 0)
+                .unwrap_or(300),
+        ),
+        auto_onboard: cx
+            .manifest
+            .watch
+            .as_ref()
+            .and_then(|watch| watch.auto_onboard)
+            .unwrap_or(true),
+    });
     match args.transport.as_str() {
-        "stdio" => crate::mcp::serve_stdio(cx.name, cx.dir).await,
+        "stdio" => crate::mcp::serve_stdio(cx.name, cx.dir, watcher).await,
         "http" => {
             let access_key = crate::cortex::load_access_key(&cx.dir, cx.manifest.access.as_ref())?;
             let tls = validate_http_access(&cx.manifest, &cx.dir, &args.host, &access_key)?;
-            if !args.no_watch
-                && cx
-                    .manifest
-                    .watch
-                    .as_ref()
-                    .and_then(|watch| watch.enabled)
-                    .unwrap_or(true)
-            {
-                let debounce = std::time::Duration::from_millis(
-                    cx.manifest
-                        .watch
-                        .as_ref()
-                        .map(|watch| watch.debounce_ms)
-                        .filter(|value| *value > 0)
-                        .unwrap_or(300),
-                );
-                let name = cx.name.clone();
-                let path = cx.dir.clone();
-                std::thread::spawn(move || {
-                    if let Err(error) = crate::watch::serve(name, path, debounce) {
-                        eprintln!("Noema watcher stopped: {error:#}");
-                    }
-                });
-            }
-            crate::mcp::serve_http(cx.name, cx.dir, args.host, args.port, access_key, tls).await
+            crate::mcp::serve_http(
+                cx.name, cx.dir, args.host, args.port, access_key, tls, watcher,
+            )
+            .await
         }
         other => bail!("unknown transport {other:?}"),
     }

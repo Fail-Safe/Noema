@@ -57,6 +57,13 @@ graduation gates; a separate backdated event log exercises the idle trigger.
 Both paths verify exact tier-change events, Markdown updates, and restart
 idempotency.
 
+`watcher_parity.py` starts independent Go and Rust HTTP servers with watchers
+enabled, then applies the same external filesystem mutations. It compares
+event and database outcomes for body/frontmatter edits, burst debounce, valid
+file drops, archive/unarchive moves, atomic-save replacement, malformed-file
+healing, raw Markdown onboarding, recoverable delete, external purge, and
+source-lock enforcement.
+
 `benchmark.sh` creates independent but equivalent cortexes and reports TSV for
 process-level ingest, full-text search, filtered list, sync, verification, and
 release binary size. `mcp_benchmark.py` keeps each stdio MCP server alive and

@@ -5,9 +5,9 @@ Updated: 2026-08-15
 ## Pause point
 
 - Branch: `experiment/rust-rewrite`
-- Latest completed milestone: bounded real-model consolidation comparison.
-- Latest code milestone: `8e60dc9 feat(rust): add consolidate CLI parity`.
-- Previous code milestone: `2a326c7 feat(rust): add model-driven consolidation`.
+- Latest completed milestone: filesystem watcher parity.
+- Previous milestone: `aa5a5ee test(rust): compare real-model consolidation`.
+- Earlier code milestone: `8e60dc9 feat(rust): add consolidate CLI parity`.
 - Verify the exact commit ID and signature with `git log --show-signature -2`
   after resuming.
 - The Go implementation remains the behavioral oracle. The Rust build is an
@@ -92,12 +92,23 @@ Updated: 2026-08-15
 - CLI dry-run mode performs prompts and parsing but suppresses both distilled
   writes and heuristic fallback. `--emit-json` writes the Go-compatible run
   metadata, summary counters, per-cluster outcome, and source snapshot shape.
+- External file edits use per-path debounce and update SQLite, FTS, lineage,
+  tags, and the event log without rewriting editor-owned bytes.
+- External create, archive/unarchive moves, recoverable deletion, trash purge,
+  atomic-save replacement, raw Markdown onboarding, and frontmatter healing
+  match the tested Go outcomes while preserving source locks.
+- Watchers run for both stdio and HTTP under the existing single-background-
+  owner lock, and server readiness now waits for successful registration.
+- The native watcher is backed by a bounded, dependency-free metadata rescan
+  because macOS FSEvents did not deliver events in the controlled temporary-
+  cortex fixture. The fallback preserves sub-second modification precision and
+  avoids hashing trace bodies on every pass.
 
 ## Latest validation
 
-The following passed for the consolidate CLI milestone:
+The following passed for the watcher milestone:
 
-- `make rust-test` — formatting, clippy with warnings denied, and 49 Rust tests.
+- `make rust-test` — formatting, clippy with warnings denied, and 55 Rust tests.
 - `go test ./...`
 - `go test -race ./...`
 - `go vet ./...`
@@ -121,7 +132,9 @@ The following passed for the consolidate CLI milestone:
     distilled lineage/telemetry, source preservation and exclusion, malformed
     response retries, offline fallback, and restart idempotency; and
   - identical CLI flag overrides, summary text, dry-run write suppression,
-    fallback suppression, and emitted per-cluster JSON.
+    fallback suppression, and emitted per-cluster JSON; and
+  - identical external edit/reindex, debounce, create, archive/unarchive,
+    atomic-save, heal, onboarding, delete/purge, and source-lock outcomes.
 - The expanded model-driven scenario passed five consecutive repetitions. The
   mixed three-node ring and all earlier consolidation gates retained their full
   passing coverage.
@@ -173,27 +186,30 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
   failed to emit a terminal event.
 - The in-flight registry must remain process-local. A restart deliberately
   forgets active windows so the watchdog can close claims abandoned by a crash.
+- A watcher must become ready before its serving socket is considered ready;
+  otherwise the first edit can fall into a registration race.
+- `notify`'s polling backend truncates modification times to whole seconds
+  unless content comparison is enabled. It cannot safely observe sub-second
+  editor bursts without hashing every watched file.
 
 ## Remaining replacement gaps
 
-1. Watcher onboarding/healing and atomic-save behavior.
-2. Semantic embedding backfill, stale detection, cosine ranking, and hybrid RRF.
-3. Exact MCP schemas, result semantics, and error parity beyond tool-name parity.
-4. Plugin installation/check/force behavior and embedded-payload verification.
-5. Full TUI behavior.
-6. Broader adversarial real-model quality evaluation beyond the current bounded
+1. Semantic embedding backfill, stale detection, cosine ranking, and hybrid RRF.
+2. Exact MCP schemas, result semantics, and error parity beyond tool-name parity.
+3. Plugin installation/check/force behavior and embedded-payload verification.
+4. Full TUI behavior.
+5. Broader adversarial real-model quality evaluation beyond the current bounded
    synthetic corpus.
-7. Certificate expiry validation/monitoring, dynamic peer-worker addition without
+6. Certificate expiry validation/monitoring, dynamic peer-worker addition without
    restart, crash-atomic file rollback, lock contention, and broader fault
    injection.
 
 ## Recommended next milestone
 
-Port the watcher with an independent Go/Rust fixture covering external create,
-edit, rename, delete, atomic-save replacement, debounce, onboarding, and index
-healing. Keep the filesystem-event stimulus identical and compare the resulting
-Markdown, SQLite, and event-log state rather than requiring identical native
-event sequences.
+Port semantic search from the embedding client outward: mock endpoint request
+parity, vector codec and content-hash freshness, bounded backfill, stale-row
+replacement, cosine ranking, and hybrid reciprocal-rank fusion. Keep the mock
+endpoint deterministic before comparing a real embedding model.
 
 Any new Rust packages still require explicit approval before adding them.
 
@@ -207,5 +223,5 @@ make rust-test
 make compare-rust
 ```
 
-After confirming the baseline, start from the consolidation rows in
+After confirming the baseline, start from the semantic-search row in
 `docs/rust-rewrite-test-plan.md` and keep the Go implementation as the oracle.

@@ -191,6 +191,42 @@ useful follow-up work. The reusable runner is
 `tests/rust-rewrite/real_model_distillation.py`; it records only counts,
 timings, and synthetic result text, never endpoint response bodies.
 
+## Filesystem watcher parity
+
+The original Rust watcher slept once per raw notification and called whole-
+cortex `sync`. That approach reindexed files but did not emit mutation events,
+distinguish moves from deletes, preserve source locks, rescue malformed files,
+or guarantee true per-path debounce.
+
+The replacement owns one Cortex connection under the existing per-cortex
+background lock and reconciles each settled path against its SQLite state. A
+mixed-process fixture now gives Go and Rust identical external edits and checks:
+
+- unchanged editor bytes after body/frontmatter reindex;
+- one update for a five-write burst;
+- valid create plus archive/unarchive transitions without transient trash;
+- atomic remove-and-replace without delete misclassification;
+- frontmatter reconstruction with user body and indexed title preserved;
+- raw Markdown onboarding with canonical rename and provenance;
+- recoverable active-file deletion followed by external trash purge; and
+- refusal to ingest edits to foreign source-locked traces.
+
+The complete fixture passes in `make compare-rust`, and three earlier
+repetitions passed concurrently as a timing-stress check. Watcher startup is
+also synchronous with server readiness, so a server cannot begin accepting MCP
+traffic before directory registration succeeds.
+
+On this macOS host, `notify` 8.2's default FSEvents backend registered without
+error but did not deliver events for the temporary-cortex fixture. Its polling
+fallback also missed same-second writes unless content hashing was enabled,
+which would impose repeated full-file reads. The Rust watcher therefore keeps
+the existing native backend for low-latency delivery and adds a dependency-free
+metadata rescan using full `SystemTime` precision and file length. The rescan
+interval is five debounce windows bounded to 250 milliseconds through two
+seconds; a focused test pins same-second detection. A post-reconcile snapshot
+also records files created internally during recoverable delete or onboarding,
+so an immediate follow-up purge or edit remains observable.
+
 ## Bounded federation soak
 
 Equivalent homogeneous three-node clusters ran 80 paced create mutations over
@@ -225,7 +261,8 @@ the critical signing/vector-clock rules cleanly, use materially less memory,
 remain competitive for smaller cortexes, and now sustain lower measured RSS and
 CPU during a short replicated workload. The real-model fixture also indicates
 that Rust's shorter consolidation prompt can preserve the tested information at
-about half the prompt-token cost. It still does not justify an all-in rewrite
-because larger-result throughput is not better and certificate-lifecycle
-checks, semantic search, plugins, watcher parity, broader distillation-quality
-evaluation, and operator recovery behavior remain incomplete.
+about half the prompt-token cost. Watcher behavior now also matches the tested
+Go outcomes. It still does not justify an all-in rewrite because larger-result
+throughput is not better and certificate-lifecycle checks, semantic search,
+plugins, broader distillation-quality evaluation, and operator recovery
+behavior remain incomplete.
