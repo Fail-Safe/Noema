@@ -75,6 +75,8 @@ pub struct ConsolidationConfig {
     #[serde(default)]
     pub threshold_short: i64,
     #[serde(default)]
+    pub window_hours: i64,
+    #[serde(default)]
     pub llm_enabled: bool,
     #[serde(default)]
     pub local_llm_endpoint: String,
@@ -269,6 +271,21 @@ pub struct Row {
     pub content_hash: String,
     pub source_locked: bool,
     pub source_hash: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PromotionCandidate {
+    pub id: String,
+    pub tier: String,
+    #[serde(rename = "type")]
+    pub trace_type: String,
+    pub read_count: i64,
+    pub modify_count: i64,
+    pub search_hit_count: i64,
+    pub tier_votes: i64,
+    pub derived_from_count: i64,
+    pub source_count: i64,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -518,6 +535,77 @@ impl Cortex {
         }
         let (sql, values) = list_query(options, true, Some(fts))?;
         self.query_rows(&sql, values)
+    }
+
+    pub fn short_tier_count(&self) -> Result<i64> {
+        Ok(self.connection.query_row(
+            "SELECT COUNT(*) FROM traces
+             WHERE tier='short'
+               AND archived_at IS NULL
+               AND trashed_at IS NULL
+               AND purged_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn promotion_candidates(
+        &self,
+        tier: &str,
+        window: std::time::Duration,
+    ) -> Result<Vec<PromotionCandidate>> {
+        let window = chrono::Duration::from_std(window).context("promotion window is too large")?;
+        let cutoff = (Utc::now() - window).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let mut statement = self.connection.prepare(
+            "SELECT
+                t.id,
+                t.tier,
+                t.type,
+                COALESCE(u.total_reads, 0),
+                COALESCE(u.total_modifies, 0),
+                COALESCE(u.total_search_hits, 0),
+                t.tier_votes,
+                COALESCE(v.n, 0),
+                COALESCE(s.n, 0),
+                t.created_at
+             FROM traces t
+             LEFT JOIN (
+                SELECT trace_id,
+                       SUM(read_count) AS total_reads,
+                       SUM(modify_count) AS total_modifies,
+                       SUM(search_hit_count) AS total_search_hits
+                FROM trace_usage
+                GROUP BY trace_id
+             ) u ON u.trace_id=t.id
+             LEFT JOIN v_derived_from_count v ON v.trace_id=t.id
+             LEFT JOIN (
+                SELECT trace_id, COUNT(*) AS n
+                FROM trace_lineage
+                GROUP BY trace_id
+             ) s ON s.trace_id=t.id
+             WHERE t.tier=?1
+               AND t.archived_at IS NULL
+               AND t.trashed_at IS NULL
+               AND t.purged_at IS NULL
+               AND t.created_at>=?2
+               AND t.id!=''
+             ORDER BY t.created_at DESC",
+        )?;
+        let rows = statement.query_map(params![tier, cutoff], |row| {
+            Ok(PromotionCandidate {
+                id: row.get(0)?,
+                tier: row.get(1)?,
+                trace_type: row.get(2)?,
+                read_count: row.get(3)?,
+                modify_count: row.get(4)?,
+                search_hit_count: row.get(5)?,
+                tier_votes: row.get(6)?,
+                derived_from_count: row.get(7)?,
+                source_count: row.get(8)?,
+                created_at: row.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn bump_search_hits(&self, rows: &[Row]) {

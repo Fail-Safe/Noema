@@ -1,10 +1,15 @@
 //! Memory-tier consolidation eligibility, election, and scoring.
 
 mod coordination;
+mod heuristic;
 
 pub use coordination::{
     FailReason, GateResult, GateState, InFlightRegistry, PassGate, WatchdogScheduler,
     sweep_watchdog,
+};
+pub use heuristic::{
+    HeuristicConfig, PassResult, ThresholdScheduler, ThresholdState, run_heuristic_pass,
+    score_candidate,
 };
 
 use std::{path::PathBuf, time::Duration};
@@ -16,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::cortex::{ConsolidationConfig, Cortex, PeerEntry, Row, read_manifest};
+use crate::cortex::{ConsolidationConfig, Cortex, PeerEntry, read_manifest};
 
 pub const RANK_INELIGIBLE: u8 = 0;
 pub const RANK_MIN: u8 = 1;
@@ -265,24 +270,6 @@ pub fn configured_peer_ranks(cx: &Cortex, peers: &[PeerEntry]) -> Vec<RankEntry>
         .iter()
         .filter_map(|peer| get_peer_rank(cx, &peer.name).ok())
         .collect()
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct CandidateScore {
-    pub id: String,
-    pub score: f64,
-}
-
-pub fn rank(rows: &[Row]) -> Vec<CandidateScore> {
-    let mut ranked: Vec<_> = rows
-        .iter()
-        .map(|row| CandidateScore {
-            id: row.id.clone(),
-            score: 0.0,
-        })
-        .collect();
-    ranked.sort_by(|a, b| a.id.cmp(&b.id));
-    ranked
 }
 
 #[cfg(test)]

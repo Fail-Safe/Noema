@@ -98,9 +98,17 @@ matches Go's initial election, signed claim, quiet-period wait, re-election,
 preemption classification, in-flight tracking, inner-pass error closure, and
 success behavior. The live Rust server runs a stale-claim watchdog with a strict
 local timeout, extra remote propagation grace, in-flight suppression, and
-event-log-based deduplication. The gate is intentionally not scheduled yet:
-Rust still has no real promotion or distillation pass to place behind it, and a
-no-op pass must not claim successful consolidation.
+event-log-based deduplication.
+
+Rust now also runs a real deterministic pass from the threshold trigger. Its
+candidate query matches Go's active-state and rolling-window filters and sums
+usage across peers. Its score matches the Go weights for reads/search hits,
+modifications, inbound lineage, and votes, including the two-inbound-reference
+minimum and the single-source passive-search guard. Qualifying traces move from
+short to mid in both SQLite and Markdown, emit the same promotion event data,
+and leave the candidate pool so a restart cannot promote them twice. Federated
+cortexes execute this pass through the existing election gate; single-node
+cortexes avoid unnecessary claim/success events.
 
 The mixed Go/Rust fixture exercises deterministic winner selection, endpoint
 loss and rank-zero failover, endpoint recovery, and replay of a real Go
@@ -110,10 +118,11 @@ preconditions were made explicit. The fixture now also removes a terminal event
 from the Rust replica to model an orphaned Go claim, then verifies Rust emits a
 signed `watchdog_expired` closure that Go accepts under enforced verification.
 
-This does not yet port Rust's trigger scheduler, candidate scoring, clustering,
-promotion, graduation, or LLM distillation. The current result establishes
-coordination compatibility around a future pass, not end-to-end consolidation
-parity.
+The independent Go/Rust promotion fixture gives both implementations identical
+read, search, edit, vote, lineage, age, and archive inputs. It checks exact
+candidate choices, event data, frontmatter mutation, and restart idempotency;
+the scenario passed five consecutive repetitions. Cron and idle cadence,
+graduation, clustering, and LLM distillation are not yet ported.
 
 ## Bounded federation soak
 
@@ -136,8 +145,8 @@ and recovery rather than only under a single-process search benchmark.
 This remains a complexity probe, not complete federation parity. The Rust path
 does not yet dynamically add new workers without restart, monitor certificate
 expiry, or provide crash-atomic file rollback. Its consolidation election and
-coordination wire, pass gate, and watchdog recovery are now present, but no Rust
-consolidation pass executes yet.
+coordination wire, pass gate, watchdog recovery, and threshold heuristic pass
+are now present, but the remaining cadence and model-driven paths are not.
 
 ## Current interpretation
 
@@ -147,5 +156,5 @@ the critical signing/vector-clock rules cleanly, use materially less memory,
 remain competitive for smaller cortexes, and now sustain lower measured RSS and
 CPU during a short replicated workload. It still does not justify an all-in
 rewrite because larger-result throughput is not better and certificate-lifecycle
-checks, consolidation pass execution, semantic search, plugins, watcher parity,
-and broader operator recovery behavior remain unported.
+checks, consolidation cadence/graduation/distillation, semantic search, plugins,
+watcher parity, and broader operator recovery behavior remain unported.

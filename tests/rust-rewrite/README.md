@@ -38,7 +38,17 @@ Go threshold-election restart uses a delayed eligibility probe so its fixed,
 quiet rank remains stable while the real consolidator claims the test window.
 The fixture then makes that signed Go claim orphaned on the Rust replica and
 checks that Rust's live watchdog emits a signed `watchdog_expired` closure which
-Go accepts.
+Go accepts. Finally, it makes Rust the stable winner, runs the real threshold
+heuristic behind the pass gate, and verifies Go receives both the promotion and
+the Rust-signed claim/success window. Active endpoint-probe delays are applied
+to the live fixture servers so fixed quiet ranks cannot be overwritten during
+either gated startup.
+
+`heuristic_promotion.py` gives independent Go and Rust cortexes the same usage,
+vote, inbound-lineage, outbound-source, and age signals. It starts each live
+threshold scheduler and checks identical short-to-mid choices, exact promotion
+event data, Markdown frontmatter updates, window filtering, the single-source
+search-hit guard, and restart idempotency.
 
 `benchmark.sh` creates independent but equivalent cortexes and reports TSV for
 process-level ingest, full-text search, filtered list, sync, verification, and

@@ -78,6 +78,11 @@ class ModelEndpoint:
         self.server = None
         self.thread = None
 
+    def set_probe_delay(self, delay: float) -> None:
+        self.probe_delay = delay
+        if self.server is not None:
+            self.server.probe_delay = delay
+
 
 def initialize_node(node: Node, env: dict[str, str], parent: Path) -> None:
     subprocess.run(
@@ -178,6 +183,24 @@ def watchdog_fail(
         and data.get("cortex_id") == winner_id
         and data.get("reason") == "watchdog_expired"
     )
+
+
+def trace_tier(database_path: Path, trace_id: str) -> str:
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT tier FROM traces WHERE id=?", (trace_id,)
+        ).fetchone()
+    return "" if row is None else str(row[0])
+
+
+def action_count(database_path: Path, trace_id: str, action: str) -> int:
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT count(*) FROM events WHERE trace_id=? AND action=?",
+            (trace_id, action),
+        ).fetchone()
+    assert row is not None
+    return int(row[0])
 
 
 def set_threshold(manifest: Path, threshold: int) -> None:
@@ -289,7 +312,7 @@ def exercise(go: Path, rust: Path, root: Path) -> None:
         add_trace(peer_a, env, "election-a", "first election payload")
         add_trace(peer_a, env, "election-b", "second election payload")
         set_rank(database(root, peer_a), "consolidation:rank", fixed[peer_a.name])
-        go_endpoint.probe_delay = 2.0
+        go_endpoint.set_probe_delay(2.0)
         start(peer_a, env)
         wait_until(
             "signed Go coordination claim reaches Rust",
@@ -376,6 +399,7 @@ def exercise(go: Path, rust: Path, root: Path) -> None:
             ),
         )
         set_rank(database(root, peer_b), "consolidation:rank", fixed[peer_b.name])
+        set_rank(database(root, peer_a), "consolidation:rank", fixed[peer_a.name])
         wait_until(
             "Go observes the recovered Rust rank",
             lambda: state_rank(
@@ -383,8 +407,58 @@ def exercise(go: Path, rust: Path, root: Path) -> None:
             )
             == fixed[peer_b.name],
         )
+        wait_until(
+            "Rust observes the stable recovered Go rank",
+            lambda: state_rank(
+                database(root, peer_b), f"peer:{peer_a.name}:consolidation_rank"
+            )
+            == fixed[peer_a.name],
+        )
         status = rust_status(peer_b, env)
         assert status["consolidation"]["winner"] == identities[peer_b.name], status
+
+        assert stop(peer_b)
+        set_threshold(cortex_dir(root, peer_b) / "cortex.md", 1)
+        promoted_id = add_trace(
+            peer_b, env, "rust-threshold-promotion", "real gated pass payload"
+        )
+        with sqlite3.connect(database(root, peer_b)) as connection:
+            connection.execute(
+                "UPDATE traces SET tier_votes=1 WHERE id=?", (promoted_id,)
+            )
+        set_rank(database(root, peer_b), "consolidation:rank", fixed[peer_b.name])
+        set_rank(
+            database(root, peer_b),
+            f"peer:{peer_a.name}:consolidation_rank",
+            fixed[peer_a.name],
+        )
+        rust_endpoint.set_probe_delay(2.0)
+        start(peer_b, env)
+        wait_until(
+            "Rust winner runs the real gated promotion pass",
+            lambda: trace_tier(database(root, peer_b), promoted_id) == "mid"
+            and action_count(database(root, peer_b), promoted_id, "promote") == 1,
+        )
+        wait_until(
+            "Rust promotion replays to Go",
+            lambda: trace_tier(database(root, peer_a), promoted_id) == "mid"
+            and action_count(database(root, peer_a), promoted_id, "promote") == 1,
+        )
+        wait_until(
+            "Rust gated claim and success replay to Go",
+            lambda: bool(
+                coordination_windows(
+                    database(root, peer_a),
+                    "consolidation_claim",
+                    identities[peer_b.name],
+                )
+                & coordination_windows(
+                    database(root, peer_a),
+                    "consolidation_success",
+                    identities[peer_b.name],
+                )
+            ),
+        )
     finally:
         graceful = [stop(node) for node in nodes]
         go_endpoint.stop()
@@ -405,7 +479,7 @@ def main() -> None:
         exercise(args.go.resolve(), args.rust.resolve(), Path(directory))
     print(
         "mixed consolidation election: rank exchange, failover, coordination, "
-        "watchdog, recovery PASS"
+        "watchdog, recovery, gated promotion PASS"
     )
 
 
