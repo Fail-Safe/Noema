@@ -154,8 +154,42 @@ runtime replays both the create snapshot and consolidate event exactly once.
 The same fixture now drives each operator CLI with manifest values deliberately
 overridden by flags. It compares summary text and emitted JSON, and proves both
 successful distillation and malformed-response fallback remain write-free under
-`--dry-run`. Actual model quality and resource consumption have not yet been
-measured.
+`--dry-run`.
+
+## Real-model consolidation
+
+Seven alternating-order runs drove the release Go and Rust CLIs against the
+same trusted LAN OpenAI-compatible endpoint and `qwen3.5-9b` model. Each run
+created fresh cortexes containing nine synthetic traces: one cohesive decision
+bucket, one deliberately unrelated fact bucket, and one cohesive observation
+bucket. Both CLIs used `--dry-run`, so the model saw only synthetic fixture data
+and neither cortex was mutated by consolidation.
+
+| Metric | Go | Rust | Rust relative result |
+| --- | ---: | ---: | ---: |
+| Bucket decisions | 21/21 | 21/21 | equal |
+| Planted-term retention | 111/112 | 112/112 | one additional term retained |
+| Median wall time | 17.19 s | 13.68 s | 20.4% lower |
+| Wall-time range | 16.55-18.45 s | 11.85-18.10 s | wider model variance |
+| Median peak RSS | 23.06 MiB | 14.75 MiB | 36.0% lower |
+| Peak-RSS range | 22.77-23.33 MiB | 14.69-14.88 MiB | consistently lower |
+
+Every run made five successful HTTP requests per implementation. The final two
+runs added request accounting: Go sent 2,488 prompt tokens and 11,071 request
+bytes per run, while Rust sent 1,220 prompt tokens and 5,206 request bytes. Rust
+therefore used 51.0% fewer prompt tokens and 53.0% fewer request bytes on this
+fixture. Completion-token counts varied with model output, as expected.
+
+The lower Rust wall time is principally a model-workload result, not evidence
+that its HTTP client executes inference faster: nearly the entire measured wall
+time was spent awaiting the endpoint, while each CLI consumed only about 0.00
+to 0.02 seconds of user plus system CPU. The experiment does establish that the
+shorter Rust prompt retained the tested decisions, values, and unrelated-bucket
+rejection while materially reducing prompt cost. It does not establish general
+distillation-quality parity; larger, ambiguous, and adversarial corpora remain
+useful follow-up work. The reusable runner is
+`tests/rust-rewrite/real_model_distillation.py`; it records only counts,
+timings, and synthetic result text, never endpoint response bodies.
 
 ## Bounded federation soak
 
@@ -179,8 +213,9 @@ This remains a complexity probe, not complete federation parity. The Rust path
 does not yet dynamically add new workers without restart, monitor certificate
 expiry, or provide crash-atomic file rollback. Its consolidation election and
 coordination wire, pass gate, watchdog recovery, full cadence, heuristic pass,
-graduation, and model-driven distillation are now present. Real-model quality
-and resource measurements remain outstanding.
+graduation, and model-driven distillation are now present. A bounded real-model
+comparison also passes, but broader distillation-quality evaluation remains
+advisable.
 
 ## Current interpretation
 
@@ -188,7 +223,9 @@ The additional work further weakens the case for stopping immediately: Rust can
 interoperate with the Go federation wire protocol in both directions, express
 the critical signing/vector-clock rules cleanly, use materially less memory,
 remain competitive for smaller cortexes, and now sustain lower measured RSS and
-CPU during a short replicated workload. It still does not justify an all-in
-rewrite because larger-result throughput is not better and certificate-lifecycle
-checks, semantic search, plugins, watcher parity, real-model distillation
-evaluation, and broader operator recovery behavior remain incomplete.
+CPU during a short replicated workload. The real-model fixture also indicates
+that Rust's shorter consolidation prompt can preserve the tested information at
+about half the prompt-token cost. It still does not justify an all-in rewrite
+because larger-result throughput is not better and certificate-lifecycle
+checks, semantic search, plugins, watcher parity, broader distillation-quality
+evaluation, and operator recovery behavior remain incomplete.

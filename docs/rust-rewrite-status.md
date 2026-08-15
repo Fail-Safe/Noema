@@ -5,8 +5,9 @@ Updated: 2026-08-15
 ## Pause point
 
 - Branch: `experiment/rust-rewrite`
-- Latest completed milestone: `feat(rust): add consolidate CLI parity`.
-- Previous milestone: `2a326c7 feat(rust): add model-driven consolidation`
+- Latest completed milestone: bounded real-model consolidation comparison.
+- Latest code milestone: `8e60dc9 feat(rust): add consolidate CLI parity`.
+- Previous code milestone: `2a326c7 feat(rust): add model-driven consolidation`.
 - Verify the exact commit ID and signature with `git log --show-signature -2`
   after resuming.
 - The Go implementation remains the behavioral oracle. The Rust build is an
@@ -138,6 +139,12 @@ complete comparison target exited successfully.
 - In the bounded three-node federation soak, both builds converged to exactly
   80 unique events per node. Rust used about 62.6% of Go's peak aggregate RSS
   and about 81.2% of Go's mean sampled CPU.
+- Across seven alternating-order real-model dry runs, both builds made all 21
+  bucket decisions correctly. Rust retained 112/112 planted terms versus Go's
+  111/112, used 36.0% less median peak RSS, and had 20.4% lower median wall
+  time. In the two instrumented runs, Rust used 51.0% fewer prompt tokens, so
+  the timing result primarily measures lower model workload rather than client
+  execution speed.
 
 See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
 
@@ -169,24 +176,24 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
 
 ## Remaining replacement gaps
 
-1. Real-model distillation quality/resource evaluation. Scheduled and CLI
-   small, large, and frontier protocol paths pass deterministic endpoints.
-2. Watcher onboarding/healing and atomic-save behavior.
-3. Semantic embedding backfill, stale detection, cosine ranking, and hybrid RRF.
-4. Exact MCP schemas, result semantics, and error parity beyond tool-name parity.
-5. Plugin installation/check/force behavior and embedded-payload verification.
-6. Full TUI behavior.
+1. Watcher onboarding/healing and atomic-save behavior.
+2. Semantic embedding backfill, stale detection, cosine ranking, and hybrid RRF.
+3. Exact MCP schemas, result semantics, and error parity beyond tool-name parity.
+4. Plugin installation/check/force behavior and embedded-payload verification.
+5. Full TUI behavior.
+6. Broader adversarial real-model quality evaluation beyond the current bounded
+   synthetic corpus.
 7. Certificate expiry validation/monitoring, dynamic peer-worker addition without
    restart, crash-atomic file rollback, lock contention, and broader fault
    injection.
 
 ## Recommended next milestone
 
-Run both CLIs in dry-run/emit-JSON mode against the same non-private fixture
-corpus and an actual trusted model endpoint. Compare cluster decisions and
-distillation fidelity first, then measure wall time, CPU, peak RSS, request
-counts, and retry behavior. Keep these quality/resource results separate from
-the already-passing deterministic protocol gate.
+Port the watcher with an independent Go/Rust fixture covering external create,
+edit, rename, delete, atomic-save replacement, debounce, onboarding, and index
+healing. Keep the filesystem-event stimulus identical and compare the resulting
+Markdown, SQLite, and event-log state rather than requiring identical native
+event sequences.
 
 Any new Rust packages still require explicit approval before adding them.
 
