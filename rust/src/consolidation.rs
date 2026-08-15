@@ -1,16 +1,17 @@
 //! Memory-tier consolidation eligibility, election, and scoring.
 
+mod cadence;
 mod coordination;
+mod graduation;
 mod heuristic;
 
+pub use cadence::{CadenceScheduler, CadenceState};
 pub use coordination::{
     FailReason, GateResult, GateState, InFlightRegistry, PassGate, WatchdogScheduler,
     sweep_watchdog,
 };
-pub use heuristic::{
-    HeuristicConfig, PassResult, ThresholdScheduler, ThresholdState, run_heuristic_pass,
-    score_candidate,
-};
+pub use graduation::{GraduationPassConfig, run_graduation_pass, should_graduate};
+pub use heuristic::{HeuristicConfig, PassResult, run_heuristic_pass, score_candidate};
 
 use std::{path::PathBuf, time::Duration};
 

@@ -5,8 +5,8 @@ Updated: 2026-08-15
 ## Pause point
 
 - Branch: `experiment/rust-rewrite`
-- Latest completed milestone: `feat(rust): add heuristic promotion pass`.
-- Previous milestone: `54cf2f0 feat(rust): add consolidation pass coordination`
+- Latest completed milestone: `feat(rust): add consolidation cadence and graduation`.
+- Previous milestone: `1dae704 feat(rust): add heuristic promotion pass`
 - Verify the exact commit ID and signature with `git log --show-signature -2`
   after resuming.
 - The Go implementation remains the behavioral oracle. The Rust build is an
@@ -55,6 +55,18 @@ Updated: 2026-08-15
 - A live threshold scheduler with Go-compatible strict `count > threshold`
   activation, 80% hysteresis, immediate startup evaluation, and graceful
   cancellation.
+- A unified cadence scheduler with Go's trigger priority (`cron`, threshold,
+  idle), strict `HH:MM` parsing, once-per-local-day cron state, idle history
+  requirement, and cooldown from any pass.
+- Federated cron retries use the same five-minute window and three-retry budget
+  as Go, stop after any locally observed or replayed success, and mark the day
+  complete after success or exhaustion. Single-node cron marks the day on fire
+  because it deliberately emits no coordination success event.
+- Deterministic mid-to-long graduation with the Go defaults (14 days, three
+  reads plus search hits, unmodified, no downvote) and automatic exclusion of
+  preference, young, inactive, unstable, or negatively voted traces.
+- Heuristic and graduation passes are chained in order behind one gate;
+  graduation still runs if the heuristic pass fails.
 - Short-to-mid promotion runs directly for single-node cortexes and behind the
   existing election gate/shared in-flight registry when peers are configured.
 - Promotion updates both SQLite and Markdown frontmatter, emits the exact
@@ -65,7 +77,7 @@ Updated: 2026-08-15
 
 The following passed for the heuristic-promotion milestone:
 
-- `make rust-test` — formatting, clippy with warnings denied, and 35 Rust tests.
+- `make rust-test` — formatting, clippy with warnings denied, and 43 Rust tests.
 - `go test ./...`
 - `go test -race ./...`
 - `go vet ./...`
@@ -82,9 +94,12 @@ The following passed for the heuristic-promotion milestone:
     accepted by Go; and
   - identical Go/Rust threshold-triggered candidate choices, active/window
     filtering, lineage and single-source scoring, promotion event data,
-    frontmatter mutation, and restart idempotency.
-- The new heuristic-promotion scenario passed five consecutive repetitions.
-  The mixed election and three-node ring retained their full passing gates.
+    frontmatter mutation, and restart idempotency; and
+  - identical midnight cron graduation and idle-triggered maintenance across
+    age, read/search, modification, vote, type, and archive gates.
+- The heuristic-promotion, mixed election, and tier-maintenance scenarios each
+  passed five consecutive repetitions. The mixed three-node ring retained its
+  full passing gate.
 
 One sandbox-only warning appeared while Go tried to update its module-download
 stat cache outside the writable workspace. The Go build still succeeded and the
@@ -130,8 +145,8 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
 
 ## Remaining replacement gaps
 
-1. Consolidation cron/idle scheduling, clustering, graduation, and LLM
-   distillation parity. Threshold scheduling and heuristic promotion now pass.
+1. Consolidation clustering and LLM distillation parity. Cron, idle, threshold,
+   heuristic promotion, graduation, election, and watchdog behavior now pass.
 2. Watcher onboarding/healing and atomic-save behavior.
 3. Semantic embedding backfill, stale detection, cosine ranking, and hybrid RRF.
 4. Exact MCP schemas, result semantics, and error parity beyond tool-name parity.
@@ -143,20 +158,19 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
 
 ## Recommended next milestone
 
-Complete the deterministic tier-maintenance boundary before adding an actual
-model call. The threshold path now proves candidate selection, mutation, and
-coordination; the next uncertainty is whether the other cadence paths and the
-more conservative mid-to-long transition match Go.
+Port model-driven consolidation behind a deterministic fake endpoint. The
+entire non-LLM tier-maintenance path now matches Go; the next uncertainty is
+cluster selection, distilled-trace materialization, and failure isolation.
 
 Suggested sequence:
 
-1. Add cron and idle scheduling with Go's retry/cooldown semantics.
-2. Port deterministic mid-to-long graduation and chain it after the heuristic
-   pass behind the same election gate.
-3. Add mixed-runtime fixtures for cron once-per-day behavior, idle cooldown,
-   graduation gates, and loser/no-winner retries.
-4. Then port candidate clustering behind a fake LLM boundary; only afterward
-   add actual distillation and compare resource use.
+1. Port Go's LLM candidate query, including already-consolidated source
+   exclusion without auto-promoting source traces.
+2. Exercise clustering and validation through a deterministic fake
+   OpenAI-compatible endpoint, including malformed and unavailable responses.
+3. Materialize distilled mid-tier traces with exact lineage and consolidate
+   event data, then verify Go/Rust replay and idempotency.
+4. Only afterward compare actual model-backed distillation resource use.
 
 Any new Rust packages still require explicit approval before adding them.
 

@@ -50,6 +50,13 @@ threshold scheduler and checks identical short-to-mid choices, exact promotion
 event data, Markdown frontmatter updates, window filtering, the single-source
 search-hit guard, and restart idempotency.
 
+`tier_maintenance.py` drives the remaining deterministic cadence paths on
+independent Go and Rust cortexes. A midnight cron run evaluates old mid-tier
+traces against age, read/search, modification, vote, type, and active-state
+graduation gates; a separate backdated event log exercises the idle trigger.
+Both paths verify exact tier-change events, Markdown updates, and restart
+idempotency.
+
 `benchmark.sh` creates independent but equivalent cortexes and reports TSV for
 process-level ingest, full-text search, filtered list, sync, verification, and
 release binary size. `mcp_benchmark.py` keeps each stdio MCP server alive and

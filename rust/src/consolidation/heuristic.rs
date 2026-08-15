@@ -1,14 +1,11 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::time::Duration;
 
 use anyhow::Result;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::{InFlightRegistry, PassGate};
-use crate::cortex::{Cortex, PromotionCandidate, read_manifest};
+use crate::cortex::{Cortex, PromotionCandidate};
 
 const DEFAULT_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
-const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_PROMOTION_THRESHOLD: i64 = 5;
 const MIN_INBOUND_REFERENCES_FOR_CREDIT: i64 = 2;
 
@@ -98,125 +95,6 @@ pub fn run_heuristic_pass(
     Ok(result)
 }
 
-#[derive(Debug, Default)]
-pub struct ThresholdState {
-    armed: bool,
-}
-
-impl ThresholdState {
-    pub fn should_fire(&mut self, count: i64, threshold: i64) -> bool {
-        if threshold <= 0 {
-            return false;
-        }
-        if self.armed {
-            if count < ((threshold as f64) * 0.8) as i64 {
-                self.armed = false;
-            }
-            return false;
-        }
-        if count > threshold {
-            self.armed = true;
-            return true;
-        }
-        false
-    }
-}
-
-pub struct ThresholdScheduler {
-    cancellation: CancellationToken,
-    worker: JoinHandle<()>,
-}
-
-impl ThresholdScheduler {
-    pub fn start(
-        name: String,
-        path: PathBuf,
-        cancellation: CancellationToken,
-        registry: Arc<InFlightRegistry>,
-    ) -> Result<Option<Self>> {
-        let manifest = read_manifest(&path)?;
-        let config = manifest.consolidation_config()?.unwrap_or_default();
-        if !config.enabled || config.threshold_short <= 0 {
-            return Ok(None);
-        }
-        let federation = manifest.federation.unwrap_or_default();
-        let peers: Vec<_> = federation
-            .peers
-            .iter()
-            .map(|peer| peer.name.clone())
-            .collect();
-        let quiet_period = crate::federation::parse_interval(&federation.interval)
-            .unwrap_or(Duration::from_secs(30))
-            .saturating_mul(2);
-        let heuristic = HeuristicConfig {
-            window: if config.window_hours > 0 {
-                Duration::from_secs((config.window_hours as u64).saturating_mul(60 * 60))
-            } else {
-                DEFAULT_WINDOW
-            },
-            ..HeuristicConfig::default()
-        };
-        let worker_cancellation = cancellation.clone();
-        let worker = tokio::spawn(async move {
-            let mut state = ThresholdState::default();
-            let gate = (!peers.is_empty())
-                .then(|| PassGate::new(name.clone(), path.clone(), peers, quiet_period, registry));
-            loop {
-                if worker_cancellation.is_cancelled() {
-                    break;
-                }
-                let count = Cortex::open(&name, &path).and_then(|cx| cx.short_tier_count());
-                match count {
-                    Ok(count) if state.should_fire(count, config.threshold_short) => {
-                        let pass_name = name.clone();
-                        let pass_path = path.clone();
-                        let pass_config = heuristic.clone();
-                        let pass_cancellation = worker_cancellation.clone();
-                        let outcome = if let Some(gate) = &gate {
-                            gate.run(
-                                worker_cancellation.clone(),
-                                "threshold",
-                                move |_| async move {
-                                    let cx = Cortex::open(pass_name, pass_path)?;
-                                    run_heuristic_pass(&cx, &pass_config, &pass_cancellation)?;
-                                    Ok(())
-                                },
-                            )
-                            .await
-                            .map(|_| ())
-                        } else {
-                            Cortex::open(pass_name, pass_path).and_then(|cx| {
-                                run_heuristic_pass(&cx, &pass_config, &pass_cancellation)
-                                    .map(|_| ())
-                            })
-                        };
-                        if let Err(error) = outcome {
-                            eprintln!("consolidation threshold pass failed: {error:#}");
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(error) => eprintln!("consolidation threshold probe failed: {error:#}"),
-                }
-                tokio::select! {
-                    _ = worker_cancellation.cancelled() => break,
-                    _ = tokio::time::sleep(DEFAULT_POLL_INTERVAL) => {}
-                }
-            }
-        });
-        Ok(Some(Self {
-            cancellation,
-            worker,
-        }))
-    }
-
-    pub async fn stop(self) {
-        self.cancellation.cancel();
-        if let Err(error) = self.worker.await {
-            eprintln!("consolidation threshold worker join warning: {error}");
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,17 +178,6 @@ mod tests {
         for (candidate, expected) in cases {
             assert_eq!(score_candidate(&candidate, &config), expected);
         }
-    }
-
-    #[test]
-    fn threshold_is_strict_and_rearms_below_eighty_percent() {
-        let mut state = ThresholdState::default();
-        assert!(!state.should_fire(10, 10));
-        assert!(state.should_fire(11, 10));
-        assert!(!state.should_fire(12, 10));
-        assert!(!state.should_fire(8, 10));
-        assert!(!state.should_fire(7, 10));
-        assert!(state.should_fire(11, 10));
     }
 
     #[test]

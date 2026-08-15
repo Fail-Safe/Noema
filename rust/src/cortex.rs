@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::SigningKey;
 use rusqlite::{
     Connection, OptionalExtension, Transaction, params, params_from_iter, types::Value,
@@ -82,11 +82,52 @@ pub struct ConsolidationConfig {
     pub local_llm_endpoint: String,
     #[serde(default)]
     pub watchdog_timeout: String,
+    #[serde(default)]
+    pub graduation: Option<GraduationConfig>,
 }
 
 impl ConsolidationConfig {
     pub fn has_trigger(&self) -> bool {
         !self.cron.is_empty() || self.idle_minutes != 0 || self.threshold_short != 0
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GraduationConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub min_age_days: i64,
+    #[serde(default)]
+    pub min_read_count: i64,
+    #[serde(default)]
+    pub require_unmodified: Option<bool>,
+}
+
+impl GraduationConfig {
+    pub fn effective_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    pub fn effective_min_age(&self) -> std::time::Duration {
+        let days = if self.min_age_days > 0 {
+            self.min_age_days as u64
+        } else {
+            14
+        };
+        std::time::Duration::from_secs(days.saturating_mul(24 * 60 * 60))
+    }
+
+    pub fn effective_min_read_count(&self) -> i64 {
+        if self.min_read_count > 0 {
+            self.min_read_count
+        } else {
+            3
+        }
+    }
+
+    pub fn effective_require_unmodified(&self) -> bool {
+        self.require_unmodified.unwrap_or(true)
     }
 }
 
@@ -606,6 +647,89 @@ impl Cortex {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn graduation_candidates(
+        &self,
+        min_age: std::time::Duration,
+    ) -> Result<Vec<PromotionCandidate>> {
+        let min_age =
+            chrono::Duration::from_std(min_age).context("graduation minimum age is too large")?;
+        let cutoff = (Utc::now() - min_age).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let mut statement = self.connection.prepare(
+            "SELECT
+                t.id,
+                t.tier,
+                t.type,
+                COALESCE(u.total_reads, 0),
+                COALESCE(u.total_modifies, 0),
+                COALESCE(u.total_search_hits, 0),
+                t.tier_votes,
+                COALESCE(v.n, 0),
+                COALESCE(s.n, 0),
+                t.created_at
+             FROM traces t
+             LEFT JOIN (
+                SELECT trace_id,
+                       SUM(read_count) AS total_reads,
+                       SUM(modify_count) AS total_modifies,
+                       SUM(search_hit_count) AS total_search_hits
+                FROM trace_usage
+                GROUP BY trace_id
+             ) u ON u.trace_id=t.id
+             LEFT JOIN v_derived_from_count v ON v.trace_id=t.id
+             LEFT JOIN (
+                SELECT trace_id, COUNT(*) AS n
+                FROM trace_lineage
+                GROUP BY trace_id
+             ) s ON s.trace_id=t.id
+             WHERE t.tier='mid'
+               AND t.archived_at IS NULL
+               AND t.trashed_at IS NULL
+               AND t.purged_at IS NULL
+               AND t.created_at<=?1
+               AND t.id!=''
+             ORDER BY t.created_at ASC",
+        )?;
+        let rows = statement.query_map([cutoff], |row| {
+            Ok(PromotionCandidate {
+                id: row.get(0)?,
+                tier: row.get(1)?,
+                trace_type: row.get(2)?,
+                read_count: row.get(3)?,
+                modify_count: row.get(4)?,
+                search_hit_count: row.get(5)?,
+                tier_votes: row.get(6)?,
+                derived_from_count: row.get(7)?,
+                source_count: row.get(8)?,
+                created_at: row.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn last_mutation_time(&self) -> Result<Option<DateTime<Utc>>> {
+        let timestamp: Option<String> =
+            self.connection
+                .query_row("SELECT MAX(timestamp) FROM events", [], |row| row.get(0))?;
+        timestamp
+            .map(|timestamp| {
+                DateTime::parse_from_rfc3339(&timestamp)
+                    .map(|value| value.with_timezone(&Utc))
+                    .context("parsing latest event timestamp")
+            })
+            .transpose()
+    }
+
+    pub fn has_consolidation_success_after(&self, cutoff: DateTime<Utc>) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM events
+                WHERE action='consolidation_success' AND timestamp>?1
+             )",
+            [cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn bump_search_hits(&self, rows: &[Row]) {

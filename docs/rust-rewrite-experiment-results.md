@@ -121,8 +121,22 @@ signed `watchdog_expired` closure that Go accepts under enforced verification.
 The independent Go/Rust promotion fixture gives both implementations identical
 read, search, edit, vote, lineage, age, and archive inputs. It checks exact
 candidate choices, event data, frontmatter mutation, and restart idempotency;
-the scenario passed five consecutive repetitions. Cron and idle cadence,
-graduation, clustering, and LLM distillation are not yet ported.
+the scenario passed five consecutive repetitions.
+
+The rest of deterministic tier maintenance is now present as one cadence owner,
+preserving Go's cron-before-threshold-before-idle priority. Cron fires once per
+local day; federated runs wait for a success event and retry three times at
+five-minute intervals, while single-node runs mark the day immediately. Idle
+requires a real event-history timestamp and uses any prior pass as its cooldown
+boundary. Graduation runs after the heuristic pass and uses the same AND-gates:
+minimum age, reads plus search hits, optional unmodified requirement, no active
+downvote, and no automatic promotion for preference traces.
+
+A second independent Go/Rust fixture drives midnight cron and a backdated idle
+log, checking old/young, read/search, modified, downvoted, preference, and
+archived cases. It verifies exact `mid` to `long` event data, Markdown updates,
+and restart idempotency. The scenario passed five consecutive repetitions.
+Clustering and LLM distillation remain unported.
 
 ## Bounded federation soak
 
@@ -145,8 +159,8 @@ and recovery rather than only under a single-process search benchmark.
 This remains a complexity probe, not complete federation parity. The Rust path
 does not yet dynamically add new workers without restart, monitor certificate
 expiry, or provide crash-atomic file rollback. Its consolidation election and
-coordination wire, pass gate, watchdog recovery, and threshold heuristic pass
-are now present, but the remaining cadence and model-driven paths are not.
+coordination wire, pass gate, watchdog recovery, full cadence, heuristic pass,
+and graduation are now present, but model-driven paths are not.
 
 ## Current interpretation
 
@@ -156,5 +170,5 @@ the critical signing/vector-clock rules cleanly, use materially less memory,
 remain competitive for smaller cortexes, and now sustain lower measured RSS and
 CPU during a short replicated workload. It still does not justify an all-in
 rewrite because larger-result throughput is not better and certificate-lifecycle
-checks, consolidation cadence/graduation/distillation, semantic search, plugins,
-watcher parity, and broader operator recovery behavior remain unported.
+checks, consolidation clustering/distillation, semantic search, plugins, watcher
+parity, and broader operator recovery behavior remain unported.

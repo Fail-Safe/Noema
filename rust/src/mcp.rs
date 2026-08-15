@@ -604,7 +604,7 @@ pub async fn serve_stdio(name: String, path: PathBuf) -> Result<()> {
     let background_lock = CortexLock::try_acquire_background(&cortex_id)?;
     let cancellation = CancellationToken::new();
     let registry = Arc::new(crate::consolidation::InFlightRegistry::default());
-    let (scheduler, eligibility, threshold, watchdog) = if background_lock.is_some() {
+    let (scheduler, eligibility, cadence, watchdog) = if background_lock.is_some() {
         (
             Some(crate::federation::FederationScheduler::start(
                 name.clone(),
@@ -617,7 +617,7 @@ pub async fn serve_stdio(name: String, path: PathBuf) -> Result<()> {
                 path.clone(),
                 cancellation.clone(),
             )?,
-            crate::consolidation::ThresholdScheduler::start(
+            crate::consolidation::CadenceScheduler::start(
                 name.clone(),
                 path.clone(),
                 cancellation.clone(),
@@ -646,8 +646,8 @@ pub async fn serve_stdio(name: String, path: PathBuf) -> Result<()> {
     if let Some(eligibility) = eligibility {
         eligibility.stop().await;
     }
-    if let Some(threshold) = threshold {
-        threshold.stop().await;
+    if let Some(cadence) = cadence {
+        cadence.stop().await;
     }
     if let Some(watchdog) = watchdog {
         watchdog.stop().await;
@@ -695,7 +695,7 @@ pub async fn serve_http(
     let address = listener.local_addr()?;
     let cancellation = CancellationToken::new();
     let registry = Arc::new(crate::consolidation::InFlightRegistry::default());
-    let (scheduler, eligibility, threshold, watchdog) = if background_lock.is_some() {
+    let (scheduler, eligibility, cadence, watchdog) = if background_lock.is_some() {
         (
             Some(crate::federation::FederationScheduler::start(
                 name.clone(),
@@ -708,7 +708,7 @@ pub async fn serve_http(
                 path.clone(),
                 cancellation.clone(),
             )?,
-            crate::consolidation::ThresholdScheduler::start(
+            crate::consolidation::CadenceScheduler::start(
                 name.clone(),
                 path.clone(),
                 cancellation.clone(),
@@ -766,8 +766,8 @@ pub async fn serve_http(
     if let Some(eligibility) = eligibility {
         eligibility.stop().await;
     }
-    if let Some(threshold) = threshold {
-        threshold.stop().await;
+    if let Some(cadence) = cadence {
+        cadence.stop().await;
     }
     if let Some(watchdog) = watchdog {
         watchdog.stop().await;
