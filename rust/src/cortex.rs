@@ -481,6 +481,74 @@ pub struct ScoredRow {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
+pub struct PopularTrace {
+    pub id: String,
+    pub title: String,
+    #[serde(rename = "type")]
+    pub trace_type: String,
+    pub tier: String,
+    pub search_hits: i64,
+    pub read_count: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TagSummary {
+    pub tag: String,
+    pub trace_count: i64,
+    pub search_hits: i64,
+    pub read_count: i64,
+    pub modify_count: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ConsolidationDay {
+    pub date: String,
+    pub success: i64,
+    pub fail: i64,
+    pub lost_election: i64,
+    pub claim: i64,
+    pub promote: i64,
+    pub distill: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ConsolidationTotals {
+    pub success: i64,
+    pub fail: i64,
+    pub lost_election: i64,
+    pub claim: i64,
+    pub promote: i64,
+    pub distill: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ConsolidationActivity {
+    pub since: String,
+    pub since_start: String,
+    pub daily: Vec<ConsolidationDay>,
+    pub totals: ConsolidationTotals,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PromotionStats {
+    pub count: usize,
+    pub p50: String,
+    pub p95: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PromotionLatency {
+    pub short_to_mid: PromotionStats,
+    pub mid_to_long: PromotionStats,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OneSourceMidCount {
+    pub current: i64,
+    pub promoted_last_7d: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SyncResult {
     pub added: usize,
     pub updated: usize,
@@ -715,6 +783,249 @@ impl Cortex {
         }
         let (sql, values) = list_query(options, true, Some(fts))?;
         self.query_rows(&sql, values)
+    }
+
+    pub fn top_searched_traces(&self, limit: usize) -> Result<Vec<PopularTrace>> {
+        let limit = if limit == 0 { 10 } else { limit };
+        let mut statement = self.connection.prepare(
+            "SELECT t.id,t.title,t.type,t.tier,
+                    COALESCE(SUM(u.search_hit_count),0) AS hits,
+                    COALESCE(SUM(u.read_count),0) AS reads
+             FROM traces t
+             LEFT JOIN trace_usage u ON u.trace_id=t.id
+             WHERE t.archived_at IS NULL
+               AND t.trashed_at IS NULL
+               AND t.purged_at IS NULL
+             GROUP BY t.id
+             HAVING hits>0 OR reads>0
+             ORDER BY hits DESC,reads DESC,t.id ASC
+             LIMIT ?1",
+        )?;
+        Ok(statement
+            .query_map([limit as i64], |row| {
+                Ok(PopularTrace {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    trace_type: row.get(2)?,
+                    tier: row.get(3)?,
+                    search_hits: row.get(4)?,
+                    read_count: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn tag_activity(&self, limit: usize) -> Result<Vec<TagSummary>> {
+        let limit = if limit == 0 { 20 } else { limit };
+        let mut statement = self.connection.prepare(
+            "SELECT tt.tag,
+                    COUNT(DISTINCT t.id) AS trace_count,
+                    COALESCE(SUM(u.search_hit_count),0) AS hits,
+                    COALESCE(SUM(u.read_count),0) AS reads,
+                    COALESCE(SUM(u.modify_count),0) AS mods
+             FROM trace_tags tt
+             JOIN traces t ON t.id=tt.trace_id
+             LEFT JOIN trace_usage u ON u.trace_id=t.id
+             WHERE t.archived_at IS NULL
+               AND t.trashed_at IS NULL
+               AND t.purged_at IS NULL
+             GROUP BY tt.tag
+             ORDER BY hits DESC,reads DESC,mods DESC,tt.tag ASC
+             LIMIT ?1",
+        )?;
+        Ok(statement
+            .query_map([limit as i64], |row| {
+                Ok(TagSummary {
+                    tag: row.get(0)?,
+                    trace_count: row.get(1)?,
+                    search_hits: row.get(2)?,
+                    read_count: row.get(3)?,
+                    modify_count: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn consolidation_activity(&self, since: Duration) -> Result<ConsolidationActivity> {
+        let mut output = ConsolidationActivity {
+            since: format_go_duration(since),
+            since_start: "0001-01-01T00:00:00Z".into(),
+            daily: Vec::new(),
+            ..Default::default()
+        };
+        let actions = [
+            "consolidation_success",
+            "consolidation_fail",
+            "consolidation_claim",
+            "promote",
+            "consolidate",
+        ];
+        let mut sql = String::from(
+            "SELECT substr(timestamp,1,10) AS date,action,
+                    COALESCE(json_extract(data,'$.reason'),'') AS reason,
+                    COUNT(*)
+             FROM events
+             WHERE action IN (?1,?2,?3,?4,?5)",
+        );
+        let cutoff = if since > Duration::zero() {
+            let cutoff = Utc::now() - since;
+            let formatted = cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            output.since_start = formatted.clone();
+            sql.push_str(" AND timestamp>=?6");
+            Some(formatted)
+        } else {
+            None
+        };
+        sql.push_str(" GROUP BY date,action,reason ORDER BY date");
+
+        let mut statement = self.connection.prepare(&sql)?;
+        let mut by_date: BTreeMap<String, ConsolidationDay> = BTreeMap::new();
+        let mut rows = if let Some(cutoff) = cutoff {
+            statement.query(params![
+                actions[0], actions[1], actions[2], actions[3], actions[4], cutoff
+            ])?
+        } else {
+            statement.query(params![
+                actions[0], actions[1], actions[2], actions[3], actions[4]
+            ])?
+        };
+        while let Some(row) = rows.next()? {
+            let date: String = row.get(0)?;
+            let action: String = row.get(1)?;
+            let reason: String = row.get(2)?;
+            let count: i64 = row.get(3)?;
+            let day = by_date
+                .entry(date.clone())
+                .or_insert_with(|| ConsolidationDay {
+                    date,
+                    ..Default::default()
+                });
+            match action.as_str() {
+                "consolidation_success" => {
+                    day.success += count;
+                    output.totals.success += count;
+                }
+                "consolidation_fail"
+                    if matches!(
+                        reason.as_str(),
+                        "peer_outranked" | "no_winner_at_recheck" | "context_canceled"
+                    ) =>
+                {
+                    day.lost_election += count;
+                    output.totals.lost_election += count;
+                }
+                "consolidation_fail" => {
+                    day.fail += count;
+                    output.totals.fail += count;
+                }
+                "consolidation_claim" => {
+                    day.claim += count;
+                    output.totals.claim += count;
+                }
+                "promote" => {
+                    day.promote += count;
+                    output.totals.promote += count;
+                }
+                "consolidate" => {
+                    day.distill += count;
+                    output.totals.distill += count;
+                }
+                _ => {}
+            }
+        }
+        output.daily = by_date.into_values().collect();
+        Ok(output)
+    }
+
+    pub fn promotion_latency(&self) -> Result<PromotionLatency> {
+        #[derive(Clone)]
+        struct Promotion {
+            timestamp: DateTime<Utc>,
+            from: String,
+            to: String,
+            created: DateTime<Utc>,
+        }
+
+        let mut statement = self.connection.prepare(
+            "SELECT e.trace_id,e.timestamp,
+                    COALESCE(json_extract(e.data,'$.from'),''),
+                    COALESCE(json_extract(e.data,'$.to'),''),t.created_at
+             FROM events e
+             JOIN traces t ON t.id=e.trace_id
+             WHERE e.action='promote'
+             ORDER BY e.trace_id,e.timestamp",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut by_trace: BTreeMap<String, Vec<Promotion>> = BTreeMap::new();
+        while let Some(row) = rows.next()? {
+            let timestamp: String = row.get(1)?;
+            let created: String = row.get(4)?;
+            let (Ok(timestamp), Ok(created)) = (
+                DateTime::parse_from_rfc3339(&timestamp),
+                DateTime::parse_from_rfc3339(&created),
+            ) else {
+                continue;
+            };
+            by_trace.entry(row.get(0)?).or_default().push(Promotion {
+                timestamp: timestamp.with_timezone(&Utc),
+                from: row.get(2)?,
+                to: row.get(3)?,
+                created: created.with_timezone(&Utc),
+            });
+        }
+
+        let mut short_to_mid = Vec::new();
+        let mut mid_to_long = Vec::new();
+        for promotions in by_trace.into_values() {
+            let mut mid_entry = None;
+            for promotion in promotions {
+                if promotion.from == "short" && promotion.to == "mid" {
+                    short_to_mid.push(promotion.timestamp - promotion.created);
+                    mid_entry = Some(promotion.timestamp);
+                }
+                if promotion.from == "mid" && promotion.to == "long" {
+                    mid_to_long.push(promotion.timestamp - mid_entry.unwrap_or(promotion.created));
+                }
+            }
+        }
+        Ok(PromotionLatency {
+            short_to_mid: summarize_durations(&mut short_to_mid),
+            mid_to_long: summarize_durations(&mut mid_to_long),
+        })
+    }
+
+    pub fn one_source_mid_count(&self) -> Result<OneSourceMidCount> {
+        let current = self.connection.query_row(
+            "SELECT COUNT(*)
+             FROM traces t
+             JOIN (SELECT trace_id,COUNT(*) AS n FROM trace_lineage GROUP BY trace_id) l
+               ON l.trace_id=t.id
+             WHERE t.tier='mid'
+               AND t.archived_at IS NULL
+               AND t.trashed_at IS NULL
+               AND t.purged_at IS NULL
+               AND l.n=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let cutoff =
+            (Utc::now() - Duration::days(7)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let promoted_last_7d = self.connection.query_row(
+            "SELECT COUNT(DISTINCT e.trace_id)
+             FROM events e
+             JOIN (SELECT trace_id,COUNT(*) AS n FROM trace_lineage GROUP BY trace_id) l
+               ON l.trace_id=e.trace_id
+             WHERE e.action='promote'
+               AND COALESCE(json_extract(e.data,'$.to'),'')='mid'
+               AND e.timestamp>=?1
+               AND l.n=1",
+            [cutoff],
+            |row| row.get(0),
+        )?;
+        Ok(OneSourceMidCount {
+            current,
+            promoted_last_7d,
+        })
     }
 
     pub fn embedding_status(&self, model: &str) -> Result<EmbeddingStatus> {
@@ -1657,6 +1968,64 @@ impl Cortex {
         )?;
         let rows = statement.query_map([id], scan_event)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn resolve_divergence(
+        &self,
+        divergence_id: &str,
+        accept_origin: &str,
+        custom_body: &str,
+    ) -> Result<()> {
+        if accept_origin.is_empty() && custom_body.is_empty() {
+            bail!("resolution requires either an accept origin or a custom body");
+        }
+        if !accept_origin.is_empty() && !custom_body.is_empty() {
+            bail!("specify only one of accept origin or custom body");
+        }
+
+        let (row, divergence) = self
+            .get_trace(divergence_id)
+            .with_context(|| format!("divergence trace {divergence_id:?} not found"))?;
+        if row.trace_type != "divergence" {
+            bail!(
+                "trace {divergence_id:?} is not a divergence (type={})",
+                row.trace_type
+            );
+        }
+        let original_id = row.derived_from.first().ok_or_else(|| {
+            anyhow::anyhow!(
+                "divergence trace {divergence_id:?} has no derived_from link to original trace"
+            )
+        })?;
+
+        let resolution = if !custom_body.is_empty() {
+            custom_body.to_owned()
+        } else {
+            let sections = split_divergence_sections(&divergence.body)
+                .with_context(|| format!("parsing divergence trace {divergence_id:?}"))?;
+            if let Some(section) = sections
+                .iter()
+                .find(|section| section.matches(accept_origin))
+            {
+                section.body.trim().to_owned()
+            } else {
+                let available = sections
+                    .iter()
+                    .map(DivergenceSection::label)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "origin {accept_origin:?} not found in divergence {divergence_id:?} (available: {available})"
+                );
+            }
+        };
+
+        let (_, mut original) = self
+            .get_trace(original_id)
+            .with_context(|| format!("original trace {original_id:?} not found"))?;
+        original.body = resolution;
+        self.update_trace(original_id, &mut original, false)?;
+        self.trash(divergence_id)
     }
 
     pub fn unresolved_coordination_claims_before(
@@ -2954,6 +3323,169 @@ fn trace_snapshot(trace: &Trace) -> serde_json::Value {
     value.into()
 }
 
+pub fn parse_since(value: &str) -> Result<Duration> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(Duration::zero());
+    }
+    if value == "0" {
+        return Ok(Duration::zero());
+    }
+    let (sign, mut rest) = value.strip_prefix('-').map_or_else(
+        || {
+            value
+                .strip_prefix('+')
+                .map_or((1.0, value), |rest| (1.0, rest))
+        },
+        |rest| (-1.0, rest),
+    );
+    let mut nanoseconds = 0.0;
+    while !rest.is_empty() {
+        let number_end = rest
+            .find(|character: char| !character.is_ascii_digit() && character != '.')
+            .unwrap_or(rest.len());
+        if number_end == 0 || number_end == rest.len() {
+            bail!(invalid_duration(value));
+        }
+        let amount: f64 = rest[..number_end]
+            .parse()
+            .map_err(|_| anyhow::anyhow!(invalid_duration(value)))?;
+        rest = &rest[number_end..];
+        let (unit, tail) = ["ms", "us", "µs", "ns", "w", "d", "h", "m", "s"]
+            .into_iter()
+            .find_map(|unit| rest.strip_prefix(unit).map(|tail| (unit, tail)))
+            .ok_or_else(|| anyhow::anyhow!(invalid_duration(value)))?;
+        rest = tail;
+        nanoseconds += amount
+            * match unit {
+                "w" => 7.0 * 24.0 * 60.0 * 60.0 * 1_000_000_000.0,
+                "d" => 24.0 * 60.0 * 60.0 * 1_000_000_000.0,
+                "h" => 60.0 * 60.0 * 1_000_000_000.0,
+                "m" => 60.0 * 1_000_000_000.0,
+                "s" => 1_000_000_000.0,
+                "ms" => 1_000_000.0,
+                "us" | "µs" => 1_000.0,
+                "ns" => 1.0,
+                _ => unreachable!(),
+            };
+    }
+    nanoseconds *= sign;
+    if !nanoseconds.is_finite() || nanoseconds > i64::MAX as f64 || nanoseconds < i64::MIN as f64 {
+        bail!("duration {value:?} is out of range");
+    }
+    Ok(Duration::nanoseconds(nanoseconds as i64))
+}
+
+fn invalid_duration(value: &str) -> String {
+    format!(
+        "invalid duration {value:?}: use Go duration syntax (e.g. 24h, 90m) or days/weeks (7d, 2w)"
+    )
+}
+
+fn format_go_duration(duration: Duration) -> String {
+    let total_seconds = duration.num_seconds();
+    if total_seconds == 0 {
+        return "0s".into();
+    }
+    let negative = total_seconds < 0;
+    let mut seconds = total_seconds.unsigned_abs();
+    let hours = seconds / 3600;
+    seconds %= 3600;
+    let minutes = seconds / 60;
+    seconds %= 60;
+    let mut output = if negative {
+        String::from("-")
+    } else {
+        String::new()
+    };
+    if hours > 0 {
+        output.push_str(&format!("{hours}h"));
+    }
+    if minutes > 0 || hours > 0 {
+        output.push_str(&format!("{minutes}m"));
+    }
+    output.push_str(&format!("{seconds}s"));
+    output
+}
+fn summarize_durations(values: &mut [Duration]) -> PromotionStats {
+    if values.is_empty() {
+        return PromotionStats::default();
+    }
+    values.sort();
+    let pick = |percent: usize| {
+        let rank = (percent * values.len()).div_ceil(100);
+        values[rank.saturating_sub(1).min(values.len() - 1)]
+    };
+    PromotionStats {
+        count: values.len(),
+        p50: format_go_duration(pick(50)),
+        p95: format_go_duration(pick(95)),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DivergenceSection {
+    name: String,
+    cortex_id: String,
+    body: String,
+}
+
+impl DivergenceSection {
+    fn label(&self) -> String {
+        if self.cortex_id.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{} ({})", self.name, self.cortex_id)
+        }
+    }
+
+    fn matches(&self, accepted: &str) -> bool {
+        accepted == self.name
+            || (!self.cortex_id.is_empty()
+                && (accepted == self.cortex_id || accepted.starts_with(&self.cortex_id)))
+    }
+}
+
+fn split_divergence_sections(body: &str) -> Result<Vec<DivergenceSection>> {
+    const HEADER: &str = "### Version from ";
+    let mut sections = Vec::new();
+    let mut rest = body;
+    while let Some(index) = rest.find(HEADER) {
+        rest = &rest[index + HEADER.len()..];
+        let (label, after_label) = rest.split_once('\n').unwrap_or((rest, ""));
+        rest = after_label;
+        if rest.starts_with("**Vector clock:**") {
+            rest = rest.split_once('\n').map_or("", |(_, after)| after);
+        }
+        let (section_body, after_section) = match rest.find(&format!("\n{HEADER}")) {
+            Some(next) => (&rest[..next], &rest[next + 1..]),
+            None => (rest, ""),
+        };
+        let label = label.trim();
+        let (name, cortex_id) = if let Some(without_suffix) = label.strip_suffix(')') {
+            without_suffix
+                .rsplit_once(" (")
+                .map(|(name, id)| (name.trim(), id.trim()))
+                .unwrap_or((label, ""))
+        } else {
+            (label, "")
+        };
+        sections.push(DivergenceSection {
+            name: name.to_owned(),
+            cortex_id: cortex_id.to_owned(),
+            body: section_body.to_owned(),
+        });
+        rest = after_section;
+        if rest.is_empty() {
+            break;
+        }
+    }
+    if sections.is_empty() {
+        bail!("no '### Version from ' headers found");
+    }
+    Ok(sections)
+}
+
 fn nullable(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
 }
@@ -3038,6 +3570,120 @@ mod tests {
         Cortex::create("test", temp.path()).unwrap();
         let cx = Cortex::open("test", temp.path().join("test")).unwrap();
         (temp, cx)
+    }
+
+    #[test]
+    fn parses_observability_windows_and_go_duration_labels() {
+        assert_eq!(parse_since("24h").unwrap(), Duration::hours(24));
+        assert_eq!(parse_since("7d").unwrap(), Duration::days(7));
+        assert_eq!(parse_since("1h30m").unwrap(), Duration::minutes(90));
+        assert_eq!(format_go_duration(Duration::minutes(90)), "1h30m0s");
+        assert!(parse_since("tomorrow").is_err());
+    }
+
+    #[test]
+    fn observability_aggregates_usage_events_latency_and_leaks() {
+        let (_temp, cx) = cortex();
+        let mut source = Trace::new("Source", "fact", "", vec!["alpha".into()], "source");
+        cx.add(&mut source).unwrap();
+        let mut derived = Trace::new(
+            "Derived",
+            "observation",
+            "",
+            vec!["alpha".into(), "beta".into()],
+            "derived",
+        );
+        derived.frontmatter.derived_from = vec![source.frontmatter.id.clone()];
+        cx.add(&mut derived).unwrap();
+        cx.bump_read(&derived.frontmatter.id).unwrap();
+        cx.bump_read(&derived.frontmatter.id).unwrap();
+        cx.bump_search_hits(&[cx.get(&derived.frontmatter.id).unwrap()]);
+        cx.promote(&derived.frontmatter.id, "mid").unwrap();
+        cx.emit_coordination_event(
+            "consolidation_fail",
+            "window-peer",
+            json!({"reason":"peer_outranked"}),
+        )
+        .unwrap();
+        cx.emit_coordination_event(
+            "consolidation_fail",
+            "window-error",
+            json!({"reason":"endpoint_error"}),
+        )
+        .unwrap();
+
+        let popular = cx.top_searched_traces(10).unwrap();
+        assert_eq!(popular.len(), 1);
+        assert_eq!(popular[0].id, derived.frontmatter.id);
+        assert_eq!((popular[0].search_hits, popular[0].read_count), (1, 2));
+        let tags = cx.tag_activity(10).unwrap();
+        assert_eq!(tags[0].tag, "alpha");
+        assert_eq!(tags[0].search_hits, 1);
+
+        let activity = cx.consolidation_activity(Duration::hours(24)).unwrap();
+        assert_eq!(activity.totals.promote, 1);
+        assert_eq!(activity.totals.lost_election, 1);
+        assert_eq!(activity.totals.fail, 1);
+        let latency = cx.promotion_latency().unwrap();
+        assert_eq!(latency.short_to_mid.count, 1);
+        let leaks = cx.one_source_mid_count().unwrap();
+        assert_eq!(leaks.current, 1);
+        assert_eq!(leaks.promoted_last_7d, 1);
+    }
+
+    #[test]
+    fn resolves_divergence_by_origin_or_custom_body() {
+        let (_temp, cx) = cortex();
+        let mut original = Trace::new("Original", "fact", "", vec![], "old body");
+        cx.add(&mut original).unwrap();
+
+        let body = format!(
+            "## Concurrent edits detected\n\n**Trace:** {}\n**Conflicting origins:** test (LOCAL123), peer (REMOTE12)\n\n### Version from test (LOCAL123)\n**Vector clock:** {{}}\n\nlocal body\n\n### Version from peer (REMOTE12)\n**Vector clock:** {{}}\n\nremote body",
+            original.frontmatter.id
+        );
+        let mut divergence = Trace::new(
+            "Divergence: Original",
+            "divergence",
+            "system",
+            vec!["divergence".into()],
+            body,
+        );
+        divergence.frontmatter.derived_from = vec![original.frontmatter.id.clone()];
+        cx.add(&mut divergence).unwrap();
+        cx.resolve_divergence(&divergence.frontmatter.id, "peer", "")
+            .unwrap();
+        assert_eq!(
+            cx.get_trace(&original.frontmatter.id).unwrap().1.body,
+            "remote body"
+        );
+        assert!(
+            !cx.get(&divergence.frontmatter.id)
+                .unwrap()
+                .trashed_at
+                .is_empty()
+        );
+
+        let mut custom = Trace::new(
+            "Divergence: Original custom",
+            "divergence",
+            "system",
+            vec!["divergence".into()],
+            "unparsed body",
+        );
+        custom.frontmatter.derived_from = vec![original.frontmatter.id.clone()];
+        cx.add(&mut custom).unwrap();
+        cx.resolve_divergence(&custom.frontmatter.id, "", "merged body")
+            .unwrap();
+        assert_eq!(
+            cx.get_trace(&original.frontmatter.id).unwrap().1.body,
+            "merged body"
+        );
+        assert!(
+            !cx.get(&custom.frontmatter.id)
+                .unwrap()
+                .trashed_at
+                .is_empty()
+        );
     }
 
     #[test]

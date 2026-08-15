@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use axum::{
@@ -9,7 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use rmcp::{
-    ErrorData, ServerHandler, ServiceExt,
+    ErrorData, Json, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     tool, tool_handler, tool_router,
     transport::streamable_http_server::{
@@ -27,7 +27,7 @@ use crate::{
     VERSION,
     cortex::{
         AccessKey, Cortex, DistilledTraceSpec, ListOptions, PeerEntry, SemanticOptions,
-        write_manifest,
+        parse_since, write_manifest,
     },
     embedding::HttpEmbedder,
     lock::CortexLock,
@@ -36,7 +36,6 @@ use crate::{
 
 #[derive(Clone)]
 pub struct NoemaServer {
-    name: String,
     cortex: Arc<Mutex<Cortex>>,
     tool_router: ToolRouter<Self>,
 }
@@ -46,7 +45,6 @@ impl NoemaServer {
         let name = name.into();
         let cortex = Cortex::open(&name, path.into())?;
         Ok(Self {
-            name,
             cortex: Arc::new(Mutex::new(cortex)),
             tool_router: Self::tool_router(),
         })
@@ -65,101 +63,184 @@ struct Empty {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct IdParam {
+    /// Trace ID
     id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct GetParams {
+    /// Trace ID
+    id: String,
+    /// Record this as an agent read for memory-tier promotion signals (default false). Pass true for task-driven retrieval where the read should count toward durability.
+    #[serde(default)]
+    record_usage: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct ListParams {
+    /// Filter by trace type
     #[serde(default, rename = "type")]
     trace_type: String,
+    /// Filter by author
     #[serde(default)]
     author: String,
+    /// Filter by tag
     #[serde(default)]
     tag: String,
+    /// Filter by origin cortex name
     #[serde(default)]
     origin: String,
+    /// Show only archived traces
     #[serde(default)]
     archived: bool,
+    /// Show active and archived traces
     #[serde(default)]
     all: bool,
 }
 
+#[derive(Debug, JsonSchema)]
+#[schemars(rename_all = "lowercase")]
+#[allow(dead_code)]
+enum TraceTypeSchema {
+    Fact,
+    Decision,
+    Preference,
+    Context,
+    Skill,
+    Intent,
+    Observation,
+    Note,
+    Divergence,
+}
+
+#[derive(Debug, JsonSchema)]
+#[schemars(rename_all = "lowercase")]
+#[allow(dead_code)]
+enum VoteDirectionSchema {
+    Up,
+    Down,
+}
+
+#[derive(Debug, JsonSchema)]
+#[schemars(rename_all = "lowercase")]
+#[allow(dead_code)]
+enum ModelTierSchema {
+    Small,
+    Large,
+    Frontier,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CreateParams {
+    /// Trace title
     title: String,
+    /// Trace type
     #[serde(rename = "type")]
+    #[schemars(with = "TraceTypeSchema")]
     trace_type: String,
+    /// Trace body content
     body: String,
+    /// Author name or agent identifier
     #[serde(default)]
     author: String,
+    /// Comma-separated tags
     #[serde(default)]
     tags: String,
+    /// Comma-separated trace IDs this trace was derived from
     #[serde(default)]
     derived_from: String,
+    /// Origin cortex name (defaults to current cortex)
     #[serde(default)]
     origin: String,
+    /// Content hash from the source/publisher cortex
     #[serde(default)]
     source_hash: String,
+    /// Mark trace as source-locked (immutable on consumer side)
     #[serde(default)]
     source_locked: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct UpdateParams {
+    /// Trace ID
     id: String,
+    /// New title
     title: Option<String>,
+    /// New type
     #[serde(rename = "type")]
+    #[schemars(with = "Option<TraceTypeSchema>")]
     trace_type: Option<String>,
+    /// New author
     author: Option<String>,
+    /// New tags, comma-separated (replaces existing tags)
     tags: Option<String>,
+    /// New derived_from, comma-separated trace IDs (replaces existing lineage)
     derived_from: Option<String>,
+    /// New body content
     body: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SearchParams {
+    /// Search query
     query: String,
+    /// Include archived traces
     #[serde(default)]
     all: bool,
+    /// Search mode: 'lexical' (FTS5, default), 'semantic' (embedding similarity), or 'hybrid'. Semantic/hybrid need a configured search block; if unavailable, falls back to lexical.
     #[serde(default)]
     mode: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SimilarParams {
+    /// ID of the source trace
     trace_id: String,
+    /// Maximum matches to return (default 10)
     limit: Option<usize>,
+    /// Include archived traces (default false)
     include_archived: Option<bool>,
+    /// 'lexical' (FTS5, default) or 'semantic'/'hybrid' (embedding similarity). Falls back to lexical if semantic isn't configured or the source isn't embedded.
     mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct TagsParam {
+    /// Trace ID
     id: String,
+    /// Comma-separated tags
     tags: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct VoteParam {
+    /// Trace ID to vote on
     id: String,
+    /// 'up' for promotion preference, 'down' for demotion preference
+    #[schemars(with = "VoteDirectionSchema")]
     direction: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct AppendParam {
+    /// Trace ID
     id: String,
+    /// Content to append to the trace body
     content: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SinceParam {
+    /// Cursor; interpretation depends on the sync tool
     since: Option<String>,
+    /// Maximum rows to return (default 100, max 1000)
     limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct TopParam {
-    top: Option<usize>,
+    /// How many top traces and tags to return. Default 10. Capped at 100.
+    top: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -167,49 +248,104 @@ struct CandidateParam {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct HealthParam {
+    /// Lookback window for activity buckets, for example '24h' or '7d'
     since: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ConsolidateParam {
+    /// Title for the distilled trace
     title: String,
+    /// Body of the distilled trace
     body: String,
+    /// Comma-separated source trace IDs (at least 2)
     source_ids: String,
+    /// Comma-separated tags (optional)
     tags: Option<String>,
+    /// Author identifier for the distilled trace (optional)
     author: Option<String>,
+    /// Model that produced the distillation (optional)
     model_name: Option<String>,
+    /// Prompt profile used (optional)
+    #[schemars(with = "Option<ModelTierSchema>")]
     model_tier_profile: Option<String>,
+    /// Confidence 0.0-1.0 that the cluster was cohesive (optional)
     cohesion_confidence: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ResolveParam {
+    /// Divergence trace ID
     id: String,
+    /// Origin name whose version to accept
     accept: Option<String>,
+    /// Custom merged body content, mutually exclusive with accept
     body: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct AnnounceParam {
+    /// Name of the announcing cortex
     name: String,
+    /// Streamable HTTP base URL of the announcing cortex
     endpoint: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct TagMutationOutput {
+    id: String,
+    action: TagMutationAction,
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[schemars(rename_all = "lowercase")]
+enum TagMutationAction {
+    Set,
+    Append,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct CortexUsageOutput {
+    schema_version: u32,
+    cortex: BTreeMap<String, serde_json::Value>,
+    contract: CortexContractOutput,
+    startup: BTreeMap<String, serde_json::Value>,
+    trace_model: BTreeMap<String, serde_json::Value>,
+    search: BTreeMap<String, serde_json::Value>,
+    workflows: BTreeMap<String, serde_json::Value>,
+    runtime: BTreeMap<String, serde_json::Value>,
+    authoring_tips: Vec<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct CortexContractOutput {
+    tool_discovery_authoritative: bool,
+    markdown_instructions_tool: String,
+    structured_usage_tool: String,
+    callable_tools_policy: String,
 }
 
 #[tool_router(router = tool_router)]
 impl NoemaServer {
-    #[tool(description = "Returns concise Markdown guidance for agent use of this Cortex.")]
-    async fn get_instructions(&self, _: Parameters<Empty>) -> String {
-        format!(
-            "# Noema Agent Instructions\n\n## Active Cortex\nName:     {}\nVersion:  noema-rs v{} (manifest v2)\n\nUse `list_traces` with tag=\"user-preference\" at startup, then `get_trace` with record_usage=false.",
-            self.name, VERSION
-        )
+    #[tool(
+        description = "Returns concise Markdown guidance for agent use of this Cortex. Call this first if you are unfamiliar with Noema; use cortex_usage for structured MCP/client context."
+    )]
+    async fn get_instructions(&self, _: Parameters<Empty>) -> Result<String, ErrorData> {
+        let cx = self.open().await?;
+        Ok(render_instructions(&cx.manifest))
     }
 
-    #[tool(description = "Returns structured JSON context for MCP clients.")]
-    async fn cortex_usage(&self, _: Parameters<Empty>) -> Result<String, ErrorData> {
-        Ok(json_text(
-            json!({"schema_version":1,"cortex":{"name":self.name},"contract":{"tool_discovery_authoritative":true},"runtime":{"implementation":"rust"}}),
-        ))
+    #[tool(
+        description = "Returns structured JSON context for MCP clients: active Cortex identity, trace semantics, startup preference pattern, runtime posture, and operational constraints. Tool discovery remains authoritative for callable tools."
+    )]
+    async fn cortex_usage(
+        &self,
+        _: Parameters<Empty>,
+    ) -> Result<Json<CortexUsageOutput>, ErrorData> {
+        let cx = self.open().await?;
+        build_cortex_usage(&cx).map(Json).map_err(mcp_error)
     }
 
     #[tool(description = "List traces in the cortex")]
@@ -233,10 +369,12 @@ impl NoemaServer {
     }
 
     #[tool(description = "Get a trace by ID, including its full body")]
-    async fn get_trace(&self, Parameters(p): Parameters<IdParam>) -> Result<String, ErrorData> {
+    async fn get_trace(&self, Parameters(p): Parameters<GetParams>) -> Result<String, ErrorData> {
         let cx = self.open().await?;
         let (row, trace) = cx.get_trace(&p.id).map_err(mcp_error)?;
-        cx.bump_read(&p.id).map_err(mcp_error)?;
+        if p.record_usage {
+            cx.bump_read(&p.id).map_err(mcp_error)?;
+        }
         Ok(json_text(
             json!({"id":row.id,"title":row.title,"type":row.trace_type,"tier":row.tier,"author":row.author,"tags":row.tags,"derived_from":row.derived_from,"origin":row.origin,"created":row.created_at,"updated":row.updated_at,"body":trace.body,"content_hash":row.content_hash,"source_hash":row.source_hash,"source_locked":row.source_locked}),
         ))
@@ -369,12 +507,14 @@ impl NoemaServer {
         Ok(json_text(json!({"mode":mode,"note":note,"results":rows})))
     }
 
-    #[tool(description = "Move a trace to trash")]
+    #[tool(
+        description = "Move a trace to trash (soft-delete, recoverable for 30 days). Use recover_trace to restore it."
+    )]
     async fn delete_trace(&self, Parameters(p): Parameters<IdParam>) -> Result<String, ErrorData> {
         self.open().await?.trash(&p.id).map_err(mcp_error)?;
         Ok("Trace moved to trash".into())
     }
-    #[tool(description = "Restore a trace from trash")]
+    #[tool(description = "Restore a trace from trash back to active")]
     async fn recover_trace(&self, Parameters(p): Parameters<IdParam>) -> Result<String, ErrorData> {
         self.open().await?.recover(&p.id).map_err(mcp_error)?;
         Ok("Trace recovered".into())
@@ -393,7 +533,7 @@ impl NoemaServer {
         Ok("Trace unarchived".into())
     }
 
-    #[tool(description = "Update fields of an existing trace")]
+    #[tool(description = "Update fields of an existing trace. Only provided fields are changed.")]
     async fn update_trace(
         &self,
         Parameters(p): Parameters<UpdateParams>,
@@ -423,31 +563,45 @@ impl NoemaServer {
         Ok("Trace updated".into())
     }
 
-    #[tool(description = "Replace trace tags")]
+    #[tool(
+        description = "Replace a trace's tags with the provided comma-separated list. Use for metadata hygiene; do not use vote_trace as a substitute for tag cleanup."
+    )]
     async fn set_trace_tags(
         &self,
         Parameters(p): Parameters<TagsParam>,
-    ) -> Result<String, ErrorData> {
+    ) -> Result<Json<TagMutationOutput>, ErrorData> {
         let tags = csv(&p.tags);
         self.open()
             .await?
             .set_tags(&p.id, tags.clone(), true)
             .map_err(mcp_error)?;
-        Ok(json_text(json!({"id":p.id,"action":"set","tags":tags})))
+        Ok(Json(TagMutationOutput {
+            id: p.id,
+            action: TagMutationAction::Set,
+            tags,
+        }))
     }
-    #[tool(description = "Add trace tags idempotently")]
+    #[tool(
+        description = "Add tags to a trace idempotently. Use for retrieval metadata; do not use vote_trace as a substitute for tag cleanup."
+    )]
     async fn append_trace_tags(
         &self,
         Parameters(p): Parameters<TagsParam>,
-    ) -> Result<String, ErrorData> {
+    ) -> Result<Json<TagMutationOutput>, ErrorData> {
         let tags = self
             .open()
             .await?
             .append_tags(&p.id, csv(&p.tags), true)
             .map_err(mcp_error)?;
-        Ok(json_text(json!({"id":p.id,"action":"append","tags":tags})))
+        Ok(Json(TagMutationOutput {
+            id: p.id,
+            action: TagMutationAction::Append,
+            tags,
+        }))
     }
-    #[tool(description = "Cast a tier-preference vote")]
+    #[tool(
+        description = "Cast a tier-preference vote on a trace. Use sparingly: only when the user has clearly indicated preference. Votes accumulate across calls and are preferences, not overrides."
+    )]
     async fn vote_trace(&self, Parameters(p): Parameters<VoteParam>) -> Result<String, ErrorData> {
         let delta = match p.direction.as_str() {
             "up" => 1,
@@ -481,27 +635,42 @@ impl NoemaServer {
             .map_err(mcp_error)?;
         Ok(json_text(rows))
     }
-    #[tool(description = "Recent consolidation pipeline health")]
+    #[tool(
+        description = "Recent consolidation pipeline health: daily success/fail/promote/distill counts within the lookback window, short→mid and mid→long promotion-latency percentiles, and the 1-source mid leak detector. Lets an agent or operator answer 'is consolidation actually happening, and is anything leaking?' without raw SQL against the events table."
+    )]
     async fn consolidation_health(
         &self,
         Parameters(p): Parameters<HealthParam>,
     ) -> Result<String, ErrorData> {
-        Ok(json_text(
-            json!({"since":p.since.unwrap_or_else(||"24h".into()),"daily":[],"totals":{"success":0,"fail":0,"promote":0,"distill":0}}),
-        ))
+        let since = parse_since(p.since.as_deref().unwrap_or("24h")).map_err(mcp_error)?;
+        let cx = self.open().await?;
+        Ok(json_text(json!({
+            "schema_version": 1,
+            "activity": cx.consolidation_activity(since).map_err(mcp_error)?,
+            "latency": cx.promotion_latency().map_err(mcp_error)?,
+            "one_source_mid": cx.one_source_mid_count().map_err(mcp_error)?,
+        })))
     }
-    #[tool(description = "Top traces and tags by search popularity")]
+    #[tool(
+        description = "Top-N traces by federation-wide search popularity (search_hit_count then read_count) plus top-N tags by aggregate engagement. Lets an agent answer 'what's worth reading?' or 'which topics are hot?' without scanning every trace. Active traces only; archived/trashed are excluded."
+    )]
     async fn search_activity(
         &self,
         Parameters(p): Parameters<TopParam>,
     ) -> Result<String, ErrorData> {
-        let mut rows = self
-            .open()
-            .await?
-            .list(&ListOptions::default())
-            .map_err(mcp_error)?;
-        rows.truncate(p.top.unwrap_or(10));
-        Ok(json_text(json!({"traces":rows,"tags":[]})))
+        let requested = p.top.unwrap_or(10.0) as i64;
+        let top = if requested <= 0 {
+            10
+        } else {
+            requested.min(100) as usize
+        };
+        let cx = self.open().await?;
+        Ok(json_text(json!({
+            "schema_version": 1,
+            "top": top,
+            "traces": cx.top_searched_traces(top).map_err(mcp_error)?,
+            "tags": cx.tag_activity(top).map_err(mcp_error)?,
+        })))
     }
     #[tool(description = "Materialize a distilled mid-tier trace")]
     async fn record_consolidation_result(
@@ -532,7 +701,7 @@ impl NoemaServer {
     ) -> Result<String, ErrorData> {
         self.open()
             .await?
-            .append(&p.id, &p.content, true)
+            .append(&p.id, &p.content, false)
             .map_err(mcp_error)?;
         Ok("Content appended".into())
     }
@@ -549,19 +718,27 @@ impl NoemaServer {
             json!({"id":p.id,"derived_from":from,"derived_by":by}),
         ))
     }
-    #[tool(description = "Resolve a divergence")]
+    #[tool(
+        description = "Resolve a divergence (concurrent edit conflict). Either accept one of the versions by origin name, or supply a custom merged body."
+    )]
     async fn resolve_divergence(
         &self,
         Parameters(p): Parameters<ResolveParam>,
     ) -> Result<String, ErrorData> {
-        let _ = (p.accept, p.body);
-        Err(ErrorData::invalid_params(
-            format!(
-                "divergence resolution for {} requires a parsed conflict body",
-                p.id
-            ),
-            None,
-        ))
+        let accept = p.accept.unwrap_or_default();
+        let body = p.body.unwrap_or_default();
+        self.open()
+            .await?
+            .resolve_divergence(&p.id, &accept, &body)
+            .map_err(mcp_error)?;
+        if !accept.is_empty() {
+            Ok(format!(
+                "Divergence {} resolved (accepted {}).",
+                p.id, accept
+            ))
+        } else {
+            Ok(format!("Divergence {} resolved (custom merge).", p.id))
+        }
     }
     #[tool(description = "Return this cortex stable identity")]
     async fn cortex_identity(&self, _: Parameters<Empty>) -> Result<String, ErrorData> {
@@ -950,6 +1127,256 @@ async fn shutdown_signal() {
 #[cfg(not(unix))]
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+fn render_instructions(manifest: &crate::cortex::Manifest) -> String {
+    let purpose = if manifest.purpose.is_empty() {
+        String::new()
+    } else {
+        format!("Purpose:  {}\n", manifest.purpose)
+    };
+    let owner = if manifest.owner.is_empty() {
+        String::new()
+    } else {
+        format!("Owner:    {}\n", manifest.owner)
+    };
+    format!(
+        r#"# Noema Agent Instructions
+
+## Active Cortex
+Name:     {}
+Version:  noema-rs {} (manifest v{})
+{}{}
+## Agent Startup
+Before establishing user or project defaults, fetch durable preferences from
+this Cortex:
+
+1. list_traces with tag="user-preference".
+2. get_trace for each relevant result with record_usage=false; the body is the binding content.
+
+Do not broad-scan type="preference" during normal startup. Use type="preference"
+only for task-scoped discovery when the current task needs preference search
+beyond active startup rules.
+
+If preference retrieval fails because of transport, auth, or schema issues,
+surface that failure explicitly and proceed with ordinary defaults.
+
+## MCP Usage
+Use MCP tool discovery and each tool's input schema as the source of truth for
+what this client can call right now. Some Noema deployments expose read-only,
+federated, or client-filtered tool sets.
+
+Call cortex_usage when you need structured JSON context for MCP clients:
+runtime posture, trace semantics, startup sequence, search configuration, and
+operational constraints.
+
+## Memory Semantics
+A Cortex is a named collection of Traces; this instance is {:?}. A Trace is one
+memory unit with a markdown body, YAML frontmatter, and SQLite index row.
+
+Choose the most specific trace type:
+
+- fact: discrete thing that is true.
+- decision: choice made and why.
+- preference: behavioral or stylistic lean.
+- context: situational background.
+- skill: learned capability or procedure.
+- intent: something that needs to happen.
+- observation: witnessed but not yet verified.
+- note: fallback for anything else.
+- divergence: concurrent edit conflict, created by federation.
+
+## Creating Traces
+When create_trace is exposed, pass title, type, and body plus optional author,
+tags, derived_from, origin, source_locked, and source_hash per the tool schema.
+
+Aim for titles under 80 characters. Do NOT include a date in the title — the ID
+generator prepends today's date automatically, and leading YYYYMMDD- or
+YYYY-MM-DD- prefixes in the title are stripped to prevent doubled IDs like
+20260402-20260402-foo. Avoid mid-title dates too, such as "session 20260416
+142000"; only leading prefixes are stripped, so mid-title date fragments survive.
+If a trace is about a specific date, put it in a tag such as event-2026-04-02 or
+in the body.
+
+Search before creating a durable trace when duplication would matter. Use
+derived_from when synthesizing conclusions from existing traces.
+
+append_trace is useful for running logs and fire-and-forget writes because it
+appends content without reading the full trace first.
+
+Use set_trace_tags or append_trace_tags for retrieval metadata hygiene. Do not
+use vote_trace to compensate for missing or excessive tags; voting is only a
+tier-preference signal.
+
+## Guardrails
+- Prefer specific types over note.
+- Use tags for cross-cutting retrieval.
+- Set author to the human or agent responsible for the memory.
+- Keep public-facing content free of private hostnames, personal identifiers,
+  cortex names, and secret-bearing output unless explicitly approved.
+"#,
+        manifest.name, VERSION, manifest.version, purpose, owner, manifest.name
+    )
+}
+
+fn value_object(value: serde_json::Value) -> BTreeMap<String, serde_json::Value> {
+    match value {
+        serde_json::Value::Object(map) => map.into_iter().collect(),
+        _ => BTreeMap::new(),
+    }
+}
+
+fn build_cortex_usage(cortex: &Cortex) -> Result<CortexUsageOutput> {
+    let manifest = &cortex.manifest;
+    let federation = manifest.federation.as_ref();
+    let federation_mode = federation
+        .map(|config| config.mode.as_str())
+        .filter(|mode| !mode.is_empty())
+        .unwrap_or("sync");
+    let federation_verify = federation
+        .map(|config| config.verify.as_str())
+        .filter(|verify| !verify.is_empty())
+        .unwrap_or("off");
+    let access_key = crate::cortex::load_access_key(&cortex.dir, manifest.access.as_ref());
+    let access = match access_key {
+        Ok(key) if key.keyed() => json!({
+            "mode":"keyed",
+            "source":key.source,
+            "fingerprint":key.fingerprint,
+            "tls_required_when_keyed":true
+        }),
+        Ok(_) => json!({"mode":"open","tls_required_when_keyed":true}),
+        Err(error) => json!({
+            "mode":"error",
+            "error":error.to_string(),
+            "tls_required_when_keyed":true
+        }),
+    };
+    let watch_enabled = manifest
+        .watch
+        .as_ref()
+        .and_then(|watch| watch.enabled)
+        .unwrap_or(true);
+    let search = manifest.search.as_ref();
+    let default_mode = search
+        .map(|config| config.effective_default_mode())
+        .unwrap_or("lexical");
+    let hybrid_weight = search
+        .map(|config| config.effective_hybrid_weight())
+        .unwrap_or(0.5);
+    let max_chars = search
+        .map(|config| config.effective_max_chars())
+        .unwrap_or(32_000);
+    let trace_types = crate::trace::VALID_TYPES
+        .iter()
+        .map(|name| {
+            json!({
+                "name":name,
+                "description":trace_type_description(name)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(CortexUsageOutput {
+        schema_version: 1,
+        cortex: value_object(json!({
+            "id":manifest.id,
+            "name":manifest.name,
+            "purpose":manifest.purpose,
+            "owner":manifest.owner,
+            "created":manifest.created,
+            "manifest_version":manifest.version,
+            "noema_version":VERSION
+        })),
+        contract: CortexContractOutput {
+            tool_discovery_authoritative: true,
+            markdown_instructions_tool: "get_instructions".into(),
+            structured_usage_tool: "cortex_usage".into(),
+            callable_tools_policy: "Use MCP tool discovery and each tool schema as the source of truth for callable operations in this client session.".into(),
+        },
+        startup: value_object(json!({
+            "preference_sequence":[
+                {"tool":"list_traces","arguments":{"tag":"user-preference"}},
+                {"tool":"get_trace","for_each_result":true,"arguments":{"record_usage":false},"body_policy":"binding durable preference content"}
+            ],
+            "preference_discovery":"Do not broad-scan type=preference during normal startup. Use type=preference only for task-scoped discovery when the current task needs preference search beyond active startup rules.",
+            "failure_policy":"If preference retrieval fails because of transport, auth, or schema issues, surface the failure explicitly and proceed with ordinary defaults."
+        })),
+        trace_model: value_object(json!({
+            "types":trace_types,
+            "id":{"format":"YYYYMMDD-slugified-title","slug_max_len":crate::trace::MAX_SLUG_LEN,"generated_by":"create_trace"},
+            "title_rules":[
+                "Aim for titles under 80 characters.",
+                "Do not include a date in the title; create_trace prepends today's date automatically.",
+                "Leading YYYYMMDD- and YYYY-MM-DD- prefixes are stripped, but mid-title date fragments survive.",
+                "If a trace is about a specific date, put it in a tag such as event-2026-04-02 or in the body."
+            ],
+            "required_fields":["id","title","type","created","updated"],
+            "optional_fields":["author","tags","derived_from","origin","source_hash","source_locked"],
+            "generated_fields":["content_hash"],
+            "tier_glyphs":{"s":"short","m":"mid","L":"long"}
+        })),
+        search: value_object(json!({
+            "modes":["lexical","semantic","hybrid"],
+            "default_mode":default_mode,
+            "semantic_enabled":search.is_some_and(|config| config.semantic_enabled),
+            "embedding_endpoint_configured":!manifest.resolved_embedding_endpoint()?.is_empty(),
+            "embedding_model_configured":search.is_some_and(|config| !config.embedding_model.is_empty()),
+            "hybrid_weight":hybrid_weight,
+            "max_chars":max_chars
+        })),
+        workflows: value_object(json!({
+            "read":[
+                "list_traces lists active traces by default; archived=true shows archived only; all=true shows active and archived.",
+                "get_trace returns full body and metadata.",
+                "search_traces searches by text and may support semantic or hybrid ranking when configured.",
+                "find_similar_traces starts from an existing trace ID."
+            ],
+            "write":[
+                "create_trace creates a new trace when exposed.",
+                "update_trace changes selected fields when exposed.",
+                "append_trace appends content without reading the full trace first.",
+                "set_trace_tags replaces retrieval tags without touching title, body, type, or lineage.",
+                "append_trace_tags adds retrieval tags idempotently without touching title, body, type, or lineage.",
+                "archive_trace hides without deleting; delete_trace moves to trash; recover_trace restores from trash."
+            ],
+            "audit_federation":[
+                "trace_history shows immutable mutation history.",
+                "trace_lineage shows derived_from and derived_by relationships.",
+                "resolve_divergence resolves federation conflicts by accepting a peer version or supplying a merge."
+            ]
+        })),
+        runtime: value_object(json!({
+            "federation_mode":federation_mode,
+            "federation_verify":federation_verify,
+            "access":access,
+            "filesystem_watch_enabled":watch_enabled,
+            "long_tier_content_mutable":false,
+            "trash_visible_through_mcp":false,
+            "source_locking_description":"Source-locked foreign traces refuse update, delete, and remove outside their origin; archive and unarchive remain local visibility choices."
+        })),
+        authoring_tips: vec![
+            "Prefer specific types over note.".into(),
+            "Use tags for cross-cutting retrieval.".into(),
+            "Use set_trace_tags or append_trace_tags for tag cleanup; vote_trace is only a tier-preference signal.".into(),
+            "Set author to the human or agent responsible for the memory.".into(),
+            "Keep public-facing content free of private hostnames, personal identifiers, cortex names, and secret-bearing output unless explicitly approved.".into(),
+        ],
+    })
+}
+
+fn trace_type_description(trace_type: &str) -> &'static str {
+    match trace_type {
+        "fact" => "discrete thing that is true",
+        "decision" => "choice made and why",
+        "preference" => "behavioral or stylistic lean",
+        "context" => "situational background",
+        "skill" => "learned capability or procedure",
+        "intent" => "something that needs to happen",
+        "observation" => "witnessed but not yet verified",
+        "divergence" => "concurrent edit conflict, created by federation",
+        _ => "fallback for anything else",
+    }
 }
 
 fn resolve_search_mode(

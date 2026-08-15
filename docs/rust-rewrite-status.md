@@ -5,8 +5,10 @@ Updated: 2026-08-15
 ## Pause point
 
 - Branch: `experiment/rust-rewrite`
-- Latest completed milestone: semantic-search parity (this handoff commit).
-- Previous milestone: `c0f8c8a feat(rust): add watcher parity`.
+- Latest completed milestone: MCP contract, observability, and divergence parity
+  (this handoff commit).
+- Previous milestone: `b73a089 feat(rust): add semantic search parity`.
+- Earlier watcher milestone: `c0f8c8a feat(rust): add watcher parity`.
 - Earlier experiment milestone: `aa5a5ee test(rust): compare real-model consolidation`.
 - Verify the exact commit ID and signature with `git log --show-signature -2`
   after resuming.
@@ -19,6 +21,18 @@ Updated: 2026-08-15
   search, and core CRUD lifecycle operations.
 - MCP stdio and Streamable HTTP transports, with the same 28 discovered tool
   names in the current comparison fixture.
+- MCP discovery now matches tool parameter names, required fields, enums, field
+  descriptions, and the three Go output-schema surfaces. Structured cortex
+  usage and tag-mutation results match across runtimes.
+- `get_trace` defaults to a policy read that does not affect promotion signals;
+  explicit `record_usage=true` records exactly one read in both builds.
+- Search activity aggregates per-peer search/read/modify counters across active
+  traces and tags. Consolidation health matches daily success/failure/election,
+  promotion/distillation totals, promotion-latency percentiles, and the
+  one-source-mid leak detector.
+- Divergence resolution accepts a named stored version or a custom merge,
+  updates the original through normal source-lock and immutability checks, and
+  moves the resolved conflict trace to recoverable trash.
 - Signed Go-to-Rust and Rust-to-Go federation with exact event-byte
   compatibility, identity pinning, vector clocks, pagination, lifecycle replay,
   divergence creation, source locks, and duplicate-event idempotency.
@@ -118,9 +132,9 @@ Updated: 2026-08-15
 
 ## Latest validation
 
-The following passed for the semantic-search milestone:
+The following passed for the MCP-contract milestone:
 
-- `make rust-test` — formatting, clippy with warnings denied, and 60 Rust tests.
+- `make rust-test` — formatting, clippy with warnings denied, and 63 Rust tests.
 - `go test ./...`
 - `go test -race ./...`
 - `go vet ./...`
@@ -150,7 +164,11 @@ The following passed for the semantic-search milestone:
   - identical deterministic embedding requests, bearer indirection, codec
     bytes, freshness transitions, bounded/idempotent backfill, cosine/RRF
     rankings, archive rules, corrupt-vector rejection, MCP degradation, and
-    serve-time maintenance.
+    serve-time maintenance; and
+  - identical MCP tool names, parameter/required/enum schemas, documented
+    fields, output-schema presence, structured usage/tag results, policy-read
+    accounting, tag/append/archive/search/history behavior, search activity,
+    consolidation health, and custom divergence resolution.
 - The expanded model-driven scenario passed five consecutive repetitions. The
   mixed three-node ring and all earlier consolidation gates retained their full
   passing coverage.
@@ -207,11 +225,19 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
 - `notify`'s polling backend truncates modification times to whole seconds
   unless content comparison is enabled. It cannot safely observe sub-second
   editor bursts without hashing every watched file.
+- MCP mutation methods must match Go's usage-signal policy as well as their
+  visible result. The contract fixture caught Rust counting `append_trace` as a
+  modification while Go deliberately does not.
+- Rust rejects trace types outside the advertised enum. The Go runtime accepts
+  them despite advertising the same enum; the fixture records this as a
+  deliberate stricter-validation difference rather than weakening Rust.
 
 ## Remaining replacement gaps
 
-1. Exact MCP schemas, result semantics, and error parity beyond tool-name and
-   semantic-mode parity.
+1. Exhaustive MCP result/error parity for the remaining advanced tools,
+   especially consolidation candidate/result paths, federation sync/status,
+   and read-only mode restrictions. Discovery schema and representative core
+   behavior are now automated.
 2. Plugin installation/check/force behavior and embedded-payload verification.
 3. Full TUI behavior.
 4. Broader adversarial real-model quality evaluation beyond the current bounded
@@ -222,10 +248,10 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
 
 ## Recommended next milestone
 
-Expand the MCP contract fixture from tool-name discovery to exact input schemas,
-successful result shapes, actor/usage side effects, invalid-argument errors, and
-read-only federation-mode restrictions. Preserve the current generic semantic
-fallback behavior while comparing every remaining tool surface.
+Port and compare the plugin install/check/force lifecycle and embedded payload
+verification. In parallel, extend `mcp_contract.py` across the remaining
+advanced federation/consolidation tools and read-only mode errors; preserve the
+current generic semantic fallback and stricter Rust type validation.
 
 Any new Rust packages still require explicit approval before adding them.
 
@@ -239,5 +265,5 @@ make rust-test
 make compare-rust
 ```
 
-After confirming the baseline, start from the MCP stdio row in
+After confirming the baseline, start from the Plugins row in
 `docs/rust-rewrite-test-plan.md` and keep the Go implementation as the oracle.

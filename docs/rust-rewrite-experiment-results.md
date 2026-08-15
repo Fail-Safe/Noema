@@ -254,6 +254,35 @@ real-model comparison would be useful only after selecting a representative
 embedding model and query corpus; model quality and index throughput remain
 separate questions from the wire/storage/ranking parity established here.
 
+## MCP contract parity
+
+The MCP comparison now snapshots both servers' discovered tool contracts and
+normalizes only protocol-equivalent schema dialect differences. The 28 tool
+names, parameter sets, required fields, advertised enums, field descriptions,
+and output-schema presence match. The fixture also exercises structured cortex
+usage and tag results, startup policy reads, explicit usage recording, tag and
+append mutations, archive transitions, lexical search, history, invalid votes,
+and instruction sections.
+
+Three previously shallow Rust tools now use the shared Cortex storage and event
+contracts. `search_activity` aggregates federation-wide usage rows for traces
+and tags. `consolidation_health` reports daily activity, separates election
+preemption from pipeline failure, derives short-to-mid and mid-to-long latency,
+and exposes the one-source-mid leak detector. `resolve_divergence` applies a
+selected or custom body through the guarded update path and trashes the resolved
+conflict. Synthetic fixed-time rows make these outputs deterministic across Go
+and Rust.
+
+The fixture found one invisible side-effect mismatch: Rust's MCP append path
+incremented `modify_count`, while Go's fire-and-forget append does not. Aligning
+that policy restored identical tag-activity output. Rust deliberately retains
+stricter runtime rejection for trace types outside the enum that both servers
+advertise; Go currently accepts such input despite its discovery schema.
+
+This is representative contract parity, not exhaustive coverage of every
+successful and failing result from all 28 tools. Advanced federation and
+consolidation surfaces plus read-only mode restrictions remain to be added.
+
 ## Bounded federation soak
 
 Equivalent homogeneous three-node clusters ran 80 paced create mutations over
@@ -289,8 +318,8 @@ remain competitive for smaller cortexes, and now sustain lower measured RSS and
 CPU during a short replicated workload. The real-model fixture also indicates
 that Rust's shorter consolidation prompt can preserve the tested information at
 about half the prompt-token cost. Watcher behavior now also matches the tested
-Go outcomes, as do deterministic semantic indexing and ranking. It still does
-not justify an all-in rewrite because larger-result throughput is not better
-and certificate-lifecycle checks, exact MCP contract parity, plugins, broader
-distillation-quality evaluation, and operator recovery behavior remain
-incomplete.
+Go outcomes, as do deterministic semantic indexing/ranking and the
+representative MCP contract. It still does not justify an all-in rewrite
+because larger-result throughput is not better and certificate-lifecycle
+checks, exhaustive advanced MCP errors, plugins, broader distillation-quality
+evaluation, and operator recovery behavior remain incomplete.
