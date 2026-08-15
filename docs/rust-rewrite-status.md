@@ -5,8 +5,8 @@ Updated: 2026-08-15
 ## Pause point
 
 - Branch: `experiment/rust-rewrite`
-- Latest completed milestone: `feat(rust): add consolidation election foundation`
-- Previous milestone: `23e56c3 feat(rust): add authenticated TLS federation`
+- Latest completed milestone: `feat(rust): add consolidation pass coordination`
+- Previous milestone: `0e7b303 feat(rust): add consolidation election foundation`
 - Verify the exact commit ID and signature with `git log --show-signature -2`
   after resuming.
 - The Go implementation remains the behavioral oracle. The Rust build is an
@@ -41,12 +41,20 @@ Updated: 2026-08-15
   without creating synthetic trace records.
 - One cross-runtime background owner per cortex; lock losers continue serving
   MCP without starting duplicate federation or eligibility workers.
+- A reusable pass gate with initial election, signed claim, cancellable quiet
+  wait, re-election, distinct preemption reasons, in-flight tracking, pass-error
+  closure, and signed success.
+- A live stale-claim watchdog with a ten-minute default, manifest override,
+  strict local timeout, two-sync-interval remote grace, in-flight suppression,
+  and event-log deduplication.
+- The pass gate is not scheduled yet because Rust has no real promotion or
+  distillation pass; it cannot emit false successful no-op consolidations.
 
 ## Latest validation
 
-The following passed for the consolidation-election milestone:
+The following passed for the consolidation-coordination milestone:
 
-- `make rust-test` — formatting, clippy with warnings denied, and 25 Rust tests.
+- `make rust-test` — formatting, clippy with warnings denied, and 32 Rust tests.
 - `go test ./...`
 - `go test -race ./...`
 - `go vet ./...`
@@ -59,9 +67,10 @@ The following passed for the consolidation-election milestone:
   - authenticated Go/Rust HTTPS federation, CA rejection, bearer rejection,
     access-key recovery, plaintext refusal, and secret redaction; and
   - mixed Go/Rust rank exchange, deterministic election, endpoint failover and
-    recovery, plus signed Go claim/success replay.
-- The mixed consolidation scenario and mixed three-node ring each passed five
-  consecutive repetitions after their timing preconditions were made explicit.
+    recovery, signed Go claim/success replay, and a Rust-signed watchdog closure
+    accepted by Go.
+- The expanded mixed consolidation scenario passed five repetitions. The mixed
+  three-node ring retained its full passing comparison gate.
 
 One sandbox-only warning appeared while Go tried to update its module-download
 stat cache outside the writable workspace. The Go build still succeeded and the
@@ -99,11 +108,16 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
 - Short-lived MCP processes must not run background federation or eligibility
   loops. Enforcing one background owner removed hidden duplicate sync workers
   and made cursor/election behavior deterministic.
+- A watchdog closure carries two identities: the event emitter identifies the
+  observer that closed the orphan, while the payload identifies the winner that
+  failed to emit a terminal event.
+- The in-flight registry must remain process-local. A restart deliberately
+  forgets active windows so the watchdog can close claims abandoned by a crash.
 
 ## Remaining replacement gaps
 
-1. Consolidation pass gating, in-flight claims, watchdog closure, clustering,
-   promotion, and LLM distillation parity.
+1. Consolidation trigger scheduling, candidate scoring, clustering, promotion,
+   graduation, and LLM distillation parity.
 2. Watcher onboarding/healing and atomic-save behavior.
 3. Semantic embedding backfill, stale detection, cosine ranking, and hybrid RRF.
 4. Exact MCP schemas, result semantics, and error parity beyond tool-name parity.
@@ -115,22 +129,22 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
 
 ## Recommended next milestone
 
-Finish the deterministic consolidation coordination layer before adding LLM
-distillation. The rank wire and winner calculation are now established; the
-next uncertainty is whether two runtimes make the same pass/preemption and
-stale-claim decisions.
+Port a real deterministic memory-tier pass before adding LLM distillation. The
+coordination boundary is now established; the next uncertainty is whether Rust
+selects and promotes the same short-tier candidates as Go without corrupting
+lineage, usage signals, or federation replay.
 
 Suggested sequence:
 
-1. Port the pass gate that snapshots ranks, elects, emits a claim, rechecks for
-   preemption, and records a stable failure reason or success.
-2. Port the in-flight registry and stale-claim watchdog with an injectable
-   clock.
-3. Add mixed Go/Rust tests for no-winner, lost-election, duplicate claims,
-   watchdog closure, and idempotency.
-4. Then port promotion and candidate clustering behind a fake LLM boundary.
-5. Only after those gates pass, port actual distillation and compare resource
-   use.
+1. Map Go's candidate score, window filtering, promotion event/data, and
+   already-consolidated-source exclusions.
+2. Port deterministic short-to-mid heuristic promotion and its threshold/idle
+   trigger boundary.
+3. Place that real pass behind the existing gate and shared in-flight registry.
+4. Add Go/Rust fixtures for identical candidate choice, promotion replay,
+   idempotency, and loser/no-winner behavior.
+5. Then port clustering behind a fake LLM boundary; only afterward add actual
+   distillation and compare resource use.
 
 Any new Rust packages still require explicit approval before adding them.
 

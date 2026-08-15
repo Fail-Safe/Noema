@@ -78,6 +78,8 @@ pub struct ConsolidationConfig {
     pub llm_enabled: bool,
     #[serde(default)]
     pub local_llm_endpoint: String,
+    #[serde(default)]
+    pub watchdog_timeout: String,
 }
 
 impl ConsolidationConfig {
@@ -286,6 +288,13 @@ pub struct SyncResult {
     pub added: usize,
     pub updated: usize,
     pub orphaned: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoordinationClaim {
+    pub window_id: String,
+    pub winner_id: String,
+    pub timestamp: String,
 }
 
 pub struct Cortex {
@@ -735,6 +744,33 @@ impl Cortex {
         )?;
         let rows = statement.query_map([id], scan_event)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn unresolved_coordination_claims_before(
+        &self,
+        cutoff: &str,
+    ) -> Result<Vec<CoordinationClaim>> {
+        let mut statement = self.connection.prepare(
+            "SELECT trace_id,cortex_id,timestamp
+             FROM events
+             WHERE action='consolidation_claim'
+               AND timestamp<?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM events resolved
+                   WHERE resolved.trace_id=events.trace_id
+                     AND resolved.action IN ('consolidation_success','consolidation_fail')
+               )
+             ORDER BY timestamp",
+        )?;
+        Ok(statement
+            .query_map([cutoff], |row| {
+                Ok(CoordinationClaim {
+                    window_id: row.get(0)?,
+                    winner_id: row.get(1)?,
+                    timestamp: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn events_since(&self, since: &str, limit: usize) -> Result<Vec<Event>> {

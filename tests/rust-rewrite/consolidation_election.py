@@ -91,18 +91,21 @@ def initialize_node(node: Node, env: dict[str, str], parent: Path) -> None:
     run(node, env, "keygen")
 
 
-def insert_consolidation(manifest: Path, endpoint: str) -> None:
+def insert_consolidation(manifest: Path, endpoint: str, rust: bool) -> None:
     lines = manifest.read_text().splitlines()
     boundaries = [index for index, line in enumerate(lines) if line == "---"]
     if len(boundaries) < 2:
         raise RuntimeError(f"manifest has no closing frontmatter boundary: {manifest}")
-    lines[boundaries[1]:boundaries[1]] = [
+    block = [
         "consolidation:",
         "  enabled: true",
         "  threshold_short: 1000000",
         "  llm_enabled: true",
         f"  local_llm_endpoint: {endpoint}",
     ]
+    if rust:
+        block.append("  watchdog_timeout: 1s")
+    lines[boundaries[1]:boundaries[1]] = block
     manifest.write_text("\n".join(lines) + "\n")
 
 
@@ -157,6 +160,26 @@ def coordination_windows(
         }
 
 
+def watchdog_fail(
+    database_path: Path, window_id: str, emitter_id: str, winner_id: str
+) -> bool:
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT data FROM events "
+            "WHERE action='consolidation_fail' AND trace_id=? AND cortex_id=? "
+            "ORDER BY id DESC LIMIT 1",
+            (window_id, emitter_id),
+        ).fetchone()
+    if row is None:
+        return False
+    data = json.loads(str(row[0]))
+    return (
+        data.get("window_id") == window_id
+        and data.get("cortex_id") == winner_id
+        and data.get("reason") == "watchdog_expired"
+    )
+
+
 def set_threshold(manifest: Path, threshold: int) -> None:
     source = manifest.read_text()
     updated = source.replace(
@@ -194,7 +217,7 @@ def exercise(go: Path, rust: Path, root: Path) -> None:
         )
         manifest = cortex_dir(root, node) / "cortex.md"
         configure_policy(manifest, node.rust)
-        insert_consolidation(manifest, endpoint.url)
+        insert_consolidation(manifest, endpoint.url, node.rust)
 
     identities = {
         node.name: manifest_id(cortex_dir(root, node) / "cortex.md") for node in nodes
@@ -298,6 +321,7 @@ def exercise(go: Path, rust: Path, root: Path) -> None:
             "consolidation_success",
             identities[peer_a.name],
         )
+        watchdog_window = sorted(windows)[0]
         with sqlite3.connect(database(root, peer_b)) as connection:
             for window in windows:
                 assert (
@@ -317,8 +341,33 @@ def exercise(go: Path, rust: Path, root: Path) -> None:
         )
 
         assert stop(peer_b)
+        with sqlite3.connect(database(root, peer_b)) as connection:
+            removed = connection.execute(
+                "DELETE FROM events WHERE action='consolidation_success' AND trace_id=?",
+                (watchdog_window,),
+            ).rowcount
+        assert removed == 1
+        time.sleep(2)
         rust_endpoint.start()
         start(peer_b, env)
+        wait_until(
+            "Rust watchdog closes the orphaned Go claim",
+            lambda: watchdog_fail(
+                database(root, peer_b),
+                watchdog_window,
+                identities[peer_b.name],
+                identities[peer_a.name],
+            ),
+        )
+        wait_until(
+            "signed Rust watchdog closure reaches Go",
+            lambda: watchdog_fail(
+                database(root, peer_a),
+                watchdog_window,
+                identities[peer_b.name],
+                identities[peer_a.name],
+            ),
+        )
         wait_until(
             "Rust endpoint recovery restores eligibility",
             lambda: valid_rank(
@@ -356,7 +405,7 @@ def main() -> None:
         exercise(args.go.resolve(), args.rust.resolve(), Path(directory))
     print(
         "mixed consolidation election: rank exchange, failover, coordination, "
-        "recovery PASS"
+        "watchdog, recovery PASS"
     )
 
 

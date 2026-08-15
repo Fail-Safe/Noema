@@ -36,6 +36,9 @@ deterministic winner agreement, endpoint-loss demotion and failover, recovery,
 and signed Go claim/success replay without creating synthetic trace rows. The
 Go threshold-election restart uses a delayed eligibility probe so its fixed,
 quiet rank remains stable while the real consolidator claims the test window.
+The fixture then makes that signed Go claim orphaned on the Rust replica and
+checks that Rust's live watchdog emits a signed `watchdog_expired` closure which
+Go accepts.
 
 `benchmark.sh` creates independent but equivalent cortexes and reports TSV for
 process-level ingest, full-text search, filtered list, sync, verification, and

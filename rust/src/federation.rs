@@ -517,7 +517,7 @@ async fn sync_usage(
     Ok(())
 }
 
-fn parse_interval(value: &str) -> Result<Duration> {
+pub(crate) fn parse_interval(value: &str) -> Result<Duration> {
     if value.trim().is_empty() {
         return Ok(Duration::from_secs(30));
     }

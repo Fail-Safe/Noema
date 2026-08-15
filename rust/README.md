@@ -27,8 +27,10 @@ Federated consolidation eligibility is also implemented: one background owner
 per cortex probes the configured model endpoint, advertises a rank through the
 identity handshake, persists peer ranks, and reports the quiet-period election
 winner through `federation status`. Signed consolidation coordination events are
-wire-compatible with Go. The actual Rust pass gate, watchdog, and distillation
-pipeline remain experimental gaps.
+wire-compatible with Go. A reusable pass gate implements claim, quiet-period
+recheck, preemption, in-flight tracking, and terminal events; live servers also
+close stale claims with a federation-aware watchdog. The gate is not scheduled
+until Rust has a real promotion or distillation pass to run behind it.
 
 Run the cross-implementation gate and release benchmark from the repository
 root:

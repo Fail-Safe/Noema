@@ -93,16 +93,27 @@ distillation pass:
 - a cross-runtime background lock so only one server process per cortex runs
   federation and eligibility workers.
 
+The next coordination layer is also present. A reusable Rust pass gate now
+matches Go's initial election, signed claim, quiet-period wait, re-election,
+preemption classification, in-flight tracking, inner-pass error closure, and
+success behavior. The live Rust server runs a stale-claim watchdog with a strict
+local timeout, extra remote propagation grace, in-flight suppression, and
+event-log-based deduplication. The gate is intentionally not scheduled yet:
+Rust still has no real promotion or distillation pass to place behind it, and a
+no-op pass must not claim successful consolidation.
+
 The mixed Go/Rust fixture exercises deterministic winner selection, endpoint
 loss and rank-zero failover, endpoint recovery, and replay of a real Go
 threshold pass's signed claim/success pair. Both the election and three-node
 ring scenarios passed five consecutive repetitions after their timing
-preconditions were made explicit.
+preconditions were made explicit. The fixture now also removes a terminal event
+from the Rust replica to model an orphaned Go claim, then verifies Rust emits a
+signed `watchdog_expired` closure that Go accepts under enforced verification.
 
-This does not yet port Rust's consolidation pass gate, in-flight claim registry,
-watchdog, candidate clustering, promotion, or LLM distillation. The current
-result establishes wire and decision compatibility for leader selection, not
-end-to-end consolidation parity.
+This does not yet port Rust's trigger scheduler, candidate scoring, clustering,
+promotion, graduation, or LLM distillation. The current result establishes
+coordination compatibility around a future pass, not end-to-end consolidation
+parity.
 
 ## Bounded federation soak
 
@@ -125,8 +136,8 @@ and recovery rather than only under a single-process search benchmark.
 This remains a complexity probe, not complete federation parity. The Rust path
 does not yet dynamically add new workers without restart, monitor certificate
 expiry, or provide crash-atomic file rollback. Its consolidation election and
-coordination wire are now present, but pass execution and watchdog recovery are
-not.
+coordination wire, pass gate, and watchdog recovery are now present, but no Rust
+consolidation pass executes yet.
 
 ## Current interpretation
 

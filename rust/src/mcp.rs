@@ -603,7 +603,8 @@ pub async fn serve_stdio(name: String, path: PathBuf) -> Result<()> {
     };
     let background_lock = CortexLock::try_acquire_background(&cortex_id)?;
     let cancellation = CancellationToken::new();
-    let (scheduler, eligibility) = if background_lock.is_some() {
+    let registry = Arc::new(crate::consolidation::InFlightRegistry::default());
+    let (scheduler, eligibility, watchdog) = if background_lock.is_some() {
         (
             Some(crate::federation::FederationScheduler::start(
                 name.clone(),
@@ -611,11 +612,21 @@ pub async fn serve_stdio(name: String, path: PathBuf) -> Result<()> {
                 federation,
                 cancellation.clone(),
             )?),
-            crate::consolidation::EligibilityScheduler::start(name, path, cancellation.clone())?,
+            crate::consolidation::EligibilityScheduler::start(
+                name.clone(),
+                path.clone(),
+                cancellation.clone(),
+            )?,
+            crate::consolidation::WatchdogScheduler::start(
+                name,
+                path,
+                cancellation.clone(),
+                registry,
+            )?,
         )
     } else {
         eprintln!("another process owns cortex background work; serving MCP only");
-        (None, None)
+        (None, None, None)
     };
     let result = server
         .serve(rmcp::transport::stdio())
@@ -628,6 +639,9 @@ pub async fn serve_stdio(name: String, path: PathBuf) -> Result<()> {
     }
     if let Some(eligibility) = eligibility {
         eligibility.stop().await;
+    }
+    if let Some(watchdog) = watchdog {
+        watchdog.stop().await;
     }
     result?;
     Ok(())
@@ -671,7 +685,8 @@ pub async fn serve_http(
     listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
     let cancellation = CancellationToken::new();
-    let (scheduler, eligibility) = if background_lock.is_some() {
+    let registry = Arc::new(crate::consolidation::InFlightRegistry::default());
+    let (scheduler, eligibility, watchdog) = if background_lock.is_some() {
         (
             Some(crate::federation::FederationScheduler::start(
                 name.clone(),
@@ -679,11 +694,21 @@ pub async fn serve_http(
                 federation,
                 cancellation.clone(),
             )?),
-            crate::consolidation::EligibilityScheduler::start(name, path, cancellation.clone())?,
+            crate::consolidation::EligibilityScheduler::start(
+                name.clone(),
+                path.clone(),
+                cancellation.clone(),
+            )?,
+            crate::consolidation::WatchdogScheduler::start(
+                name,
+                path,
+                cancellation.clone(),
+                registry,
+            )?,
         )
     } else {
         eprintln!("another process owns cortex background work; serving MCP only");
-        (None, None)
+        (None, None, None)
     };
     let signal_cancellation = cancellation.clone();
     let signal_task = tokio::spawn(async move {
@@ -725,6 +750,9 @@ pub async fn serve_http(
     }
     if let Some(eligibility) = eligibility {
         eligibility.stop().await;
+    }
+    if let Some(watchdog) = watchdog {
+        watchdog.stop().await;
     }
     signal_task.abort();
     shutdown_task.abort();

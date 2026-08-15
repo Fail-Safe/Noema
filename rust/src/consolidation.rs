@@ -1,5 +1,12 @@
 //! Memory-tier consolidation eligibility, election, and scoring.
 
+mod coordination;
+
+pub use coordination::{
+    FailReason, GateResult, GateState, InFlightRegistry, PassGate, WatchdogScheduler,
+    sweep_watchdog,
+};
+
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::Result;
