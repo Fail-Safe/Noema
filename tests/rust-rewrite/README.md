@@ -22,6 +22,13 @@ mesh using their background schedulers. It checks eventual convergence and
 event de-duplication, independent usage-signal replication, live peer
 pause/resume, classified outage and recovery health, concurrent-edit divergence,
 graceful SIGTERM handling, and fail-closed signing-key rotation.
+The rotation case then stages an explicit hard pin without resetting the event
+cursor, resumes the peer, and verifies recovery under the new key.
+
+`federation_tls.py` runs signed Go↔Rust federation over HTTPS with a temporary
+self-signed certificate and shared bearer key. It verifies missing/wrong/correct
+authorization, custom-CA failure and recovery, secret-free failure output, and
+the keyed-plaintext startup refusal.
 
 `benchmark.sh` creates independent but equivalent cortexes and reports TSV for
 process-level ingest, full-text search, filtered list, sync, verification, and

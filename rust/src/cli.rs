@@ -130,7 +130,10 @@ enum Command {
         command: MigrateCommand,
     },
     /// Generate a federation signing key
-    Keygen,
+    Keygen {
+        #[arg(long)]
+        force: bool,
+    },
     /// Verify integrity
     Verify {
         #[command(subcommand)]
@@ -280,6 +283,11 @@ enum FederationCommand {
     },
     ResumePeer {
         name: String,
+    },
+    RePinPeer {
+        name: String,
+        #[arg(long)]
+        pubkey: String,
     },
     Key {
         #[command(subcommand)]
@@ -468,7 +476,7 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
         },
         Command::Tui => crate::tui::run(cx)?,
         Command::Federation { command } => federation_command(cx, command).await?,
-        Command::Keygen => keygen(cx)?,
+        Command::Keygen { force } => keygen(cx, force)?,
         Command::Verify { command } => verify(cx, command)?,
         Command::Plugin { command } => plugin_command(command)?,
         Command::Consolidate => println!("No eligible consolidation candidates."),
@@ -704,6 +712,9 @@ async fn federation_command(cx: &mut Cortex, command: FederationCommand) -> Resu
             peer.mode = String::new();
             write_manifest(&cx.dir, &cx.manifest)?;
         }
+        FederationCommand::RePinPeer { name, pubkey } => {
+            repin_peer(cx, &name, &pubkey)?;
+        }
         FederationCommand::ResetPeer { names } => {
             for name in names {
                 let id_key = format!("peer:{name}:cortex_id");
@@ -726,23 +737,29 @@ async fn federation_command(cx: &mut Cortex, command: FederationCommand) -> Resu
         FederationCommand::Key {
             command: FederationKeyCommand::Fingerprint,
         } => {
-            let key = cx
-                .manifest
-                .signing
-                .as_ref()
-                .map(|s| s.public_key.as_str())
-                .unwrap_or("");
-            if key.is_empty() {
-                bail!("no signing key configured")
-            };
-            println!("{}", crate::trace::content_hash(key));
+            let key = crate::cortex::load_access_key(&cx.dir, cx.manifest.access.as_ref())?;
+            if !key.keyed() {
+                println!("Access: open mode (no key configured)");
+            } else {
+                println!("Source:      {}", key.source);
+                if !key.path.as_os_str().is_empty() {
+                    println!("Path:        {}", key.path.display());
+                }
+                println!("Fingerprint: {}", key.fingerprint);
+                if key.env_override() {
+                    println!(
+                        "Note:        {} is overriding access.shared_key_file",
+                        crate::cortex::ACCESS_KEY_ENV
+                    );
+                }
+            }
         }
     }
     Ok(())
 }
 
-fn keygen(cx: &mut Cortex) -> Result<()> {
-    if cx.manifest.signing.is_some() {
+fn keygen(cx: &mut Cortex, force: bool) -> Result<()> {
+    if cx.manifest.signing.is_some() && !force {
         bail!("signing key already configured")
     };
     let (_key, public, seed) = eventsig::generate()?;
@@ -759,7 +776,32 @@ fn keygen(cx: &mut Cortex) -> Result<()> {
         private_key_file: filename.into(),
     });
     write_manifest(&cx.dir, &cx.manifest)?;
-    println!("Signing key generated.\nPublic key: {public}");
+    println!(
+        "Signing key {}.\nPublic key: {public}",
+        if force { "rotated" } else { "generated" }
+    );
+    Ok(())
+}
+
+fn repin_peer(cx: &mut Cortex, name: &str, public_key: &str) -> Result<()> {
+    eventsig::parse_public(public_key).context("invalid peer Ed25519 public key")?;
+    let cortex_id = cx.federation_state(&format!("peer:{name}:cortex_id"))?;
+    if cortex_id.is_empty() {
+        bail!("peer {name:?} has no pinned identity; sync it successfully before re-pinning")
+    }
+    let peer = cx
+        .manifest
+        .federation
+        .as_mut()
+        .and_then(|federation| federation.peers.iter_mut().find(|peer| peer.name == name))
+        .ok_or_else(|| anyhow::anyhow!("unknown peer"))?;
+    peer.pubkey = public_key.trim().to_owned();
+    peer.mode = "paused".into();
+    write_manifest(&cx.dir, &cx.manifest)?;
+    println!(
+        "Updated the hard pin for {name} ({}). The peer remains paused; verify the fingerprint out of band, then run federation resume-peer {name}.",
+        eventsig::public_fingerprint(public_key)?
+    );
     Ok(())
 }
 
@@ -837,7 +879,8 @@ async fn serve(selected: Option<&str>, args: ServeArgs) -> Result<()> {
     match args.transport.as_str() {
         "stdio" => crate::mcp::serve_stdio(cx.name, cx.dir).await,
         "http" => {
-            validate_http_access(&cx.manifest, &args.host)?;
+            let access_key = crate::cortex::load_access_key(&cx.dir, cx.manifest.access.as_ref())?;
+            let tls = validate_http_access(&cx.manifest, &cx.dir, &args.host, &access_key)?;
             if !args.no_watch
                 && cx
                     .manifest
@@ -862,28 +905,35 @@ async fn serve(selected: Option<&str>, args: ServeArgs) -> Result<()> {
                     }
                 });
             }
-            crate::mcp::serve_http(cx.name, cx.dir, args.host, args.port).await
+            crate::mcp::serve_http(cx.name, cx.dir, args.host, args.port, access_key, tls).await
         }
         other => bail!("unknown transport {other:?}"),
     }
 }
 
-fn validate_http_access(manifest: &crate::cortex::Manifest, host: &str) -> Result<()> {
-    if let Some(access) = &manifest.access
-        && (!access.shared_key_file.is_empty()
-            || !access.tls_cert_path.is_empty()
-            || !access.tls_key_path.is_empty())
-    {
+fn validate_http_access(
+    manifest: &crate::cortex::Manifest,
+    dir: &std::path::Path,
+    host: &str,
+    access_key: &crate::cortex::AccessKey,
+) -> Result<Option<(PathBuf, PathBuf)>> {
+    let (certificate, private_key) =
+        crate::cortex::resolve_tls_paths(dir, manifest.access.as_ref());
+    if certificate.as_os_str().is_empty() != private_key.as_os_str().is_empty() {
+        bail!("access.tls_cert_path and access.tls_key_path must be configured together")
+    }
+    let tls = (!certificate.as_os_str().is_empty()).then_some((certificate, private_key));
+    if access_key.keyed() && tls.is_none() {
         bail!(
-            "Rust HTTP access-control parity is not complete; refusing to ignore cortex.md shared-key or TLS settings"
+            "refusing to serve MCP bearer authentication over plaintext HTTP; configure access.tls_cert_path and access.tls_key_path"
         )
     }
-    if !["127.0.0.1", "localhost", "::1"].contains(&host) {
+    if !["127.0.0.1", "localhost", "::1"].contains(&host) && !access_key.keyed() {
         bail!(
-            "unauthenticated Rust HTTP transport is restricted to loopback until shared-key and TLS support is complete"
+            "unauthenticated Rust HTTP transport is restricted to loopback; configure a shared key and TLS before binding a network address"
         )
     }
-    Ok(())
+    Ok(tls)
 }
 
 fn print_trace(row: &crate::cortex::Row, trace: &Trace) {
@@ -935,21 +985,77 @@ fn read_stdin() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cortex::{AccessConfig, Manifest};
+    use crate::cortex::{AccessConfig, FederationConfig, Manifest, PeerEntry, read_manifest};
 
     #[test]
     fn experimental_http_transport_fails_closed() {
         let manifest = Manifest::default();
-        validate_http_access(&manifest, "127.0.0.1").unwrap();
-        assert!(validate_http_access(&manifest, "0.0.0.0").is_err());
+        let temp = tempfile::tempdir().unwrap();
+        assert!(
+            validate_http_access(&manifest, temp.path(), "127.0.0.1", &Default::default())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            validate_http_access(&manifest, temp.path(), "0.0.0.0", &Default::default()).is_err()
+        );
 
         let protected = Manifest {
             access: Some(AccessConfig {
-                shared_key_file: "access.key".into(),
+                tls_cert_path: "server.crt".into(),
+                tls_key_path: "server.key".into(),
                 ..Default::default()
             }),
             ..Default::default()
         };
-        assert!(validate_http_access(&protected, "127.0.0.1").is_err());
+        let keyed = crate::cortex::AccessKey {
+            value: "test-key".into(),
+            ..Default::default()
+        };
+        assert!(
+            validate_http_access(&protected, temp.path(), "127.0.0.1", &keyed)
+                .unwrap()
+                .is_some()
+        );
+        assert!(validate_http_access(&manifest, temp.path(), "127.0.0.1", &keyed).is_err());
+    }
+
+    #[test]
+    fn repin_peer_preserves_cursor_and_pauses_until_explicit_resume() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manifest = Cortex::create("local", temp.path()).unwrap();
+        let root = temp.path().join("local");
+        manifest.federation = Some(FederationConfig {
+            peers: vec![PeerEntry {
+                name: "peer-a".into(),
+                endpoint: "https://peer-a.example.com".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        write_manifest(&root, &manifest).unwrap();
+        let mut cx = Cortex::open("local", &root).unwrap();
+        cx.set_federation_state("peer:peer-a:cortex_id", "01KNOWNPEER")
+            .unwrap();
+        cx.set_federation_state("peer:peer-a:last_event", "01CURSOR")
+            .unwrap();
+        cx.set_federation_state("cortexkey:01KNOWNPEER", "old-key")
+            .unwrap();
+        let (_, public, _) = eventsig::generate().unwrap();
+
+        repin_peer(&mut cx, "peer-a", &public).unwrap();
+
+        let persisted = read_manifest(&root).unwrap();
+        let peer = &persisted.federation.unwrap().peers[0];
+        assert_eq!(peer.mode, "paused");
+        assert_eq!(peer.pubkey, public);
+        assert_eq!(
+            cx.federation_state("peer:peer-a:last_event").unwrap(),
+            "01CURSOR"
+        );
+        assert_eq!(
+            cx.federation_state("cortexkey:01KNOWNPEER").unwrap(),
+            "old-key"
+        );
     }
 }

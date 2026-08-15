@@ -149,6 +149,19 @@ def configure_policy(path: Path, rust: bool) -> None:
     path.write_text(source)
 
 
+def signing_public_key(path: Path) -> str:
+    in_signing = False
+    for line in path.read_text().splitlines():
+        if line == "signing:":
+            in_signing = True
+            continue
+        if in_signing and line and not line.startswith(" "):
+            break
+        if in_signing and line.lstrip().startswith("public_key:"):
+            return line.split(": ", 1)[1].strip(" '\"")
+    raise RuntimeError(f"no signing public key in {path}")
+
+
 def add_trace(node: Node, env: dict[str, str], title: str, body: str) -> str:
     result = run(
         node,
@@ -414,8 +427,51 @@ def exercise(go: Path, rust: Path, root: Path) -> None:
                 ).get("reason")
                 == "identity_mismatch",
             )
-            assert state(database(root, node), "peer:peer-a:last_event") == frozen[node.name]
+            rejected_cursor = state(database(root, node), "peer:peer-a:last_event")
+            if rejected_cursor != frozen[node.name]:
+                log_path = Path(env["HOME"]).parent / f"{node.name}.log"
+                raise RuntimeError(
+                    f"key rotation advanced {node.name} cursor from "
+                    f"{frozen[node.name]} to {rejected_cursor}; "
+                    f"health={health(database(root, node), 'peer-a')}; "
+                    f"log tail={log_path.read_text()[-2000:]}"
+                )
             assert not has_trace(node, env, rotated_id)
+
+        new_public_key = signing_public_key(cortex_dir(root, peer_a) / "cortex.md")
+        for node in nodes[1:]:
+            run(
+                node,
+                env,
+                "federation",
+                "re-pin-peer",
+                "peer-a",
+                "--pubkey",
+                new_public_key,
+            )
+        time.sleep(0.5)
+        for node in nodes[1:]:
+            assert state(database(root, node), "peer:peer-a:last_event") == frozen[node.name]
+            run(node, env, "federation", "resume-peer", "peer-a")
+            try:
+                wait_until(
+                    f"key rotation recovery on {node.name}",
+                    lambda n=node: has_trace(n, env, rotated_id, "must fail closed"),
+                    timeout=30,
+                )
+            except RuntimeError as error:
+                log_path = Path(env["HOME"]).parent / f"{node.name}.log"
+                raise RuntimeError(
+                    f"{error}; health={health(database(root, node), 'peer-a')}; "
+                    f"log tail={log_path.read_text()[-2000:]}"
+                ) from error
+            wait_until(
+                f"rotated peer health recovery on {node.name}",
+                lambda n=node: health(database(root, n), "peer-a").get(
+                    "consecutive_failures", 0
+                )
+                == 0,
+            )
     finally:
         graceful = [stop(node) for node in nodes]
         if not all(graceful):
@@ -434,7 +490,7 @@ def main() -> None:
         exercise(args.go.resolve(), args.rust.resolve(), Path(directory))
     print(
         "mixed ring: convergence, usage, pause/resume, outage, divergence, "
-        "shutdown, key-rotation rejection PASS"
+        "shutdown, key-rotation rejection/recovery PASS"
     )
 
 

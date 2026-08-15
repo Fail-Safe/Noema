@@ -1,6 +1,13 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
+use axum::{
+    body::Body,
+    extract::State,
+    http::{Request, StatusCode, header},
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
 use rmcp::{
     ErrorData, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -12,12 +19,13 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     VERSION,
-    cortex::{Cortex, ListOptions, PeerEntry, write_manifest},
+    cortex::{AccessKey, Cortex, ListOptions, PeerEntry, write_manifest},
     trace::Trace,
 };
 
@@ -608,7 +616,14 @@ pub async fn serve_stdio(name: String, path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-pub async fn serve_http(name: String, path: PathBuf, host: String, port: u16) -> Result<()> {
+pub async fn serve_http(
+    name: String,
+    path: PathBuf,
+    host: String,
+    port: u16,
+    access_key: AccessKey,
+    tls: Option<(PathBuf, PathBuf)>,
+) -> Result<()> {
     let server = NoemaServer::new(&name, &path)?;
     let federation = server
         .cortex
@@ -629,7 +644,14 @@ pub async fn serve_http(name: String, path: PathBuf, host: String, port: u16) ->
                 "::1".to_owned(),
             ]),
         );
-    let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
+    let tls_config = match tls {
+        Some((certificate, private_key)) => Some(
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(certificate, private_key).await?,
+        ),
+        None => None,
+    };
+    let listener = std::net::TcpListener::bind((host.as_str(), port))?;
+    listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
     let cancellation = CancellationToken::new();
     let scheduler = crate::federation::FederationScheduler::start(
@@ -643,15 +665,82 @@ pub async fn serve_http(name: String, path: PathBuf, host: String, port: u16) ->
         shutdown_signal().await;
         signal_cancellation.cancel();
     });
-    eprintln!("Noema MCP listening on http://{address}/mcp");
-    let result = axum::serve(listener, axum::Router::new().nest_service("/mcp", service))
-        .with_graceful_shutdown(cancellation.clone().cancelled_owned())
-        .await;
+    let scheme = if tls_config.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    eprintln!("Noema MCP listening on {scheme}://{address}/mcp");
+    let mut router = axum::Router::new().nest_service("/mcp", service);
+    if access_key.keyed() {
+        let expected = BearerDigest::new(&access_key.value);
+        router = router.layer(axum::middleware::from_fn_with_state(expected, bearer_auth));
+    }
+    let server_handle = axum_server::Handle::new();
+    let shutdown_handle = server_handle.clone();
+    let server_cancellation = cancellation.clone();
+    let shutdown_task = tokio::spawn(async move {
+        server_cancellation.cancelled().await;
+        shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+    });
+    let result = if let Some(tls_config) = tls_config {
+        axum_server::from_tcp_rustls(listener, tls_config)?
+            .handle(server_handle)
+            .serve(router.into_make_service())
+            .await
+    } else {
+        axum_server::from_tcp(listener)?
+            .handle(server_handle)
+            .serve(router.into_make_service())
+            .await
+    };
     cancellation.cancel();
     scheduler.stop().await;
     signal_task.abort();
+    shutdown_task.abort();
     result?;
     Ok(())
+}
+
+#[derive(Clone)]
+struct BearerDigest([u8; 32]);
+
+impl BearerDigest {
+    fn new(key: &str) -> Self {
+        Self(Sha256::digest(format!("Bearer {key}")).into())
+    }
+
+    fn matches(&self, authorization: &[u8]) -> bool {
+        let received: [u8; 32] = Sha256::digest(authorization).into();
+        self.0
+            .iter()
+            .zip(received)
+            .fold(0_u8, |difference, (expected, received)| {
+                difference | (expected ^ received)
+            })
+            == 0
+    }
+}
+
+async fn bearer_auth(
+    State(expected): State<BearerDigest>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let authorized = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .is_some_and(|value| expected.matches(value.as_bytes()));
+    if authorized {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            [(header::CONTENT_TYPE, "application/json")],
+            "{\"error\":\"unauthorized: NOEMA_MCP_KEY / access.shared_key_file required\"}",
+        )
+            .into_response()
+    }
 }
 
 #[cfg(unix)]
@@ -682,4 +771,18 @@ fn json_text<T: Serialize>(value: T) -> String {
 }
 fn mcp_error(error: impl std::fmt::Display) -> ErrorData {
     ErrorData::internal_error(error.to_string(), None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bearer_digest_requires_the_exact_scheme_and_key() {
+        let digest = BearerDigest::new("test-secret");
+        assert!(digest.matches(b"Bearer test-secret"));
+        assert!(!digest.matches(b"bearer test-secret"));
+        assert!(!digest.matches(b"Bearer wrong"));
+        assert!(!digest.matches(b""));
+    }
 }

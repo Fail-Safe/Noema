@@ -1,6 +1,6 @@
 # Rust rewrite experiment results
 
-Date: 2026-08-14. Host: Apple Silicon macOS. Both implementations were built
+Date: 2026-08-15. Host: Apple Silicon macOS. Both implementations were built
 with release optimizations. Results are local comparisons, not portable
 performance guarantees.
 
@@ -53,7 +53,13 @@ and mixed-process tests cover:
 - three-node background convergence with transitive duplicate delivery;
 - live pause/resume, outage classification and recovery, and graceful SIGTERM;
 - concurrent edits across two disconnected replicas; and
-- fail-closed signing-key rotation with event cursors left unchanged.
+- fail-closed signing-key rotation with event cursors left unchanged, followed
+  by explicit hard-pin recovery without replaying old signatures;
+- shared bearer-key authentication with environment-over-sidecar precedence;
+- Rustls HTTPS serving and TLS 1.2-or-newer outbound federation;
+- private-CA trust for both Go-to-Rust and Rust-to-Go federation; and
+- missing/wrong bearer rejection, missing-CA rejection, live outbound access-key
+  reload, plaintext-auth refusal, and secret-redacted failure output.
 
 The network experiment found two interoperability defects that in-process tests
 did not expose. Rust's first identity response did not use Go's `version` and
@@ -87,10 +93,9 @@ Rust scheduler retained its earlier memory advantage under active replication
 and recovery rather than only under a single-process search benchmark.
 
 This remains a complexity probe, not complete federation parity. The Rust path
-does not yet support shared-key auth or custom CAs, dynamically add new workers
-without restart, recover an intentionally rotated signing key through a safe
-operator workflow, or provide crash-atomic file rollback. Federation-aware
-consolidation and election behavior also remain unported.
+does not yet dynamically add new workers without restart, monitor certificate
+expiry, or provide crash-atomic file rollback. Federation-aware consolidation
+and election behavior also remain unported.
 
 ## Current interpretation
 
@@ -99,6 +104,6 @@ interoperate with the Go federation wire protocol in both directions, express
 the critical signing/vector-clock rules cleanly, use materially less memory,
 remain competitive for smaller cortexes, and now sustain lower measured RSS and
 CPU during a short replicated workload. It still does not justify an all-in
-rewrite because larger-result throughput is not better and security transports,
-consolidation, semantic search, plugins, watcher parity, and operator recovery
-behavior remain unported.
+rewrite because larger-result throughput is not better and certificate-lifecycle
+checks, consolidation, semantic search, plugins, watcher parity, and broader
+operator recovery behavior remain unported.

@@ -9,7 +9,9 @@ use chrono::Utc;
 use rmcp::{
     ServiceExt,
     model::{CallToolRequestParams, ClientInfo},
-    transport::StreamableHttpClientTransport,
+    transport::{
+        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -17,7 +19,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    cortex::{Cortex, FederationConfig, MANIFEST_VERSION, PeerEntry, read_manifest},
+    cortex::{
+        Cortex, FederationConfig, MANIFEST_VERSION, PeerEntry, load_access_key, read_manifest,
+    },
     event::Event,
     eventsig,
 };
@@ -107,7 +111,18 @@ pub struct FederationScheduler {
 }
 
 pub fn status(cx: &Cortex) -> Result<serde_json::Value> {
-    let config = read_manifest(&cx.dir)?.federation.unwrap_or_default();
+    let manifest = read_manifest(&cx.dir)?;
+    let access = match load_access_key(&cx.dir, manifest.access.as_ref()) {
+        Ok(key) if key.keyed() => json!({
+            "mode": "keyed",
+            "source": key.source,
+            "path": key.path,
+            "fingerprint": key.fingerprint,
+        }),
+        Ok(_) => json!({"mode": "open"}),
+        Err(error) => json!({"mode": "error", "error": error.to_string()}),
+    };
+    let config = manifest.federation.unwrap_or_default();
     let mut peers = Vec::with_capacity(config.peers.len());
     for peer in &config.peers {
         let health_text = cx.federation_state(&format!("peer:{}:health", peer.name))?;
@@ -131,6 +146,7 @@ pub fn status(cx: &Cortex) -> Result<serde_json::Value> {
         "mode": if config.mode.is_empty() { "sync" } else { config.mode.as_str() },
         "interval": if config.interval.is_empty() { "30s" } else { config.interval.as_str() },
         "verify": if config.verify.is_empty() { "off" } else { config.verify.as_str() },
+        "access": access,
         "peers": peers,
         "vclock": cx.get_clock()?,
     }))
@@ -152,6 +168,8 @@ impl FederationScheduler {
             workers.push(tokio::spawn(async move {
                 let mut backoff = interval;
                 let mut was_failing = false;
+                let mut next_attempt = tokio::time::Instant::now();
+                let mut last_configuration = None;
                 loop {
                     if worker_cancellation.is_cancelled() {
                         break;
@@ -165,11 +183,12 @@ impl FederationScheduler {
                             );
                             tokio::select! {
                                 _ = worker_cancellation.cancelled() => break,
-                                _ = tokio::time::sleep(backoff) => {}
+                                _ = tokio::time::sleep(interval) => {}
                             }
                             continue;
                         }
                     };
+                    let live_access = manifest.access.clone();
                     let live_config = manifest.federation.unwrap_or_default();
                     let live_interval = parse_interval(&live_config.interval).unwrap_or(interval);
                     let Some(live_peer) = live_config
@@ -184,6 +203,22 @@ impl FederationScheduler {
                         }
                         continue;
                     };
+                    let access_fingerprint = load_access_key(&manifest_path, live_access.as_ref())
+                        .map(|key| key.fingerprint)
+                        .unwrap_or_else(|_| "invalid".into());
+                    let configuration = (
+                        live_config.mode.clone(),
+                        live_peer.endpoint.clone(),
+                        live_peer.ca.clone(),
+                        live_peer.mode.clone(),
+                        live_peer.pubkey.clone(),
+                        access_fingerprint,
+                    );
+                    if last_configuration.as_ref() != Some(&configuration) {
+                        last_configuration = Some(configuration);
+                        backoff = live_interval;
+                        next_attempt = tokio::time::Instant::now();
+                    }
                     if live_config.mode == "publish" || live_peer.mode == "paused" {
                         backoff = live_interval;
                         tokio::select! {
@@ -192,6 +227,16 @@ impl FederationScheduler {
                         }
                         continue;
                     }
+                    let now = tokio::time::Instant::now();
+                    if now < next_attempt {
+                        let wait = live_interval.min(next_attempt.duration_since(now));
+                        tokio::select! {
+                            _ = worker_cancellation.cancelled() => break,
+                            _ = tokio::time::sleep(wait) => {}
+                        }
+                        continue;
+                    }
+                    cx.manifest.access = live_access;
                     cx.manifest.federation = Some(live_config);
                     match sync_peer(&mut cx, &live_peer).await {
                         Ok(report) => {
@@ -208,6 +253,7 @@ impl FederationScheduler {
                             }
                             was_failing = false;
                             backoff = live_interval;
+                            next_attempt = tokio::time::Instant::now() + live_interval;
                         }
                         Err(error) => {
                             if let Err(health_error) =
@@ -219,6 +265,7 @@ impl FederationScheduler {
                                 );
                             }
                             backoff = backoff.saturating_mul(2).min(Duration::from_secs(300));
+                            next_attempt = tokio::time::Instant::now() + backoff;
                             eprintln!(
                                 "federation peer {} poll failed; retrying in {:?}: {error:#}",
                                 peer.name, backoff
@@ -226,9 +273,14 @@ impl FederationScheduler {
                             was_failing = true;
                         }
                     }
+                    let wait = live_interval.min(
+                        next_attempt
+                            .checked_duration_since(tokio::time::Instant::now())
+                            .unwrap_or_default(),
+                    );
                     tokio::select! {
                         _ = worker_cancellation.cancelled() => break,
-                        _ = tokio::time::sleep(backoff) => {}
+                        _ = tokio::time::sleep(wait) => {}
                     }
                 }
             }));
@@ -264,12 +316,31 @@ pub async fn sync_peer(cx: &mut Cortex, peer: &PeerEntry) -> Result<SyncReport> 
     if peer.mode == "paused" {
         bail!("peer {:?} is paused", peer.name);
     }
-    if !peer.ca.is_empty() {
-        bail!("custom peer CA files are not yet supported by the Rust experiment");
-    }
 
     let endpoint = format!("{}/mcp", peer.endpoint.trim_end_matches('/'));
-    let transport = StreamableHttpClientTransport::from_uri(endpoint.clone());
+    let access_key = load_access_key(&cx.dir, cx.manifest.access.as_ref())?;
+    let mut transport_config = StreamableHttpClientTransportConfig::with_uri(endpoint.clone());
+    if access_key.keyed() {
+        transport_config = transport_config.auth_header(access_key.value);
+    }
+    let mut client_builder = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .redirect(reqwest::redirect::Policy::none())
+        .tls_version_min(reqwest::tls::Version::TLS_1_2);
+    if !peer.ca.is_empty() {
+        let pem = std::fs::read(&peer.ca)
+            .with_context(|| format!("reading CA file for peer {:?}", peer.name))?;
+        let certificates = reqwest::Certificate::from_pem_bundle(&pem)
+            .with_context(|| format!("parsing CA file for peer {:?}", peer.name))?;
+        if certificates.is_empty() {
+            bail!("CA file for peer {:?} contains no certificates", peer.name);
+        }
+        client_builder = client_builder.tls_certs_merge(certificates);
+    }
+    let http_client = client_builder
+        .build()
+        .context("building federation HTTP client")?;
+    let transport = StreamableHttpClientTransport::with_client(http_client, transport_config);
     let mut client = ClientInfo::default()
         .serve(transport)
         .await
@@ -480,8 +551,14 @@ fn classify_error(error: &anyhow::Error) -> String {
     let message = format!("{error:#}").to_ascii_lowercase();
     if message.contains("identity mismatch") || message.contains("signing key") {
         "identity_mismatch"
-    } else if message.contains("401") || message.contains("unauthorized") {
+    } else if message.contains("unauthorized")
+        || message.contains("http status 401")
+        || message.contains("status: 401")
+        || message.contains("status 401")
+    {
         "auth"
+    } else if message.contains("tls") || message.contains("certificate") {
+        "network_tls"
     } else if message.contains("connection refused")
         || message.contains("client error (connect)")
         || message.contains("tcp connect error")
@@ -493,8 +570,6 @@ fn classify_error(error: &anyhow::Error) -> String {
         "network_timeout"
     } else if message.contains("dns") || message.contains("no such host") {
         "network_dns"
-    } else if message.contains("tls") || message.contains("certificate") {
-        "network_tls"
     } else if message.contains("unknown action") || message.contains("does not replay action") {
         "unknown_action"
     } else if message.contains("invalid trace id") {
@@ -599,6 +674,12 @@ mod tests {
         );
         assert_eq!(
             classify_error(&anyhow::anyhow!("connection refused by host")),
+            "network_refused"
+        );
+        assert_eq!(
+            classify_error(&anyhow::anyhow!(
+                "error sending request for url (http://127.0.0.1:54014/mcp)"
+            )),
             "network_refused"
         );
     }

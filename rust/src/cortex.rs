@@ -12,6 +12,7 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::{
     config::{Config, CortexEntry},
@@ -24,6 +25,7 @@ use crate::{
 
 pub const MANIFEST_VERSION: u32 = 2;
 pub const MAX_SEARCH_QUERY_LEN: usize = 1000;
+pub const ACCESS_KEY_ENV: &str = "NOEMA_MCP_KEY";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
@@ -60,6 +62,97 @@ pub struct AccessConfig {
     pub tls_cert_path: String,
     #[serde(default)]
     pub tls_key_path: String,
+}
+
+#[derive(Clone, Default)]
+pub struct AccessKey {
+    pub value: String,
+    pub source: String,
+    pub path: PathBuf,
+    pub fingerprint: String,
+}
+
+impl AccessKey {
+    pub fn keyed(&self) -> bool {
+        !self.value.is_empty()
+    }
+
+    pub fn env_override(&self) -> bool {
+        self.source == "env" && !self.path.as_os_str().is_empty()
+    }
+}
+
+pub fn load_access_key(dir: &Path, config: Option<&AccessConfig>) -> Result<AccessKey> {
+    let configured_path = config
+        .map(|access| access.shared_key_file.as_str())
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                dir.join(path)
+            }
+        })
+        .unwrap_or_default();
+
+    if let Some(raw) = std::env::var_os(ACCESS_KEY_ENV).filter(|value| !value.is_empty()) {
+        let raw = raw
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("{ACCESS_KEY_ENV} is not valid UTF-8"))?;
+        let value = raw.trim().to_owned();
+        if value.is_empty() {
+            bail!("{ACCESS_KEY_ENV} is set but contains only whitespace");
+        }
+        return Ok(AccessKey {
+            fingerprint: key_fingerprint(&value),
+            value,
+            source: "env".into(),
+            path: configured_path,
+        });
+    }
+
+    if configured_path.as_os_str().is_empty() {
+        return Ok(AccessKey::default());
+    }
+    let value = load_sidecar_line(&configured_path, "access key file")?;
+    Ok(AccessKey {
+        fingerprint: key_fingerprint(&value),
+        value,
+        source: "file".into(),
+        path: configured_path,
+    })
+}
+
+pub fn resolve_tls_paths(dir: &Path, config: Option<&AccessConfig>) -> (PathBuf, PathBuf) {
+    let resolve = |value: &str| {
+        let path = PathBuf::from(value);
+        if value.is_empty() || path.is_absolute() {
+            path
+        } else {
+            dir.join(path)
+        }
+    };
+    config
+        .map(|access| {
+            (
+                resolve(&access.tls_cert_path),
+                resolve(&access.tls_key_path),
+            )
+        })
+        .unwrap_or_default()
+}
+
+pub fn key_fingerprint(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    format!(
+        "SHA256:{}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    )
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1365,6 +1458,47 @@ impl Cortex {
     }
 }
 
+fn load_sidecar_line(path: &Path, label: &str) -> Result<String> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("reading {label} metadata {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{label} {} is not a regular file", path.display());
+    }
+    if metadata.len() > 4096 {
+        bail!(
+            "{label} {} is {} bytes; maximum is 4096",
+            path.display(),
+            metadata.len()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!(
+                "refusing to read {label} {}: permissions are too broad; expected 0600",
+                path.display()
+            );
+        }
+    }
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("reading {label} {}", path.display()))?;
+    let lines: Vec<_> = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    match lines.as_slice() {
+        [] => bail!("{label} {} is empty or whitespace-only", path.display()),
+        [line] => Ok((*line).to_owned()),
+        _ => bail!(
+            "{label} {} contains {} non-empty lines; only one is supported",
+            path.display(),
+            lines.len()
+        ),
+    }
+}
+
 fn load_signing_key(dir: &Path, manifest: &Manifest) -> Result<Option<SigningKey>> {
     let Some(config) = &manifest.signing else {
         return Ok(None);
@@ -1378,25 +1512,8 @@ fn load_signing_key(dir: &Path, manifest: &Manifest) -> Result<Option<SigningKey
     } else {
         dir.join(configured)
     };
-    let metadata = fs::metadata(&path)
-        .with_context(|| format!("reading signing key metadata {}", path.display()))?;
-    if !metadata.is_file() || metadata.len() > 4096 {
-        bail!("signing key file must be a regular file no larger than 4096 bytes");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            bail!("signing key file permissions are too broad; expected 0600");
-        }
-    }
-    let contents = fs::read_to_string(&path)?;
-    let seed = contents
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("signing key file is empty"))?;
-    let key = eventsig::signing_key_from_seed(seed)?;
+    let seed = load_sidecar_line(&path, "signing key file")?;
+    let key = eventsig::signing_key_from_seed(&seed)?;
     let public = eventsig::encode_public(&key.verifying_key());
     if !config.public_key.is_empty() && config.public_key.trim() != public {
         bail!("signing key does not match cortex.md public_key");
@@ -2041,5 +2158,34 @@ mod tests {
         let parsed = read_manifest(&temp.path().join("test")).unwrap();
         assert_eq!(parsed.id, manifest.id);
         assert_eq!(parsed.version, 2);
+    }
+
+    #[test]
+    fn access_sidecars_are_single_line_private_files_with_safe_fingerprints() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("access.key");
+        fs::write(&path, "  shared-secret  \n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(
+            load_sidecar_line(&path, "access key file").unwrap(),
+            "shared-secret"
+        );
+        assert_eq!(
+            key_fingerprint("abc"),
+            "SHA256:ba:78:16:bf:8f:01:cf:ea:41:41:40:de:5d:ae:22:23:b0:03:61:a3:96:17:7a:9c:b4:10:ff:61:f2:00:15:ad"
+        );
+
+        fs::write(&path, "first\nsecond\n").unwrap();
+        assert!(load_sidecar_line(&path, "access key file").is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(load_sidecar_line(&path, "access key file").is_err());
+        }
     }
 }

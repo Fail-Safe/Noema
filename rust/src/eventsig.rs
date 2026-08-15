@@ -75,6 +75,19 @@ pub fn parse_public(value: &str) -> Result<VerifyingKey> {
     VerifyingKey::from_bytes(&bytes).context("invalid public key")
 }
 
+pub fn public_fingerprint(value: &str) -> Result<String> {
+    let key = parse_public(value)?;
+    let digest = Sha256::digest(key.as_bytes());
+    Ok(format!(
+        "SHA256:{}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    ))
+}
+
 fn decode_prefixed(value: &str, expected: usize) -> Result<Vec<u8>> {
     let encoded = value
         .trim()
