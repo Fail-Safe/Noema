@@ -26,9 +26,16 @@ The rotation case then stages an explicit hard pin without resetting the event
 cursor, resumes the peer, and verifies recovery under the new key.
 
 `federation_tls.py` runs signed Go↔Rust federation over HTTPS with a temporary
-self-signed certificate and shared bearer key. It verifies missing/wrong/correct
-authorization, custom-CA failure and recovery, secret-free failure output, and
-the keyed-plaintext startup refusal.
+private CA, CA-signed server certificate, and shared bearer key. It verifies
+missing/wrong/correct authorization, custom-CA failure and recovery, secret-free
+failure output, and the keyed-plaintext startup refusal.
+
+`consolidation_election.py` runs Go and Rust eligibility loops against temporary
+OpenAI-compatible `/models` probes. It checks rank advertisement and exchange,
+deterministic winner agreement, endpoint-loss demotion and failover, recovery,
+and signed Go claim/success replay without creating synthetic trace rows. The
+Go threshold-election restart uses a delayed eligibility probe so its fixed,
+quiet rank remains stable while the real consolidator claims the test window.
 
 `benchmark.sh` creates independent but equivalent cortexes and reports TSV for
 process-level ingest, full-text search, filtered list, sync, verification, and

@@ -64,6 +64,39 @@ pub struct AccessConfig {
     pub tls_key_path: String,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ConsolidationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub cron: String,
+    #[serde(default)]
+    pub idle_minutes: i64,
+    #[serde(default)]
+    pub threshold_short: i64,
+    #[serde(default)]
+    pub llm_enabled: bool,
+    #[serde(default)]
+    pub local_llm_endpoint: String,
+}
+
+impl ConsolidationConfig {
+    pub fn has_trigger(&self) -> bool {
+        !self.cron.is_empty() || self.idle_minutes != 0 || self.threshold_short != 0
+    }
+}
+
+impl Manifest {
+    pub fn consolidation_config(&self) -> Result<Option<ConsolidationConfig>> {
+        self.consolidation
+            .as_ref()
+            .map(|value| {
+                serde_yaml::from_value(value.clone()).context("parsing consolidation configuration")
+            })
+            .transpose()
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct AccessKey {
     pub value: String,
@@ -733,6 +766,12 @@ impl Cortex {
         if exists {
             return Ok(());
         }
+        if matches!(
+            event.action.as_str(),
+            "consolidation_claim" | "consolidation_success" | "consolidation_fail"
+        ) {
+            return self.store_remote_event(event);
+        }
         if !trace::is_valid_id(&event.trace_id) {
             bail!(
                 "rejecting remote event with invalid trace ID {:?}",
@@ -1306,6 +1345,24 @@ impl Cortex {
             "INSERT INTO federation_state(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             params![key, value],
         )?;
+        Ok(())
+    }
+
+    pub fn emit_coordination_event(
+        &self,
+        action: &str,
+        window_id: &str,
+        data: serde_json::Value,
+    ) -> Result<()> {
+        if !matches!(
+            action,
+            "consolidation_claim" | "consolidation_success" | "consolidation_fail"
+        ) {
+            bail!("unsupported coordination event action {action:?}")
+        }
+        let tx = self.connection.unchecked_transaction()?;
+        self.emit_event(&tx, action, window_id, &trace::now_rfc3339(), data)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2000,6 +2057,29 @@ mod tests {
         let (_, mut foreign) = beta.get_trace(&locked_id).unwrap();
         foreign.body = "unauthorized".into();
         assert!(beta.update_trace(&locked_id, &mut foreign, false).is_err());
+    }
+
+    #[test]
+    fn signed_coordination_events_replay_without_trace_materialization() {
+        let temp = tempfile::tempdir().unwrap();
+        let alpha = signed_cortex(temp.path(), "alpha");
+        let beta = signed_cortex(temp.path(), "beta");
+        let window = ulid::Ulid::new().to_string();
+        alpha
+            .emit_coordination_event(
+                "consolidation_claim",
+                &window,
+                json!({"window_id":window,"cortex_id":alpha.id}),
+            )
+            .unwrap();
+        let event = event_for(&alpha, &window, "consolidation_claim", &alpha.id);
+        eventsig::verify(&event.pubkey, &event, &event.signature).unwrap();
+
+        beta.replay_event(&event).unwrap();
+        beta.replay_event(&event).unwrap();
+
+        assert_eq!(beta.history(&window).unwrap().len(), 1);
+        assert!(beta.get(&window).is_err());
     }
 
     #[test]

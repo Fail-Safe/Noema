@@ -208,6 +208,13 @@ def event_counts(database_path: Path) -> tuple[int, int]:
     return int(row[0]), int(row[1])
 
 
+def latest_event_id(database_path: Path) -> str:
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute("SELECT max(id) FROM events").fetchone()
+    assert row is not None and row[0]
+    return str(row[0])
+
+
 def usage_owner_count(database_path: Path, trace_id: str) -> int:
     with sqlite3.connect(database_path) as connection:
         row = connection.execute(
@@ -411,6 +418,13 @@ def exercise(go: Path, rust: Path, root: Path) -> None:
             )
 
         peer_a = nodes[0]
+        pre_rotation_event = latest_event_id(database(root, peer_a))
+        for node in nodes[1:]:
+            wait_until(
+                f"direct peer-a cursor catch-up on {node.name}",
+                lambda n=node: state(database(root, n), "peer:peer-a:last_event")
+                >= pre_rotation_event,
+            )
         assert stop(peer_a)
         frozen = {
             node.name: state(database(root, node), "peer:peer-a:last_event")

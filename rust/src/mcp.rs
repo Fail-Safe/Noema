@@ -26,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     VERSION,
     cortex::{AccessKey, Cortex, ListOptions, PeerEntry, write_manifest},
+    lock::CortexLock,
     trace::Trace,
 };
 
@@ -500,9 +501,12 @@ impl NoemaServer {
     #[tool(description = "Return this cortex stable identity")]
     async fn cortex_identity(&self, _: Parameters<Empty>) -> Result<String, ErrorData> {
         let cx = self.open().await?;
-        Ok(json_text(
-            json!({"id":cx.id,"name":cx.name,"version":cx.manifest.version,"binary_version":VERSION,"pubkey":cx.manifest.signing.as_ref().map(|signing| signing.public_key.as_str()).unwrap_or("")}),
-        ))
+        let mut payload = json!({"id":cx.id,"name":cx.name,"version":cx.manifest.version,"binary_version":VERSION,"pubkey":cx.manifest.signing.as_ref().map(|signing| signing.public_key.as_str()).unwrap_or("")});
+        let rank = crate::consolidation::get_local_rank(&cx).map_err(mcp_error)?;
+        if !rank.cortex_id.is_empty() {
+            payload["rank"] = serde_json::to_value(rank).map_err(mcp_error)?;
+        }
+        Ok(json_text(payload))
     }
     #[tool(description = "Return events for federation sync")]
     async fn sync_events(
@@ -590,28 +594,41 @@ impl NoemaServer {
 
 pub async fn serve_stdio(name: String, path: PathBuf) -> Result<()> {
     let server = NoemaServer::new(&name, &path)?;
-    let federation = server
-        .cortex
-        .lock()
-        .await
-        .manifest
-        .federation
-        .clone()
-        .unwrap_or_default();
+    let (cortex_id, federation) = {
+        let cortex = server.cortex.lock().await;
+        (
+            cortex.id.clone(),
+            cortex.manifest.federation.clone().unwrap_or_default(),
+        )
+    };
+    let background_lock = CortexLock::try_acquire_background(&cortex_id)?;
     let cancellation = CancellationToken::new();
-    let scheduler = crate::federation::FederationScheduler::start(
-        name,
-        path,
-        federation,
-        cancellation.clone(),
-    )?;
+    let (scheduler, eligibility) = if background_lock.is_some() {
+        (
+            Some(crate::federation::FederationScheduler::start(
+                name.clone(),
+                path.clone(),
+                federation,
+                cancellation.clone(),
+            )?),
+            crate::consolidation::EligibilityScheduler::start(name, path, cancellation.clone())?,
+        )
+    } else {
+        eprintln!("another process owns cortex background work; serving MCP only");
+        (None, None)
+    };
     let result = server
         .serve(rmcp::transport::stdio())
         .await?
         .waiting()
         .await;
     cancellation.cancel();
-    scheduler.stop().await;
+    if let Some(scheduler) = scheduler {
+        scheduler.stop().await;
+    }
+    if let Some(eligibility) = eligibility {
+        eligibility.stop().await;
+    }
     result?;
     Ok(())
 }
@@ -625,14 +642,14 @@ pub async fn serve_http(
     tls: Option<(PathBuf, PathBuf)>,
 ) -> Result<()> {
     let server = NoemaServer::new(&name, &path)?;
-    let federation = server
-        .cortex
-        .lock()
-        .await
-        .manifest
-        .federation
-        .clone()
-        .unwrap_or_default();
+    let (cortex_id, federation) = {
+        let cortex = server.cortex.lock().await;
+        (
+            cortex.id.clone(),
+            cortex.manifest.federation.clone().unwrap_or_default(),
+        )
+    };
+    let background_lock = CortexLock::try_acquire_background(&cortex_id)?;
     let service: StreamableHttpService<NoemaServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(server.clone()),
@@ -654,12 +671,20 @@ pub async fn serve_http(
     listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
     let cancellation = CancellationToken::new();
-    let scheduler = crate::federation::FederationScheduler::start(
-        name,
-        path,
-        federation,
-        cancellation.clone(),
-    )?;
+    let (scheduler, eligibility) = if background_lock.is_some() {
+        (
+            Some(crate::federation::FederationScheduler::start(
+                name.clone(),
+                path.clone(),
+                federation,
+                cancellation.clone(),
+            )?),
+            crate::consolidation::EligibilityScheduler::start(name, path, cancellation.clone())?,
+        )
+    } else {
+        eprintln!("another process owns cortex background work; serving MCP only");
+        (None, None)
+    };
     let signal_cancellation = cancellation.clone();
     let signal_task = tokio::spawn(async move {
         shutdown_signal().await;
@@ -695,7 +720,12 @@ pub async fn serve_http(
             .await
     };
     cancellation.cancel();
-    scheduler.stop().await;
+    if let Some(scheduler) = scheduler {
+        scheduler.stop().await;
+    }
+    if let Some(eligibility) = eligibility {
+        eligibility.stop().await;
+    }
     signal_task.abort();
     shutdown_task.abort();
     result?;

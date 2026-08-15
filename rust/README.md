@@ -23,6 +23,13 @@ must use TLS; open HTTP is restricted to loopback. A rotated peer signing key ca
 be recovered explicitly with `federation re-pin-peer` without resetting the
 event cursor.
 
+Federated consolidation eligibility is also implemented: one background owner
+per cortex probes the configured model endpoint, advertises a rank through the
+identity handshake, persists peer ranks, and reports the quiet-period election
+winner through `federation status`. Signed consolidation coordination events are
+wire-compatible with Go. The actual Rust pass gate, watchdog, and distillation
+pipeline remain experimental gaps.
+
 Run the cross-implementation gate and release benchmark from the repository
 root:
 

@@ -123,6 +123,7 @@ pub fn status(cx: &Cortex) -> Result<serde_json::Value> {
         Err(error) => json!({"mode": "error", "error": error.to_string()}),
     };
     let config = manifest.federation.unwrap_or_default();
+    let local_rank = crate::consolidation::get_local_rank(cx)?;
     let mut peers = Vec::with_capacity(config.peers.len());
     for peer in &config.peers {
         let health_text = cx.federation_state(&format!("peer:{}:health", peer.name))?;
@@ -131,6 +132,7 @@ pub fn status(cx: &Cortex) -> Result<serde_json::Value> {
         } else {
             serde_json::from_str::<PeerHealth>(&health_text).ok()
         };
+        let rank = crate::consolidation::get_peer_rank(cx, &peer.name)?;
         peers.push(json!({
             "name": peer.name,
             "endpoint": peer.endpoint,
@@ -139,14 +141,32 @@ pub fn status(cx: &Cortex) -> Result<serde_json::Value> {
             "last_event": cx.federation_state(&format!("peer:{}:last_event", peer.name))?,
             "last_seen": cx.federation_state(&format!("peer:{}:last_seen", peer.name))?,
             "last_usage": cx.federation_state(&format!("peer:{}:last_usage", peer.name))?,
+            "consolidation_rank": rank,
             "health": health,
         }));
     }
+    let quiet_period = parse_interval(&config.interval)
+        .unwrap_or(Duration::from_secs(30))
+        .saturating_mul(2);
+    let election = crate::consolidation::decide(
+        &cx.id,
+        local_rank.clone(),
+        crate::consolidation::configured_peer_ranks(cx, &config.peers),
+        quiet_period,
+        Utc::now(),
+    );
     Ok(json!({
         "mode": if config.mode.is_empty() { "sync" } else { config.mode.as_str() },
         "interval": if config.interval.is_empty() { "30s" } else { config.interval.as_str() },
         "verify": if config.verify.is_empty() { "off" } else { config.verify.as_str() },
         "access": access,
+        "consolidation": {
+            "local_rank": local_rank,
+            "quiet_period_ms": quiet_period.as_millis(),
+            "winner": election.winner,
+            "should_run_here": election.should_run,
+            "reason": election.reason,
+        },
         "peers": peers,
         "vclock": cx.get_clock()?,
     }))
@@ -310,6 +330,8 @@ struct PeerIdentity {
     version: u32,
     #[serde(default, alias = "public_key")]
     pubkey: String,
+    #[serde(default)]
+    rank: Option<crate::consolidation::RankEntry>,
 }
 
 pub async fn sync_peer(cx: &mut Cortex, peer: &PeerEntry) -> Result<SyncReport> {
@@ -358,6 +380,10 @@ pub async fn sync_peer(cx: &mut Cortex, peer: &PeerEntry) -> Result<SyncReport> 
     let identity: PeerIdentity = identity_result
         .into_typed()
         .with_context(|| format!("parsing cortex_identity from peer {:?}", peer.name))?;
+    if let Some(mut rank) = identity.rank.clone() {
+        rank.cortex_id.clone_from(&identity.id);
+        crate::consolidation::set_peer_rank(cx, &peer.name, &rank)?;
+    }
     verify_and_pin_identity(cx, peer, &identity)?;
 
     let cursor_key = format!("peer:{}:last_event", peer.name);

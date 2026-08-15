@@ -74,6 +74,36 @@ slice as `null`, while the original Rust client accepted only `[]`. Rust now
 normalizes either form to an empty batch. The same tolerance applies to empty
 usage-signal results.
 
+## Consolidation election foundation
+
+The Rust server now implements the coordination layer below the actual
+distillation pass:
+
+- Go-compatible eligibility gates for feature enablement, scheduling triggers,
+  federation mode, and an OpenAI-compatible `/models` health probe;
+- cryptographically random ranks from 1 through 99, with rank zero reserved for
+  ineligible nodes;
+- persisted local and per-peer rank advertisements exchanged through the
+  existing federation identity handshake;
+- quiet-period filtering, highest-rank selection, and lexical cortex-ID
+  tie-breaking;
+- operator-visible winner and local-run decisions in federation status;
+- signed claim, success, and failure coordination events that replay into the
+  audit log without materializing synthetic traces; and
+- a cross-runtime background lock so only one server process per cortex runs
+  federation and eligibility workers.
+
+The mixed Go/Rust fixture exercises deterministic winner selection, endpoint
+loss and rank-zero failover, endpoint recovery, and replay of a real Go
+threshold pass's signed claim/success pair. Both the election and three-node
+ring scenarios passed five consecutive repetitions after their timing
+preconditions were made explicit.
+
+This does not yet port Rust's consolidation pass gate, in-flight claim registry,
+watchdog, candidate clustering, promotion, or LLM distillation. The current
+result establishes wire and decision compatibility for leader selection, not
+end-to-end consolidation parity.
+
 ## Bounded federation soak
 
 Equivalent homogeneous three-node clusters ran 80 paced create mutations over
@@ -94,8 +124,9 @@ and recovery rather than only under a single-process search benchmark.
 
 This remains a complexity probe, not complete federation parity. The Rust path
 does not yet dynamically add new workers without restart, monitor certificate
-expiry, or provide crash-atomic file rollback. Federation-aware consolidation
-and election behavior also remain unported.
+expiry, or provide crash-atomic file rollback. Its consolidation election and
+coordination wire are now present, but pass execution and watchdog recovery are
+not.
 
 ## Current interpretation
 
@@ -105,5 +136,5 @@ the critical signing/vector-clock rules cleanly, use materially less memory,
 remain competitive for smaller cortexes, and now sustain lower measured RSS and
 CPU during a short replicated workload. It still does not justify an all-in
 rewrite because larger-result throughput is not better and certificate-lifecycle
-checks, consolidation, semantic search, plugins, watcher parity, and broader
-operator recovery behavior remain unported.
+checks, consolidation pass execution, semantic search, plugins, watcher parity,
+and broader operator recovery behavior remain unported.
