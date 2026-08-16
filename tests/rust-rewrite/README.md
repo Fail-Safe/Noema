@@ -40,6 +40,12 @@ and the manifest read-only in turn. It checks that rejected append, archive, and
 configuration mutations leave file bytes, SQLite metadata, event counts, and
 database integrity unchanged in both builds.
 
+`rust/tests/crash_recovery.rs` exercises Rust's post-filesystem/pre-commit
+boundary directly. It pauses create, update, and archive operations after the
+durable file mutation, kills the CLI process, and requires the next Rust open
+to restore exact prior file/database/event state. The archive case also opens
+the Cortex concurrently to prove that recovery skips a live mutation owner.
+
 `federation_tls.py` runs signed Go↔Rust federation over HTTPS with a temporary
 private CA, CA-signed server certificate, and shared bearer key. It verifies
 missing/wrong/correct authorization, custom-CA failure and recovery, secret-free

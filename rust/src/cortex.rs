@@ -1,12 +1,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
-    path::{Path, PathBuf},
+    fs::{self, File, OpenOptions},
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::SigningKey;
+use fs2::FileExt;
 use rusqlite::{
     Connection, OptionalExtension, Transaction, params, params_from_iter, types::Value,
 };
@@ -27,6 +29,7 @@ use crate::{
 pub const MANIFEST_VERSION: u32 = 2;
 pub const MAX_SEARCH_QUERY_LEN: usize = 1000;
 pub const ACCESS_KEY_ENV: &str = "NOEMA_MCP_KEY";
+const PENDING_MUTATION_PREFIX: &str = "rust_pending_mutation:";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
@@ -586,6 +589,45 @@ struct FileSnapshot {
     permissions: fs::Permissions,
 }
 
+#[derive(Serialize, Deserialize)]
+struct PendingFileMutation {
+    version: u32,
+    kind: String,
+    trace_id: String,
+    #[serde(default)]
+    relative_path: String,
+    #[serde(default)]
+    source_path: String,
+    #[serde(default)]
+    target_path: String,
+    #[serde(default)]
+    original_bytes: String,
+    #[serde(default)]
+    replacement_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_mode: Option<u32>,
+    #[serde(default)]
+    original_readonly: bool,
+}
+
+struct PendingMutationGuard {
+    key: String,
+    lock_path: PathBuf,
+    lock_file: File,
+}
+
+impl PendingMutationGuard {
+    fn cleanup(self) {
+        let Self {
+            lock_path,
+            lock_file,
+            ..
+        } = self;
+        drop(lock_file);
+        let _ = fs::remove_file(lock_path);
+    }
+}
+
 impl FileSnapshot {
     fn capture(path: &Path) -> Result<Self> {
         Ok(Self {
@@ -597,37 +639,131 @@ impl FileSnapshot {
         })
     }
 
-    fn restore_after<T>(self, path: &Path, result: Result<T>) -> Result<T> {
-        let Err(error) = result else {
-            return result;
-        };
-        let rollback =
-            fs::write(path, self.bytes).and_then(|()| fs::set_permissions(path, self.permissions));
-        match rollback {
-            Ok(()) => Err(error),
-            Err(rollback_error) => Err(error.context(format!(
-                "also failed to restore {} after database error: {rollback_error}",
-                path.display()
-            ))),
-        }
+    fn restore(self, path: &Path) -> Result<()> {
+        trace::write_bytes_atomic(path, &self.bytes)?;
+        fs::set_permissions(path, self.permissions)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn mode(&self) -> Option<u32> {
+        use std::os::unix::fs::PermissionsExt;
+        Some(self.permissions.mode())
+    }
+
+    #[cfg(not(unix))]
+    fn mode(&self) -> Option<u32> {
+        None
     }
 }
 
-fn restore_move_after<T>(source: &Path, target: &Path, result: Result<T>) -> Result<T> {
-    let Err(error) = result else {
-        return result;
+fn bytes_hash(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn trace_lock_name(trace_id: &str) -> String {
+    format!("trace-{:x}.lock", Sha256::digest(trace_id.as_bytes()))
+}
+
+fn remove_created_replacement(path: &Path, replacement_hash: &str) -> Result<()> {
+    match fs::read(path) {
+        Ok(bytes) if bytes_hash(&bytes) == replacement_hash => {
+            fs::remove_file(path)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => bail!(
+            "refusing to remove independently changed trace {} during crash recovery",
+            path.display()
+        ),
+        Err(error) => Err(error).context("reading pending trace creation"),
+    }
+}
+
+fn rename_trace_durable(source: &Path, target: &Path) -> Result<()> {
+    fs::rename(source, target)
+        .with_context(|| format!("moving {} to {}", source.display(), target.display()))?;
+    let source_directory = source
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("trace source has no parent directory"))?;
+    let target_directory = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("trace target has no parent directory"))?;
+    trace::sync_directory(source_directory)?;
+    if target_directory != source_directory {
+        trace::sync_directory(target_directory)?;
+    }
+    Ok(())
+}
+
+fn restore_moved_file(source: &Path, target: &Path, file_hash: &str) -> Result<()> {
+    match (fs::read(source), fs::read(target)) {
+        (Ok(source_bytes), Err(target_error))
+            if target_error.kind() == std::io::ErrorKind::NotFound
+                && bytes_hash(&source_bytes) == file_hash =>
+        {
+            Ok(())
+        }
+        (Err(source_error), Ok(target_bytes))
+            if source_error.kind() == std::io::ErrorKind::NotFound
+                && bytes_hash(&target_bytes) == file_hash =>
+        {
+            rename_trace_durable(target, source)
+        }
+        (Ok(_), Err(target_error)) if target_error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("source trace changed independently before move recovery")
+        }
+        (Err(source_error), Ok(_)) if source_error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("target trace changed independently before move recovery")
+        }
+        (Ok(_), Ok(_)) => bail!("both source and target traces exist during move recovery"),
+        (Ok(_), Err(target_error)) => Err(target_error).context("reading move recovery target"),
+        (Err(source_error), Ok(_)) => Err(source_error).context("reading move recovery source"),
+        (Err(source_error), Err(target_error)) => Err(source_error).context(format!(
+            "neither move endpoint is readable; target error: {target_error}"
+        )),
+    }
+}
+
+fn validate_relative_trace_path(path: &Path) -> Result<()> {
+    if !path
+        .components()
+        .all(|component| matches!(component, Component::Normal(_)))
+        || path.extension().and_then(|extension| extension.to_str()) != Some("md")
+        || !(path.starts_with("traces")
+            || path.starts_with("archive/traces")
+            || path.starts_with("trash/traces"))
+    {
+        bail!("invalid pending mutation trace path")
+    }
+    Ok(())
+}
+
+fn trace_id_from_path(path: &Path) -> Result<String> {
+    let id = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("trace path has no valid UTF-8 file stem"))?;
+    if !trace::is_valid_id(id) {
+        bail!("trace path has an invalid trace ID")
+    }
+    Ok(id.to_owned())
+}
+
+#[cfg(debug_assertions)]
+fn pause_after_filesystem_mutation_for_test() -> Result<()> {
+    let Some(marker) = std::env::var_os("NOEMA_RUST_TEST_PAUSE_AFTER_FILESYSTEM_MUTATION") else {
+        return Ok(());
     };
-    if source == target {
-        return Err(error);
+    fs::write(marker, b"filesystem mutation complete\n")?;
+    loop {
+        std::thread::park();
     }
-    match fs::rename(target, source) {
-        Ok(()) => Err(error),
-        Err(rollback_error) => Err(error.context(format!(
-            "also failed to move {} back to {}: {rollback_error}",
-            target.display(),
-            source.display()
-        ))),
-    }
+}
+
+#[cfg(not(debug_assertions))]
+fn pause_after_filesystem_mutation_for_test() -> Result<()> {
+    Ok(())
 }
 
 impl Cortex {
@@ -679,6 +815,7 @@ impl Cortex {
             force_source_lock: false,
             signing_key,
         };
+        cortex.recover_pending_mutations()?;
         cortex.rebuild_fts_if_stale()?;
         let days = Config::load()
             .map(|cfg| {
@@ -691,6 +828,444 @@ impl Cortex {
             .unwrap_or(30);
         let _ = cortex.purge_expired(days);
         Ok(cortex)
+    }
+
+    fn begin_pending_replace(
+        &self,
+        path: &Path,
+        snapshot: &FileSnapshot,
+        replacement: &[u8],
+    ) -> Result<PendingMutationGuard> {
+        let relative_path = self.relative_trace_path(path)?;
+        let pending = PendingFileMutation {
+            version: 1,
+            kind: "replace".into(),
+            trace_id: trace_id_from_path(path)?,
+            relative_path,
+            source_path: String::new(),
+            target_path: String::new(),
+            original_bytes: BASE64.encode(&snapshot.bytes),
+            replacement_hash: bytes_hash(replacement),
+            original_mode: snapshot.mode(),
+            original_readonly: snapshot.permissions.readonly(),
+        };
+        self.begin_pending_mutation(&pending)
+    }
+
+    fn acquire_trace_mutation_lock(&self, path: &Path) -> Result<File> {
+        let trace_id = trace_id_from_path(path)?;
+        let lock_directory = self.pending_mutation_lock_directory();
+        fs::create_dir_all(&lock_directory)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lock_directory, fs::Permissions::from_mode(0o700))?;
+        }
+        let path_lock_path = lock_directory.join(trace_lock_name(&trace_id));
+        let path_lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path_lock_path)?;
+        path_lock_file.try_lock_exclusive().with_context(|| {
+            format!(
+                "trace mutation is already in progress ({})",
+                path_lock_path.display()
+            )
+        })?;
+        Ok(path_lock_file)
+    }
+
+    fn begin_pending_create(
+        &self,
+        path: &Path,
+        replacement: &[u8],
+    ) -> Result<PendingMutationGuard> {
+        let pending = PendingFileMutation {
+            version: 1,
+            kind: "create".into(),
+            trace_id: trace_id_from_path(path)?,
+            relative_path: self.relative_trace_path(path)?,
+            source_path: String::new(),
+            target_path: String::new(),
+            original_bytes: String::new(),
+            replacement_hash: bytes_hash(replacement),
+            original_mode: None,
+            original_readonly: false,
+        };
+        self.begin_pending_mutation(&pending)
+    }
+
+    fn begin_pending_move(&self, source: &Path, target: &Path) -> Result<PendingMutationGuard> {
+        let pending = PendingFileMutation {
+            version: 1,
+            kind: "move".into(),
+            trace_id: trace_id_from_path(source)?,
+            relative_path: String::new(),
+            source_path: self.relative_trace_path(source)?,
+            target_path: self.relative_trace_path(target)?,
+            original_bytes: String::new(),
+            replacement_hash: bytes_hash(
+                &fs::read(source)
+                    .with_context(|| format!("reading {} before move", source.display()))?,
+            ),
+            original_mode: None,
+            original_readonly: false,
+        };
+        self.begin_pending_mutation(&pending)
+    }
+
+    fn begin_pending_mutation(
+        &self,
+        pending: &PendingFileMutation,
+    ) -> Result<PendingMutationGuard> {
+        let id = ulid::Ulid::new().to_string();
+        let key = format!("{PENDING_MUTATION_PREFIX}{id}");
+        let lock_directory = self.pending_mutation_lock_directory();
+        fs::create_dir_all(&lock_directory)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lock_directory, fs::Permissions::from_mode(0o700))?;
+        }
+        let lock_path = lock_directory.join(format!("{id}.lock"));
+        let lock_file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        lock_file.try_lock_exclusive()?;
+        let insert = self.connection.execute(
+            "INSERT INTO federation_state(key,value) VALUES (?1,?2)",
+            params![key, serde_json::to_string(&pending)?],
+        );
+        if let Err(error) = insert {
+            drop(lock_file);
+            let _ = fs::remove_file(&lock_path);
+            return Err(error.into());
+        }
+        Ok(PendingMutationGuard {
+            key,
+            lock_path,
+            lock_file,
+        })
+    }
+
+    fn finish_pending_replace<T>(
+        &self,
+        guard: PendingMutationGuard,
+        snapshot: FileSnapshot,
+        path: &Path,
+        result: Result<T>,
+    ) -> Result<T> {
+        let Err(error) = result else {
+            guard.cleanup();
+            return result;
+        };
+        if let Err(rollback_error) = snapshot.restore(path) {
+            guard.cleanup();
+            return Err(error.context(format!(
+                "also failed to restore {} after mutation error: {rollback_error}",
+                path.display()
+            )));
+        }
+        let clear = self
+            .connection
+            .execute("DELETE FROM federation_state WHERE key=?1", [&guard.key]);
+        guard.cleanup();
+        match clear {
+            Ok(_) => Err(error),
+            Err(clear_error) => Err(error.context(format!(
+                "filesystem rollback succeeded but clearing its recovery record failed: {clear_error}"
+            ))),
+        }
+    }
+
+    fn finish_pending_create<T>(
+        &self,
+        guard: PendingMutationGuard,
+        path: &Path,
+        replacement_hash: &str,
+        result: Result<T>,
+    ) -> Result<T> {
+        let Err(error) = result else {
+            guard.cleanup();
+            return result;
+        };
+        if let Err(rollback_error) = remove_created_replacement(path, replacement_hash) {
+            guard.cleanup();
+            return Err(error.context(format!(
+                "also failed to remove {} after mutation error: {rollback_error}",
+                path.display()
+            )));
+        }
+        let clear = self
+            .connection
+            .execute("DELETE FROM federation_state WHERE key=?1", [&guard.key]);
+        guard.cleanup();
+        match clear {
+            Ok(_) => Err(error),
+            Err(clear_error) => Err(error.context(format!(
+                "filesystem rollback succeeded but clearing its recovery record failed: {clear_error}"
+            ))),
+        }
+    }
+
+    fn finish_pending_move<T>(
+        &self,
+        guard: PendingMutationGuard,
+        source: &Path,
+        target: &Path,
+        file_hash: &str,
+        result: Result<T>,
+    ) -> Result<T> {
+        let Err(error) = result else {
+            guard.cleanup();
+            return result;
+        };
+        if let Err(rollback_error) = restore_moved_file(source, target, file_hash) {
+            guard.cleanup();
+            return Err(error.context(format!(
+                "also failed to move {} back to {}: {rollback_error}",
+                target.display(),
+                source.display()
+            )));
+        }
+        let clear = self
+            .connection
+            .execute("DELETE FROM federation_state WHERE key=?1", [&guard.key]);
+        guard.cleanup();
+        match clear {
+            Ok(_) => Err(error),
+            Err(clear_error) => Err(error.context(format!(
+                "filesystem rollback succeeded but clearing its recovery record failed: {clear_error}"
+            ))),
+        }
+    }
+
+    fn replace_trace_transactionally<F>(
+        &self,
+        path: &Path,
+        trace: &Trace,
+        database: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&str) -> Result<()>,
+    {
+        let _trace_lock = self.acquire_trace_mutation_lock(path)?;
+        let snapshot = FileSnapshot::capture(path)?;
+        let replacement = trace.encoded()?;
+        let pending = self.begin_pending_replace(path, &snapshot, &replacement)?;
+        if let Err(error) = trace.write_preserving_updated(path) {
+            return self.finish_pending_replace(pending, snapshot, path, Err(error));
+        }
+        if let Err(error) = pause_after_filesystem_mutation_for_test() {
+            return self.finish_pending_replace(pending, snapshot, path, Err(error));
+        }
+        let database_result = database(&pending.key);
+        self.finish_pending_replace(pending, snapshot, path, database_result)
+    }
+
+    fn create_trace_transactionally<F>(&self, path: &Path, trace: &Trace, database: F) -> Result<()>
+    where
+        F: FnOnce(&str) -> Result<()>,
+    {
+        let _trace_lock = self.acquire_trace_mutation_lock(path)?;
+        let replacement = trace.encoded()?;
+        let replacement_hash = bytes_hash(&replacement);
+        let pending = self.begin_pending_create(path, &replacement)?;
+        if let Err(error) = trace.write_preserving_updated(path) {
+            return self.finish_pending_create(pending, path, &replacement_hash, Err(error));
+        }
+        if let Err(error) = pause_after_filesystem_mutation_for_test() {
+            return self.finish_pending_create(pending, path, &replacement_hash, Err(error));
+        }
+        let database_result = database(&pending.key);
+        self.finish_pending_create(pending, path, &replacement_hash, database_result)
+    }
+
+    fn move_trace_transactionally<F>(&self, source: &Path, target: &Path, database: F) -> Result<()>
+    where
+        F: FnOnce(Option<&str>) -> Result<()>,
+    {
+        if source == target {
+            return database(None);
+        }
+        let _trace_lock = self.acquire_trace_mutation_lock(source)?;
+        let file_hash = bytes_hash(
+            &fs::read(source)
+                .with_context(|| format!("reading {} before move", source.display()))?,
+        );
+        let pending = self.begin_pending_move(source, target)?;
+        if let Err(error) = rename_trace_durable(source, target) {
+            return self.finish_pending_move(pending, source, target, &file_hash, Err(error));
+        }
+        if let Err(error) = pause_after_filesystem_mutation_for_test() {
+            return self.finish_pending_move(pending, source, target, &file_hash, Err(error));
+        }
+        let database_result = database(Some(&pending.key));
+        self.finish_pending_move(pending, source, target, &file_hash, database_result)
+    }
+
+    fn clear_pending_in_transaction(tx: &Transaction<'_>, key: &str) -> Result<()> {
+        tx.execute("DELETE FROM federation_state WHERE key=?1", [key])?;
+        Ok(())
+    }
+
+    fn recover_pending_mutations(&mut self) -> Result<()> {
+        let pattern = format!("{PENDING_MUTATION_PREFIX}%");
+        let pending: Vec<(String, String)> = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT key,value FROM federation_state WHERE key LIKE ?1 ORDER BY key")?;
+            statement
+                .query_map([pattern], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let lock_directory = self.pending_mutation_lock_directory();
+        fs::create_dir_all(&lock_directory)?;
+        for (key, value) in pending {
+            let id = key
+                .strip_prefix(PENDING_MUTATION_PREFIX)
+                .ok_or_else(|| anyhow::anyhow!("invalid pending mutation key"))?;
+            ulid::Ulid::from_string(id).context("invalid pending mutation ID")?;
+            let lock_path = lock_directory.join(format!("{id}.lock"));
+            let lock_file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)?;
+            match lock_file.try_lock_exclusive() {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(error) => return Err(error).context("locking pending mutation recovery"),
+            }
+            let mutation: PendingFileMutation =
+                serde_json::from_str(&value).context("parsing pending mutation recovery record")?;
+            if !trace::is_valid_id(&mutation.trace_id) {
+                bail!("pending mutation has an invalid trace ID")
+            }
+            let path_lock_path = lock_directory.join(trace_lock_name(&mutation.trace_id));
+            let path_lock_file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path_lock_path)?;
+            match path_lock_file.try_lock_exclusive() {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(error) => return Err(error).context("locking pending trace recovery"),
+            }
+            match mutation.kind.as_str() {
+                "replace" => self.recover_pending_replace(&mutation)?,
+                "create" => self.recover_pending_create(&mutation)?,
+                "move" => self.recover_pending_move(&mutation)?,
+                kind => bail!("unsupported pending mutation kind {kind:?}"),
+            }
+            self.connection
+                .execute("DELETE FROM federation_state WHERE key=?1", [&key])?;
+            drop(path_lock_file);
+            drop(lock_file);
+            let _ = fs::remove_file(lock_path);
+        }
+        Ok(())
+    }
+
+    fn recover_pending_replace(&self, mutation: &PendingFileMutation) -> Result<()> {
+        if mutation.version != 1 {
+            bail!(
+                "unsupported pending mutation record version {}",
+                mutation.version
+            );
+        }
+        let path = self.resolve_relative_trace_path(&mutation.relative_path)?;
+        if trace_id_from_path(&path)? != mutation.trace_id {
+            bail!("pending replacement path does not match its trace ID")
+        }
+        let original = BASE64
+            .decode(&mutation.original_bytes)
+            .context("decoding pending mutation backup")?;
+        match fs::read(&path) {
+            Ok(current) if current == original => {}
+            Ok(current) if bytes_hash(&current) == mutation.replacement_hash => {
+                trace::write_bytes_atomic(&path, &original)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                trace::write_bytes_atomic(&path, &original)?;
+            }
+            Ok(_) => bail!(
+                "refusing to overwrite independently changed trace {} during crash recovery",
+                path.display()
+            ),
+            Err(error) => return Err(error).context("reading pending mutation target"),
+        }
+        let mut permissions = fs::metadata(&path)?.permissions();
+        permissions.set_readonly(mutation.original_readonly);
+        #[cfg(unix)]
+        if let Some(mode) = mutation.original_mode {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(mode);
+        }
+        fs::set_permissions(&path, permissions)?;
+        Ok(())
+    }
+
+    fn recover_pending_create(&self, mutation: &PendingFileMutation) -> Result<()> {
+        if mutation.version != 1 {
+            bail!(
+                "unsupported pending mutation record version {}",
+                mutation.version
+            );
+        }
+        let path = self.resolve_relative_trace_path(&mutation.relative_path)?;
+        if trace_id_from_path(&path)? != mutation.trace_id {
+            bail!("pending creation path does not match its trace ID")
+        }
+        remove_created_replacement(&path, &mutation.replacement_hash)
+    }
+
+    fn recover_pending_move(&self, mutation: &PendingFileMutation) -> Result<()> {
+        if mutation.version != 1 {
+            bail!(
+                "unsupported pending mutation record version {}",
+                mutation.version
+            );
+        }
+        let source = self.resolve_relative_trace_path(&mutation.source_path)?;
+        let target = self.resolve_relative_trace_path(&mutation.target_path)?;
+        if trace_id_from_path(&source)? != mutation.trace_id
+            || trace_id_from_path(&target)? != mutation.trace_id
+        {
+            bail!("pending move paths do not match their trace ID")
+        }
+        restore_moved_file(&source, &target, &mutation.replacement_hash)
+    }
+
+    fn relative_trace_path(&self, path: &Path) -> Result<String> {
+        let relative = path
+            .strip_prefix(&self.dir)
+            .with_context(|| format!("trace path {} is outside the cortex", path.display()))?;
+        validate_relative_trace_path(relative)?;
+        relative
+            .to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("trace path is not valid UTF-8"))
+    }
+
+    fn resolve_relative_trace_path(&self, relative: &str) -> Result<PathBuf> {
+        let relative = Path::new(relative);
+        validate_relative_trace_path(relative)?;
+        Ok(self.dir.join(relative))
+    }
+
+    fn pending_mutation_lock_directory(&self) -> PathBuf {
+        self.dir.join("db/pending-mutations")
     }
 
     pub fn resolve(name_override: Option<&str>) -> Result<Self> {
@@ -780,15 +1355,27 @@ impl Cortex {
             bail!("trace ID {:?} already exists", trace.frontmatter.id);
         }
         let path = self.trace_file(&trace.frontmatter.id, false);
-        trace.write(&path)?;
-        let result = self.insert_trace(trace, true);
-        if result.is_err() {
-            let _ = fs::remove_file(path);
+        trace.frontmatter.updated = trace::now_rfc3339();
+        if path.exists() {
+            return self.replace_trace_transactionally(&path, trace, |pending_key| {
+                self.insert_trace_with_pending(trace, true, Some(pending_key))
+            });
         }
-        result
+        self.create_trace_transactionally(&path, trace, |pending_key| {
+            self.insert_trace_with_pending(trace, true, Some(pending_key))
+        })
     }
 
     fn insert_trace(&self, trace: &Trace, emit: bool) -> Result<()> {
+        self.insert_trace_with_pending(trace, emit, None)
+    }
+
+    fn insert_trace_with_pending(
+        &self,
+        trace: &Trace,
+        emit: bool,
+        pending_key: Option<&str>,
+    ) -> Result<()> {
         let f = &trace.frontmatter;
         let tx = self.connection.unchecked_transaction()?;
         tx.execute(
@@ -801,6 +1388,9 @@ impl Cortex {
         upsert_fts(&tx, &f.id, &f.title, &trace.body, &f.tags)?;
         if emit {
             self.emit_event(&tx, "create", &f.id, &f.created, trace_snapshot(trace))?;
+        }
+        if let Some(pending_key) = pending_key {
+            Self::clear_pending_in_transaction(&tx, pending_key)?;
         }
         tx.commit()?;
         Ok(())
@@ -1714,9 +2304,7 @@ impl Cortex {
         trace.frontmatter.content_hash = trace::content_hash(&trace.body);
         trace.validate()?;
         let path = self.file_path(&existing);
-        let snapshot = FileSnapshot::capture(&path)?;
-        trace.write_preserving_updated(&path)?;
-        let database_result: Result<()> = (|| {
+        self.replace_trace_transactionally(&path, trace, |pending_key| {
             let tx = self.connection.unchecked_transaction()?;
             let f = &trace.frontmatter;
             tx.execute(
@@ -1727,10 +2315,10 @@ impl Cortex {
             replace_lineage(&tx, id, &f.derived_from)?;
             upsert_fts(&tx, id, &f.title, &trace.body, &f.tags)?;
             self.emit_event(&tx, "update", id, &f.updated, trace_snapshot(trace))?;
+            Self::clear_pending_in_transaction(&tx, pending_key)?;
             tx.commit()?;
             Ok(())
-        })();
-        snapshot.restore_after(&path, database_result)?;
+        })?;
         if actor_agent {
             self.bump_usage(id, false, true)?;
         }
@@ -1924,10 +2512,6 @@ impl Cortex {
             Visibility::Archive => self.trace_file(id, true),
             Visibility::Trash => self.trash_dir().join(format!("{id}.md")),
         };
-        if source != target {
-            fs::rename(&source, &target)
-                .with_context(|| format!("moving {} to {}", source.display(), target.display()))?;
-        }
         let now = trace::now_rfc3339();
         let (action, archived, trashed) = match destination {
             Visibility::Active if !row.trashed_at.is_empty() => ("recover", None, None),
@@ -1935,17 +2519,19 @@ impl Cortex {
             Visibility::Archive => ("archive", Some(now.as_str()), None),
             Visibility::Trash => ("trash", None, Some(now.as_str())),
         };
-        let database_result: Result<()> = (|| {
+        self.move_trace_transactionally(&source, &target, |pending_key| {
             let tx = self.connection.unchecked_transaction()?;
             tx.execute(
                 "UPDATE traces SET archived_at=?1,trashed_at=?2 WHERE id=?3",
                 params![archived, trashed, id],
             )?;
             self.emit_event(&tx, action, id, &now, json!({}))?;
+            if let Some(pending_key) = pending_key {
+                Self::clear_pending_in_transaction(&tx, pending_key)?;
+            }
             tx.commit()?;
             Ok(())
-        })();
-        restore_move_after(&source, &target, database_result)
+        })
     }
 
     pub fn remove_hard(&self, id: &str) -> Result<()> {
@@ -1991,12 +2577,10 @@ impl Cortex {
 
     fn change_tier(&self, row: &Row, to: &str, action: &str) -> Result<()> {
         let path = self.file_path(row);
-        let snapshot = FileSnapshot::capture(&path)?;
         let mut trace = Trace::parse_file(&path)?;
         trace.frontmatter.tier = to.to_owned();
         trace.frontmatter.updated = row.updated_at.clone();
-        trace.write_preserving_updated(&path)?;
-        let database_result: Result<()> = (|| {
+        self.replace_trace_transactionally(&path, &trace, |pending_key| {
             let tx = self.connection.unchecked_transaction()?;
             tx.execute("UPDATE traces SET tier=?1 WHERE id=?2", params![to, row.id])?;
             self.emit_event(
@@ -2006,10 +2590,10 @@ impl Cortex {
                 &trace::now_rfc3339(),
                 json!({"from": row.tier, "to": to}),
             )?;
+            Self::clear_pending_in_transaction(&tx, pending_key)?;
             tx.commit()?;
             Ok(())
-        })();
-        snapshot.restore_after(&path, database_result)
+        })
     }
 
     pub fn vote(&self, id: &str, delta: i64, actor: &str) -> Result<()> {
@@ -2296,9 +2880,7 @@ impl Cortex {
         trace.frontmatter.tier = row.tier.clone();
         trace.frontmatter.updated = row.updated_at.clone();
         let path = self.file_path(&row);
-        let snapshot = FileSnapshot::capture(&path)?;
-        trace.write_preserving_updated(&path)?;
-        let database_result: Result<()> = (|| {
+        self.replace_trace_transactionally(&path, &trace, |pending_key| {
             let tx = self.connection.unchecked_transaction()?;
             replace_tags(&tx, &event.trace_id, &trace.frontmatter.tags)?;
             upsert_fts(
@@ -2309,10 +2891,10 @@ impl Cortex {
                 &trace.frontmatter.tags,
             )?;
             self.store_remote_event_tx(&tx, event)?;
+            Self::clear_pending_in_transaction(&tx, pending_key)?;
             tx.commit()?;
             Ok(())
-        })();
-        snapshot.restore_after(&path, database_result)
+        })
     }
 
     fn replay_visibility(&self, event: &Event) -> Result<()> {
@@ -2357,21 +2939,19 @@ impl Cortex {
                 ),
                 _ => unreachable!(),
             };
-        if source != target {
-            fs::rename(&source, &target)
-                .with_context(|| format!("moving {} to {}", source.display(), target.display()))?;
-        }
-        let database_result: Result<()> = (|| {
+        self.move_trace_transactionally(&source, &target, |pending_key| {
             let tx = self.connection.unchecked_transaction()?;
             tx.execute(
                 "UPDATE traces SET archived_at=?1,trashed_at=?2 WHERE id=?3",
                 params![archived, trashed, event.trace_id],
             )?;
             self.store_remote_event_tx(&tx, event)?;
+            if let Some(pending_key) = pending_key {
+                Self::clear_pending_in_transaction(&tx, pending_key)?;
+            }
             tx.commit()?;
             Ok(())
-        })();
-        restore_move_after(&source, &target, database_result)
+        })
     }
 
     fn replay_tier_change(&self, event: &Event) -> Result<()> {
@@ -2387,22 +2967,20 @@ impl Cortex {
             return self.store_remote_event(event);
         };
         let path = self.file_path(&row);
-        let snapshot = FileSnapshot::capture(&path)?;
         let mut trace = Trace::parse_file(&path)?;
         trace.frontmatter.tier = data.to.clone();
         trace.frontmatter.updated = row.updated_at.clone();
-        trace.write_preserving_updated(&path)?;
-        let database_result: Result<()> = (|| {
+        self.replace_trace_transactionally(&path, &trace, |pending_key| {
             let tx = self.connection.unchecked_transaction()?;
             tx.execute(
                 "UPDATE traces SET tier=?1 WHERE id=?2",
                 params![data.to, event.trace_id],
             )?;
             self.store_remote_event_tx(&tx, event)?;
+            Self::clear_pending_in_transaction(&tx, pending_key)?;
             tx.commit()?;
             Ok(())
-        })();
-        snapshot.restore_after(&path, database_result)
+        })
     }
 
     fn replay_consolidate(&self, event: &Event) -> Result<()> {
@@ -2424,19 +3002,17 @@ impl Cortex {
             return self.store_remote_event(event);
         }
         let path = self.file_path(&row);
-        let snapshot = FileSnapshot::capture(&path)?;
         let mut trace = Trace::parse_file(&path)?;
         trace.frontmatter.tier = "mid".into();
         trace.frontmatter.updated = row.updated_at.clone();
-        trace.write_preserving_updated(&path)?;
-        let database_result: Result<()> = (|| {
+        self.replace_trace_transactionally(&path, &trace, |pending_key| {
             let tx = self.connection.unchecked_transaction()?;
             tx.execute("UPDATE traces SET tier='mid' WHERE id=?1", [id])?;
             self.store_remote_event_tx(&tx, event)?;
+            Self::clear_pending_in_transaction(&tx, pending_key)?;
             tx.commit()?;
             Ok(())
-        })();
-        snapshot.restore_after(&path, database_result)
+        })
     }
 
     fn replay_vote(&self, event: &Event) -> Result<()> {
@@ -2531,46 +3107,45 @@ impl Cortex {
             .as_ref()
             .map(|row| self.file_path(row))
             .unwrap_or_else(|| self.trace_file(&event.trace_id, false));
-        let snapshot = path
-            .exists()
-            .then(|| FileSnapshot::capture(&path))
-            .transpose()?;
-        trace.write_preserving_updated(&path)?;
-        let database_result: Result<()> = (|| {
-            let tx = self.connection.unchecked_transaction()?;
-            let f = &trace.frontmatter;
-            if existing.is_some() {
-                tx.execute(
-                    "UPDATE traces SET title=?1,type=?2,author=?3,origin=?4,updated_at=?5,content_hash=?6,source_locked=?7,source_hash=?8 WHERE id=?9",
-                    params![f.title,f.trace_type,f.author,f.origin,f.updated,f.content_hash,i64::from(f.source_locked),nullable(&f.source_hash),f.id],
-                )?;
-            } else {
-                tx.execute(
-                    "INSERT INTO traces(id,title,type,tier,author,origin,cortex_id,created_at,updated_at,content_hash,source_locked,source_hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-                    params![f.id,f.title,f.trace_type,f.tier,f.author,f.origin,event.cortex_id,f.created,f.updated,f.content_hash,i64::from(f.source_locked),nullable(&f.source_hash)],
-                )?;
-            }
-            replace_tags(&tx, &f.id, &f.tags)?;
-            replace_lineage(&tx, &f.id, &f.derived_from)?;
-            upsert_fts(&tx, &f.id, &f.title, &trace.body, &f.tags)?;
-            self.store_remote_event_tx(&tx, event)?;
-            tx.commit()?;
-            Ok(())
-        })();
-        match snapshot {
-            Some(snapshot) => snapshot.restore_after(&path, database_result),
-            None if database_result.is_err() => {
-                let error = database_result.unwrap_err();
-                match fs::remove_file(&path) {
-                    Ok(()) => Err(error),
-                    Err(rollback_error) => Err(error.context(format!(
-                        "also failed to remove newly materialized {}: {rollback_error}",
-                        path.display()
-                    ))),
-                }
-            }
-            None => database_result,
+        if path.exists() {
+            return self.replace_trace_transactionally(&path, &trace, |pending_key| {
+                self.commit_remote_snapshot(event, existing.is_some(), &trace, Some(pending_key))
+            });
         }
+        self.create_trace_transactionally(&path, &trace, |pending_key| {
+            self.commit_remote_snapshot(event, false, &trace, Some(pending_key))
+        })
+    }
+
+    fn commit_remote_snapshot(
+        &self,
+        event: &Event,
+        existing: bool,
+        trace: &Trace,
+        pending_key: Option<&str>,
+    ) -> Result<()> {
+        let tx = self.connection.unchecked_transaction()?;
+        let f = &trace.frontmatter;
+        if existing {
+            tx.execute(
+                "UPDATE traces SET title=?1,type=?2,author=?3,origin=?4,updated_at=?5,content_hash=?6,source_locked=?7,source_hash=?8 WHERE id=?9",
+                params![f.title,f.trace_type,f.author,f.origin,f.updated,f.content_hash,i64::from(f.source_locked),nullable(&f.source_hash),f.id],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO traces(id,title,type,tier,author,origin,cortex_id,created_at,updated_at,content_hash,source_locked,source_hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                params![f.id,f.title,f.trace_type,f.tier,f.author,f.origin,event.cortex_id,f.created,f.updated,f.content_hash,i64::from(f.source_locked),nullable(&f.source_hash)],
+            )?;
+        }
+        replace_tags(&tx, &f.id, &f.tags)?;
+        replace_lineage(&tx, &f.id, &f.derived_from)?;
+        upsert_fts(&tx, &f.id, &f.title, &trace.body, &f.tags)?;
+        self.store_remote_event_tx(&tx, event)?;
+        if let Some(pending_key) = pending_key {
+            Self::clear_pending_in_transaction(&tx, pending_key)?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     fn create_divergence(&self, local: &Row, remote: &Event) -> Result<()> {
@@ -4566,5 +5141,21 @@ mod tests {
         );
         assert!(beta.get(&id).is_err());
         assert!(beta.history(&id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_same_trace_create_is_rejected_before_file_write() {
+        let temp = tempfile::tempdir().unwrap();
+        Cortex::create("shared", temp.path()).unwrap();
+        let root = temp.path().join("shared");
+        let first = Cortex::open("shared", &root).unwrap();
+        let second = Cortex::open("shared", &root).unwrap();
+        let mut trace = Trace::new("Serialized create", "fact", "", vec![], "body");
+        let path = first.trace_file(&trace.frontmatter.id, false);
+        let _held = first.acquire_trace_mutation_lock(&path).unwrap();
+
+        assert!(second.add(&mut trace).is_err());
+        assert!(!path.exists());
+        assert!(first.get(&trace.frontmatter.id).is_err());
     }
 }

@@ -75,7 +75,12 @@ and mixed-process tests cover:
   an aborted SQLite trace transaction. Local and replay tests require exact
   original bytes and permissions, inverse lifecycle moves, cleanup of newly
   materialized files, preservation of orphan files, unchanged rows, and no
-  partial event.
+  partial event; and
+- Rust atomic trace replacement plus durable pending records for transactional
+  create, replace, and move paths. Three subprocess fixtures kill the writer
+  after the filesystem mutation and prove the next Rust open restores the old
+  row/file/event state. Owner locks skip live mutations; stable per-trace locks
+  reject concurrent duplicate materialization before file replacement.
 
 The network experiment found two interoperability defects that in-process tests
 did not expose. Rust's first identity response did not use Go's `version` and
@@ -364,9 +369,11 @@ and recovery rather than only under a single-process search benchmark.
 
 This remains a complexity probe, not complete federation parity. The Rust path
 now dynamically reconciles workers without restart and rolls filesystem state
-back when a non-destructive trace transaction returns an error. It does not yet
-provide crash-atomic replacement if the process dies before rollback can run.
-Its consolidation election and
+back when a non-destructive trace transaction returns an error. Atomic writes
+and durable recovery records now cover process death for transactional create,
+replace, and move paths on the next Rust open. Hard purge, external-delete
+reconstruction, corrupt-database recovery, mixed-runtime takeover, and
+power-loss qualification remain open. Its consolidation election and
 coordination wire, pass gate, watchdog recovery, full cadence, heuristic pass,
 graduation, and model-driven distillation are now present. A bounded real-model
 comparison also passes, but broader distillation-quality evaluation remains
@@ -384,8 +391,8 @@ about half the prompt-token cost. Watcher behavior now also matches the tested
 Go outcomes, as do deterministic semantic indexing/ranking, the advanced MCP
 contract, and the functional TUI state model. TLS certificate lifecycle checks
 now also match the deterministic Go oracle, while returned database failures
-have stronger filesystem recovery in the Rust experiment. It still does not
-justify an all-in rewrite because larger-result throughput is not better and
-pixel-level/live-terminal TUI validation, broader distillation-quality
-evaluation, crash/corruption fault injection, and operator recovery behavior
-remain incomplete.
+and tested process death have stronger filesystem recovery in the Rust
+experiment. It still does not justify an all-in rewrite because larger-result
+throughput is not better and pixel-level/live-terminal TUI validation, broader
+distillation-quality evaluation, destructive/corrupt-database fault injection,
+mixed-runtime recovery, and operator recovery behavior remain incomplete.

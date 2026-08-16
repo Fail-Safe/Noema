@@ -5,9 +5,9 @@ Updated: 2026-08-16
 ## Pause point
 
 - Branch: `experiment/rust-rewrite`
-- Latest completed milestone: returned database-failure rollback for Rust trace
-  mutations (this handoff commit).
-- Previous milestone: `752d6da test(rust): add lock and I/O fault gates`.
+- Latest completed milestone: atomic trace writes and `SIGKILL` recovery for
+  transactional Rust create/replace/move mutations (this handoff commit).
+- Previous milestone: `f2d61cf fix(rust): roll back failed trace transactions`.
 - Earlier TLS milestone: `33424c0 feat(rust): add TLS certificate lifecycle parity`.
 - Earlier TUI milestone: `a7e7196 feat(rust): add functional TUI parity`.
 - Earlier advanced MCP milestone: `29cd610 feat(rust): complete advanced MCP parity`.
@@ -91,12 +91,16 @@ Updated: 2026-08-16
 - Multi-process contention now proves that both builds keep lock losers in
   MCP-only mode, release the kernel lock after a killed owner, and allow a new
   owner to acquire it while the original loser remains alive.
-- Rust local updates, visibility moves, and tier changes now roll their
-  filesystem mutation back when the corresponding SQLite transaction returns
-  an error. Federation replay applies the same rule to snapshots, tags,
-  visibility, tiers, and consolidation: existing files regain their exact
-  bytes and permissions, moves are reversed, new files are removed, and
-  pre-existing orphan files are preserved.
+- Rust trace writes now use synced same-directory temporary files and atomic
+  rename while retaining the prior read-only-file rejection contract.
+- Local create/update/visibility/tier operations and the equivalent federation
+  replay paths create a durable recovery record before changing the filesystem.
+  Removing that record is part of the same SQLite transaction as the trace and
+  event mutation. A later Rust open restores exact bytes and permissions,
+  reverses a move, or removes an uncommitted new file after process death.
+- Per-mutation owner locks prevent a live writer from being recovered by a
+  concurrent open. Stable per-trace locks serialize duplicate local or replay
+  mutations before either worker touches the same Markdown path.
 - A reusable pass gate with initial election, signed claim, cancellable quiet
   wait, re-election, distinct preemption reasons, in-flight tracking, pass-error
   closure, and signed success.
@@ -173,13 +177,19 @@ Updated: 2026-08-16
 
 ## Latest validation
 
-The following passed for the combined transaction rollback, fault-safety,
-dynamic federation, TLS lifecycle, advanced MCP, and functional TUI tree:
+The following passed for the combined crash recovery, transaction rollback,
+fault-safety, dynamic federation, TLS lifecycle, advanced MCP, and functional
+TUI tree:
 
-- `make rust-test` — formatting, clippy with warnings denied, and 81 Rust tests.
+- `make rust-test` — formatting, clippy with warnings denied, 84 unit tests, and
+  three subprocess crash-recovery tests.
 - Five focused SQLite-abort tests prove byte- and permission-identical rollback
   for local update/tier/visibility operations and remote update/create replay,
   including removal of a new file and preservation of an orphan file.
+- Three subprocess tests pause the Rust CLI after a durable file mutation but
+  before SQLite commit, send `SIGKILL`, and verify idempotent next-open recovery
+  for exact-byte update, archive move, and new trace creation. The move case
+  also proves that a concurrent open leaves the still-live writer alone.
 - `go test ./...`
 - `go test -race ./...`
 - `go vet ./...`
@@ -314,6 +324,13 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
 - Managed-plugin replacement must inspect symlinks without following them and
   replace the directory entry atomically. Following the link would overwrite
   operator data outside the managed plugin directory.
+- Atomic rename can replace a read-only file when its directory remains
+  writable. A non-truncating write-open check is required before creating the
+  temporary trace so atomicity does not weaken the existing access contract.
+- Per-mutation recovery locks do not serialize two independent workers. The
+  mixed ring exposed duplicate create replay where the losing rollback removed
+  the winner's file; a stable lock derived from the trace path must be acquired
+  before the recovery record or filesystem mutation.
 
 ## Remaining replacement gaps
 
@@ -321,20 +338,19 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
    dark/light auto-detection, and external-editor workflows.
 2. Broader adversarial real-model quality evaluation beyond the current bounded
    synthetic corpus.
-3. Abrupt-process-death safety during direct file replacement, hard-purge and
-   external-delete recovery, corrupt-database recovery, and broader fault
-   injection. Returned SQLite failures in non-destructive local and replay
-   mutation paths now roll the filesystem back, but `SIGKILL` cannot run that
-   rollback code.
+3. Hard-remove/purge and watcher external-delete reconstruction still need the
+   same crash protocol. Corrupt-database recovery, power-loss durability, and a
+   Go process taking over a Cortex before Rust consumes a pending Rust recovery
+   record remain unverified.
 
 ## Recommended next milestone
 
-Design the abrupt-process-death boundary before changing more mutation code.
-Evaluate same-directory atomic replacement plus either a small mutation journal
-or deterministic startup repair, then inject `SIGKILL` between replacement and
-SQLite commit. Preserve exact editor-owned bytes and cover hard purge and
-external-delete reconstruction separately. Keep the returned-failure,
-pre-write I/O, and multi-process lock fixtures as regression gates.
+Extend the pending-mutation protocol to hard remove/purge and watcher
+external-delete reconstruction, with deterministic `SIGKILL` tests on both
+sides of their SQLite commits. Then design corrupt-database/operator recovery
+and mixed-runtime takeover behavior; do not assume Go understands the Rust
+recovery records. Keep the returned-failure, read-only I/O, duplicate-replay,
+and subprocess crash fixtures as regression gates.
 
 Any new Rust packages still require explicit approval before adding them.
 

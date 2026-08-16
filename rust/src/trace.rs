@@ -1,4 +1,9 @@
-use std::{fs, path::Path, sync::LazyLock};
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    path::Path,
+    sync::LazyLock,
+};
 
 use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
@@ -145,9 +150,8 @@ impl Trace {
     }
 
     pub fn write_preserving_updated(&self, path: &Path) -> Result<()> {
-        fs::write(path, self.encoded()?).with_context(|| format!("writing {}", path.display()))?;
-        set_private_permissions(path)?;
-        Ok(())
+        write_bytes_atomic(path, &self.encoded()?)
+            .with_context(|| format!("writing {}", path.display()))
     }
 
     pub fn effective_tier(&self) -> &str {
@@ -157,6 +161,44 @@ impl Trace {
             &self.frontmatter.tier
         }
     }
+}
+
+pub(crate) fn write_bytes_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("trace path has no parent directory"))?;
+    if path.exists() {
+        drop(OpenOptions::new().write(true).open(path)?);
+    }
+    let temporary = directory.join(format!(".noema-trace-{}.tmp", ulid::Ulid::new()));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        set_private_permissions(&temporary)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        sync_directory(directory)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(unix)]
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 pub fn now_rfc3339() -> String {
@@ -245,5 +287,42 @@ mod tests {
         trace.frontmatter.content_hash = content_hash(&trace.body);
         let parsed = Trace::parse(&trace.encoded().unwrap()).unwrap();
         assert_eq!(parsed, trace);
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_file_without_leaving_temporary_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("trace.md");
+        fs::write(&path, b"old bytes").unwrap();
+        let mut trace = Trace::new("Atomic", "fact", "", vec![], "new body");
+        trace.write(&path).unwrap();
+
+        assert_eq!(Trace::parse_file(&path).unwrap(), trace);
+        assert!(fs::read_dir(temp.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".noema-trace-")
+        }));
+    }
+
+    #[test]
+    fn failed_atomic_replace_cleans_up_temporary_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("destination");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("keep"), b"keep").unwrap();
+        let mut trace = Trace::new("Atomic failure", "fact", "", vec![], "body");
+
+        assert!(trace.write(&path).is_err());
+        assert_eq!(fs::read(path.join("keep")).unwrap(), b"keep");
+        assert!(fs::read_dir(temp.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".noema-trace-")
+        }));
     }
 }
