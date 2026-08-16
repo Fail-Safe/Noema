@@ -55,6 +55,10 @@ Updated: 2026-08-16
   archive/trash filters, help, confirmation, archive/trash/recover/purge,
   session-scoped vote cycling, live/manual refresh, sticky selection, fading
   new-row highlights, editor handoff, theme loading, and terminal restoration.
+- A responsive PTY fixture now exercises the actual Crossterm backend: initial
+  render, external-editor leave/show/re-enter ordering, help, a 24-to-32-row
+  resize redraw, keyboard exit, canonical/echo restoration, alternate-screen
+  exit, and visible-cursor restoration.
 - The Rust binary compile-time embeds the same three Hermes and three Obsidian
   runtime files as Go. Plugin list/status/install/check/force commands run
   without requiring a configured cortex and use the same target resolution.
@@ -328,10 +332,9 @@ advanced MCP, and functional TUI tree:
   search/tier/help transitions, vote and visibility lifecycle mutations,
   sticky selection with fading live highlights, a 120x28 off-screen renderer,
   explicit dark/light themes, Unicode truncation, and body wrapping.
-- An isolated managed-PTY launch restored the alternate screen safely but could
-  not complete because the harness does not answer the terminal cursor-position
-  query. Treat live-terminal behavior as unverified, not failed application
-  behavior.
+- The responsive live-PTY scenario passed five consecutive runs, including
+  external-editor handoff, resize, and all terminal restoration invariants. It
+  is now part of `make compare-rust`.
 - The expanded model-driven scenario passed five consecutive repetitions. The
   mixed three-node ring and all earlier consolidation gates retained their full
   passing coverage.
@@ -443,8 +446,9 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
 
 ## Remaining replacement gaps
 
-1. Pixel-level TUI parity and live human terminal validation across resize,
-   dark/light auto-detection, and external-editor workflows.
+1. Pixel-level TUI parity and live human validation across several real
+   terminal emulators remain. Automated PTY coverage now includes resize,
+   external-editor handoff, exit, and terminal restoration.
 2. Broader adversarial real-model quality evaluation beyond the current bounded
    synthetic corpus.
 3. Backup restore now has hash-bound, explicit resume/rollback for every tested

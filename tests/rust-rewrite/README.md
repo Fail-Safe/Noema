@@ -114,6 +114,12 @@ file drops, archive/unarchive moves, atomic-save replacement, malformed-file
 healing, raw Markdown onboarding, recoverable delete, external purge, and
 source-lock enforcement.
 
+`tui_pty.py` launches the Rust TUI in a real pseudo-terminal, answers cursor-
+position queries when emitted by the terminal backend, opens help, proves a
+24-to-32-row resize redraw, exercises the external-editor leave/show/re-enter
+sequence, exits through the keyboard path, and verifies raw/canonical mode,
+alternate-screen, and cursor restoration.
+
 `benchmark.sh` creates independent but equivalent cortexes and reports TSV for
 process-level ingest, full-text search, filtered list, sync, verification, and
 release binary size. `mcp_benchmark.py` keeps each stdio MCP server alive and

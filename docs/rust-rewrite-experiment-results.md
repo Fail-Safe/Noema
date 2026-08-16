@@ -352,7 +352,14 @@ a 120x28 off-screen render containing the brand header, list, detail metadata,
 filters, footer, and help surface. Explicit dark/light palettes, Unicode-safe
 truncation, and word wrapping are covered. This is functional state/render
 evidence, not a pixel-for-pixel comparison or a human validation across real
-terminal emulators and resize sequences.
+terminal emulators.
+
+A dependency-free PTY fixture now drives the actual Crossterm backend. It
+checks initial rendering, the external-editor leave-alternate/show-cursor/
+re-enter ordering, help, a real 24-to-32-row resize redraw, keyboard exit,
+canonical/echo mode restoration, alternate-screen exit, and visible-cursor
+restoration. Five consecutive focused runs passed, and the fixture is part of
+the complete differential target.
 
 ## Backup and restore parity
 
@@ -462,7 +469,7 @@ experiment. Cross-runtime backup restore now supplies an explicit recovery
 path from a known-good archive, and non-mutating status plus explicit
 resume/rollback reconciles interrupted restore transactions without exposing
 journal contents. It still does not justify an all-in rewrite because
-larger-result throughput is not better and pixel-level/live-terminal TUI
+larger-result throughput is not better and pixel-level/multi-emulator human TUI
 validation, broader distillation-quality evaluation, automatic startup restore
 recovery, power-loss fault injection, older-Go recovery, and corrupt-database
 salvage remain incomplete.

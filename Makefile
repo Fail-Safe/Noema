@@ -147,6 +147,8 @@ compare-rust: build rust-build
 	python3 ./tests/rust-rewrite/plugin_lifecycle.py \
 		--go "$(CURDIR)/noema" \
 		--rust "$(CURDIR)/rust/target/debug/noema-rs"
+	python3 ./tests/rust-rewrite/tui_pty.py \
+		--rust "$(CURDIR)/rust/target/debug/noema-rs"
 
 benchmark-rust: comparison-release
 	./tests/rust-rewrite/benchmark.sh
