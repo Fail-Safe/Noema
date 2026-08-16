@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use tokio_util::sync::CancellationToken;
 
@@ -313,9 +313,23 @@ enum CortexCommand {
     RecoveryStatus {
         name: String,
     },
+    /// List durable cortex-restore transactions without exposing paths or hashes
+    RestoreStatus,
+    /// Explicitly resume or roll back a durable cortex-restore transaction
+    RestoreRecover {
+        transaction_id: String,
+        #[arg(long, value_enum)]
+        action: RestoreRecoveryActionArg,
+    },
     Remove {
         name: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RestoreRecoveryActionArg {
+    Resume,
+    Rollback,
 }
 #[derive(Debug, Subcommand)]
 enum FederationCommand {
@@ -901,6 +915,11 @@ fn cortex_command(command: CortexCommand) -> Result<()> {
                     backup.display()
                 );
             }
+            if let Some(transaction) = result.retained_transaction {
+                eprintln!(
+                    "warning: restore transaction {transaction} remains for explicit recovery or cleanup"
+                );
+            }
         }
         CortexCommand::RecoveryStatus { name } => {
             let cfg = Config::load()?;
@@ -928,6 +947,54 @@ fn cortex_command(command: CortexCommand) -> Result<()> {
                     );
                 }
             }
+        }
+        CortexCommand::RestoreStatus => {
+            let cfg = Config::load()?;
+            let report = crate::restore::inspect_restore_transactions(&cfg)?;
+            if report.transactions.is_empty() && report.malformed == 0 {
+                println!("Restore transactions: clean");
+            } else {
+                for transaction in report.transactions {
+                    let state = match transaction.state {
+                        crate::restore::RestoreTransactionState::Resumable => "resumable",
+                        crate::restore::RestoreTransactionState::RollbackOnly => "rollback-only",
+                        crate::restore::RestoreTransactionState::CommittedCleanup => {
+                            "committed-cleanup"
+                        }
+                        crate::restore::RestoreTransactionState::Ambiguous => "ambiguous",
+                    };
+                    println!(
+                        "{} cortex={:?} phase={:?} state={state}",
+                        transaction.id, transaction.name, transaction.phase
+                    );
+                }
+                if report.malformed > 0 {
+                    println!(
+                        "Malformed restore transaction record(s): {}",
+                        report.malformed
+                    );
+                }
+            }
+        }
+        CortexCommand::RestoreRecover {
+            transaction_id,
+            action,
+        } => {
+            let mut cfg = Config::load()?;
+            let action = match action {
+                RestoreRecoveryActionArg::Resume => crate::restore::RestoreRecoveryAction::Resume,
+                RestoreRecoveryActionArg::Rollback => {
+                    crate::restore::RestoreRecoveryAction::Rollback
+                }
+            };
+            crate::restore::recover_restore_transaction(&mut cfg, &transaction_id, action)?;
+            println!(
+                "Restore transaction {transaction_id} {} successfully.",
+                match action {
+                    crate::restore::RestoreRecoveryAction::Resume => "resumed",
+                    crate::restore::RestoreRecoveryAction::Rollback => "rolled back",
+                }
+            );
         }
         CortexCommand::Remove { name } => {
             let mut cfg = Config::load()?;

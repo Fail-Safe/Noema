@@ -344,7 +344,7 @@ def exercise(go: Path, rust: Path, root: Path) -> None:
             "consolidation_success",
             identities[peer_a.name],
         )
-        watchdog_window = sorted(windows)[0]
+        watchdog_window = sorted(windows)[-1]
         with sqlite3.connect(database(root, peer_b)) as connection:
             for window in windows:
                 assert (
@@ -366,10 +366,19 @@ def exercise(go: Path, rust: Path, root: Path) -> None:
         assert stop(peer_b)
         with sqlite3.connect(database(root, peer_b)) as connection:
             removed = connection.execute(
-                "DELETE FROM events WHERE action='consolidation_success' AND trace_id=?",
+                "DELETE FROM events WHERE "
+                "action IN ('consolidation_success','consolidation_fail') "
+                "AND trace_id=?",
                 (watchdog_window,),
             ).rowcount
-        assert removed == 1
+            remaining = connection.execute(
+                "SELECT count(*) FROM events WHERE "
+                "action IN ('consolidation_success','consolidation_fail') "
+                "AND trace_id=?",
+                (watchdog_window,),
+            ).fetchone()[0]
+        assert removed >= 1
+        assert remaining == 0
         time.sleep(2)
         rust_endpoint.start()
         start(peer_b, env)
@@ -443,6 +452,21 @@ def exercise(go: Path, rust: Path, root: Path) -> None:
             "Rust promotion replays to Go",
             lambda: trace_tier(database(root, peer_a), promoted_id) == "mid"
             and action_count(database(root, peer_a), promoted_id, "promote") == 1,
+        )
+        wait_until(
+            "Rust records its gated claim and success locally",
+            lambda: bool(
+                coordination_windows(
+                    database(root, peer_b),
+                    "consolidation_claim",
+                    identities[peer_b.name],
+                )
+                & coordination_windows(
+                    database(root, peer_b),
+                    "consolidation_success",
+                    identities[peer_b.name],
+                )
+            ),
         )
         wait_until(
             "Rust gated claim and success replay to Go",

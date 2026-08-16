@@ -2,18 +2,24 @@ use std::{
     collections::BTreeSet,
     ffi::OsString,
     fs::{self, File, OpenOptions},
-    io,
+    io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     time::UNIX_EPOCH,
 };
 
 use anyhow::{Context, Result, bail};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
-    config::{Config, CortexEntry},
+    config::{self, Config, CortexEntry},
     cortex::{read_manifest, write_manifest},
 };
+
+const RESTORE_TRANSACTION_VERSION: u32 = 1;
+const RESTORE_TRANSACTION_DIRECTORY: &str = "restore-transactions";
 
 #[derive(Debug, Clone, Default)]
 pub struct RestoreOptions {
@@ -29,6 +35,59 @@ pub struct RestoreResult {
     pub id: String,
     pub is_default: bool,
     pub retained_backup: Option<PathBuf>,
+    pub retained_transaction: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestorePhase {
+    Prepared,
+    IncomingReady,
+    DestinationPreserved,
+    RestorePlaced,
+    ConfigSaved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreTransactionState {
+    Resumable,
+    RollbackOnly,
+    CommittedCleanup,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreTransactionSummary {
+    pub id: String,
+    pub name: String,
+    pub phase: RestorePhase,
+    pub state: RestoreTransactionState,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestoreTransactionReport {
+    pub transactions: Vec<RestoreTransactionSummary>,
+    pub malformed: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreRecoveryAction {
+    Resume,
+    Rollback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RestoreTransaction {
+    version: u32,
+    id: String,
+    name: String,
+    cortex_id: String,
+    final_parent: PathBuf,
+    had_destination: bool,
+    restored_hash: String,
+    previous_hash: Option<String>,
+    previous_default: String,
+    phase: RestorePhase,
 }
 
 pub fn backup(source: &Path, output: &Path, force: bool) -> Result<u64> {
@@ -181,18 +240,510 @@ impl Drop for ScratchDirectory {
     }
 }
 
+fn restore_transaction_directory() -> Result<PathBuf> {
+    let config_path = config::path()?;
+    let parent = config_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Noema config path has no parent directory"))?;
+    Ok(parent.join(RESTORE_TRANSACTION_DIRECTORY))
+}
+
+fn restore_transaction_path(directory: &Path, id: &str) -> Result<PathBuf> {
+    ulid::Ulid::from_string(id).context("invalid restore transaction ID")?;
+    Ok(directory.join(format!("{id}.json")))
+}
+
+fn lock_restore_target(directory: &Path, final_path: &Path) -> Result<File> {
+    fs::create_dir_all(directory)?;
+    set_directory_permissions(directory, 0o700)?;
+    let digest = Sha256::digest(final_path.as_os_str().as_encoded_bytes());
+    let path = directory.join(format!("target-{digest:x}.lock"));
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    set_file_permissions(&path, 0o600)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(file),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            bail!("a restore for this destination is already in progress")
+        }
+        Err(error) => Err(error).context("locking restore destination"),
+    }
+}
+
+fn save_restore_transaction(directory: &Path, transaction: &RestoreTransaction) -> Result<()> {
+    validate_restore_transaction(transaction)?;
+    fs::create_dir_all(directory)?;
+    set_directory_permissions(directory, 0o700)?;
+    let path = restore_transaction_path(directory, &transaction.id)?;
+    write_restore_transaction_atomic(&path, &serde_json::to_vec(transaction)?)
+        .context("writing restore transaction")
+}
+
+fn write_restore_transaction_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("restore transaction has no parent directory"))?;
+    if path.exists() {
+        drop(OpenOptions::new().write(true).open(path)?);
+    }
+    let temporary = directory.join(format!(".noema-restore-journal-{}.tmp", ulid::Ulid::new()));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        set_file_permissions(&temporary, 0o600)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        sync_directory(directory)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+fn remove_restore_transaction(directory: &Path, id: &str) -> Result<()> {
+    let path = restore_transaction_path(directory, id)?;
+    match fs::remove_file(&path) {
+        Ok(()) => sync_directory(path.parent().unwrap()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("removing restore transaction"),
+    }
+}
+
+fn validate_restore_transaction(transaction: &RestoreTransaction) -> Result<()> {
+    if transaction.version != RESTORE_TRANSACTION_VERSION {
+        bail!(
+            "unsupported restore transaction version {}",
+            transaction.version
+        )
+    }
+    ulid::Ulid::from_string(&transaction.id).context("invalid restore transaction ID")?;
+    validate_name(&transaction.name).context("invalid restore transaction cortex name")?;
+    if !transaction.cortex_id.is_empty() {
+        ulid::Ulid::from_string(&transaction.cortex_id)
+            .context("invalid restore transaction cortex ID")?;
+    }
+    if !transaction.final_parent.is_absolute() {
+        bail!("restore transaction parent is not absolute")
+    }
+    let valid_hash = |value: &str| {
+        value.strip_prefix("sha256:").is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    };
+    if !valid_hash(&transaction.restored_hash)
+        || transaction
+            .previous_hash
+            .as_deref()
+            .is_some_and(|value| !valid_hash(value))
+        || transaction.had_destination != transaction.previous_hash.is_some()
+    {
+        bail!("restore transaction has invalid content hashes")
+    }
+    Ok(())
+}
+
+fn transaction_artifact_path(transaction: &RestoreTransaction, purpose: &str) -> PathBuf {
+    transaction
+        .final_parent
+        .join(format!(".noema-restore-{purpose}-{}", transaction.id))
+}
+
+fn tree_hash(root: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hash_tree_entry(root, root, &mut hasher)?;
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn hash_tree_entry(root: &Path, path: &Path, hasher: &mut Sha256) -> Result<()> {
+    let relative = path.strip_prefix(root)?;
+    let encoded = relative.as_os_str().as_encoded_bytes();
+    hasher.update((encoded.len() as u64).to_be_bytes());
+    hasher.update(encoded);
+    let metadata = fs::symlink_metadata(path)?;
+    hasher.update(metadata_mode(&metadata, 0).to_be_bytes());
+    if metadata.is_dir() {
+        hasher.update(b"directory");
+        let mut entries = fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()?;
+        entries.sort_by_key(fs::DirEntry::file_name);
+        for entry in entries {
+            hash_tree_entry(root, &entry.path(), hasher)?;
+        }
+    } else if metadata.is_file() {
+        hasher.update(b"file");
+        hasher.update(metadata.len().to_be_bytes());
+        let mut file = File::open(path)?;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+    } else {
+        bail!(
+            "restore transaction cannot protect non-regular entry {}",
+            path.display()
+        )
+    }
+    Ok(())
+}
+
+fn load_restore_transaction(directory: &Path, path: &Path) -> Result<RestoreTransaction> {
+    let bytes = fs::read(path).context("reading restore transaction")?;
+    let transaction = serde_json::from_slice::<RestoreTransaction>(&bytes)
+        .map_err(|_| anyhow::anyhow!("malformed restore transaction"))?;
+    validate_restore_transaction(&transaction)
+        .map_err(|_| anyhow::anyhow!("malformed restore transaction"))?;
+    let expected = restore_transaction_path(directory, &transaction.id)?;
+    if path != expected {
+        bail!("restore transaction filename does not match its ID")
+    }
+    Ok(transaction)
+}
+
+fn ensure_no_conflicting_restore_transaction(
+    directory: &Path,
+    name: &str,
+    parent: &Path,
+) -> Result<()> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("reading restore transactions"),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let transaction = load_restore_transaction(directory, &entry.path())?;
+        if transaction.name == name && transaction.final_parent == parent {
+            bail!(
+                "restore transaction {} is already pending for cortex {:?}; inspect or recover it before restoring again",
+                transaction.id,
+                name
+            )
+        }
+    }
+    Ok(())
+}
+
+fn path_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn path_matches_hash(path: &Path, expected: &str) -> bool {
+    tree_hash(path).is_ok_and(|value| value == expected)
+}
+
+fn config_entry_matches(config: &Config, transaction: &RestoreTransaction) -> Result<bool> {
+    let Some(entry) = config.cortexes.get(&transaction.name) else {
+        return Ok(false);
+    };
+    if entry.id != transaction.cortex_id
+        || !paths_match(
+            &entry.path,
+            &transaction.final_parent.join(&transaction.name),
+        )
+    {
+        bail!("registered cortex conflicts with restore transaction")
+    }
+    Ok(true)
+}
+
+fn classify_restore_transaction(
+    config: &Config,
+    transaction: &RestoreTransaction,
+) -> RestoreTransactionState {
+    let final_path = transaction.final_parent.join(&transaction.name);
+    let incoming = transaction_artifact_path(transaction, "incoming");
+    let backup = transaction_artifact_path(transaction, "backup");
+    let config_matches = match config_entry_matches(config, transaction) {
+        Ok(value) => value,
+        Err(_) => return RestoreTransactionState::Ambiguous,
+    };
+    let final_is_restored = path_matches_hash(&final_path, &transaction.restored_hash);
+    let incoming_is_restored = path_matches_hash(&incoming, &transaction.restored_hash);
+    let backup_is_previous = transaction
+        .previous_hash
+        .as_deref()
+        .is_some_and(|hash| path_matches_hash(&backup, hash));
+
+    if config_matches {
+        return if final_is_restored {
+            RestoreTransactionState::CommittedCleanup
+        } else {
+            RestoreTransactionState::Ambiguous
+        };
+    }
+    if final_is_restored || incoming_is_restored {
+        return RestoreTransactionState::Resumable;
+    }
+    if backup_is_previous
+        || (transaction.had_destination
+            && transaction
+                .previous_hash
+                .as_deref()
+                .is_some_and(|hash| path_matches_hash(&final_path, hash)))
+        || (!transaction.had_destination
+            && matches!(transaction.phase, RestorePhase::Prepared)
+            && !final_path.exists()
+            && !incoming.exists())
+    {
+        return RestoreTransactionState::RollbackOnly;
+    }
+    RestoreTransactionState::Ambiguous
+}
+
+pub fn inspect_restore_transactions(config: &Config) -> Result<RestoreTransactionReport> {
+    let directory = restore_transaction_directory()?;
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(RestoreTransactionReport::default());
+        }
+        Err(error) => return Err(error).context("reading restore transactions"),
+    };
+    let mut paths = entries
+        .collect::<io::Result<Vec<_>>>()?
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut report = RestoreTransactionReport::default();
+    for path in paths {
+        match load_restore_transaction(&directory, &path) {
+            Ok(transaction) => report.transactions.push(RestoreTransactionSummary {
+                id: transaction.id.clone(),
+                name: transaction.name.clone(),
+                phase: transaction.phase,
+                state: classify_restore_transaction(config, &transaction),
+            }),
+            Err(_) => report.malformed += 1,
+        }
+    }
+    Ok(report)
+}
+
+fn require_hash(path: &Path, expected: &str, label: &str) -> Result<()> {
+    if !path_matches_hash(path, expected) {
+        bail!("{label} does not match the restore transaction hash")
+    }
+    Ok(())
+}
+
+fn remove_hashed_path(path: &Path, expected: &str, label: &str) -> Result<()> {
+    if !path_exists(path)? {
+        return Ok(());
+    }
+    require_hash(path, expected, label)?;
+    remove_path(path).with_context(|| format!("removing {label}"))
+}
+
+pub fn recover_restore_transaction(
+    config: &mut Config,
+    id: &str,
+    action: RestoreRecoveryAction,
+) -> Result<()> {
+    let directory = restore_transaction_directory()?;
+    let path = restore_transaction_path(&directory, id)?;
+    let lock_path = directory.join(format!("{id}.lock"));
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    lock_file
+        .try_lock_exclusive()
+        .context("locking restore transaction")?;
+    let mut transaction = load_restore_transaction(&directory, &path)?;
+    let _target_lock = lock_restore_target(
+        &directory,
+        &transaction.final_parent.join(&transaction.name),
+    )?;
+    match action {
+        RestoreRecoveryAction::Resume => {
+            resume_restore_transaction(config, &directory, &mut transaction)?
+        }
+        RestoreRecoveryAction::Rollback => {
+            rollback_restore_transaction(config, &directory, &transaction)?
+        }
+    }
+    drop(lock_file);
+    let _ = fs::remove_file(lock_path);
+    Ok(())
+}
+
+fn resume_restore_transaction(
+    config: &mut Config,
+    directory: &Path,
+    transaction: &mut RestoreTransaction,
+) -> Result<()> {
+    let final_path = transaction.final_parent.join(&transaction.name);
+    let incoming = transaction_artifact_path(transaction, "incoming");
+    let backup = transaction_artifact_path(transaction, "backup");
+    let config_matches = config_entry_matches(config, transaction)?;
+
+    if !config_matches {
+        let incoming_ready = path_matches_hash(&incoming, &transaction.restored_hash);
+        let final_ready = path_matches_hash(&final_path, &transaction.restored_hash);
+        if incoming_ready {
+            if path_exists(&final_path)? && !final_ready {
+                let previous_hash = transaction.previous_hash.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("unexpected destination blocks restore resume")
+                })?;
+                require_hash(&final_path, previous_hash, "existing destination")?;
+                if path_exists(&backup)? {
+                    bail!("both destination and preserved backup exist during restore resume")
+                }
+                fs::rename(&final_path, &backup)?;
+            }
+            if !path_exists(&final_path)? {
+                fs::rename(&incoming, &final_path)?;
+            }
+        } else if !final_ready {
+            bail!("restore transaction has no intact restored tree to resume")
+        }
+        require_hash(
+            &final_path,
+            &transaction.restored_hash,
+            "restored destination",
+        )?;
+        transaction.phase = RestorePhase::RestorePlaced;
+        save_restore_transaction(directory, transaction)?;
+        config.cortexes.insert(
+            transaction.name.clone(),
+            CortexEntry {
+                path: final_path.clone(),
+                id: transaction.cortex_id.clone(),
+            },
+        );
+        if config.default.is_empty() {
+            config.default.clone_from(&transaction.name);
+        }
+        config.save()?;
+        transaction.phase = RestorePhase::ConfigSaved;
+        save_restore_transaction(directory, transaction)?;
+    } else {
+        require_hash(
+            &final_path,
+            &transaction.restored_hash,
+            "restored destination",
+        )?;
+    }
+
+    if let Some(previous_hash) = transaction.previous_hash.as_deref() {
+        remove_hashed_path(&backup, previous_hash, "preserved destination")?;
+    }
+    remove_hashed_path(
+        &incoming,
+        &transaction.restored_hash,
+        "incoming restored tree",
+    )?;
+    remove_restore_transaction(directory, &transaction.id)
+}
+
+fn rollback_restore_transaction(
+    config: &mut Config,
+    directory: &Path,
+    transaction: &RestoreTransaction,
+) -> Result<()> {
+    let final_path = transaction.final_parent.join(&transaction.name);
+    let incoming = transaction_artifact_path(transaction, "incoming");
+    let backup = transaction_artifact_path(transaction, "backup");
+    let discarded = transaction_artifact_path(transaction, "rollback");
+    let config_matches = config_entry_matches(config, transaction)?;
+
+    if transaction.had_destination {
+        let previous_hash = transaction.previous_hash.as_deref().unwrap();
+        if path_exists(&backup)? {
+            require_hash(&backup, previous_hash, "preserved destination")?;
+            if path_exists(&final_path)? {
+                require_hash(
+                    &final_path,
+                    &transaction.restored_hash,
+                    "restored destination",
+                )?;
+                if path_exists(&discarded)? {
+                    bail!("restore rollback discard path already exists")
+                }
+                fs::rename(&final_path, &discarded)?;
+            }
+            fs::rename(&backup, &final_path)?;
+        } else {
+            require_hash(&final_path, previous_hash, "original destination")?;
+        }
+    } else if path_exists(&final_path)? {
+        require_hash(
+            &final_path,
+            &transaction.restored_hash,
+            "restored destination",
+        )?;
+        fs::rename(&final_path, &discarded)?;
+    }
+
+    remove_hashed_path(
+        &incoming,
+        &transaction.restored_hash,
+        "incoming restored tree",
+    )?;
+    if config_matches {
+        config.cortexes.remove(&transaction.name);
+        if config.default == transaction.name {
+            config.default = if transaction.previous_default.is_empty()
+                || config.cortexes.contains_key(&transaction.previous_default)
+            {
+                transaction.previous_default.clone()
+            } else {
+                String::new()
+            };
+        }
+        config.save()?;
+    }
+    remove_hashed_path(
+        &discarded,
+        &transaction.restored_hash,
+        "rolled-back restored tree",
+    )?;
+    remove_restore_transaction(directory, &transaction.id)
+}
+
 pub fn restore(
     config: &mut Config,
     tarball: &Path,
     options: &RestoreOptions,
 ) -> Result<RestoreResult> {
-    restore_with_save(config, tarball, options, Config::save)
+    let transaction_directory = restore_transaction_directory()?;
+    restore_with_save(
+        config,
+        tarball,
+        options,
+        &transaction_directory,
+        Config::save,
+    )
 }
 
 fn restore_with_save<F>(
     config: &mut Config,
     tarball: &Path,
     options: &RestoreOptions,
+    transaction_directory: &Path,
     save: F,
 ) -> Result<RestoreResult>
 where
@@ -265,27 +816,63 @@ where
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(error) => return Err(error).context("inspecting restore destination"),
     };
+    let restored_hash = tree_hash(&staged_cortex).context("hashing staged restored cortex")?;
+    let previous_hash = existing_destination
+        .then(|| tree_hash(&final_path).context("hashing existing restore destination"))
+        .transpose()?;
 
     fs::create_dir_all(&final_parent)
         .with_context(|| format!("creating restore parent {}", final_parent.display()))?;
-    let incoming = unique_sibling(&final_path, "incoming");
-    move_directory(&staged_cortex, &incoming).context("staging restored cortex for placement")?;
+    let _target_lock = lock_restore_target(transaction_directory, &final_path)?;
+    ensure_no_conflicting_restore_transaction(transaction_directory, &final_name, &final_parent)?;
+    let mut transaction = RestoreTransaction {
+        version: RESTORE_TRANSACTION_VERSION,
+        id: ulid::Ulid::new().to_string(),
+        name: final_name.clone(),
+        cortex_id: manifest.id.clone(),
+        final_parent: final_parent.clone(),
+        had_destination: existing_destination,
+        restored_hash,
+        previous_hash,
+        previous_default: config.default.clone(),
+        phase: RestorePhase::Prepared,
+    };
+    save_restore_transaction(transaction_directory, &transaction)?;
+    let incoming = transaction_artifact_path(&transaction, "incoming");
+    let backup = existing_destination.then(|| transaction_artifact_path(&transaction, "backup"));
+    if let Err(error) = move_directory(&staged_cortex, &incoming) {
+        let _ = remove_restore_transaction(transaction_directory, &transaction.id);
+        return Err(error).context("staging restored cortex for placement");
+    }
+    transaction.phase = RestorePhase::IncomingReady;
+    save_restore_transaction(transaction_directory, &transaction)?;
 
-    let backup = existing_destination.then(|| unique_sibling(&final_path, "backup"));
     if let Some(backup) = &backup
         && let Err(error) = fs::rename(&final_path, backup)
     {
         let _ = fs::remove_dir_all(&incoming);
+        let _ = remove_restore_transaction(transaction_directory, &transaction.id);
         return Err(error).context("preserving existing restore destination");
     }
+    transaction.phase = RestorePhase::DestinationPreserved;
+    save_restore_transaction(transaction_directory, &transaction)?;
     pause_restore_for_test("destination-preserved");
     if let Err(error) = fs::rename(&incoming, &final_path) {
-        if let Some(backup) = &backup {
-            let _ = fs::rename(backup, &final_path);
+        let rollback = backup
+            .as_ref()
+            .map(|backup| fs::rename(backup, &final_path))
+            .transpose();
+        if let Err(rollback_error) = rollback {
+            return Err(anyhow::Error::new(error).context(format!(
+                "placing restored cortex failed and restoring the previous destination also failed: {rollback_error}"
+            )));
         }
         let _ = fs::remove_dir_all(&incoming);
+        let _ = remove_restore_transaction(transaction_directory, &transaction.id);
         return Err(error).context("placing restored cortex");
     }
+    transaction.phase = RestorePhase::RestorePlaced;
+    save_restore_transaction(transaction_directory, &transaction)?;
     pause_restore_for_test("restore-placed");
 
     let previous_config = config.clone();
@@ -301,32 +888,45 @@ where
     }
     if let Err(error) = save(config) {
         *config = previous_config;
-        let failed_restore = unique_sibling(&final_path, "failed");
-        let displaced = fs::rename(&final_path, &failed_restore);
-        let restored = backup
-            .as_ref()
-            .map(|backup| fs::rename(backup, &final_path))
-            .transpose();
-        let _ = fs::remove_dir_all(&failed_restore);
-        if let Err(rollback_error) = displaced.and(restored.map(|_| ())) {
+        let failed_restore = transaction_artifact_path(&transaction, "failed");
+        let rollback = (|| -> Result<()> {
+            fs::rename(&final_path, &failed_restore)?;
+            if let Some(backup) = &backup {
+                fs::rename(backup, &final_path)?;
+            }
+            remove_path(&failed_restore)?;
+            remove_restore_transaction(transaction_directory, &transaction.id)?;
+            Ok(())
+        })();
+        if let Err(rollback_error) = rollback {
             return Err(error.context(format!(
                 "saving configuration failed and restoring the previous destination also failed: {rollback_error}"
             )));
         }
         return Err(error).context("saving restored cortex configuration");
     }
+    transaction.phase = RestorePhase::ConfigSaved;
+    save_restore_transaction(transaction_directory, &transaction)?;
     pause_restore_for_test("config-saved");
 
     let retained_backup = backup.and_then(|backup| match remove_path(&backup) {
         Ok(()) => None,
         Err(_) => Some(backup),
     });
+    let retained_transaction = if retained_backup.is_none()
+        && remove_restore_transaction(transaction_directory, &transaction.id).is_ok()
+    {
+        None
+    } else {
+        Some(transaction.id.clone())
+    };
     Ok(RestoreResult {
         name: final_name.clone(),
         path: final_path,
         id: manifest.id,
         is_default: config.default == final_name,
         retained_backup,
+        retained_transaction,
     })
 }
 
@@ -609,6 +1209,7 @@ mod tests {
                 parent: Some(destination.clone()),
                 force: false,
             },
+            &temp.path().join("transactions"),
             |_| Ok(()),
         )
         .unwrap();
@@ -616,6 +1217,8 @@ mod tests {
         assert_eq!(result.id, original_id);
         assert_eq!(result.name, "renamed");
         assert!(result.is_default);
+        assert!(result.retained_backup.is_none());
+        assert!(result.retained_transaction.is_none());
         let manifest = read_manifest(&result.path).unwrap();
         assert_eq!(manifest.name, "renamed");
         let restored = Cortex::open("renamed", &result.path).unwrap();
@@ -735,6 +1338,7 @@ mod tests {
                     parent: Some(destination.clone()),
                     force: true,
                 },
+                &temp.path().join("transactions"),
                 |_| Ok(()),
             )
             .is_err()
@@ -772,12 +1376,25 @@ mod tests {
                     force: true,
                     ..Default::default()
                 },
+                &temp.path().join("transactions"),
                 |_| bail!("injected config failure"),
             )
             .is_err()
         );
         assert!(config.cortexes.is_empty());
         assert_eq!(fs::read(existing.join("keep")).unwrap(), b"operator data");
+        let transactions = temp.path().join("transactions");
+        assert!(
+            !transactions.exists()
+                || fs::read_dir(transactions).unwrap().all(|entry| {
+                    entry
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        != Some("json")
+                })
+        );
     }
 
     #[test]

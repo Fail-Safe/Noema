@@ -5,9 +5,10 @@ Updated: 2026-08-16
 ## Pause point
 
 - Branch: `experiment/rust-rewrite`
-- Latest completed milestone: secret-safe recovery status and restore
-  process-death preservation (this handoff commit).
-- Previous milestone: `b95b14c feat(rust): add safe cortex restore`.
+- Latest completed milestone: durable restore transactions with explicit,
+  secret-safe resume and rollback (this handoff commit).
+- Previous milestone: `9b2bfe9 feat(rust): expose safe recovery status`.
+- Earlier restore milestone: `b95b14c feat(rust): add safe cortex restore`.
 - Earlier recovery milestone: `bc21b8d fix(recovery): guard mixed-runtime takeover`.
 - Earlier recovery milestone: `5a9337e fix(rust): recover interrupted trace deletion`.
 - Earlier recovery milestone: `0a753e5 fix(rust): recover interrupted trace mutations`.
@@ -125,14 +126,26 @@ Updated: 2026-08-16
   collisions; and retains a forced destination until placement and
   configuration persistence succeed. Cross-filesystem placement copies only
   directories and regular files.
+- Restore now records a content-free transaction beside the user configuration
+  before moving either tree. The owner-only journal tracks prepared, incoming,
+  preserved, placed, and config-saved phases; binds the incoming and previous
+  trees by SHA-256; and is serialized with a stable per-destination kernel
+  lock. A successful restore removes its journal and displaced tree.
+- `cortex restore-status` reports transaction IDs, cortex labels, phases, and
+  coarse recovery states without paths, hashes, trace content, or malformed
+  record bodies. `cortex restore-recover <id> --action resume|rollback`
+  validates the recorded tree hashes and configuration identity before making
+  an explicit change. Ambiguous or tampered state fails closed, and a new
+  restore cannot overlap an unfinished transaction for the same destination.
 - `cortex recovery-status <name>` inspects the configured database read-only
   and reports only clean, pending count, malformed-journal count, or unreadable
   database. It does not open the Cortex, consume a journal record, expose trace
   IDs or paths, or print SQLite/parser error text.
-- Three subprocess tests kill forced restore after preserving the old
-  destination, after placing the new tree, and after saving configuration. The
-  old destination and complete incoming/restored tree survive every boundary;
-  after configuration save, the restored cortex is registered and usable.
+- Eight subprocess scenarios cover forced restore after destination
+  preservation, placement, and configuration save; resume and rollback from
+  each recoverable state; rollback into an initially empty destination;
+  tampered incoming data; malformed-journal redaction; and concurrent restore
+  rejection with post-`SIGKILL` lock release.
 - A reusable pass gate with initial election, signed claim, cancellable quiet
   wait, re-election, distinct preemption reasons, in-flight tracking, pass-error
   closure, and signed success.
@@ -214,8 +227,8 @@ transaction rollback, fault-safety, dynamic federation, TLS lifecycle,
 advanced MCP, and functional TUI tree:
 
 - `make rust-test` — formatting, clippy with warnings denied, 97 unit tests,
-  five mutation crash-recovery scenarios, five recovery-safety tests, and three
-  restore process-death scenarios.
+  five mutation crash-recovery scenarios, five recovery-safety tests, and eight
+  restore crash/recovery scenarios.
 - Eight focused SQLite-abort tests prove byte- and permission-identical rollback
   for local update/tier/visibility/hard-delete operations, watcher
   reconstruction, and remote update/create/purge replay, including removal of
@@ -237,9 +250,10 @@ advanced MCP, and functional TUI tree:
 - Ten restore unit tests cover round trips, metadata normalization, long paths,
   self-inclusion, forced replacement rollback, identity collisions, unsafe
   names, duplicate paths, multiple roots, links, and traversal.
-- Three restore subprocess tests prove `SIGKILL` at each destination/config
-  boundary retains both the displaced operator directory and the complete new
-  tree, with registration present only after the config save completes.
+- Eight restore subprocess scenarios prove explicit resume/rollback from each
+  `SIGKILL` boundary, committed cleanup, rollback into an empty destination,
+  hash-bound tamper refusal, malformed-record redaction, journal permissions,
+  concurrent-target exclusion, and kernel-lock release after process death.
 - `go test ./...`
 - `go test -race ./...`
 - `go vet ./...`
@@ -312,15 +326,13 @@ One sandbox-only warning appeared while Go tried to update its module-download
 stat cache outside the writable workspace. The Go build still succeeded and the
 complete comparison target exited successfully.
 
-The first post-plugin full comparison hit one timeout waiting for the existing
-consolidation watchdog fixture. The exact fixture passed immediately on retry,
-and a subsequent complete `make compare-rust` run passed, including the same
-watchdog path and the new plugin fixture.
-
-The first post-recovery-status full comparison hit the existing federation-ring
-key-rotation timing assertion: the cursor advanced once before the identity
-mismatch was observed. The exact fixture passed immediately on retry, followed
-by a complete passing `make compare-rust` run.
+The restore-journal validation exposed two pre-existing fixture races. The
+key-rotation scenario now waits until receivers have observed the stopped peer
+before freezing their cursors, and the watchdog scenario explicitly removes
+every terminal event before asserting orphan recovery. A local coordination
+checkpoint now distinguishes emission failure from replay failure. Both mixed
+runtime scenarios passed three consecutive focused repetitions, followed by
+one uninterrupted complete `make compare-rust` run.
 
 ## Performance evidence so far
 
@@ -403,9 +415,15 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
 - `Cortex::open` is not a safe diagnostic API: it can recover pending
   mutations, rebuild FTS, and purge expired trash. Recovery status therefore
   needs a separate read-only SQLite path with deliberately coarse output.
-- Portable forced directory replacement is a multi-step transaction. `SIGKILL`
-  testing proves both trees survive, but without a durable restore transaction
-  journal the hidden backup/incoming artifacts are not automatically reconciled.
+- Portable forced directory replacement is a multi-step transaction. Its
+  journal must precede filesystem placement, bind every recoverable tree by
+  hash, advance durably after each phase, and retain evidence whenever returned
+  rollback cannot restore a single unambiguous state.
+- Rotation fixtures must observe a completed post-shutdown failed poll before
+  freezing cursors; otherwise a response obtained before shutdown can be
+  replayed after the snapshot and look like an identity-check violation.
+- A watchdog fixture must remove every success/fail terminal for its selected
+  claim. Deleting only one success does not prove the claim is orphaned.
 
 ## Remaining replacement gaps
 
@@ -413,21 +431,20 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
    dark/light auto-detection, and external-editor workflows.
 2. Broader adversarial real-model quality evaluation beyond the current bounded
    synthetic corpus.
-3. Backup restore and secret-safe recovery status now provide explicit operator
-   paths, and restore/configuration `SIGKILL` boundaries preserve both trees.
-   Corrupt-database salvage, automatic reconciliation of crash-retained restore
-   artifacts, and real power-loss durability remain absent. Older Go binaries
-   also cannot safely take over until the Rust recovery record has been
-   consumed.
+3. Backup restore now has hash-bound, explicit resume/rollback for every tested
+   process-death boundary. Configuration-file replacement is still not atomic,
+   automatic startup reconciliation is deliberately absent, and real
+   power-loss durability remains unqualified. Corrupt-database salvage is also
+   absent. Older Go binaries cannot safely take over until Rust mutation
+   recovery has completed.
 
 ## Recommended next milestone
 
-Add a durable, content-free restore transaction record so the retained old and
-incoming trees can be classified and reconciled after process death without
-guessing from random artifact names. Keep destructive selection explicit and
-fail closed when filesystem/config state is ambiguous. Then qualify archive
-replacement, restore placement, configuration persistence, and SQLite under a
-real power-loss simulation.
+Make configuration persistence use a synced temporary file, atomic rename, and
+parent-directory sync while preserving the current rollback behavior. Then
+qualify archive replacement, restore placement, configuration persistence, and
+SQLite under a real power-loss simulation. Corrupt-database salvage and a safe
+policy for takeover by older Go builds remain separate later decisions.
 
 ## Resume commands
 

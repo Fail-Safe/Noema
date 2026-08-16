@@ -374,9 +374,9 @@ previous destination.
 The differential fixture passed Go archive to Rust restore and Rust archive to
 Go restore while preserving trace IDs and bodies. It also passed duplicate-ID
 refusal, non-destructive refusal, forced replacement without leftover staging
-artifacts, traversal refusal, and symlink refusal. This is interoperability and
-returned-error evidence; process death during restore placement/configuration
-and real power loss have not yet been qualified.
+artifacts, traversal refusal, and symlink refusal. This establishes archive
+interoperability and returned-error behavior; real power loss remains
+unqualified.
 
 A separate read-only recovery-status path classifies a configured cortex as
 clean, pending, malformed-journal, or unreadable-database without opening it or
@@ -384,12 +384,23 @@ printing journal values, trace identifiers, paths, or decoder errors. Five
 safety tests prove the probe leaves corrupt bytes, pending records, and trace
 files unchanged and that the executable output omits sensitive journal fields.
 
-Three subprocess tests now send `SIGKILL` at the forced-restore boundaries:
-after the old destination is preserved, after the new tree is placed, and after
-configuration is saved. Both complete trees survive the first two boundaries;
-after the third, the new cortex is registered and usable while the old tree is
-still recoverable. These tests establish process-death data preservation, not
-automatic cleanup/reconciliation or power-loss durability.
+Restore now writes an owner-only, content-free transaction journal before
+moving either tree. Its five phases bind the incoming and previous trees by
+SHA-256 and record only the cortex identity, destination parent, prior default,
+and expected filesystem state. A stable per-destination kernel lock rejects
+concurrent replacement while allowing recovery after a killed owner.
+
+`cortex restore-status` lists transaction IDs, labels, phases, and coarse
+recovery states without paths or hashes. `cortex restore-recover` performs an
+explicit resume or rollback only after the current tree and configuration
+match the recorded state. Tampered or ambiguous state remains untouched.
+
+Eight subprocess scenarios now cover `SIGKILL` after preservation, placement,
+and configuration save; resume and rollback of the resulting states; committed
+cleanup; rollback when no destination previously existed; tamper refusal;
+malformed-journal redaction; owner-only permissions; concurrent-target
+rejection; and killed-owner lock release. These establish process-death
+reconciliation, not automatic startup recovery or power-loss durability.
 
 ## Bounded federation soak
 
@@ -416,9 +427,10 @@ and durable recovery records now cover process death for transactional create,
 replace, move, delete, purge replay, and watcher reconstruction paths on the
 next Rust open. The branch Go build now refuses mixed-runtime takeover until
 Rust recovery completes, and database corruption fails without rewriting data.
-Explicit restore from a prior archive is now available, while corrupt-database
-salvage/status, compatibility with older unaware Go binaries, and power-loss
-qualification remain open. Its consolidation election and
+Explicit restore from a prior archive and hash-bound recovery of interrupted
+restore transactions are now available, while atomic configuration
+persistence, corrupt-database salvage/status, compatibility with older unaware
+Go binaries, and power-loss qualification remain open. Its consolidation election and
 coordination wire, pass gate, watchdog recovery, full cadence, heuristic pass,
 graduation, and model-driven distillation are now present. A bounded real-model
 comparison also passes, but broader distillation-quality evaluation remains
@@ -438,9 +450,10 @@ contract, and the functional TUI state model. TLS certificate lifecycle checks
 now also match the deterministic Go oracle, while returned database failures
 and tested process death have stronger filesystem recovery in the Rust
 experiment. Cross-runtime backup restore now supplies an explicit recovery
-path from a known-good archive, and non-mutating status distinguishes recovery
-states without exposing journal contents. It still does not justify an all-in rewrite
-because larger-result throughput is not better and pixel-level/live-terminal
-TUI validation, broader distillation-quality evaluation, automatic restore
-transaction reconciliation, power-loss fault injection, older-Go recovery, and
-corrupt-database salvage remain incomplete.
+path from a known-good archive, and non-mutating status plus explicit
+resume/rollback reconciles interrupted restore transactions without exposing
+journal contents. It still does not justify an all-in rewrite because
+larger-result throughput is not better and pixel-level/live-terminal TUI
+validation, broader distillation-quality evaluation, atomic configuration
+persistence, automatic startup restore recovery, power-loss fault injection,
+older-Go recovery, and corrupt-database salvage remain incomplete.

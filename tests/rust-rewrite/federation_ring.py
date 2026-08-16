@@ -426,6 +426,14 @@ def exercise(go: Path, rust: Path, root: Path) -> None:
                 >= pre_rotation_event,
             )
         assert stop(peer_a)
+        for node in nodes[1:]:
+            wait_until(
+                f"peer-a shutdown observed on {node.name}",
+                lambda n=node: health(database(root, n), "peer-a")
+                .get("last_error", {})
+                .get("reason")
+                == "network_refused",
+            )
         frozen = {
             node.name: state(database(root, node), "peer:peer-a:last_event")
             for node in nodes[1:]
