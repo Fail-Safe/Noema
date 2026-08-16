@@ -5,10 +5,11 @@ Updated: 2026-08-16
 ## Pause point
 
 - Branch: `experiment/rust-rewrite`
-- Latest completed milestone: functional TUI state/render parity (this handoff
+- Latest completed milestone: TLS certificate lifecycle parity (this handoff
   commit).
-- Previous milestone: `29cd610 feat(rust): complete advanced MCP parity`.
-- Earlier MCP milestone: `0a6e721 feat(rust): tighten MCP contract parity`.
+- Previous milestone: `a7e7196 feat(rust): add functional TUI parity`.
+- Earlier advanced MCP milestone: `29cd610 feat(rust): complete advanced MCP parity`.
+- Earlier MCP contract milestone: `0a6e721 feat(rust): tighten MCP contract parity`.
 - Earlier semantic milestone: `b73a089 feat(rust): add semantic search parity`.
 - Earlier watcher milestone: `c0f8c8a feat(rust): add watcher parity`.
 - Earlier experiment milestone: `aa5a5ee test(rust): compare real-model consolidation`.
@@ -63,6 +64,11 @@ Updated: 2026-08-16
 - Rustls HTTPS serving, shared bearer authentication, custom peer CA trust, a
   TLS 1.2 minimum for outbound federation, and refusal to send bearer-protected
   MCP traffic over plaintext.
+- TLS certificate paths use Go-compatible per-flag CLI-over-manifest precedence.
+  The Rust server refuses expired and not-yet-valid leaf certificates, warns at
+  seven days, exposes the same explicit temporary bypass, and re-reads the leaf
+  hourly under the single-background-owner lock while logging only 90/30/7-day,
+  expired, or unreadable band transitions.
 - Access-key resolution compatible with Go:
   `NOEMA_MCP_KEY` first, then `access.shared_key_file`, then open mode.
 - Secret-safe access-key fingerprints and failure output.
@@ -152,9 +158,10 @@ Updated: 2026-08-16
 
 ## Latest validation
 
-The following passed for the combined advanced MCP and functional TUI tree:
+The following passed for the combined TLS lifecycle, advanced MCP, and
+functional TUI tree:
 
-- `make rust-test` — formatting, clippy with warnings denied, and 72 Rust tests.
+- `make rust-test` — formatting, clippy with warnings denied, and 75 Rust tests.
 - `go test ./...`
 - `go test -race ./...`
 - `go vet ./...`
@@ -166,6 +173,9 @@ The following passed for the combined advanced MCP and functional TUI tree:
     signing-key rejection/recovery; and
   - authenticated Go/Rust HTTPS federation, CA rejection, bearer rejection,
     access-key recovery, plaintext refusal, and secret redaction; and
+  - identical expired and not-yet-valid startup refusal, seven-day warnings,
+    CLI-over-manifest TLS precedence, explicit bypass behavior, immediate
+    monitor bands, malformed-certificate redaction, and graceful shutdown; and
   - mixed Go/Rust rank exchange, deterministic election, endpoint failover and
     recovery, signed Go claim/success replay, and a Rust-signed watchdog closure
     accepted by Go; and
@@ -284,16 +294,15 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
    dark/light auto-detection, and external-editor workflows.
 2. Broader adversarial real-model quality evaluation beyond the current bounded
    synthetic corpus.
-3. Certificate expiry validation/monitoring, dynamic peer-worker addition without
-   restart, crash-atomic file rollback, lock contention, and broader fault
-   injection.
+3. Dynamic peer-worker addition without restart, crash-atomic file rollback,
+   lock contention, and broader fault injection.
 
 ## Recommended next milestone
 
-With approval to add `x509-parser`, port Go's TLS certificate validity gate and
-add deterministic expired, not-yet-valid, near-expiry, and override coverage
-to the existing mixed-runtime TLS fixture. Keep certificate contents and
-private-key material out of output.
+Exercise the fault-tolerance rows next. Start with dynamic federation peer
+addition/removal without restart and retain the existing one-worker-per-peer,
+cursor, signing, and shutdown invariants. Then add bounded lock-contention and
+interrupted-file-write fixtures before changing file mutation internals.
 
 Any new Rust packages still require explicit approval before adding them.
 

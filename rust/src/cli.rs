@@ -422,6 +422,12 @@ struct ServeArgs {
     port: u16,
     #[arg(long)]
     no_watch: bool,
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+    #[arg(long)]
+    tls_key: Option<PathBuf>,
+    #[arg(long)]
+    insecure_allow_expired: bool,
 }
 
 pub async fn run() -> Result<()> {
@@ -1322,7 +1328,23 @@ async fn serve(selected: Option<&str>, args: ServeArgs) -> Result<()> {
         "stdio" => crate::mcp::serve_stdio(cx.name, cx.dir, watcher).await,
         "http" => {
             let access_key = crate::cortex::load_access_key(&cx.dir, cx.manifest.access.as_ref())?;
-            let tls = validate_http_access(&cx.manifest, &cx.dir, &args.host, &access_key)?;
+            let tls = validate_http_access(
+                &cx.manifest,
+                &cx.dir,
+                &args.host,
+                &access_key,
+                args.tls_cert.as_deref(),
+                args.tls_key.as_deref(),
+            )?;
+            if let Some((certificate, _)) = tls.as_ref()
+                && let Some(warning) = crate::tlsutil::gate_startup(
+                    certificate,
+                    args.insecure_allow_expired,
+                    Utc::now(),
+                )?
+            {
+                eprintln!("{warning}");
+            }
             crate::mcp::serve_http(
                 cx.name, cx.dir, args.host, args.port, access_key, tls, watcher,
             )
@@ -1337,11 +1359,21 @@ fn validate_http_access(
     dir: &std::path::Path,
     host: &str,
     access_key: &crate::cortex::AccessKey,
+    certificate_override: Option<&std::path::Path>,
+    private_key_override: Option<&std::path::Path>,
 ) -> Result<Option<(PathBuf, PathBuf)>> {
-    let (certificate, private_key) =
+    let (manifest_certificate, manifest_private_key) =
         crate::cortex::resolve_tls_paths(dir, manifest.access.as_ref());
+    let certificate = certificate_override
+        .map(PathBuf::from)
+        .unwrap_or(manifest_certificate);
+    let private_key = private_key_override
+        .map(PathBuf::from)
+        .unwrap_or(manifest_private_key);
     if certificate.as_os_str().is_empty() != private_key.as_os_str().is_empty() {
-        bail!("access.tls_cert_path and access.tls_key_path must be configured together")
+        bail!(
+            "--tls-cert and --tls-key must resolve to a complete pair (CLI flags override access.tls_cert_path and access.tls_key_path independently)"
+        )
     }
     let tls = (!certificate.as_os_str().is_empty()).then_some((certificate, private_key));
     if access_key.keyed() && tls.is_none() {
@@ -1436,12 +1468,27 @@ mod tests {
         let manifest = Manifest::default();
         let temp = tempfile::tempdir().unwrap();
         assert!(
-            validate_http_access(&manifest, temp.path(), "127.0.0.1", &Default::default())
-                .unwrap()
-                .is_none()
+            validate_http_access(
+                &manifest,
+                temp.path(),
+                "127.0.0.1",
+                &Default::default(),
+                None,
+                None
+            )
+            .unwrap()
+            .is_none()
         );
         assert!(
-            validate_http_access(&manifest, temp.path(), "0.0.0.0", &Default::default()).is_err()
+            validate_http_access(
+                &manifest,
+                temp.path(),
+                "0.0.0.0",
+                &Default::default(),
+                None,
+                None
+            )
+            .is_err()
         );
 
         let protected = Manifest {
@@ -1457,11 +1504,40 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            validate_http_access(&protected, temp.path(), "127.0.0.1", &keyed)
+            validate_http_access(&protected, temp.path(), "127.0.0.1", &keyed, None, None)
                 .unwrap()
                 .is_some()
         );
-        assert!(validate_http_access(&manifest, temp.path(), "127.0.0.1", &keyed).is_err());
+        assert!(
+            validate_http_access(&manifest, temp.path(), "127.0.0.1", &keyed, None, None).is_err()
+        );
+
+        let cli_cert = temp.path().join("cli.crt");
+        let cli_key = temp.path().join("cli.key");
+        let resolved = validate_http_access(
+            &protected,
+            temp.path(),
+            "127.0.0.1",
+            &keyed,
+            Some(&cli_cert),
+            Some(&cli_key),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resolved, (cli_cert.clone(), cli_key));
+
+        let mixed = validate_http_access(
+            &protected,
+            temp.path(),
+            "127.0.0.1",
+            &keyed,
+            Some(&cli_cert),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(mixed.0, cli_cert);
+        assert_eq!(mixed.1, temp.path().join("server.key"));
     }
 
     #[test]

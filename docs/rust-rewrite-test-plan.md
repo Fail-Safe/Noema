@@ -13,7 +13,7 @@ integrity, or security requirements.
 | CRUD lifecycle | Differential | Either build can create, read, search, append, archive, trash, recover, sync, and verify the same cortex | `compare.sh` |
 | Events and signing | Unit + differential | Canonical signatures verify across languages; mutation clocks remain monotonic | Rust signing tests, Go Rust-wire fixture, mixed signed federation |
 | MCP stdio | Contract | Exact tool-name set, compatible input schemas, result semantics, and errors | `mcp_contract.py` covers names, schemas, structured results, lifecycle, observability, candidates/distillation/lineage, identity/status/sync, non-mutating announcements, and invalid/missing-resource behavior |
-| MCP HTTP | Integration | Both transports initialize and serve calls; auth, TLS, host validation, shutdown, and federation-mode restrictions match | `http_smoke.sh`; `federation_tls.py` covers authenticated HTTPS, custom CA, and plaintext refusal; `mcp_contract.py` covers every publish-mode mutation guard, local stdio exemption, and subscribe-mode publication guards |
+| MCP HTTP | Integration | Both transports initialize and serve calls; auth, TLS, host validation, shutdown, and federation-mode restrictions match | `http_smoke.sh`; `federation_tls.py` covers authenticated HTTPS, custom CA, and plaintext refusal; `tls_certificate_lifecycle.py` covers validity gates, CLI precedence, monitor bands, and redaction; `mcp_contract.py` covers every publish-mode mutation guard, local stdio exemption, and subscribe-mode publication guards |
 | Watcher | Integration | External create/edit/rename is debounced, onboarded, indexed once, and healed after atomic save | `watcher_parity.py` covers edit bytes, metadata reindex, burst debounce, create, archive/unarchive, atomic save, heal, onboarding, delete/purge, and source locks |
 | Federation | Multi-process | Multiple nodes converge under normal, duplicate, reordered, concurrent, signed, paused, and unavailable-peer cases | `federation_network.py` covers signed bidirectional batching/lifecycle; `federation_ring.py` covers three nodes, background sync, pause/recovery, concurrency, shutdown, and key-rotation recovery; `federation_tls.py` covers authenticated mixed-runtime TLS |
 | Memory tiers | Unit + differential | Usage counters, scoring, promotion, graduation, votes, purge, and health output match | Per-peer usage publication/merge, short-to-mid scoring/promotion, strict mid-to-long graduation, search activity, promotion latency, election/failure totals, and one-source leak reporting automated |
@@ -22,7 +22,7 @@ integrity, or security requirements.
 | Plugins | File integration | Embedded payload hashes, install/check/force rules, target resolution, and drift reporting match | `plugin_lifecycle.py` covers all six payloads, independent CLI dispatch, target guards, dry-run non-mutation, idempotency, drift hashes/refusal, forced atomic file/symlink replacement, unmanaged files, and temp cleanup |
 | TUI | State-machine + snapshot | Navigation, filters, tier actions, themes, resize, and error recovery match | Six Rust suites cover navigation/focus/scroll, search/tier/help transitions, lifecycle and vote mutations, sticky live refresh/highlights, dark/light render snapshot, Unicode truncation, and wrapping; exact visual and live-terminal comparison remains |
 | Fault tolerance | Fault injection | Interrupted writes, malformed Markdown, corrupt DB, unavailable endpoints, and lock contention fail safely | Background-lock single-owner/reacquisition unit coverage; broader fault injection pending |
-| Security | Negative integration | Path traversal, source-lock bypass, forged signatures, bearer auth, TLS expiry, and secret redaction match | Signing/source-lock, bearer rejection, private-CA rejection, plaintext-auth refusal, and secret-redaction cases present; TLS expiry pending |
+| Security | Negative integration | Path traversal, source-lock bypass, forged signatures, bearer auth, TLS expiry, and secret redaction match | Signing/source-lock, bearer rejection, private-CA rejection, plaintext-auth refusal, expired/future validity refusal, explicit bypass, monitor transitions, and secret/certificate-content redaction automated |
 
 ## Performance protocol
 
@@ -50,6 +50,6 @@ and otherwise permits unauthenticated HTTP only on loopback. Semantic backfill,
 ranking, MCP routing, and automatic maintenance now pass the deterministic Go
 oracle. MCP discovery, successful advanced-tool results, invalid inputs,
 missing resources, and federation-mode transport boundaries are automated.
-Certificate-expiry monitoring, pixel-level/live-terminal TUI validation, and
-broader adversarial real-model quality evaluation still require ports and
-parity fixtures.
+Pixel-level/live-terminal TUI validation, broader fault injection, and broader
+adversarial real-model quality evaluation still require ports and parity
+fixtures.

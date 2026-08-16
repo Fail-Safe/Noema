@@ -1101,6 +1101,7 @@ pub async fn serve_http(
                 "::1".to_owned(),
             ]),
         );
+    let certificate_path = tls.as_ref().map(|(certificate, _)| certificate.clone());
     let tls_config = match tls {
         Some((certificate, private_key)) => Some(
             axum_server::tls_rustls::RustlsConfig::from_pem_file(certificate, private_key).await?,
@@ -1159,6 +1160,13 @@ pub async fn serve_http(
             eprintln!("another process owns cortex background work; serving MCP only");
             (None, None, None, None, None, None)
         };
+    let cert_monitor = if background_lock.is_some() {
+        certificate_path
+            .as_deref()
+            .map(crate::tlsutil::CertMonitor::start)
+    } else {
+        None
+    };
     let signal_cancellation = cancellation.clone();
     let signal_task = tokio::spawn(async move {
         shutdown_signal().await;
@@ -1211,6 +1219,9 @@ pub async fn serve_http(
     }
     if let Some(embedder) = embedder {
         embedder.stop().await;
+    }
+    if let Some(cert_monitor) = cert_monitor {
+        cert_monitor.stop().await;
     }
     signal_task.abort();
     shutdown_task.abort();

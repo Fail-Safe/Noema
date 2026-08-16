@@ -30,6 +30,12 @@ private CA, CA-signed server certificate, and shared bearer key. It verifies
 missing/wrong/correct authorization, custom-CA failure and recovery, secret-free
 failure output, and the keyed-plaintext startup refusal.
 
+`tls_certificate_lifecycle.py` compares the startup and background safety layer
+around that transport. It covers expired and not-yet-valid refusal, the
+seven-day warning, CLI-over-manifest certificate precedence, the explicit
+expired-certificate escape hatch, immediate monitor bands, malformed-certificate
+redaction, and graceful shutdown for both builds.
+
 `consolidation_election.py` runs Go and Rust eligibility loops against temporary
 OpenAI-compatible `/models` probes. It checks rank advertisement and exchange,
 deterministic winner agreement, endpoint-loss demotion and failover, recovery,

@@ -1,6 +1,6 @@
 # Rust rewrite experiment results
 
-Date: 2026-08-15. Host: Apple Silicon macOS. Both implementations were built
+Date: 2026-08-16. Host: Apple Silicon macOS. Both implementations were built
 with release optimizations. Results are local comparisons, not portable
 performance guarantees.
 
@@ -59,7 +59,11 @@ and mixed-process tests cover:
 - Rustls HTTPS serving and TLS 1.2-or-newer outbound federation;
 - private-CA trust for both Go-to-Rust and Rust-to-Go federation; and
 - missing/wrong bearer rejection, missing-CA rejection, live outbound access-key
-  reload, plaintext-auth refusal, and secret-redacted failure output.
+  reload, plaintext-auth refusal, and secret-redacted failure output;
+- expired and not-yet-valid leaf refusal, seven-day startup warning,
+  CLI-over-manifest certificate precedence, and explicit bypass parity; and
+- an hourly single-owner certificate monitor with immediate, transition-only
+  90/30/7-day, expired, and unreadable observations.
 
 The network experiment found two interoperability defects that in-process tests
 did not expose. Rust's first identity response did not use Go's `version` and
@@ -347,8 +351,8 @@ Rust scheduler retained its earlier memory advantage under active replication
 and recovery rather than only under a single-process search benchmark.
 
 This remains a complexity probe, not complete federation parity. The Rust path
-does not yet dynamically add new workers without restart, monitor certificate
-expiry, or provide crash-atomic file rollback. Its consolidation election and
+does not yet dynamically add new workers without restart or provide
+crash-atomic file rollback. Its consolidation election and
 coordination wire, pass gate, watchdog recovery, full cadence, heuristic pass,
 graduation, and model-driven distillation are now present. A bounded real-model
 comparison also passes, but broader distillation-quality evaluation remains
@@ -364,7 +368,8 @@ CPU during a short replicated workload. The real-model fixture also indicates
 that Rust's shorter consolidation prompt can preserve the tested information at
 about half the prompt-token cost. Watcher behavior now also matches the tested
 Go outcomes, as do deterministic semantic indexing/ranking, the advanced MCP
-contract, and the functional TUI state model. It still does not justify an
-all-in rewrite because larger-result throughput is not better and certificate-lifecycle
-checks, pixel-level/live-terminal TUI validation, broader distillation-quality
-evaluation, and operator recovery behavior remain incomplete.
+contract, and the functional TUI state model. TLS certificate lifecycle checks
+now also match the deterministic Go oracle. It still does not justify an all-in
+rewrite because larger-result throughput is not better and pixel-level/live-
+terminal TUI validation, broader distillation-quality evaluation, fault
+injection, and operator recovery behavior remain incomplete.

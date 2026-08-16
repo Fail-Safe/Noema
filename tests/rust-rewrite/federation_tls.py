@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import http.client
 import json
 import os
@@ -27,7 +28,13 @@ from federation_ring import (
 )
 
 
-def generate_certificate(root: Path) -> tuple[Path, Path, Path]:
+def generate_certificate(
+    root: Path,
+    *,
+    not_before: datetime | None = None,
+    not_after: datetime | None = None,
+) -> tuple[Path, Path, Path]:
+    root.mkdir(parents=True, exist_ok=True)
     ca_certificate = root / "ca.crt"
     ca_private_key = root / "ca.key"
     certificate = root / "server.crt"
@@ -40,6 +47,16 @@ def generate_certificate(root: Path) -> tuple[Path, Path, Path]:
         "keyUsage=critical,digitalSignature,keyEncipherment\n"
         "extendedKeyUsage=serverAuth\n"
     )
+    if (not_before is None) != (not_after is None):
+        raise ValueError("not_before and not_after must be provided together")
+    validity = ["-days", "1"]
+    if not_before is not None and not_after is not None:
+        validity = [
+            "-not_before",
+            not_before.astimezone(timezone.utc).strftime("%Y%m%d%H%M%SZ"),
+            "-not_after",
+            not_after.astimezone(timezone.utc).strftime("%Y%m%d%H%M%SZ"),
+        ]
     commands = [
         [
             "openssl",
@@ -49,7 +66,7 @@ def generate_certificate(root: Path) -> tuple[Path, Path, Path]:
             "rsa:2048",
             "-sha256",
             "-days",
-            "1",
+            "730",
             "-nodes",
             "-keyout",
             str(ca_private_key),
@@ -89,8 +106,7 @@ def generate_certificate(root: Path) -> tuple[Path, Path, Path]:
             "-CAcreateserial",
             "-out",
             str(certificate),
-            "-days",
-            "1",
+            *validity,
             "-sha256",
             "-extfile",
             str(extensions),

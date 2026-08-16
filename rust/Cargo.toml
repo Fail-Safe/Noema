@@ -38,6 +38,7 @@ thiserror = "2.0"
 tokio = { version = "1.49", features = ["full"] }
 tokio-util = "0.7"
 ulid = { version = "1.2", features = ["serde"] }
+x509-parser = "0.18.1"
 
 [dev-dependencies]
 assert_cmd = "2.1"
