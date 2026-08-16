@@ -309,6 +309,10 @@ enum CortexCommand {
         #[arg(long)]
         force: bool,
     },
+    /// Inspect interrupted-mutation recovery state without changing the cortex
+    RecoveryStatus {
+        name: String,
+    },
     Remove {
         name: String,
     },
@@ -896,6 +900,33 @@ fn cortex_command(command: CortexCommand) -> Result<()> {
                     "warning: restored successfully but could not remove the previous destination at {}",
                     backup.display()
                 );
+            }
+        }
+        CortexCommand::RecoveryStatus { name } => {
+            let cfg = Config::load()?;
+            let entry = cfg
+                .cortexes
+                .get(&name)
+                .ok_or_else(|| anyhow::anyhow!("unknown cortex {:?}", name))?;
+            match crate::cortex::inspect_recovery_status(&entry.path) {
+                crate::cortex::RecoveryStatus::Clean => {
+                    println!("Recovery status for cortex {name:?}: clean");
+                }
+                crate::cortex::RecoveryStatus::Pending { records } => {
+                    println!(
+                        "Recovery status for cortex {name:?}: {records} pending mutation record(s); open it with the Rust build to recover"
+                    );
+                }
+                crate::cortex::RecoveryStatus::MalformedJournal { records } => {
+                    println!(
+                        "Recovery status for cortex {name:?}: malformed recovery journal ({records} record(s)); automatic recovery will fail closed"
+                    );
+                }
+                crate::cortex::RecoveryStatus::UnreadableDatabase => {
+                    println!(
+                        "Recovery status for cortex {name:?}: unreadable database; restore a known-good backup or inspect it manually"
+                    );
+                }
             }
         }
         CortexCommand::Remove { name } => {

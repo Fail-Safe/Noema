@@ -278,6 +278,7 @@ where
         let _ = fs::remove_dir_all(&incoming);
         return Err(error).context("preserving existing restore destination");
     }
+    pause_restore_for_test("destination-preserved");
     if let Err(error) = fs::rename(&incoming, &final_path) {
         if let Some(backup) = &backup {
             let _ = fs::rename(backup, &final_path);
@@ -285,6 +286,7 @@ where
         let _ = fs::remove_dir_all(&incoming);
         return Err(error).context("placing restored cortex");
     }
+    pause_restore_for_test("restore-placed");
 
     let previous_config = config.clone();
     config.cortexes.insert(
@@ -313,6 +315,7 @@ where
         }
         return Err(error).context("saving restored cortex configuration");
     }
+    pause_restore_for_test("config-saved");
 
     let retained_backup = backup.and_then(|backup| match remove_path(&backup) {
         Ok(()) => None,
@@ -527,6 +530,28 @@ fn set_file_permissions(_path: &Path, _mode: u32) -> Result<()> {
 fn set_directory_permissions(path: &Path, mode: u32) -> Result<()> {
     set_file_permissions(path, mode)
 }
+
+#[cfg(debug_assertions)]
+fn pause_restore_for_test(point: &str) {
+    let Ok(requested) = std::env::var("NOEMA_RUST_TEST_RESTORE_PAUSE_POINT") else {
+        return;
+    };
+    if requested != point {
+        return;
+    }
+    let Some(marker) = std::env::var_os("NOEMA_RUST_TEST_RESTORE_PAUSE_MARKER") else {
+        return;
+    };
+    if fs::write(marker, format!("{point}\n")).is_err() {
+        return;
+    }
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn pause_restore_for_test(_point: &str) {}
 
 #[cfg(test)]
 mod tests {

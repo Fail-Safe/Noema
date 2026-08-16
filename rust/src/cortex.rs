@@ -10,7 +10,7 @@ use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::SigningKey;
 use fs2::FileExt;
 use rusqlite::{
-    Connection, OptionalExtension, Transaction, params, params_from_iter, types::Value,
+    Connection, OpenFlags, OptionalExtension, Transaction, params, params_from_iter, types::Value,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -610,6 +610,14 @@ struct PendingFileMutation {
     original_readonly: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryStatus {
+    Clean,
+    Pending { records: usize },
+    MalformedJournal { records: usize },
+    UnreadableDatabase,
+}
+
 struct PendingMutationGuard {
     key: String,
     lock_path: PathBuf,
@@ -756,6 +764,73 @@ fn trace_id_from_path(path: &Path) -> Result<String> {
         bail!("trace path has an invalid trace ID")
     }
     Ok(id.to_owned())
+}
+
+pub fn inspect_recovery_status(dir: &Path) -> RecoveryStatus {
+    inspect_recovery_status_inner(dir).unwrap_or(RecoveryStatus::UnreadableDatabase)
+}
+
+fn inspect_recovery_status_inner(dir: &Path) -> Result<RecoveryStatus> {
+    let database_path = dir.join("db/noema.db");
+    if !fs::metadata(&database_path)?.is_file() {
+        bail!("cortex database is not a regular file")
+    }
+    let connection = Connection::open_with_flags(
+        database_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    let integrity: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        bail!("cortex database quick check failed")
+    }
+    let pattern = format!("{PENDING_MUTATION_PREFIX}*");
+    let pending: Vec<(String, String)> = {
+        let mut statement = connection
+            .prepare("SELECT key,value FROM federation_state WHERE key GLOB ?1 ORDER BY key")?;
+        statement
+            .query_map([pattern], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    if pending.is_empty() {
+        return Ok(RecoveryStatus::Clean);
+    }
+    let records = pending.len();
+    if pending
+        .iter()
+        .any(|(key, value)| !pending_record_is_well_formed(key, value))
+    {
+        return Ok(RecoveryStatus::MalformedJournal { records });
+    }
+    Ok(RecoveryStatus::Pending { records })
+}
+
+fn pending_record_is_well_formed(key: &str, value: &str) -> bool {
+    let Some(record_id) = key.strip_prefix(PENDING_MUTATION_PREFIX) else {
+        return false;
+    };
+    if ulid::Ulid::from_string(record_id).is_err() {
+        return false;
+    }
+    let Ok(mutation) = serde_json::from_str::<PendingFileMutation>(value) else {
+        return false;
+    };
+    if mutation.version != 1 || !trace::is_valid_id(&mutation.trace_id) {
+        return false;
+    }
+    let path_matches = |value: &str| {
+        let path = Path::new(value);
+        validate_relative_trace_path(path).is_ok()
+            && trace_id_from_path(path).is_ok_and(|id| id == mutation.trace_id)
+    };
+    match mutation.kind.as_str() {
+        "replace" | "delete" => {
+            path_matches(&mutation.relative_path) && BASE64.decode(&mutation.original_bytes).is_ok()
+        }
+        "create" => path_matches(&mutation.relative_path),
+        "move" => path_matches(&mutation.source_path) && path_matches(&mutation.target_path),
+        _ => false,
+    }
 }
 
 #[cfg(debug_assertions)]

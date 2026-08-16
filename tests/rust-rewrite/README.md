@@ -49,7 +49,15 @@ recovery skips a live mutation owner.
 
 `rust/tests/recovery_safety.rs` verifies that corrupt SQLite bytes, malformed
 pending JSON, and pending path traversal all fail closed without rewriting the
-database, trace, recovery record, or an outside path.
+database, trace, recovery record, or an outside path. It also verifies that the
+read-only recovery-status probe reports a valid pending record without consuming
+it or changing trace bytes. A subprocess case also requires malformed status
+output to omit the journal value, key, trace ID, and cortex path.
+
+`rust/tests/restore_crash_safety.rs` pauses forced restore after preserving the
+old destination, after placing the restored tree, and after saving config. Each
+subprocess is killed and the test requires both complete trees to remain
+recoverable, with registration appearing only after the config save boundary.
 
 `compare.sh` also kills Rust after an uncommitted trace replacement, requires
 the branch Go build to refuse takeover while the Rust recovery record exists,

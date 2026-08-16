@@ -378,6 +378,19 @@ artifacts, traversal refusal, and symlink refusal. This is interoperability and
 returned-error evidence; process death during restore placement/configuration
 and real power loss have not yet been qualified.
 
+A separate read-only recovery-status path classifies a configured cortex as
+clean, pending, malformed-journal, or unreadable-database without opening it or
+printing journal values, trace identifiers, paths, or decoder errors. Five
+safety tests prove the probe leaves corrupt bytes, pending records, and trace
+files unchanged and that the executable output omits sensitive journal fields.
+
+Three subprocess tests now send `SIGKILL` at the forced-restore boundaries:
+after the old destination is preserved, after the new tree is placed, and after
+configuration is saved. Both complete trees survive the first two boundaries;
+after the third, the new cortex is registered and usable while the old tree is
+still recoverable. These tests establish process-death data preservation, not
+automatic cleanup/reconciliation or power-loss durability.
+
 ## Bounded federation soak
 
 Equivalent homogeneous three-node clusters ran 80 paced create mutations over
@@ -424,9 +437,10 @@ Go outcomes, as do deterministic semantic indexing/ranking, the advanced MCP
 contract, and the functional TUI state model. TLS certificate lifecycle checks
 now also match the deterministic Go oracle, while returned database failures
 and tested process death have stronger filesystem recovery in the Rust
-experiment. Cross-runtime backup restore now also supplies an explicit recovery
-path from a known-good archive. It still does not justify an all-in rewrite
+experiment. Cross-runtime backup restore now supplies an explicit recovery
+path from a known-good archive, and non-mutating status distinguishes recovery
+states without exposing journal contents. It still does not justify an all-in rewrite
 because larger-result throughput is not better and pixel-level/live-terminal
-TUI validation, broader distillation-quality evaluation, restore/power-loss
-fault injection, older-Go recovery, and corrupt-database salvage/status remain
-incomplete.
+TUI validation, broader distillation-quality evaluation, automatic restore
+transaction reconciliation, power-loss fault injection, older-Go recovery, and
+corrupt-database salvage remain incomplete.
