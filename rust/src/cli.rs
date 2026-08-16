@@ -286,13 +286,28 @@ enum EmbeddingCommand {
 #[derive(Debug, Subcommand)]
 enum CortexCommand {
     List,
+    /// Write a gzipped tarball of a cortex
     Backup {
         name: String,
-        #[arg(long)]
+        /// Tarball output path (default: ./<name>-<timestamp>.tar.gz)
+        #[arg(short = 'o', long)]
         output: Option<PathBuf>,
+        /// Overwrite the output file if it exists
+        #[arg(long)]
+        force: bool,
     },
+    /// Restore a cortex from a backup tarball
     Restore {
         tarball: PathBuf,
+        /// Register the restored cortex under this name (default: name from cortex.md)
+        #[arg(long)]
+        name: Option<String>,
+        /// Parent directory for the restored cortex (default: ~/.noema)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Overwrite an existing directory at the destination
+        #[arg(long)]
+        force: bool,
     },
     Remove {
         name: String,
@@ -816,28 +831,72 @@ fn cortex_command(command: CortexCommand) -> Result<()> {
                 );
             }
         }
-        CortexCommand::Backup { name, output } => {
+        CortexCommand::Backup {
+            name,
+            output,
+            force,
+        } => {
             let cfg = Config::load()?;
             let entry = cfg
                 .cortexes
                 .get(&name)
                 .ok_or_else(|| anyhow::anyhow!("unknown cortex"))?;
-            crate::db::checkpoint_wal(&entry.path)?;
-            let output = output.unwrap_or_else(|| PathBuf::from(format!("{name}-backup.tar.gz")));
-            let status = std::process::Command::new("tar")
-                .args(["-czf"])
-                .arg(&output)
-                .arg("-C")
-                .arg(entry.path.parent().unwrap())
-                .arg(entry.path.file_name().unwrap())
-                .status()?;
-            if !status.success() {
-                bail!("tar failed")
-            };
-            println!("Backup written: {}", output.display());
+            if let Err(error) = crate::db::checkpoint_wal(&entry.path) {
+                eprintln!(
+                    "warning: WAL checkpoint failed ({error:#}); backup will include any WAL sidecar"
+                );
+            }
+            let output = output.unwrap_or_else(|| {
+                PathBuf::from(format!(
+                    "{}-{}.tar.gz",
+                    name,
+                    Utc::now().format("%Y%m%d-%H%M%SZ")
+                ))
+            });
+            let size = crate::restore::backup(&entry.path, &output, force)?;
+            println!(
+                "Backed up cortex {:?} to {} ({})",
+                name,
+                output.display(),
+                human_bytes(size)
+            );
+            if !entry.id.is_empty() {
+                println!("Cortex ID: {}", entry.id);
+            }
         }
-        CortexCommand::Restore { .. } => {
-            bail!("restore is not yet enabled in the comparison binary")
+        CortexCommand::Restore {
+            tarball,
+            name,
+            path,
+            force,
+        } => {
+            let mut cfg = Config::load()?;
+            let result = crate::restore::restore(
+                &mut cfg,
+                &tarball,
+                &crate::restore::RestoreOptions {
+                    name,
+                    parent: path,
+                    force,
+                },
+            )?;
+            println!(
+                "Restored cortex {:?} to {}",
+                result.name,
+                result.path.display()
+            );
+            if !result.id.is_empty() {
+                println!("Cortex ID: {}", result.id);
+            }
+            if result.is_default {
+                println!("Set as default cortex.");
+            }
+            if let Some(backup) = result.retained_backup {
+                eprintln!(
+                    "warning: restored successfully but could not remove the previous destination at {}",
+                    backup.display()
+                );
+            }
         }
         CortexCommand::Remove { name } => {
             let mut cfg = Config::load()?;
@@ -852,6 +911,26 @@ fn cortex_command(command: CortexCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNIT: u64 = 1024;
+    if bytes < UNIT {
+        return format!("{bytes} B");
+    }
+    let mut divisor = UNIT;
+    let mut exponent = 0;
+    let mut value = bytes / UNIT;
+    while value >= UNIT {
+        divisor *= UNIT;
+        exponent += 1;
+        value /= UNIT;
+    }
+    format!(
+        "{:.1} {}iB",
+        bytes as f64 / divisor as f64,
+        b"KMGTPE"[exponent] as char
+    )
 }
 
 fn memory_command(cx: &Cortex, command: MemoryCommand) -> Result<()> {

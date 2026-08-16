@@ -10,6 +10,7 @@ pub mod federation;
 pub mod lock;
 pub mod mcp;
 pub mod plugin;
+pub mod restore;
 pub mod tlsutil;
 pub mod trace;
 pub mod tui;

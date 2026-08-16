@@ -354,6 +354,30 @@ truncation, and word wrapping are covered. This is functional state/render
 evidence, not a pixel-for-pixel comparison or a human validation across real
 terminal emulators and resize sequences.
 
+## Backup and restore parity
+
+The Rust CLI now writes and restores Go-compatible cortex archives without
+invoking the platform `tar` command. The direct gzip/tar writer produces one
+sorted root, supports long pending-mutation paths, strips owner and extended
+metadata, refuses non-regular source entries, and prevents an output archive
+from being placed inside the cortex it is archiving. Forced archive replacement
+keeps the previous output until the new archive is complete and synced.
+
+Restore extracts into a private staging directory and accepts only safe,
+relative directories and regular files beneath exactly one root. Traversal,
+links, duplicate paths, multiple roots, unsafe names, and invalid identities
+fail before placement. Registered names, IDs, and destination paths are also
+checked before `--force` can displace an existing directory. A returned
+configuration-save failure restores both the in-memory configuration and the
+previous destination.
+
+The differential fixture passed Go archive to Rust restore and Rust archive to
+Go restore while preserving trace IDs and bodies. It also passed duplicate-ID
+refusal, non-destructive refusal, forced replacement without leftover staging
+artifacts, traversal refusal, and symlink refusal. This is interoperability and
+returned-error evidence; process death during restore placement/configuration
+and real power loss have not yet been qualified.
+
 ## Bounded federation soak
 
 Equivalent homogeneous three-node clusters ran 80 paced create mutations over
@@ -379,8 +403,9 @@ and durable recovery records now cover process death for transactional create,
 replace, move, delete, purge replay, and watcher reconstruction paths on the
 next Rust open. The branch Go build now refuses mixed-runtime takeover until
 Rust recovery completes, and database corruption fails without rewriting data.
-Operator repair/restore, compatibility with older unaware Go binaries, and
-power-loss qualification remain open. Its consolidation election and
+Explicit restore from a prior archive is now available, while corrupt-database
+salvage/status, compatibility with older unaware Go binaries, and power-loss
+qualification remain open. Its consolidation election and
 coordination wire, pass gate, watchdog recovery, full cadence, heuristic pass,
 graduation, and model-driven distillation are now present. A bounded real-model
 comparison also passes, but broader distillation-quality evaluation remains
@@ -399,7 +424,9 @@ Go outcomes, as do deterministic semantic indexing/ranking, the advanced MCP
 contract, and the functional TUI state model. TLS certificate lifecycle checks
 now also match the deterministic Go oracle, while returned database failures
 and tested process death have stronger filesystem recovery in the Rust
-experiment. It still does not justify an all-in rewrite because larger-result
-throughput is not better and pixel-level/live-terminal TUI validation, broader
-distillation-quality evaluation, power-loss fault injection, older-Go recovery,
-and operator repair behavior remain incomplete.
+experiment. Cross-runtime backup restore now also supplies an explicit recovery
+path from a known-good archive. It still does not justify an all-in rewrite
+because larger-result throughput is not better and pixel-level/live-terminal
+TUI validation, broader distillation-quality evaluation, restore/power-loss
+fault injection, older-Go recovery, and corrupt-database salvage/status remain
+incomplete.

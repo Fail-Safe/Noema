@@ -20,6 +20,7 @@ clap = { version = "4.6.6", features = ["derive", "env", "string"] }
 clap_complete = "4.6"
 crossterm = "0.29"
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+flate2 = "1.1.9"
 fs2 = "0.4"
 include_dir = "0.7"
 notify = "8.2"
@@ -34,6 +35,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 serde_yaml = "0.9"
 sha2 = "0.10"
+tar = { version = "0.4.46", default-features = false }
 thiserror = "2.0"
 tokio = { version = "1.49", features = ["full"] }
 tokio-util = "0.7"

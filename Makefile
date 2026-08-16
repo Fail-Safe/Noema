@@ -96,6 +96,9 @@ compare-rust: build rust-build
 	NOEMA_GO_BIN="$(CURDIR)/noema" \
 	NOEMA_RUST_BIN="$(CURDIR)/rust/target/debug/noema-rs" \
 	./tests/rust-rewrite/compare.sh
+	python3 ./tests/rust-rewrite/restore_parity.py \
+		--go "$(CURDIR)/noema" \
+		--rust "$(CURDIR)/rust/target/debug/noema-rs"
 	NOEMA_GO_BIN="$(CURDIR)/noema" \
 	NOEMA_RUST_BIN="$(CURDIR)/rust/target/debug/noema-rs" \
 	./tests/rust-rewrite/http_smoke.sh

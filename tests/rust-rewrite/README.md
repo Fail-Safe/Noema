@@ -55,6 +55,12 @@ database, trace, recovery record, or an outside path.
 the branch Go build to refuse takeover while the Rust recovery record exists,
 opens Rust to recover the committed state, and then requires Go to open it.
 
+`restore_parity.py` creates real Go and Rust cortex archives and restores each
+with the other build. It verifies trace preservation, duplicate-cortex-ID
+refusal, non-destructive refusal and transactional `--force` replacement of an
+existing destination, cleanup of restore artifacts, and fail-closed rejection
+of traversal and symlink archives.
+
 `federation_tls.py` runs signed Go↔Rust federation over HTTPS with a temporary
 private CA, CA-signed server certificate, and shared bearer key. It verifies
 missing/wrong/correct authorization, custom-CA failure and recovery, secret-free

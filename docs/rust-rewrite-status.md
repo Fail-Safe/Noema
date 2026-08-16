@@ -5,9 +5,10 @@ Updated: 2026-08-16
 ## Pause point
 
 - Branch: `experiment/rust-rewrite`
-- Latest completed milestone: mixed-runtime recovery interlock and fail-closed
-  corrupt-database/recovery-record probes (this handoff commit).
-- Previous milestone: `5a9337e fix(rust): recover interrupted trace deletion`.
+- Latest completed milestone: safe cross-runtime cortex backup and restore (this
+  handoff commit).
+- Previous milestone: `bc21b8d fix(recovery): guard mixed-runtime takeover`.
+- Earlier recovery milestone: `5a9337e fix(rust): recover interrupted trace deletion`.
 - Earlier recovery milestone: `0a753e5 fix(rust): recover interrupted trace mutations`.
 - Earlier TLS milestone: `33424c0 feat(rust): add TLS certificate lifecycle parity`.
 - Earlier TUI milestone: `a7e7196 feat(rust): add functional TUI parity`.
@@ -112,6 +113,17 @@ Updated: 2026-08-16
 - Rust startup fails closed on an unreadable SQLite database, malformed pending
   record, or pending path traversal without rewriting the database, trace, or
   an outside path. Corrupt-database repair is not implemented.
+- Rust backup now writes a single-root gzip tar archive directly, without
+  platform `tar` metadata. It strips owner and extended-attribute metadata,
+  supports long trace paths, rejects non-regular entries and output
+  self-inclusion, and preserves an existing output until a forced replacement
+  is ready.
+- Rust restore accepts both Go and Rust archives through a private staging
+  directory. It rejects unsafe, duplicate, linked, or multi-root entries;
+  validates cortex names and identities; detects registered name, ID, and path
+  collisions; and retains a forced destination until placement and
+  configuration persistence succeed. Cross-filesystem placement copies only
+  directories and regular files.
 - A reusable pass gate with initial election, signed claim, cancellable quiet
   wait, re-election, distinct preemption reasons, in-flight tracking, pass-error
   closure, and signed success.
@@ -188,11 +200,11 @@ Updated: 2026-08-16
 
 ## Latest validation
 
-The following passed for the combined crash recovery, transaction rollback,
-fault-safety, dynamic federation, TLS lifecycle, advanced MCP, and functional
-TUI tree:
+The following passed for the combined backup/restore, crash recovery,
+transaction rollback, fault-safety, dynamic federation, TLS lifecycle,
+advanced MCP, and functional TUI tree:
 
-- `make rust-test` — formatting, clippy with warnings denied, 87 unit tests,
+- `make rust-test` — formatting, clippy with warnings denied, 97 unit tests,
   five subprocess crash-recovery scenarios, and three recovery-safety tests.
 - Eight focused SQLite-abort tests prove byte- and permission-identical rollback
   for local update/tier/visibility/hard-delete operations, watcher
@@ -209,11 +221,17 @@ TUI tree:
 - Three recovery-safety tests prove corrupt SQLite bytes are not rewritten,
   malformed records remain available for operator diagnosis, and traversal in
   a pending path cannot escape the Cortex.
+- Ten restore unit tests cover round trips, metadata normalization, long paths,
+  self-inclusion, forced replacement rollback, identity collisions, unsafe
+  names, duplicate paths, multiple roots, links, and traversal.
 - `go test ./...`
 - `go test -race ./...`
 - `go vet ./...`
 - `make compare-rust`, including:
   - Go/Rust differential cortex compatibility;
+  - Go-to-Rust and Rust-to-Go archive restore, duplicate-ID refusal, forced
+    destination replacement, transaction-artifact cleanup, traversal refusal,
+    and link refusal;
   - HTTP initialization for both builds;
   - signed two-way federation and 205-event pagination;
   - three-node convergence, pause/recovery, outage handling, divergence, and
@@ -354,6 +372,13 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
   writer because it does not recognize the recovery record. The current branch
   Go build therefore needs a narrow fail-closed startup interlock; older Go
   binaries remain unsafe for takeover until Rust has recovered first.
+- The macOS system `tar` can add platform metadata that appears as extra
+  top-level archive entries. A direct archive writer is required for one-root,
+  cross-runtime restore compatibility and to avoid leaking owner or extended
+  metadata.
+- Allowing a backup output beneath the cortex being archived can recursively
+  include the archive or its temporary file. Backup must resolve and reject
+  that placement before creating output.
 
 ## Remaining replacement gaps
 
@@ -361,21 +386,21 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
    dark/light auto-detection, and external-editor workflows.
 2. Broader adversarial real-model quality evaluation beyond the current bounded
    synthetic corpus.
-3. Corrupt-database operator repair/restore and power-loss durability remain
-   unverified. Corruption and malformed recovery records now fail closed, but
-   the Rust `cortex restore` command is still disabled. Older Go binaries also
-   cannot safely take over until the Rust recovery record has been consumed.
+3. Backup restore now provides an explicit recovery path from a prior archive,
+   but corrupt-database salvage and an operator recovery-status surface remain
+   absent. Restore/configuration `SIGKILL` windows and real power-loss durability
+   are not yet qualified. Older Go binaries also cannot safely take over until
+   the Rust recovery record has been consumed.
 
 ## Recommended next milestone
 
-Port and harden the Go backup-restore workflow for the Rust comparison binary,
-then add an explicit recovery-status surface that can distinguish a pending
+Add an explicit recovery-status surface that can distinguish a pending
 mutation, malformed journal, and unreadable database without exposing journal
-contents. Keep automatic startup fail-closed: database reconstruction or backup
-replacement should remain an explicit operator action. Qualify filesystem and
-SQLite durability under real power-loss simulation separately.
-
-Any new Rust packages still require explicit approval before adding them.
+contents. Then inject process death across archive replacement, destination
+placement, and configuration persistence before qualifying filesystem and
+SQLite durability under real power-loss simulation. Keep automatic startup
+fail-closed: salvage or backup replacement should remain an explicit operator
+action.
 
 ## Resume commands
 
