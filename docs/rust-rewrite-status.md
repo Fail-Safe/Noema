@@ -11,8 +11,8 @@ Updated: 2026-08-16
   surfaces exercised by this repository.
 - The branch is a replacement candidate, not yet the release implementation.
   The remaining work is qualification and rollout policy, listed below.
-- Last committed baseline before the current completion tranche:
-  `bd18f71 feat(rust): complete recovery and verification parity`.
+- Port-completion baseline:
+  `8cd9719 feat(rust): complete migration and operational parity`.
   Verify the current signed commits with `git log --show-signature -3`.
 
 ## Implemented parity
@@ -126,6 +126,12 @@ not treat that warning as a failed build.
   Go's 111/112, used 36.0% less median peak RSS, and had 20.4% lower median wall
   time. The instrumented Rust runs used fewer prompt tokens, so that timing is
   not a pure client-performance comparison.
+- A harder four-run, 32-pair blinded comparison found equal 136/136 semantic
+  retention and no forbidden or novel numeric claims. Rust used 46.6% fewer
+  prompt tokens, 49.8% fewer request bytes, and 37.2% less median peak RSS, but
+  Go won 14 blind quality pairs to Rust's 3, with 15 ties. Rust's main defects
+  were collapsed/misplaced tags, source-ID leakage, and awkward ambiguity
+  prose; both builds struggled with a lexical-polysemy rejection case.
 
 See `docs/rust-rewrite-experiment-results.md` for tables and caveats.
 
@@ -142,8 +148,9 @@ These are not missing command or protocol ports:
    branch understands the pending-Rust-mutation interlock.
 4. Perform multi-emulator human TUI validation and any desired pixel-level
    comparison.
-5. Expand adversarial real-model quality evaluation beyond the bounded
-   synthetic corpus.
+5. Close the observed Rust distillation-quality gap, then repeat the blinded
+   evaluation with a redacted representative corpus, additional models, and
+   multiple reviewers.
 6. Before release replacement, choose packaging, binary naming, migration,
    rollback, and staged deployment policy, then repeat benchmarks on stripped
    release binaries at larger corpus sizes.

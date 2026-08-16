@@ -133,6 +133,29 @@ bounded mutation schedule, restarts one node halfway through, verifies exact
 event convergence, and reports sampled cluster RSS and CPU as JSON. Its default
 is eight seconds and 80 mutations per cluster.
 
+`qualitative_distillation.py` creates fresh Go and Rust cortexes for repeated
+real-model dry runs over eight synthetic cohesive and adversarial buckets. It
+alternates implementation order, records process and request metrics, scores
+decisions and planted facts, and emits both a deterministically blinded A/B
+file and a separate implementation key. Keep the key separate until review is
+complete. The endpoint is proxied locally for aggregate accounting; neither its
+address nor authorization material is written to the result files.
+
+```sh
+python3 tests/rust-rewrite/qualitative_distillation.py \
+  --go dist/noema-darwin-arm64 \
+  --rust rust/target/release/noema-rs \
+  --endpoint http://127.0.0.1:PORT/v1 \
+  --model qwen3.5-9b \
+  --runs 4 \
+  --output results.json \
+  --blind-output blind.json \
+  --key-output key.json
+
+PYTHONPATH=tests/rust-rewrite \
+  python3 -m unittest -v qualitative_distillation_test
+```
+
 ```sh
 make compare-rust
 make benchmark-rust

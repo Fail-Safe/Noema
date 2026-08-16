@@ -217,6 +217,66 @@ useful follow-up work. The reusable runner is
 `tests/rust-rewrite/real_model_distillation.py`; it records only counts,
 timings, and synthetic result text, never endpoint response bodies.
 
+### Expanded blinded qualitative comparison
+
+The final release artifacts from commit `8cd9719` were then exercised in four
+fresh, alternating-order runs against the same model. Each implementation saw
+30 synthetic traces split into eight independent type-and-day buckets: five
+cohesive cases and three rejection cases. The corpus added corrected root-cause
+history, negative preferences, chronology, unresolved contradictory evidence,
+superficially similar context, and three unrelated meanings of "Mercury". All
+runs used the small profile and `--dry-run`.
+
+Automated scoring was re-derived from the saved output text after collection,
+rather than trusting cached matches. A semantic stem treats "rejection" as
+retaining "rejected", while date fragments copied from source trace IDs are
+reported as provenance leakage instead of invented numeric facts.
+
+| Metric | Go | Rust | Interpretation |
+| --- | ---: | ---: | --- |
+| Bucket decisions | 29/32 | 28/32 | Both struggled with lexical polysemy; Go rejected it once |
+| Planted-term retention | 136/136 | 136/136 | Equal on accepted-case factual content |
+| Forbidden claims | 0 | 0 | No planted contradiction was introduced |
+| Novel numeric claims | 0 | 0 | No numeric hallucination after separating source-ID leakage |
+| Median wall time | 49.941 s | 51.447 s | Rust was 3.0% slower; run order showed no consistent advantage |
+| Median peak RSS | 23.625 MiB | 14.836 MiB | Rust used 37.2% less |
+| Prompt tokens | 29,800 | 15,916 | Rust used 46.6% fewer |
+| Request bytes | 128,968 | 64,720 | Rust used 49.8% fewer |
+| Source-reference leaks | 1 | 3 | Go copied one date fragment; Rust copied nine full IDs across three outputs |
+| Evaluation-framing mentions | 3 | 1 | Both sometimes exposed the synthetic-test context |
+| Structural tag/title degradations | 0 | 10 | Rust more often collapsed tags or placed them in the title |
+
+The 32 output pairs were deterministically labeled A/B and reviewed before the
+implementation key was revealed. The ten-point rubric assigned four points to
+fidelity, three to clarity, two to calibration, and one to concision.
+
+| Blind result | Go | Rust |
+| --- | ---: | ---: |
+| Mean score | 9.219 | 8.438 |
+| Pair wins | 14 | 3 |
+| Ties | 15 | 15 |
+
+The factual core is encouraging: when either build accepted a cohesive bucket,
+both retained every planted requirement, avoided the forbidden claims, and did
+not invent numbers. The qualitative gap is nevertheless material. Rust more
+often emitted a single oversized tag, moved a tag list into the title, or
+included trace identifiers and awkward date/hour phrasing. Go generally
+produced cleaner titles, tags, and ambiguity prose. Both builds need a stronger
+cohesion test for lexical overlap: Rust accepted the Mercury bucket in all four
+runs, while Go rejected it in only one.
+
+This result supports continuing the Rust implementation, but not selecting it
+for production solely on performance. Prompt/parser parity and the polysemy
+decision should be improved and this comparison repeated before replacement.
+The evidence remains bounded: four runs, one local model, synthetic data, and a
+single blind reviewer provide a diagnostic comparison rather than a general
+quality estimate. A redacted representative corpus, additional models, and
+multiple reviewers remain useful release qualification.
+
+The reusable runner is
+`tests/rust-rewrite/qualitative_distillation.py`; focused scoring and blinding
+tests are in `tests/rust-rewrite/qualitative_distillation_test.py`.
+
 ## Filesystem watcher parity
 
 The original Rust watcher slept once per raw notification and called whole-
