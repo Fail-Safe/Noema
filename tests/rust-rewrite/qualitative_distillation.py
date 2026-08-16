@@ -275,6 +275,10 @@ CASES = (
 NUMBER_PATTERN = re.compile(r"(?<![a-z0-9])[+-]?\d+(?:[.,:]\d+)*(?![a-z0-9-])")
 SOURCE_ID_PATTERN = re.compile(r"\b20\d{6}-[a-z0-9-]+")
 SOURCE_ID_FRAGMENT_PATTERN = re.compile(r"\b20\d{6}\b")
+REQUIRED_EQUIVALENTS = {
+    "approved": ("authoriz", "approval"),
+    "reject": ("incorrectly attributed", "incorrectly blamed"),
+}
 
 
 def initialize(node: Node, env: dict[str, str], parent: Path) -> None:
@@ -321,10 +325,6 @@ def seed(
                     source.title,
                     "--type",
                     case.trace_type,
-                    "--tag",
-                    "synthetic-quality-eval",
-                    "--tag",
-                    case.name,
                     "--body",
                     source.body,
                 ],
@@ -433,7 +433,12 @@ def score_text(
 ) -> dict[str, Any]:
     distilled = outcome == "distilled"
     rendered = f"{title}\n{body}".lower()
-    required_hits = [term for term in case.required if term.lower() in rendered]
+    required_hits = [
+        term
+        for term in case.required
+        if term.lower() in rendered
+        or any(value in rendered for value in REQUIRED_EQUIVALENTS.get(term, ()))
+    ]
     forbidden_hits = [term for term in case.forbidden if term.lower() in rendered]
     sources = sources.lower()
     source_numbers = set(NUMBER_PATTERN.findall(sources))

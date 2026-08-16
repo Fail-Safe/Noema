@@ -78,7 +78,7 @@ The completion tree passed:
 
 - `make rust-test`
   - rustfmt and Clippy with warnings denied;
-  - 119 Rust unit tests;
+  - 122 Rust unit tests;
   - one killed-config-writer subprocess test;
   - five active mutation crash-recovery scenarios (plus one ignored child
     entry point);
@@ -126,12 +126,23 @@ not treat that warning as a failed build.
   Go's 111/112, used 36.0% less median peak RSS, and had 20.4% lower median wall
   time. The instrumented Rust runs used fewer prompt tokens, so that timing is
   not a pure client-performance comparison.
-- A harder four-run, 32-pair blinded comparison found equal 136/136 semantic
-  retention and no forbidden or novel numeric claims. Rust used 46.6% fewer
-  prompt tokens, 49.8% fewer request bytes, and 37.2% less median peak RSS, but
-  Go won 14 blind quality pairs to Rust's 3, with 15 ties. Rust's main defects
-  were collapsed/misplaced tags, source-ID leakage, and awkward ambiguity
-  prose; both builds struggled with a lexical-polysemy rejection case.
+- The initial harder comparison exposed under-prompting in Rust: Go won 14
+  blind pairs to Rust's 3, and Rust produced malformed tags and source-ID
+  leakage. Full prompt/request parity, explicit zero temperature, ID-free model
+  input, a polysemy rule, and strict shape validation closed those defects.
+- The exact-artifact untagged six-run comparison produced equal 48/48
+  decisions, 203/204 adjudicated semantic retention, one isolated numeric
+  substitution per runtime, and zero forbidden claims, metadata leaks, or
+  schema defects. Blind review scored Go 473/480 and Rust 467/480, with 36
+  ties; the preceding independent batch had narrowly favored Rust. Prompt
+  tokens are equal, model-dominated wall time is effectively tied, and Rust
+  retained 37.0% lower median peak RSS.
+- Three-run real-model qualification of the other profiles found equal 24/24
+  decisions and 102/102 retention for `large`. An initial shared `frontier`
+  precision gap was traced to missing grounding instructions; after adding the
+  same rules to Go and Rust, both reached 24/24 decisions and 102/102 retention.
+  Blind frontier review was effectively tied at 239/240 for Go and 238/240 for
+  Rust, with one win each and 22 ties.
 
 See `docs/rust-rewrite-experiment-results.md` for tables and caveats.
 
@@ -148,9 +159,8 @@ These are not missing command or protocol ports:
    branch understands the pending-Rust-mutation interlock.
 4. Perform multi-emulator human TUI validation and any desired pixel-level
    comparison.
-5. Close the observed Rust distillation-quality gap, then repeat the blinded
-   evaluation with a redacted representative corpus, additional models, and
-   multiple reviewers.
+5. Extend the now-passing synthetic qualitative gate to a redacted
+   representative corpus, additional models, and multiple reviewers.
 6. Before release replacement, choose packaging, binary naming, migration,
    rollback, and staged deployment policy, then repeat benchmarks on stripped
    release binaries at larger corpus sizes.

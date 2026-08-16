@@ -62,13 +62,14 @@ func GetProfile(tier string) Profile {
 }
 
 // formatTraces builds the trace-excerpt block shared by every
-// profile's prompts. Each trace gets an ID line, title, tag list,
-// and body (truncated per-trace to keep context bounded on local
-// models with limited windows).
+// profile's prompts. Each trace gets an ordinal boundary, title, tag
+// list, and body (truncated per-trace to keep context bounded on local
+// models with limited windows). Internal IDs stay out of model input;
+// the pipeline records lineage directly from the candidate rows.
 func formatTraces(c ClusterInput, bodyLimit int) string {
 	var sb strings.Builder
 	for i, tr := range c.Traces {
-		fmt.Fprintf(&sb, "--- Trace %d (id=%s) ---\n", i+1, tr.ID)
+		fmt.Fprintf(&sb, "--- Trace %d ---\n", i+1)
 		fmt.Fprintf(&sb, "Title: %s\n", tr.Title)
 		if len(tr.Tags) > 0 {
 			fmt.Fprintf(&sb, "Tags: %s\n", strings.Join(tr.Tags, ", "))
@@ -148,6 +149,14 @@ func (p frontierProfile) Run(ctx context.Context, llm LLMClient, model string, c
 
 %s
 
+Decision and grounding rules:
+- Set cohesive to true only when the memories share a specific topic, project, recurring activity, or line of investigation. Shared dates, authors, tags, or words are not enough.
+- A shared word or name is superficial when it refers to different entities. For example, notes about Java the island, Java coffee, and the Java programming language are not one topic merely because they contain "Java".
+- Only reference entities, projects, tools, people, or topics that actually appear in the memories above. Do not invent, add, or infer topics that are not explicitly present.
+- Preserve specific named entities verbatim: skill names, tool names, identifiers, file paths, error strings, bug references, proper nouns, and numeric values.
+- The title must describe what the memories are actually about, not what they might relate to. Tags should come from source tags or terms that appear literally in the source bodies.
+- The title and body must state the durable memory directly. Do not discuss source formatting, tags, trace IDs, memory tiers, consolidation, or evaluation mechanics unless those are explicitly the subject of the source bodies.
+
 Respond with a JSON object and nothing else:
 
 {
@@ -188,6 +197,8 @@ Answer yes if they share a specific common thread. Each of these counts:
 
 Answer no if the memories are about different subjects, even if they share superficial features like the same day, the same author, or the same tag. A cluster containing "movie notes", "architecture docs", and "shopping list" is not cohesive even if they were all created on the same Tuesday. If you'd have to write an umbrella like "various activities", "mixed updates", or "general work" to summarize them together, the answer is no.
 
+A shared word or name is also superficial when it refers to different entities. For example, notes about Java the island, Java coffee, and the Java programming language are not one topic merely because they contain "Java".
+
 %s
 
 Answer with a single word on one line, with no other text: yes or no.`, len(cluster.Traces), body)
@@ -213,9 +224,10 @@ func runTemplateStep(ctx context.Context, llm LLMClient, model string, cluster C
 
 Grounding rules:
 - Only reference entities, projects, tools, people, or topics that actually appear in the memories above. Do not invent, add, or infer topics that are not explicitly present.
-- Preserve specific named entities verbatim: skill names, tool names, identifiers, file paths, error strings, bug references, proper nouns. If a source mentions "smartthings-integration-token-expiration" or "*.vpost.net_ecc SSL glob bug" or "ssh-key-troubleshooting skill", the body should name those specifics rather than flattening them to generic prose like "various skills" or "network issues". The mid-term memory loses all its value if the concrete artifacts disappear.
-- The title must describe what the memories are actually about, not what they might relate to. If the cluster is about one thing (e.g. all "hermes" sessions), the title should name that one thing — do not add unrelated subjects to make the title sound broader.
+- Preserve specific named entities verbatim: skill names, tool names, identifiers, file paths, error strings, bug references, proper nouns. If a source mentions "service-integration-token-expiration" or "*.example.net_ecc TLS glob bug" or "ssh-key-troubleshooting skill", the body should name those specifics rather than flattening them to generic prose like "various skills" or "network issues". The mid-term memory loses all its value if the concrete artifacts disappear.
+- The title must describe what the memories are actually about, not what they might relate to. If the cluster is about one thing (e.g. all deployment sessions), the title should name that one thing — do not add unrelated subjects to make the title sound broader.
 - Tags should come from the source memories' tags or from terms that appear literally in the bodies.
+- The title and body must state the durable memory directly. Do not discuss source formatting, tags, trace IDs, memory tiers, consolidation, or evaluation mechanics unless those are explicitly the subject of the source bodies.
 
 Fill in each field exactly. Do not add other fields, do not omit any:
 
@@ -393,8 +405,8 @@ func parseTemplate(raw string) (Distillation, error) {
 		}
 	}
 	d.Body = strings.TrimSpace(strings.Join(bodyLines, "\n"))
-	if d.Title == "" || d.Body == "" {
-		return d, fmt.Errorf("template response missing required fields: got title=%q body-len=%d", d.Title, len(d.Body))
+	if err := validateDistillationShape(d); err != nil {
+		return d, fmt.Errorf("template response: %w", err)
 	}
 	return d, nil
 }
@@ -425,8 +437,27 @@ func parseFrontierResponse(raw string) (Distillation, error) {
 		Tags:       body.Tags,
 		Confidence: body.Confidence,
 	}
-	if d.Cohesive && (d.Title == "" || d.Body == "") {
-		return d, fmt.Errorf("frontier response claims cohesive but missing title or body")
+	if d.Cohesive {
+		if err := validateDistillationShape(d); err != nil {
+			return d, fmt.Errorf("frontier response claims cohesive but %w", err)
+		}
 	}
 	return d, nil
+}
+
+func validateDistillationShape(d Distillation) error {
+	if d.Title == "" || d.Body == "" {
+		return fmt.Errorf("missing required fields: got title=%q body-len=%d", d.Title, len(d.Body))
+	}
+	if len([]rune(d.Title)) > 100 {
+		return fmt.Errorf("title exceeds 100 characters")
+	}
+	lowerTitle := strings.ToLower(d.Title)
+	if strings.Contains(lowerTitle, "tags:") || strings.Contains(lowerTitle, "body:") {
+		return fmt.Errorf("title contains an inline field label")
+	}
+	if len(d.Tags) == 0 || len(d.Tags) > 8 {
+		return fmt.Errorf("tag count %d is outside 1-8", len(d.Tags))
+	}
+	return nil
 }

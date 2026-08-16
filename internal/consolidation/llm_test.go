@@ -27,6 +27,13 @@ func TestHTTPLLMClient_HappyPath(t *testing.T) {
 			t.Errorf("auth header = %q, want Bearer token", got)
 		}
 		body, _ := io.ReadAll(r.Body)
+		var envelope map[string]any
+		if err := json.Unmarshal(body, &envelope); err != nil {
+			t.Fatalf("decoding request envelope: %v", err)
+		}
+		if temperature, ok := envelope["temperature"]; !ok || temperature != float64(0) {
+			t.Errorf("temperature = %v (present=%v), want explicit zero", temperature, ok)
+		}
 		var req openAIRequestBody
 		if err := json.Unmarshal(body, &req); err != nil {
 			t.Fatalf("decoding request: %v", err)

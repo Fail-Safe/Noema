@@ -4,15 +4,16 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
-from pathlib import Path
 import sqlite3
 import subprocess
 import tempfile
 import threading
 import time
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Self
 
 from federation_ring import (
     Node,
@@ -109,7 +110,7 @@ class FakeModel:
 
         return Handler
 
-    def __enter__(self) -> FakeModel:
+    def __enter__(self) -> Self:
         self.thread.start()
         return self
 
@@ -125,8 +126,7 @@ def initialize(node: Node, env: dict[str, str], parent: Path) -> None:
         env=env,
         check=True,
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
     )
 
 
@@ -227,7 +227,7 @@ def success_scenario(
     root: Path,
     model: FakeModel,
     profile: str = "frontier",
-) -> tuple[list[tuple[str, str, str]], dict[str, object]]:
+) -> tuple[list[tuple[str, str, str]], dict[str, object], list[dict[str, object]]]:
     parent = root / "cortexes"
     initialize(node, env, parent)
     configure(cortex_dir(root, node) / "cortex.md", model.endpoint, profile)
@@ -262,15 +262,26 @@ def success_scenario(
         assert request["model"] == "fixture-model"
         assert request["stream"] is False
         assert request["chat_template_kwargs"] == {"enable_thinking": False}
+        assert request["temperature"] == (0.2 if profile == "frontier" else 0.0)
+        prompts = "\n".join(
+            str(message["content"])
+            for item in model.requests
+            for message in item["messages"]
+        )
+        assert all(source_id not in prompts for source_id in source_ids)
+        assert "Java the island" in prompts
+        assert "Preserve specific named entities verbatim" in prompts
 
         start(node, env)
         time.sleep(0.7)
         assert stop(node)
         assert len(consolidated(database(root, node))) == 1
         assert len(model.requests) == first_request_count
-        return states, {
-            key: value for key, value in payload.items() if key != "distilled_id"
-        }
+        return (
+            states,
+            {key: value for key, value in payload.items() if key != "distilled_id"},
+            model.requests.copy(),
+        )
     finally:
         if not stop(node):
             raise RuntimeError(f"{node.name} did not stop gracefully")
@@ -295,8 +306,9 @@ def failure_scenario(
         start(node, env)
         wait_until(
             f"fallback promotion on {node.name}",
-            lambda: ("fallback-hot", "fact", "mid")
-            in trace_state(database(root, node)),
+            lambda: (
+                ("fallback-hot", "fact", "mid") in trace_state(database(root, node))
+            ),
         )
         assert stop(node)
         states = trace_state(database(root, node))
@@ -503,7 +515,9 @@ def main() -> None:
     for binary in (args.go, args.rust):
         if not binary.is_file():
             parser.error(f"binary does not exist: {binary}")
-    with tempfile.TemporaryDirectory(prefix="noema-rust-llm-distillation-") as directory:
+    with tempfile.TemporaryDirectory(
+        prefix="noema-rust-llm-distillation-"
+    ) as directory:
         exercise(args.go.resolve(), args.rust.resolve(), Path(directory))
     print(
         "Go/Rust LLM distillation: three profiles, CLI dry-run/JSON, lineage, source exclusion, malformed/offline fallback PASS"

@@ -72,6 +72,19 @@ class QualitativeDistillationTest(unittest.TestCase):
         )
         self.assertIn("reject", result["required_hits"])
 
+    def test_required_term_accepts_clear_semantic_equivalent(self) -> None:
+        case = CASES[5]
+        result = score_text(
+            case,
+            "distilled",
+            "Account migration",
+            ["migration"],
+            "accounts_shadow retained 18,442 rows; three phone mismatches became zero, "
+            "and cutover was authorized for 01:15.",
+            "source",
+        )
+        self.assertIn("approved", result["required_hits"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -492,34 +492,21 @@ async fn run_profile(
                 400
             };
             let sources = format_traces(cluster, limit);
-            let cohesion = format!(
-                "Below are {} short-term memories from a Noema cortex. Would a single consolidated summary be more useful because they share a specific topic, project, recurring activity, or investigation? Answer with a single word: yes or no.\n\n{}",
-                cluster.len(),
-                sources
-            );
+            let cohesion = cohesion_prompt(cluster.len(), &sources);
             let answer = llm
                 .complete(model, &cohesion, 0.0, 16, cancellation)
                 .await?;
             if !parse_cohesion(&answer) {
                 return Ok(Distillation::default());
             }
-            let template = format!(
-                "Write one consolidated memory grounded only in these sources. Preserve specific names, identifiers, paths, and errors. Respond exactly as Title: <one line>, Tags: <comma-separated lowercase-kebab-case>, Body: <1-3 paragraphs>.\n\n{}",
-                sources
-            );
+            let template = template_prompt(cluster.len(), &sources);
             let raw = llm
                 .complete(model, &template, 0.2, 800, cancellation)
                 .await?;
             let mut distilled = parse_template(&raw)?;
             distilled.cohesive = true;
             if matches!(profile, Profile::Large) {
-                let confidence = format!(
-                    "Rate how well this consolidation preserves the source information from 1-10. Give one sentence then the integer.\n\nTitle: {}\nTags: {}\nBody: {}\n\nSources:\n{}",
-                    distilled.title,
-                    distilled.tags.join(", "),
-                    distilled.body,
-                    sources
-                );
+                let confidence = confidence_prompt(&distilled, &sources);
                 if let Ok(raw) = llm
                     .complete(model, &confidence, 0.0, 120, cancellation)
                     .await
@@ -538,15 +525,114 @@ async fn run_frontier(
     cluster: &[TraceInput],
     cancellation: &CancellationToken,
 ) -> Result<Distillation> {
-    let prompt = format!(
-        "Below are {} short-term memories from a Noema cortex. Decide whether they belong together and, if so, distill them into one mid-term memory. Respond with a JSON object and nothing else using cohesive (boolean), title, tags (array), body, and confidence (0.0-1.0). If cohesive is false, other fields may be null or omitted.\n\n{}",
-        cluster.len(),
-        format_traces(cluster, 800)
-    );
+    let sources = format_traces(cluster, 800);
+    let prompt = frontier_prompt(cluster.len(), &sources);
     let raw = llm
         .complete(model, &prompt, 0.2, 1200, cancellation)
         .await?;
     parse_frontier(&raw)
+}
+
+fn cohesion_prompt(trace_count: usize, sources: &str) -> String {
+    format!(
+        r#"Below are {trace_count} short-term memories from a Noema cortex.
+
+Would a single consolidated summary of these be more useful than keeping them as separate short-term memories?
+
+Answer yes if they share a specific common thread. Each of these counts:
+- same topic, project, agent session, or line of investigation
+- same recurring activity across time (multiple session summaries, multiple heartbeat checks, multiple cron logs, multiple daily status reports) — a time-series of the same activity is cohesive even when individual entries are thin
+- same debugging or troubleshooting effort (even across multiple steps)
+
+Answer no if the memories are about different subjects, even if they share superficial features like the same day, the same author, or the same tag. A cluster containing "movie notes", "architecture docs", and "shopping list" is not cohesive even if they were all created on the same Tuesday. If you'd have to write an umbrella like "various activities", "mixed updates", or "general work" to summarize them together, the answer is no.
+
+A shared word or name is also superficial when it refers to different entities. For example, notes about Java the island, Java coffee, and the Java programming language are not one topic merely because they contain "Java".
+
+{sources}
+
+Answer with a single word on one line, with no other text: yes or no."#
+    )
+}
+
+fn template_prompt(trace_count: usize, sources: &str) -> String {
+    format!(
+        r#"Below are {trace_count} short-term memories from a Noema cortex that are cohesive enough to consolidate. Write one consolidated memory for the mid-term tier.
+
+{sources}
+
+Grounding rules:
+- Only reference entities, projects, tools, people, or topics that actually appear in the memories above. Do not invent, add, or infer topics that are not explicitly present.
+- Preserve specific named entities verbatim: skill names, tool names, identifiers, file paths, error strings, bug references, proper nouns. If a source mentions "service-integration-token-expiration" or "*.example.net_ecc TLS glob bug" or "ssh-key-troubleshooting skill", the body should name those specifics rather than flattening them to generic prose like "various skills" or "network issues". The mid-term memory loses all its value if the concrete artifacts disappear.
+- The title must describe what the memories are actually about, not what they might relate to. If the cluster is about one thing (e.g. all deployment sessions), the title should name that one thing — do not add unrelated subjects to make the title sound broader.
+- Tags should come from the source memories' tags or from terms that appear literally in the bodies.
+- The title and body must state the durable memory directly. Do not discuss source formatting, tags, trace IDs, memory tiers, consolidation, or evaluation mechanics unless those are explicitly the subject of the source bodies.
+
+Fill in each field exactly. Do not add other fields, do not omit any:
+
+Title: <one line, <=100 chars, no date prefix>
+Tags: <comma-separated list, 1-8 tags, each tag lowercase-kebab-case>
+Body: <1-3 paragraphs distilling the cluster>
+
+Tag format rules: each tag must be a single token in lowercase-kebab-case. Good: "mcp-server", "career-goals", "multi-agent", "fastmail-api". Bad: "MCP Server", "AI SME", "Hugging Face", "Memory Consolidation". If a concept naturally has spaces, join the words with hyphens and lowercase them. Never use spaces inside a tag."#
+    )
+}
+
+fn confidence_prompt(distilled: &Distillation, sources: &str) -> String {
+    let title = &distilled.title;
+    let tags = distilled.tags.join(", ");
+    let body = &distilled.body;
+    format!(
+        r#"You just wrote this consolidation:
+
+Title: {title}
+Tags: {tags}
+Body: {body}
+
+From these source memories:
+
+{sources}
+
+Rate how well the consolidation preserves the source information on this calibrated scale:
+
+  10 = every specific fact, name, and detail from every source is preserved
+  7-9 = all key points preserved, minor details omitted
+  4-6 = general theme preserved, specific facts lost
+  1-3 = only a vague umbrella description
+
+Be strict. Most summaries fall in the 4-8 range.
+
+Answer in exactly this format, nothing else:
+<one-sentence justification>
+<integer 1-10>"#
+    )
+}
+
+fn frontier_prompt(trace_count: usize, sources: &str) -> String {
+    format!(
+        r#"Below are {trace_count} short-term memories from a Noema cortex. Your job is to decide whether they belong together (same topic / same decision / same ongoing work) and, if so, to distill them into a single consolidated memory for the mid-term tier.
+
+{sources}
+
+Decision and grounding rules:
+- Set cohesive to true only when the memories share a specific topic, project, recurring activity, or line of investigation. Shared dates, authors, tags, or words are not enough.
+- A shared word or name is superficial when it refers to different entities. For example, notes about Java the island, Java coffee, and the Java programming language are not one topic merely because they contain "Java".
+- Only reference entities, projects, tools, people, or topics that actually appear in the memories above. Do not invent, add, or infer topics that are not explicitly present.
+- Preserve specific named entities verbatim: skill names, tool names, identifiers, file paths, error strings, bug references, proper nouns, and numeric values.
+- The title must describe what the memories are actually about, not what they might relate to. Tags should come from source tags or terms that appear literally in the source bodies.
+- The title and body must state the durable memory directly. Do not discuss source formatting, tags, trace IDs, memory tiers, consolidation, or evaluation mechanics unless those are explicitly the subject of the source bodies.
+
+Respond with a JSON object and nothing else:
+
+{{
+  "cohesive": <true|false>,
+  "title": "<=100 chars, one line, no date prefix",
+  "tags": ["tag1", "tag2", ...],          // 1-8 tags
+  "body": "1-3 paragraphs distilling the cluster",
+  "confidence": <0.0-1.0>                  // how confident you are the distillation preserves the essential information
+}}
+
+If "cohesive" is false, the other fields may be null or omitted."#
+    )
 }
 
 fn format_traces(cluster: &[TraceInput], body_limit: usize) -> String {
@@ -556,9 +642,8 @@ fn format_traces(cluster: &[TraceInput], body_limit: usize) -> String {
         let body: String = characters.by_ref().take(body_limit).collect();
         let truncated = characters.next().is_some();
         output.push_str(&format!(
-            "--- Trace {} (id={}) ---\nTitle: {}\n",
+            "--- Trace {} ---\nTitle: {}\n",
             index + 1,
-            trace.id,
             trace.title
         ));
         if !trace.tags.is_empty() {
@@ -600,8 +685,9 @@ fn parse_frontier(raw: &str) -> Result<Distillation> {
         body: body.body.unwrap_or_default().trim().into(),
         confidence: body.confidence,
     };
-    if distilled.cohesive && (distilled.title.is_empty() || distilled.body.is_empty()) {
-        bail!("frontier response claims cohesive but is missing title or body");
+    if distilled.cohesive {
+        validate_distillation_shape(&distilled)
+            .context("frontier response claims cohesive but has invalid shape")?;
     }
     Ok(distilled)
 }
@@ -633,10 +719,25 @@ fn parse_template(raw: &str) -> Result<Distillation> {
         }
     }
     distilled.body = body.join("\n").trim().into();
-    if distilled.title.is_empty() || distilled.body.is_empty() {
-        bail!("template response is missing required fields");
-    }
+    validate_distillation_shape(&distilled).context("template response has invalid shape")?;
     Ok(distilled)
+}
+
+fn validate_distillation_shape(distilled: &Distillation) -> Result<()> {
+    if distilled.title.is_empty() || distilled.body.is_empty() {
+        bail!("missing required title or body");
+    }
+    if distilled.title.chars().count() > 100 {
+        bail!("title exceeds 100 characters");
+    }
+    let lower_title = distilled.title.to_ascii_lowercase();
+    if lower_title.contains("tags:") || lower_title.contains("body:") {
+        bail!("title contains an inline field label");
+    }
+    if distilled.tags.is_empty() || distilled.tags.len() > 8 {
+        bail!("tag count {} is outside 1-8", distilled.tags.len());
+    }
+    Ok(())
 }
 
 fn parse_confidence(raw: &str) -> f64 {
@@ -727,5 +828,55 @@ mod tests {
         assert_eq!(parse_confidence("Looks good.\n8"), 0.8);
         assert!(parse_cohesion(" yes."));
         assert!(!parse_cohesion("yesterday"));
+    }
+
+    #[test]
+    fn malformed_template_shapes_fail_closed() {
+        for raw in [
+            "Title: T\nTags:\nBody: B".to_owned(),
+            "Title: T, Tags: x\nBody: B".to_owned(),
+            format!("Title: {}\nTags: x\nBody: B", "x".repeat(101)),
+            "Title: T\nTags: a, b, c, d, e, f, g, h, i\nBody: B".to_owned(),
+        ] {
+            assert!(
+                parse_template(&raw).is_err(),
+                "unexpectedly accepted {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_input_omits_internal_trace_ids() {
+        let cluster = vec![TraceInput {
+            id: "20260420-private-source".into(),
+            title: "Source title".into(),
+            tags: vec!["source".into()],
+            body: "Source body".into(),
+        }];
+        let formatted = format_traces(&cluster, 300);
+        assert!(!formatted.contains("20260420-private-source"));
+        assert!(!formatted.contains("id="));
+        assert!(formatted.contains("--- Trace 1 ---"));
+    }
+
+    #[test]
+    fn zero_temperature_request_is_explicit() {
+        let request = CompletionRequest {
+            model: "fixture-model",
+            messages: [Message {
+                role: "user",
+                content: "prompt",
+            }],
+            temperature: 0.0,
+            max_tokens: 16,
+            stream: false,
+            chat_template_kwargs: Thinking {
+                enable_thinking: false,
+            },
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["temperature"], 0.0);
+        assert_eq!(value["max_tokens"], 16);
+        assert_eq!(value["chat_template_kwargs"]["enable_thinking"], false);
     }
 }

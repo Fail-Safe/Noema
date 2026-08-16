@@ -138,7 +138,7 @@ func TestFrontierProfile_StripsFenceWrapping(t *testing.T) {
 	// in ```json fences. Parser tolerates this so an otherwise-valid
 	// response doesn't get rejected.
 	llm := &stubLLM{responses: []string{
-		"```json\n{\"cohesive\":true,\"title\":\"T\",\"tags\":[],\"body\":\"B\",\"confidence\":0.5}\n```",
+		"```json\n{\"cohesive\":true,\"title\":\"T\",\"tags\":[\"x\"],\"body\":\"B\",\"confidence\":0.5}\n```",
 	}}
 	d, err := frontierProfile{}.Run(context.Background(), llm, "m", sampleCluster())
 	if err != nil {
@@ -168,12 +168,12 @@ func TestFrontierProfile_CohesiveFalseNoRequiredFields(t *testing.T) {
 
 func TestParseConfidenceInt(t *testing.T) {
 	cases := map[string]float64{
-		"8":            0.8,
-		"10":           1.0,
-		"  3 ":         0.3,
+		"8":             0.8,
+		"10":            1.0,
+		"  3 ":          0.3,
 		"Confidence: 7": 0.7,
-		"none":         0,
-		"":             0,
+		"none":          0,
+		"":              0,
 	}
 	for in, want := range cases {
 		if got := parseConfidenceInt(in); got != want {
@@ -202,6 +202,30 @@ func TestParseTemplate_MissingBody(t *testing.T) {
 	_, err := parseTemplate(raw)
 	if err == nil {
 		t.Error("expected parse error when Body section is missing")
+	}
+}
+
+func TestParseTemplate_RejectsMalformedShape(t *testing.T) {
+	cases := []string{
+		"Title: T\nTags:\nBody: B",
+		"Title: T, Tags: x\nBody: B",
+		"Title: " + strings.Repeat("x", 101) + "\nTags: x\nBody: B",
+		"Title: T\nTags: a, b, c, d, e, f, g, h, i\nBody: B",
+	}
+	for _, raw := range cases {
+		if _, err := parseTemplate(raw); err == nil {
+			t.Errorf("parseTemplate(%q) unexpectedly succeeded", raw)
+		}
+	}
+}
+
+func TestFormatTraces_OmitsInternalIDs(t *testing.T) {
+	formatted := formatTraces(sampleCluster(), 300)
+	if strings.Contains(formatted, "20260420-") || strings.Contains(formatted, "id=") {
+		t.Fatalf("formatted model input exposed an internal trace ID: %q", formatted)
+	}
+	if !strings.Contains(formatted, "--- Trace 1 ---") {
+		t.Fatalf("formatted model input lost source boundaries: %q", formatted)
 	}
 }
 

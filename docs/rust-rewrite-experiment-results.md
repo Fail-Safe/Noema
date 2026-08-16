@@ -265,17 +265,103 @@ produced cleaner titles, tags, and ambiguity prose. Both builds need a stronger
 cohesion test for lexical overlap: Rust accepted the Mercury bucket in all four
 runs, while Go rejected it in only one.
 
-This result supports continuing the Rust implementation, but not selecting it
-for production solely on performance. Prompt/parser parity and the polysemy
-decision should be improved and this comparison repeated before replacement.
-The evidence remains bounded: four runs, one local model, synthetic data, and a
-single blind reviewer provide a diagnostic comparison rather than a general
-quality estimate. A redacted representative corpus, additional models, and
-multiple reviewers remain useful release qualification.
+At that checkpoint, the result supported continuing the Rust implementation
+but not selecting it for production solely on performance. It motivated the
+prompt/parser and polysemy remediation below. The evidence was bounded to four
+runs, one local model, synthetic data, and a single blind reviewer.
 
 The reusable runner is
 `tests/rust-rewrite/qualitative_distillation.py`; focused scoring and blinding
 tests are in `tests/rust-rewrite/qualitative_distillation_test.py`.
+
+### Qualitative parity remediation
+
+The first comparison exposed a concrete implementation difference rather than
+a Rust-language limitation. Rust had abbreviated all four Go prompt families:
+cohesion, template generation, confidence, and frontier JSON. The shorter
+prompts explained both the token reduction and the weaker structure. The two
+clients also disagreed on the zero-temperature wire shape because Go's JSON
+encoder omitted the zero value.
+
+The remediation:
+
+- ports the complete Go prompt guidance to Rust and pins semantic request
+  equality for all three profiles in the controlled-endpoint fixture;
+- sends `temperature: 0` explicitly from both clients;
+- adds a general polysemy warning to the cohesion gate;
+- removes internal trace IDs from model input while retaining lineage directly
+  from candidate rows;
+- rejects missing tags, inline field labels, titles over 100 characters, and
+  tag counts outside 1-8; and
+- prevents source metadata and evaluation mechanics from becoming durable
+  title/body prose unless they are the actual subject.
+
+An intermediate four-run checkpoint using only prompt/request parity removed
+all ten Rust schema degradations and all three exact source-ID leaks from the
+original sample. Rust improved from 28/32 to 31/32 decisions; Go made 32/32.
+That checkpoint also revealed that an ID date could be paraphrased rather than
+copied, motivating complete ID removal instead of output regex filtering.
+
+The definitive qualification removed evaluator-only tags from the source
+traces so the model received neither an artificial cohesion hint nor
+synthetic-test framing. A first six-run batch showed a narrow Rust lead within
+ordinary model variation. After the copied prompt examples were normalized to
+public-safe placeholders, a fresh exact-artifact batch rebuilt both release
+binaries and produced 48 new blinded pairs in alternating execution order:
+
+| Metric | Go | Rust | Rust relative result |
+| --- | ---: | ---: | ---: |
+| Bucket decisions | 48/48 | 48/48 | equal |
+| Automated requirement retention | 202/204 | 203/204 | one more literal match |
+| Adjudicated semantic retention | 203/204 | 203/204 | equal |
+| Forbidden claims | 0 | 0 | equal |
+| Novel numeric claims | 1 | 1 | equal |
+| Source-reference leaks | 0 | 0 | equal |
+| Evaluation-framing mentions | 0 | 0 | equal |
+| Structural tag/title degradations | 0 | 0 | equal |
+| Median wall time | 39.637 s | 39.124 s | 1.3% faster |
+| Median peak RSS | 23.508 MiB | 14.820 MiB | 37.0% lower |
+| Prompt tokens | 36,864 | 36,864 | equal |
+| Request bytes | 176,016 | 175,062 | 0.5% fewer |
+
+Blind review used the same ten-point rubric and wrote the score file before the
+implementation key was opened. Go scored 473/480 (mean 9.854) and Rust scored
+467/480 (mean 9.729): Go won eight pairs, Rust won four, and 36 tied. Each
+runtime made the same isolated numeric substitution, changing a planted row
+count from 18,442 to 18,444 once. Go's other automated retention miss used
+"disproved" where the scorer expected a rejection synonym, so manual
+adjudication raised Go to the same 203/204 semantic retention as Rust.
+
+The previous independent six-run batch had favored Rust by two rubric points
+with 44 ties. The direction reversal, exact request equality, equal decision
+accuracy, and symmetric factual error support bounded qualitative parity rather
+than a durable winner. The final batch also exposed occasional process-oriented
+filler in both implementations that the automatic marker list did not flag;
+blind scoring penalized it directly.
+
+Prompt cost is now intentionally equal. The earlier Rust token advantage was
+mostly under-prompting and is no longer counted as a performance benefit. Rust
+retains its process-memory advantage, while model-dominated wall time is
+effectively tied. The remaining quality qualification is broader rather than a
+known parity defect: use a redacted representative corpus, additional models,
+and multiple independent reviewers before release replacement.
+
+Profile-specific follow-up then exercised the other two model paths for three
+alternating-order runs each. The `large` profile produced equal 24/24 decisions
+and 102/102 requirement retention, with no forbidden claims, novel numbers,
+leaks, or schema defects. Median wall time was 55.808 seconds for Go and 55.916
+seconds for Rust; median peak RSS was 23.828 MiB and 14.797 MiB respectively.
+
+The first `frontier` pass made equal 24/24 decisions but only 96/102 literal
+retention in both runtimes. Every miss replaced the exact identifier
+`accounts_shadow` and the literal zero mismatch count with understandable but
+less precise paraphrases. Unlike the multi-step profiles, the single-shot
+frontier prompt lacked their grounding and verbatim-preservation rules.
+Adding those rules symmetrically raised both runtimes to 102/102 on a fresh
+three-run pass, with no forbidden claims, novel numbers, leaks, schema defects,
+or pair disagreements. Blind review scored Go 239/240 and Rust 238/240: one win
+each and 22 ties. Median wall time was 50.800 seconds for Go and 48.256 seconds
+for Rust; median peak RSS was 23.375 MiB and 14.844 MiB respectively.
 
 ## Filesystem watcher parity
 

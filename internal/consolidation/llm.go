@@ -89,7 +89,7 @@ func NewHTTPLLMClient(endpoint, apiKeyEnv string) (*HTTPLLMClient, error) {
 type openAIRequestBody struct {
 	Model              string         `json:"model"`
 	Messages           []Message      `json:"messages"`
-	Temperature        float64        `json:"temperature,omitempty"`
+	Temperature        float64        `json:"temperature"`
 	MaxTokens          int            `json:"max_tokens,omitempty"`
 	Stream             bool           `json:"stream"`
 	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs,omitempty"`
