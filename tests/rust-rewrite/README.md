@@ -41,10 +41,11 @@ configuration mutations leave file bytes, SQLite metadata, event counts, and
 database integrity unchanged in both builds.
 
 `rust/tests/crash_recovery.rs` exercises Rust's post-filesystem/pre-commit
-boundary directly. It pauses create, update, and archive operations after the
-durable file mutation, kills the CLI process, and requires the next Rust open
-to restore exact prior file/database/event state. The archive case also opens
-the Cortex concurrently to prove that recovery skips a live mutation owner.
+boundary directly. It pauses create, update, archive, hard-delete, and watcher
+reconstruction operations after the durable file mutation, kills the writer,
+and requires the next Rust open to restore the exact prior transaction state.
+The archive and watcher cases also open the Cortex concurrently to prove that
+recovery skips a live mutation owner.
 
 `federation_tls.py` runs signed Go↔Rust federation over HTTPS with a temporary
 private CA, CA-signed server certificate, and shared bearer key. It verifies

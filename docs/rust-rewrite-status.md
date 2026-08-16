@@ -5,9 +5,9 @@ Updated: 2026-08-16
 ## Pause point
 
 - Branch: `experiment/rust-rewrite`
-- Latest completed milestone: atomic trace writes and `SIGKILL` recovery for
-  transactional Rust create/replace/move mutations (this handoff commit).
-- Previous milestone: `f2d61cf fix(rust): roll back failed trace transactions`.
+- Latest completed milestone: crash recovery for destructive lifecycle and
+  watcher reconstruction paths (this handoff commit).
+- Previous milestone: `0a753e5 fix(rust): recover interrupted trace mutations`.
 - Earlier TLS milestone: `33424c0 feat(rust): add TLS certificate lifecycle parity`.
 - Earlier TUI milestone: `a7e7196 feat(rust): add functional TUI parity`.
 - Earlier advanced MCP milestone: `29cd610 feat(rust): complete advanced MCP parity`.
@@ -101,6 +101,10 @@ Updated: 2026-08-16
 - Per-mutation owner locks prevent a live writer from being recovered by a
   concurrent open. Stable per-trace locks serialize duplicate local or replay
   mutations before either worker touches the same Markdown path.
+- Hard removal, automatic expiry purge, and federation purge replay now retain
+  an exact journaled backup until their row transaction commits. Watcher repair
+  journals its reconstructed trash copy with the matching visibility update,
+  so failed or killed repair does not leave an uncommitted file behind.
 - A reusable pass gate with initial election, signed claim, cancellable quiet
   wait, re-election, distinct preemption reasons, in-flight tracking, pass-error
   closure, and signed success.
@@ -181,15 +185,17 @@ The following passed for the combined crash recovery, transaction rollback,
 fault-safety, dynamic federation, TLS lifecycle, advanced MCP, and functional
 TUI tree:
 
-- `make rust-test` — formatting, clippy with warnings denied, 84 unit tests, and
-  three subprocess crash-recovery tests.
-- Five focused SQLite-abort tests prove byte- and permission-identical rollback
-  for local update/tier/visibility operations and remote update/create replay,
-  including removal of a new file and preservation of an orphan file.
-- Three subprocess tests pause the Rust CLI after a durable file mutation but
-  before SQLite commit, send `SIGKILL`, and verify idempotent next-open recovery
-  for exact-byte update, archive move, and new trace creation. The move case
-  also proves that a concurrent open leaves the still-live writer alone.
+- `make rust-test` — formatting, clippy with warnings denied, 87 unit tests, and
+  five subprocess crash-recovery scenarios.
+- Eight focused SQLite-abort tests prove byte- and permission-identical rollback
+  for local update/tier/visibility/hard-delete operations, watcher
+  reconstruction, and remote update/create/purge replay, including removal of
+  a new file and preservation of an orphan file.
+- Five subprocess scenarios pause Rust after a durable file mutation but before
+  SQLite commit, send `SIGKILL`, and verify next-open recovery for exact-byte
+  update, archive move, new trace creation, hard deletion, and watcher trash
+  reconstruction. The move and watcher cases also prove that a concurrent open
+  leaves the still-live writer alone.
 - `go test ./...`
 - `go test -race ./...`
 - `go vet ./...`
@@ -338,19 +344,18 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
    dark/light auto-detection, and external-editor workflows.
 2. Broader adversarial real-model quality evaluation beyond the current bounded
    synthetic corpus.
-3. Hard-remove/purge and watcher external-delete reconstruction still need the
-   same crash protocol. Corrupt-database recovery, power-loss durability, and a
-   Go process taking over a Cortex before Rust consumes a pending Rust recovery
-   record remain unverified.
+3. Corrupt-database recovery, power-loss durability, and a Go process taking
+   over a Cortex before Rust consumes a pending Rust recovery record remain
+   unverified.
 
 ## Recommended next milestone
 
-Extend the pending-mutation protocol to hard remove/purge and watcher
-external-delete reconstruction, with deterministic `SIGKILL` tests on both
-sides of their SQLite commits. Then design corrupt-database/operator recovery
-and mixed-runtime takeover behavior; do not assume Go understands the Rust
-recovery records. Keep the returned-failure, read-only I/O, duplicate-replay,
-and subprocess crash fixtures as regression gates.
+Design corrupt-database/operator recovery and mixed-runtime takeover behavior;
+do not assume Go understands the Rust recovery records. First determine whether
+startup should fail closed, offer an explicit repair command, or export a
+standalone recovery artifact when SQLite cannot open. Keep the returned-failure,
+read-only I/O, duplicate-replay, destructive lifecycle, and subprocess crash
+fixtures as regression gates.
 
 Any new Rust packages still require explicit approval before adding them.
 

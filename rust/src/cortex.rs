@@ -680,6 +680,14 @@ fn remove_created_replacement(path: &Path, replacement_hash: &str) -> Result<()>
     }
 }
 
+fn remove_file_durable(path: &Path) -> Result<()> {
+    fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("trace path has no parent directory"))?;
+    trace::sync_directory(directory)
+}
+
 fn rename_trace_durable(source: &Path, target: &Path) -> Result<()> {
     fs::rename(source, target)
         .with_context(|| format!("moving {} to {}", source.display(), target.display()))?;
@@ -916,6 +924,26 @@ impl Cortex {
         self.begin_pending_mutation(&pending)
     }
 
+    fn begin_pending_delete(
+        &self,
+        path: &Path,
+        snapshot: &FileSnapshot,
+    ) -> Result<PendingMutationGuard> {
+        let pending = PendingFileMutation {
+            version: 1,
+            kind: "delete".into(),
+            trace_id: trace_id_from_path(path)?,
+            relative_path: self.relative_trace_path(path)?,
+            source_path: String::new(),
+            target_path: String::new(),
+            original_bytes: BASE64.encode(&snapshot.bytes),
+            replacement_hash: String::new(),
+            original_mode: snapshot.mode(),
+            original_readonly: snapshot.permissions.readonly(),
+        };
+        self.begin_pending_mutation(&pending)
+    }
+
     fn begin_pending_mutation(
         &self,
         pending: &PendingFileMutation,
@@ -1044,6 +1072,36 @@ impl Cortex {
         }
     }
 
+    fn finish_pending_delete<T>(
+        &self,
+        guard: PendingMutationGuard,
+        snapshot: FileSnapshot,
+        path: &Path,
+        result: Result<T>,
+    ) -> Result<T> {
+        let Err(error) = result else {
+            guard.cleanup();
+            return result;
+        };
+        if let Err(rollback_error) = snapshot.restore(path) {
+            guard.cleanup();
+            return Err(error.context(format!(
+                "also failed to restore deleted trace {}: {rollback_error}",
+                path.display()
+            )));
+        }
+        let clear = self
+            .connection
+            .execute("DELETE FROM federation_state WHERE key=?1", [&guard.key]);
+        guard.cleanup();
+        match clear {
+            Ok(_) => Err(error),
+            Err(clear_error) => Err(error.context(format!(
+                "filesystem rollback succeeded but clearing its recovery record failed: {clear_error}"
+            ))),
+        }
+    }
+
     fn replace_trace_transactionally<F>(
         &self,
         path: &Path,
@@ -1108,6 +1166,26 @@ impl Cortex {
         self.finish_pending_move(pending, source, target, &file_hash, database_result)
     }
 
+    fn delete_trace_transactionally<F>(&self, path: &Path, database: F) -> Result<()>
+    where
+        F: FnOnce(Option<&str>) -> Result<()>,
+    {
+        let _trace_lock = self.acquire_trace_mutation_lock(path)?;
+        if !path.exists() {
+            return database(None);
+        }
+        let snapshot = FileSnapshot::capture(path)?;
+        let pending = self.begin_pending_delete(path, &snapshot)?;
+        if let Err(error) = remove_file_durable(path) {
+            return self.finish_pending_delete(pending, snapshot, path, Err(error));
+        }
+        if let Err(error) = pause_after_filesystem_mutation_for_test() {
+            return self.finish_pending_delete(pending, snapshot, path, Err(error));
+        }
+        let database_result = database(Some(&pending.key));
+        self.finish_pending_delete(pending, snapshot, path, database_result)
+    }
+
     fn clear_pending_in_transaction(tx: &Transaction<'_>, key: &str) -> Result<()> {
         tx.execute("DELETE FROM federation_state WHERE key=?1", [key])?;
         Ok(())
@@ -1166,6 +1244,7 @@ impl Cortex {
                 "replace" => self.recover_pending_replace(&mutation)?,
                 "create" => self.recover_pending_create(&mutation)?,
                 "move" => self.recover_pending_move(&mutation)?,
+                "delete" => self.recover_pending_delete(&mutation)?,
                 kind => bail!("unsupported pending mutation kind {kind:?}"),
             }
             self.connection
@@ -1245,6 +1324,42 @@ impl Cortex {
             bail!("pending move paths do not match their trace ID")
         }
         restore_moved_file(&source, &target, &mutation.replacement_hash)
+    }
+
+    fn recover_pending_delete(&self, mutation: &PendingFileMutation) -> Result<()> {
+        if mutation.version != 1 {
+            bail!(
+                "unsupported pending mutation record version {}",
+                mutation.version
+            );
+        }
+        let path = self.resolve_relative_trace_path(&mutation.relative_path)?;
+        if trace_id_from_path(&path)? != mutation.trace_id {
+            bail!("pending deletion path does not match its trace ID")
+        }
+        let original = BASE64
+            .decode(&mutation.original_bytes)
+            .context("decoding pending deletion backup")?;
+        match fs::read(&path) {
+            Ok(current) if current == original => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                trace::write_bytes_atomic(&path, &original)?;
+            }
+            Ok(_) => bail!(
+                "refusing to overwrite independently recreated trace {} during crash recovery",
+                path.display()
+            ),
+            Err(error) => return Err(error).context("reading pending deletion path"),
+        }
+        let mut permissions = fs::metadata(&path)?.permissions();
+        permissions.set_readonly(mutation.original_readonly);
+        #[cfg(unix)]
+        if let Some(mode) = mutation.original_mode {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(mode);
+        }
+        fs::set_permissions(path, permissions)?;
+        Ok(())
     }
 
     fn relative_trace_path(&self, path: &Path) -> Result<String> {
@@ -2442,6 +2557,17 @@ impl Cortex {
         archived_at: Option<String>,
         trashed_at: Option<String>,
     ) -> Result<()> {
+        self.mark_visibility_with_pending(id, action, archived_at, trashed_at, None)
+    }
+
+    fn mark_visibility_with_pending(
+        &self,
+        id: &str,
+        action: &str,
+        archived_at: Option<String>,
+        trashed_at: Option<String>,
+        pending_key: Option<&str>,
+    ) -> Result<()> {
         let now = trace::now_rfc3339();
         let tx = self.connection.unchecked_transaction()?;
         tx.execute(
@@ -2449,6 +2575,9 @@ impl Cortex {
             params![archived_at, trashed_at, id],
         )?;
         self.emit_event(&tx, action, id, &now, json!({}))?;
+        if let Some(pending_key) = pending_key {
+            Self::clear_pending_in_transaction(&tx, pending_key)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -2485,7 +2614,28 @@ impl Cortex {
                 },
                 body: data.body,
             };
-            trace.write_preserving_updated(&self.trash_dir().join(format!("{id}.md")))?;
+            let path = self.trash_dir().join(format!("{id}.md"));
+            let trashed_at = trace::now_rfc3339();
+            if path.exists() {
+                return self.replace_trace_transactionally(&path, &trace, |pending_key| {
+                    self.mark_visibility_with_pending(
+                        id,
+                        "trash",
+                        None,
+                        Some(trashed_at),
+                        Some(pending_key),
+                    )
+                });
+            }
+            return self.create_trace_transactionally(&path, &trace, |pending_key| {
+                self.mark_visibility_with_pending(
+                    id,
+                    "trash",
+                    None,
+                    Some(trashed_at),
+                    Some(pending_key),
+                )
+            });
         }
         self.mark_visibility(id, "trash", None, Some(trace::now_rfc3339()))
     }
@@ -2537,10 +2687,16 @@ impl Cortex {
     pub fn remove_hard(&self, id: &str) -> Result<()> {
         let row = self.get(id)?;
         self.check_source_lock(&row)?;
-        let _ = fs::remove_file(self.file_path(&row));
-        self.connection
-            .execute("DELETE FROM traces WHERE id=?1", [id])?;
-        Ok(())
+        let path = self.file_path(&row);
+        self.delete_trace_transactionally(&path, |pending_key| {
+            let tx = self.connection.unchecked_transaction()?;
+            tx.execute("DELETE FROM traces WHERE id=?1", [id])?;
+            if let Some(pending_key) = pending_key {
+                Self::clear_pending_in_transaction(&tx, pending_key)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     pub fn purge_expired(&mut self, days: u32) -> Result<usize> {
@@ -2552,9 +2708,16 @@ impl Cortex {
                 .collect::<rusqlite::Result<_>>()?
         };
         for id in &ids {
-            let _ = fs::remove_file(self.trash_dir().join(format!("{id}.md")));
-            self.connection
-                .execute("DELETE FROM traces WHERE id=?1", [id])?;
+            let path = self.trash_dir().join(format!("{id}.md"));
+            self.delete_trace_transactionally(&path, |pending_key| {
+                let tx = self.connection.unchecked_transaction()?;
+                tx.execute("DELETE FROM traces WHERE id=?1", [id])?;
+                if let Some(pending_key) = pending_key {
+                    Self::clear_pending_in_transaction(&tx, pending_key)?;
+                }
+                tx.commit()?;
+                Ok(())
+            })?;
         }
         Ok(ids.len())
     }
@@ -3036,13 +3199,18 @@ impl Cortex {
     }
 
     fn replay_purge(&self, event: &Event) -> Result<()> {
-        let _ = fs::remove_file(self.trash_dir().join(format!("{}.md", event.trace_id)));
-        let tx = self.connection.unchecked_transaction()?;
-        tx.execute("DELETE FROM traces_fts WHERE id=?1", [&event.trace_id])?;
-        tx.execute("DELETE FROM traces WHERE id=?1", [&event.trace_id])?;
-        self.store_remote_event_tx(&tx, event)?;
-        tx.commit()?;
-        Ok(())
+        let path = self.trash_dir().join(format!("{}.md", event.trace_id));
+        self.delete_trace_transactionally(&path, |pending_key| {
+            let tx = self.connection.unchecked_transaction()?;
+            tx.execute("DELETE FROM traces_fts WHERE id=?1", [&event.trace_id])?;
+            tx.execute("DELETE FROM traces WHERE id=?1", [&event.trace_id])?;
+            self.store_remote_event_tx(&tx, event)?;
+            if let Some(pending_key) = pending_key {
+                Self::clear_pending_in_transaction(&tx, pending_key)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     fn materialize_remote_snapshot(&self, event: &Event, existing: Option<Row>) -> Result<()> {
@@ -5141,6 +5309,114 @@ mod tests {
         );
         assert!(beta.get(&id).is_err());
         assert!(beta.history(&id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_hard_delete_restores_exact_trace_file() {
+        let (_temp, cx) = cortex();
+        let mut trace = Trace::new("Delete rollback", "fact", "", vec![], "preserved body");
+        cx.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        let path = cx.trace_file(&id, false);
+        let original_bytes = fs::read(&path).unwrap();
+        let original_permissions = fs::metadata(&path).unwrap().permissions();
+        let original_events = cx.history(&id).unwrap().len();
+        cx.connection
+            .execute_batch(
+                "CREATE TRIGGER fail_hard_delete
+                 BEFORE DELETE ON traces
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected hard delete failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(cx.remove_hard(&id).is_err());
+
+        assert_eq!(fs::read(&path).unwrap(), original_bytes);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions(),
+            original_permissions
+        );
+        assert!(cx.get(&id).is_ok());
+        assert_eq!(cx.history(&id).unwrap().len(), original_events);
+    }
+
+    #[test]
+    fn failed_external_delete_reconstruction_removes_uncommitted_trash_file() {
+        let (_temp, cx) = cortex();
+        let mut trace = Trace::new("External delete", "fact", "", vec![], "recoverable body");
+        cx.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        let active = cx.trace_file(&id, false);
+        let trash = cx.trash_dir().join(format!("{id}.md"));
+        let original_events = cx.history(&id).unwrap().len();
+        fs::remove_file(active).unwrap();
+        cx.connection
+            .execute_batch(
+                "CREATE TRIGGER fail_external_delete_visibility
+                 BEFORE UPDATE OF archived_at, trashed_at ON traces
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected external delete failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(cx.ingest_external_delete(&id).is_err());
+
+        assert!(!trash.exists());
+        let row = cx.get(&id).unwrap();
+        assert!(row.archived_at.is_empty());
+        assert!(row.trashed_at.is_empty());
+        assert_eq!(cx.history(&id).unwrap().len(), original_events);
+    }
+
+    #[test]
+    fn failed_remote_purge_restores_exact_trashed_trace() {
+        let temp = tempfile::tempdir().unwrap();
+        let alpha = signed_cortex(temp.path(), "alpha");
+        let beta = signed_cortex(temp.path(), "beta");
+        let mut trace = Trace::new("Remote purge", "fact", "", vec![], "trashed body");
+        alpha.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        beta.replay_event(&event_for(&alpha, &id, "create", &alpha.id))
+            .unwrap();
+        alpha.trash(&id).unwrap();
+        beta.replay_event(&event_for(&alpha, &id, "trash", &alpha.id))
+            .unwrap();
+        let path = beta.trash_dir().join(format!("{id}.md"));
+        let original_bytes = fs::read(&path).unwrap();
+        let original_permissions = fs::metadata(&path).unwrap().permissions();
+        let original_events = beta.history(&id).unwrap().len();
+        let mut purge = Event::new(
+            "purge",
+            &id,
+            &alpha.id,
+            &alpha.name,
+            json!({}),
+            alpha.get_clock().unwrap(),
+        );
+        purge.pubkey = alpha.manifest.signing.as_ref().unwrap().public_key.clone();
+        purge.signature = eventsig::sign(alpha.signing_key.as_ref().unwrap(), &purge);
+        beta.connection
+            .execute_batch(
+                "CREATE TRIGGER fail_remote_purge
+                 BEFORE DELETE ON traces
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected remote purge failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(beta.replay_event(&purge).is_err());
+
+        assert_eq!(fs::read(&path).unwrap(), original_bytes);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions(),
+            original_permissions
+        );
+        assert!(beta.get(&id).is_ok());
+        assert_eq!(beta.history(&id).unwrap().len(), original_events);
     }
 
     #[test]

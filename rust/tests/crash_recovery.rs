@@ -51,6 +51,17 @@ fn wait_for_fault_marker(child: &mut Child, marker: &Path) {
 }
 
 #[test]
+#[ignore = "subprocess entry point"]
+fn external_delete_recovery_child() {
+    let Some(root) = std::env::var_os("NOEMA_RUST_TEST_EXTERNAL_DELETE_ROOT") else {
+        return;
+    };
+    let id = std::env::var("NOEMA_RUST_TEST_EXTERNAL_DELETE_ID").unwrap();
+    let cortex = Cortex::open("crash-test", PathBuf::from(root)).unwrap();
+    cortex.ingest_external_delete(&id).unwrap();
+}
+
+#[test]
 fn killed_update_is_rolled_back_on_next_open() {
     let (temp, config_home, root) = initialize_cortex();
     let binary = env!("CARGO_BIN_EXE_noema-rs");
@@ -200,4 +211,122 @@ fn killed_create_is_removed_on_next_open() {
     assert!(recovered.list(&Default::default()).unwrap().is_empty());
     assert!(!files[0].exists());
     assert!(recovered.events_since("", 10).unwrap().is_empty());
+}
+
+#[test]
+fn killed_hard_delete_is_restored_on_next_open() {
+    let (temp, config_home, root) = initialize_cortex();
+    let (id, path, original_bytes, original_permissions, original_events) = {
+        let cortex = Cortex::open("crash-test", &root).unwrap();
+        let mut trace = Trace::new("Crash delete", "fact", "", vec![], "preserved body");
+        cortex.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        let path = cortex.trace_file(&id, false);
+        (
+            id.clone(),
+            path.clone(),
+            fs::read(&path).unwrap(),
+            fs::metadata(&path).unwrap().permissions(),
+            cortex.history(&id).unwrap().len(),
+        )
+    };
+    let marker = temp.path().join("delete-complete");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_noema-rs"))
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("NOEMA_RUST_TEST_PAUSE_AFTER_FILESYSTEM_MUTATION", &marker)
+        .args([
+            "--cortex",
+            "crash-test",
+            "memory",
+            "purge",
+            &id,
+            "--tier",
+            "short",
+            "--reason",
+            "crash-test",
+            "--confirm",
+            "--hard",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    wait_for_fault_marker(&mut child, &marker);
+    assert!(!path.exists());
+    let database = Connection::open(root.join("db/noema.db")).unwrap();
+    let traces: i64 = database
+        .query_row("SELECT COUNT(*) FROM traces WHERE id=?1", [&id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(traces, 1);
+    drop(database);
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+
+    let recovered = Cortex::open("crash-test", &root).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), original_bytes);
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions(),
+        original_permissions
+    );
+    assert!(recovered.get(&id).is_ok());
+    assert_eq!(recovered.history(&id).unwrap().len(), original_events);
+}
+
+#[test]
+fn killed_external_delete_reconstruction_is_removed_on_next_open() {
+    let (temp, _config_home, root) = initialize_cortex();
+    let (id, active, trash, original_events) = {
+        let cortex = Cortex::open("crash-test", &root).unwrap();
+        let mut trace = Trace::new(
+            "Crash external delete",
+            "fact",
+            "",
+            vec![],
+            "reconstructed body",
+        );
+        cortex.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        (
+            id.clone(),
+            cortex.trace_file(&id, false),
+            cortex.trash_dir().join(format!("{id}.md")),
+            cortex.history(&id).unwrap().len(),
+        )
+    };
+    fs::remove_file(&active).unwrap();
+    let marker = temp.path().join("external-delete-reconstruction-complete");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .env("NOEMA_RUST_TEST_EXTERNAL_DELETE_ROOT", &root)
+        .env("NOEMA_RUST_TEST_EXTERNAL_DELETE_ID", &id)
+        .env("NOEMA_RUST_TEST_PAUSE_AFTER_FILESYSTEM_MUTATION", &marker)
+        .args(["--ignored", "--exact", "external_delete_recovery_child"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    wait_for_fault_marker(&mut child, &marker);
+    assert!(trash.exists());
+    assert!(
+        Cortex::open("crash-test", &root)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .trashed_at
+            .is_empty()
+    );
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+
+    let recovered = Cortex::open("crash-test", &root).unwrap();
+    assert!(!active.exists());
+    assert!(!trash.exists());
+    assert!(recovered.get(&id).unwrap().trashed_at.is_empty());
+    assert_eq!(recovered.history(&id).unwrap().len(), original_events);
+    recovered.ingest_external_delete(&id).unwrap();
+    assert!(trash.exists());
+    assert!(!recovered.get(&id).unwrap().trashed_at.is_empty());
 }
