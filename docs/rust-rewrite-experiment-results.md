@@ -65,7 +65,11 @@ and mixed-process tests cover:
 - an hourly single-owner certificate monitor with immediate, transition-only
   90/30/7-day, expired, and unreadable observations; and
 - live peer-set reconciliation under one supervisor, including zero-peer
-  startup, worker addition/removal/restart, and cursor-preserving re-addition.
+  startup, worker addition/removal/restart, and cursor-preserving re-addition;
+- four-process same-cortex contention in both builds, including MCP-only losers,
+  SIGKILL owner release, replacement acquisition, and continued exclusion; and
+- safe pre-mutation I/O refusal for trace overwrite, lifecycle rename, and
+  manifest replacement, with file, database, event, and integrity invariants.
 
 The network experiment found two interoperability defects that in-process tests
 did not expose. Rust's first identity response did not use Go's `version` and

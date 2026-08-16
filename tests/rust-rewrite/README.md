@@ -30,6 +30,16 @@ Go source. It adds, removes, and re-adds that source without restarting Rust,
 verifying worker start/retirement counts, sync suppression while removed,
 cursor preservation, pending-event recovery, and graceful shutdown.
 
+`background_lock_contention.py` starts four same-cortex server processes per
+implementation. It verifies that lock losers still serve MCP, a killed owner's
+kernel lock is released, a replacement owner can acquire it while the original
+loser stays alive, and further contenders remain MCP-only.
+
+`io_failure_safety.py` makes an existing trace, its lifecycle target directory,
+and the manifest read-only in turn. It checks that rejected append, archive, and
+configuration mutations leave file bytes, SQLite metadata, event counts, and
+database integrity unchanged in both builds.
+
 `federation_tls.py` runs signed Go↔Rust federation over HTTPS with a temporary
 private CA, CA-signed server certificate, and shared bearer key. It verifies
 missing/wrong/correct authorization, custom-CA failure and recovery, secret-free

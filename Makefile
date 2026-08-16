@@ -108,6 +108,12 @@ compare-rust: build rust-build
 	python3 ./tests/rust-rewrite/federation_dynamic.py \
 		--go "$(CURDIR)/noema" \
 		--rust "$(CURDIR)/rust/target/debug/noema-rs"
+	python3 ./tests/rust-rewrite/background_lock_contention.py \
+		--go "$(CURDIR)/noema" \
+		--rust "$(CURDIR)/rust/target/debug/noema-rs"
+	python3 ./tests/rust-rewrite/io_failure_safety.py \
+		--go "$(CURDIR)/noema" \
+		--rust "$(CURDIR)/rust/target/debug/noema-rs"
 	python3 ./tests/rust-rewrite/federation_tls.py \
 		--go "$(CURDIR)/noema" \
 		--rust "$(CURDIR)/rust/target/debug/noema-rs"

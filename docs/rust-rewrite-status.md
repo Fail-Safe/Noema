@@ -5,9 +5,10 @@ Updated: 2026-08-16
 ## Pause point
 
 - Branch: `experiment/rust-rewrite`
-- Latest completed milestone: dynamic federation worker reconciliation (this handoff
-  commit).
-- Previous milestone: `33424c0 feat(rust): add TLS certificate lifecycle parity`.
+- Latest completed milestone: bounded lock and I/O failure experiments (this
+  handoff commit).
+- Previous milestone: `c117b61 feat(rust): reconcile live federation workers`.
+- Earlier TLS milestone: `33424c0 feat(rust): add TLS certificate lifecycle parity`.
 - Earlier TUI milestone: `a7e7196 feat(rust): add functional TUI parity`.
 - Earlier advanced MCP milestone: `29cd610 feat(rust): complete advanced MCP parity`.
 - Earlier MCP contract milestone: `0a6e721 feat(rust): tighten MCP contract parity`.
@@ -87,6 +88,9 @@ Updated: 2026-08-16
   without creating synthetic trace records.
 - One cross-runtime background owner per cortex; lock losers continue serving
   MCP without starting duplicate federation or eligibility workers.
+- Multi-process contention now proves that both builds keep lock losers in
+  MCP-only mode, release the kernel lock after a killed owner, and allow a new
+  owner to acquire it while the original loser remains alive.
 - A reusable pass gate with initial election, signed claim, cancellable quiet
   wait, re-election, distinct preemption reasons, in-flight tracking, pass-error
   closure, and signed success.
@@ -163,8 +167,8 @@ Updated: 2026-08-16
 
 ## Latest validation
 
-The following passed for the combined dynamic federation, TLS lifecycle,
-advanced MCP, and functional TUI tree:
+The following passed for the combined fault-safety, dynamic federation, TLS
+lifecycle, advanced MCP, and functional TUI tree:
 
 - `make rust-test` — formatting, clippy with warnings denied, and 76 Rust tests.
 - `go test ./...`
@@ -179,6 +183,12 @@ advanced MCP, and functional TUI tree:
   - live zero-peer startup, peer addition/removal/re-addition, exact worker
     start/stop counts, sync suppression while removed, cursor preservation,
     pending-event recovery, and graceful shutdown; and
+  - same-cortex four-process lock contention, MCP availability for lock losers,
+    killed-owner release, replacement acquisition, and continued exclusion of
+    additional contenders in both builds; and
+  - rejected trace overwrite, lifecycle rename, and manifest-write mutations
+    with byte-identical files, unchanged database/event state, and successful
+    SQLite integrity checks in both builds; and
   - authenticated Go/Rust HTTPS federation, CA rejection, bearer rejection,
     access-key recovery, plaintext refusal, and secret redaction; and
   - identical expired and not-yet-valid startup refusal, seven-day warnings,
@@ -302,14 +312,16 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
    dark/light auto-detection, and external-editor workflows.
 2. Broader adversarial real-model quality evaluation beyond the current bounded
    synthetic corpus.
-3. Crash-atomic file rollback, lock contention, and broader fault injection.
+3. Crash-atomic file rollback after a successful filesystem mutation but before
+   database commit, corrupt-database recovery, and broader fault injection.
 
 ## Recommended next milestone
 
-Continue the fault-tolerance rows with bounded lock-contention and interrupted-
-file-write fixtures. Establish the Go oracle and exact recovery boundary before
-changing file mutation internals, then preserve editor-owned bytes and database
-consistency under injected failures.
+Add a deterministic post-write/pre-commit failure seam around Rust trace
+mutations. First demonstrate the current file/database split-brain window, then
+add rollback or startup repair without weakening editor-owned byte preservation.
+Keep the new pre-write failure and multi-process lock fixtures as regression
+gates.
 
 Any new Rust packages still require explicit approval before adding them.
 
