@@ -493,19 +493,30 @@ highlights. New and existing traces can round-trip through the configured
 external editor while raw mode and the alternate screen are suspended, and a
 drop guard restores the terminal on every exit path.
 
-Six Rust suites exercise the state transitions and SQLite/file mutations plus
-a 120x28 off-screen render containing the brand header, list, detail metadata,
-filters, footer, and help surface. Explicit dark/light palettes, Unicode-safe
-truncation, and word wrapping are covered. This is functional state/render
-evidence, not a pixel-for-pixel comparison or a human validation across real
-terminal emulators.
+Eight Rust TUI tests exercise the state transitions and SQLite/file mutations.
+A user-supplied same-trace screenshot comparison exposed visual differences
+that text-only PTY checks could not detect: an inline rather than right-aligned
+trace count, uncolored tier glyphs, clipped titles without an ellipsis, flat
+type/tag metadata, missing label punctuation, and a fixed detail separator that
+scrolled with the metadata.
+
+The Rust renderer now follows the Go hierarchy: the trace count is pinned to
+the right edge; short/mid/long glyphs use the same warm-to-cool colors; titles
+truncate explicitly; type and individually wrapped tags use inverted `#`
+chips; metadata labels retain colons; and the full-width separator shows body
+scroll direction and position while metadata stays pinned. Fixed 120x28 dark
+and light buffer tests assert content placement and actual cell colors. An
+80x14 long-body test asserts pinned metadata and bottom-scroll state. A fresh
+same-terminal screenshot and multi-emulator review remain human qualification,
+not automated claims.
 
 A dependency-free PTY fixture now drives the actual Crossterm backend. It
 checks initial rendering, the external-editor leave-alternate/show-cursor/
 re-enter ordering, help, a real 24-to-32-row resize redraw, keyboard exit,
 canonical/echo mode restoration, alternate-screen exit, and visible-cursor
-restoration. Five consecutive focused runs passed, and the fixture is part of
-the complete differential target.
+restoration. Thirty consecutive focused runs passed during the earlier backend
+qualification, and the post-visual-parity fixture passes as part of the complete
+differential target.
 
 ## Backup and restore parity
 
@@ -604,18 +615,18 @@ The additional work further weakens the case for stopping immediately: Rust can
 interoperate with the Go federation wire protocol in both directions, express
 the critical signing/vector-clock rules cleanly, use materially less memory,
 remain competitive for smaller cortexes, and now sustain lower measured RSS and
-CPU during a short replicated workload. The real-model fixture also indicates
-that Rust's shorter consolidation prompt can preserve the tested information at
-about half the prompt-token cost. Watcher behavior now also matches the tested
-Go outcomes, as do deterministic semantic indexing/ranking, the advanced MCP
-contract, and the functional TUI state model. TLS certificate lifecycle checks
+CPU during a short replicated workload. Exact consolidation prompt/request
+parity and blinded real-model evaluation now establish bounded quality parity
+rather than a Rust prompt-cost advantage. Watcher behavior also matches the
+tested Go outcomes, as do deterministic semantic indexing/ranking, the advanced
+MCP contract, and the functional TUI state model. TLS certificate lifecycle checks
 now also match the deterministic Go oracle, while returned database failures
 and tested process death have stronger filesystem recovery in the Rust
 experiment. Cross-runtime backup restore now supplies an explicit recovery
 path from a known-good archive, and non-mutating status plus explicit
 resume/rollback reconciles interrupted restore transactions without exposing
 journal contents. It still does not justify an all-in rewrite because
-larger-result throughput is not better and pixel-level/multi-emulator human TUI
+larger-result throughput is not better and post-fix multi-emulator human TUI
 validation, broader distillation-quality evaluation, automatic startup restore
 recovery, power-loss fault injection, older-Go recovery, and corrupt-database
 salvage remain incomplete.

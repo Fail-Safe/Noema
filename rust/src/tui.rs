@@ -16,10 +16,10 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph, Row as TableRow, Table, Wrap},
+    widgets::{Block, Borders, Cell as TableCell, Clear, Paragraph, Row as TableRow, Table},
 };
 
 use crate::{
@@ -548,13 +548,24 @@ impl<'a> Model<'a> {
                 palette.success.add_modifier(Modifier::BOLD),
             ));
         }
-        spans.push(Span::styled(
-            format!("  {} traces", self.rows.len()),
-            palette.dim,
-        ));
+        let count = format!("{} traces", self.rows.len());
+        let count_width = count.chars().count().min(usize::from(area.width)) as u16;
+        let sections = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(count_width.saturating_add(1).min(area.width)),
+            ])
+            .split(area);
         frame.render_widget(
             Paragraph::new(Line::from(spans)).style(palette.surface),
-            area,
+            sections[0],
+        );
+        frame.render_widget(
+            Paragraph::new(count)
+                .style(palette.dim)
+                .alignment(Alignment::Right),
+            sections[1],
         );
     }
 
@@ -569,6 +580,7 @@ impl<'a> Model<'a> {
             return;
         }
         let height = area.height as usize;
+        let title_width = list_title_width(area.width);
         let start = if self.cursor >= height {
             self.cursor - height + 1
         } else {
@@ -591,24 +603,39 @@ impl<'a> Model<'a> {
                     " "
                 };
                 let date = row.created_at.get(..10).unwrap_or(&row.created_at);
+                let dimmed = self.focus == FocusPane::Detail;
                 let style = if index == self.cursor {
-                    palette.selected
+                    if dimmed {
+                        palette.selected_dim
+                    } else {
+                        palette.selected
+                    }
                 } else if self.new_row_ttl.get(&row.id).copied().unwrap_or_default() > 0 {
-                    if self.focus == FocusPane::Detail {
+                    if dimmed {
                         palette.new_dim
                     } else {
                         palette.new_row
                     }
-                } else if self.focus == FocusPane::Detail {
-                    palette.dim
+                } else if dimmed {
+                    palette.row_dim
                 } else {
                     palette.surface
                 };
+                let mut title = row.title.clone();
+                if !row.trashed_at.is_empty() || !row.archived_at.is_empty() {
+                    title.insert(0, '~');
+                }
                 TableRow::new(vec![
-                    format!("{cursor} {}", tier_badge(&row.tier)),
-                    row.title.clone(),
-                    format!("[{}]", row.trace_type),
-                    date.to_owned(),
+                    TableCell::from(Line::from(vec![
+                        Span::raw(format!("{cursor} ")),
+                        Span::styled(
+                            tier_badge(&row.tier),
+                            tier_style(&row.tier, dimmed, palette),
+                        ),
+                    ])),
+                    TableCell::from(truncate(&title, title_width)),
+                    TableCell::from(format!("[{}]", row.trace_type)),
+                    TableCell::from(date.to_owned()),
                 ])
                 .style(style)
             });
@@ -649,13 +676,12 @@ impl<'a> Model<'a> {
         } else {
             row.tier.as_str()
         };
-        let value_width = area.width.saturating_sub(14).max(4) as usize;
+        let value_width = area.width.saturating_sub(12).max(4) as usize;
         let tier_label = format!("{tier}  (votes: {})", signed_count(votes));
-        let tags = row.tags.join(", ");
         let mut lines = vec![
             metadata("id", &truncate(&row.id, value_width), palette),
             metadata("title", &truncate(&row.title, value_width), palette),
-            metadata("type", &truncate(&row.trace_type, value_width), palette),
+            metadata_chip("type", &row.trace_type, palette),
             metadata("tier", &truncate(&tier_label, value_width), palette),
         ];
         if !row.author.is_empty() {
@@ -666,7 +692,7 @@ impl<'a> Model<'a> {
             ));
         }
         if !row.tags.is_empty() {
-            lines.push(metadata("tags", &truncate(&tags, value_width), palette));
+            lines.extend(metadata_tag_chips(&row.tags, value_width, palette));
         }
         lines.push(metadata(
             "created",
@@ -677,23 +703,35 @@ impl<'a> Model<'a> {
                 .unwrap_or(&trace.frontmatter.created),
             palette,
         ));
-        lines.push(Line::from(Span::styled(
-            "  ─────────────────────────────",
-            palette.divider,
-        )));
         let body_width = area.width.saturating_sub(4).max(10) as usize;
+        let mut body_lines = Vec::new();
         for line in trace.body.lines() {
             for wrapped in wrap_line(line, body_width) {
-                lines.push(Line::from(format!("  {wrapped}")));
+                body_lines.push(Line::from(format!("  {wrapped}")));
             }
         }
-        let maximum = lines.len().saturating_sub(area.height as usize);
-        let scroll = self.detail_scroll.min(maximum).min(u16::MAX as usize) as u16;
+        let visible_body_height = usize::from(area.height).saturating_sub(lines.len() + 1);
+        let maximum = body_lines.len().saturating_sub(visible_body_height);
+        let scroll = self.detail_scroll.min(maximum);
+        lines.push(detail_separator(
+            area.width,
+            scroll,
+            visible_body_height,
+            body_lines.len(),
+            palette,
+        ));
+        if body_lines.is_empty() {
+            lines.push(Line::from(Span::styled("  (no body)", palette.dim)));
+        } else {
+            lines.extend(
+                body_lines
+                    .into_iter()
+                    .skip(scroll)
+                    .take(visible_body_height),
+            );
+        }
         frame.render_widget(
-            Paragraph::new(Text::from(lines))
-                .style(palette.surface)
-                .scroll((scroll, 0))
-                .wrap(Wrap { trim: false }),
+            Paragraph::new(Text::from(lines)).style(palette.surface),
             area,
         );
     }
@@ -777,8 +815,14 @@ struct Palette {
     dim: Style,
     divider: Style,
     selected: Style,
+    selected_dim: Style,
+    row_dim: Style,
     new_row: Style,
     new_dim: Style,
+    chip: Style,
+    tier_short: Style,
+    tier_mid: Style,
+    tier_long: Style,
     success: Style,
     error: Style,
 }
@@ -812,6 +856,12 @@ impl Palette {
                 .bg(selected_bg)
                 .fg(selected_fg)
                 .add_modifier(Modifier::BOLD),
+            selected_dim: Style::default().bg(background).fg(Color::Indexed(244)),
+            row_dim: Style::default().bg(background).fg(if light {
+                Color::Indexed(249)
+            } else {
+                Color::Indexed(238)
+            }),
             new_row: Style::default().bg(background).fg(if light {
                 Color::Indexed(22)
             } else {
@@ -822,6 +872,16 @@ impl Palette {
             } else {
                 Color::Indexed(65)
             }),
+            chip: Style::default().bg(foreground).fg(background),
+            tier_short: Style::default()
+                .fg(Color::Indexed(if light { 166 } else { 208 }))
+                .add_modifier(Modifier::BOLD),
+            tier_mid: Style::default()
+                .fg(Color::Indexed(if light { 136 } else { 221 }))
+                .add_modifier(Modifier::BOLD),
+            tier_long: Style::default()
+                .fg(Color::Indexed(if light { 25 } else { 39 }))
+                .add_modifier(Modifier::BOLD),
             success: Style::default().bg(background).fg(if light {
                 Color::Indexed(22)
             } else {
@@ -990,6 +1050,24 @@ fn tier_badge(tier: &str) -> &'static str {
     }
 }
 
+fn tier_style(tier: &str, dimmed: bool, palette: Palette) -> Style {
+    if dimmed {
+        return Style::default();
+    }
+    match tier {
+        "short" => palette.tier_short,
+        "mid" => palette.tier_mid,
+        "long" => palette.tier_long,
+        _ => Style::default(),
+    }
+}
+
+fn list_title_width(area_width: u16) -> usize {
+    // Right border, three inter-column spaces, and fixed cursor/tier,
+    // type, and date columns consume 32 cells.
+    usize::from(area_width.saturating_sub(32).max(4))
+}
+
 fn signed_count(value: i64) -> String {
     if value > 0 {
         format!("+{value}")
@@ -1032,9 +1110,88 @@ fn wrap_line(value: &str, width: usize) -> Vec<String> {
 
 fn metadata(label: &str, value: &str, palette: Palette) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("  {label:<10}"), palette.dim),
+        Span::styled(format!("  {:<10}", format!("{label}:")), palette.dim),
         Span::styled(value.to_owned(), palette.surface),
     ])
+}
+
+fn metadata_chip(label: &str, value: &str, palette: Palette) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {:<10}", format!("{label}:")), palette.dim),
+        Span::styled(format!(" #{value} "), palette.chip),
+    ])
+}
+
+fn metadata_tag_chips(tags: &[String], value_width: usize, palette: Palette) -> Vec<Line<'static>> {
+    let mut output = Vec::new();
+    let mut spans = Vec::new();
+    let mut width = 0;
+    let mut first = true;
+    for tag in tags {
+        let chip = format!(" #{tag} ");
+        let chip_width = chip.chars().count();
+        let gap = usize::from(!spans.is_empty());
+        if !spans.is_empty() && width + gap + chip_width > value_width {
+            let label = if first { "tags:" } else { "" };
+            let mut line = vec![Span::styled(format!("  {label:<10}"), palette.dim)];
+            line.append(&mut spans);
+            output.push(Line::from(line));
+            spans = Vec::new();
+            width = 0;
+            first = false;
+        }
+        if !spans.is_empty() {
+            spans.push(Span::styled(" ", palette.surface));
+            width += 1;
+        }
+        spans.push(Span::styled(chip, palette.chip));
+        width += chip_width;
+    }
+    if !spans.is_empty() {
+        let label = if first { "tags:" } else { "" };
+        let mut line = vec![Span::styled(format!("  {label:<10}"), palette.dim)];
+        line.append(&mut spans);
+        output.push(Line::from(line));
+    }
+    output
+}
+
+fn detail_separator(
+    area_width: u16,
+    scroll: usize,
+    visible: usize,
+    total: usize,
+    palette: Palette,
+) -> Line<'static> {
+    let rule_width = usize::from(area_width.saturating_sub(4).max(1));
+    if total <= visible {
+        return Line::from(Span::styled(
+            format!("  {}", "─".repeat(rule_width)),
+            palette.divider,
+        ));
+    }
+    let maximum = total.saturating_sub(visible);
+    let glyph = if scroll > 0 && scroll < maximum {
+        "▴▾"
+    } else if scroll > 0 {
+        "▴"
+    } else {
+        "▾"
+    };
+    let upper = (scroll + visible).min(total);
+    let indicator = format!("{glyph} {upper}/{total}");
+    if rule_width > indicator.chars().count() + 2 {
+        let dashes = rule_width - indicator.chars().count() - 1;
+        Line::from(vec![
+            Span::styled(format!("  {} ", "─".repeat(dashes)), palette.divider),
+            Span::styled(indicator, palette.dim),
+        ])
+    } else {
+        Line::from(Span::styled(
+            format!("  {}", "─".repeat(rule_width)),
+            palette.divider,
+        ))
+    }
 }
 
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
@@ -1207,6 +1364,134 @@ mod tests {
     }
 
     #[test]
+    fn renderer_matches_go_visual_hierarchy_at_fixed_size() {
+        let (_temp, cortex) = fixture();
+        let long_title = "A deliberately long title that must show truncation";
+        let mut trace = Trace::new(
+            long_title,
+            "observation",
+            "tester",
+            vec!["visual-contract".into(), "second-tag".into()],
+            "body",
+        );
+        cortex.add(&mut trace).unwrap();
+        let model = Model::new(&cortex, "dark").unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 28)).unwrap();
+        terminal.draw(|frame| model.render(frame)).unwrap();
+        let screen = buffer_text(terminal.backend());
+        let rows = screen.lines().collect::<Vec<_>>();
+
+        assert_eq!(rows[0].rfind("3 traces"), Some(112));
+        assert!(screen.contains("id:"));
+        assert!(screen.contains("type:"));
+        assert!(screen.contains("#observation"));
+        assert!(screen.contains("#visual-contract"));
+
+        let body = Rect::new(0, 1, 120, 26);
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(LIST_PERCENT),
+                Constraint::Percentage(100 - LIST_PERCENT),
+            ])
+            .split(body);
+        let expected_title = truncate(long_title, list_title_width(panes[0].width));
+        assert!(expected_title.ends_with('…'));
+        assert!(screen.contains(&expected_title));
+
+        let (chip_x, chip_y) = find_text(terminal.backend(), "#observation").unwrap();
+        let chip_cell = terminal.backend().buffer().cell((chip_x, chip_y)).unwrap();
+        assert_eq!(chip_cell.bg, Color::Rgb(236, 228, 212));
+        assert_eq!(chip_cell.fg, Color::Rgb(26, 26, 26));
+
+        let mut saw_short = false;
+        let mut saw_mid = false;
+        for y in 1..4 {
+            let cell = terminal.backend().buffer().cell((2, y)).unwrap();
+            match cell.symbol() {
+                "s" => {
+                    assert_eq!(cell.fg, Color::Indexed(208));
+                    saw_short = true;
+                }
+                "m" => {
+                    assert_eq!(cell.fg, Color::Indexed(221));
+                    saw_mid = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_short && saw_mid);
+
+        let separator = rows
+            .iter()
+            .find(|row| row.contains('─'))
+            .expect("detail separator");
+        assert_eq!(
+            separator
+                .chars()
+                .filter(|character| *character == '─')
+                .count(),
+            usize::from(panes[1].width.saturating_sub(4))
+        );
+
+        let light_model = Model::new(&cortex, "light").unwrap();
+        let mut light_terminal = Terminal::new(TestBackend::new(120, 28)).unwrap();
+        light_terminal
+            .draw(|frame| light_model.render(frame))
+            .unwrap();
+        let (chip_x, chip_y) = find_text(light_terminal.backend(), "#observation").unwrap();
+        let chip_cell = light_terminal
+            .backend()
+            .buffer()
+            .cell((chip_x, chip_y))
+            .unwrap();
+        assert_eq!(chip_cell.bg, Color::Rgb(26, 26, 26));
+        assert_eq!(chip_cell.fg, Color::Rgb(255, 255, 255));
+        let mut saw_short = false;
+        let mut saw_mid = false;
+        for y in 1..4 {
+            let cell = light_terminal.backend().buffer().cell((2, y)).unwrap();
+            match cell.symbol() {
+                "s" => {
+                    assert_eq!(cell.fg, Color::Indexed(166));
+                    saw_short = true;
+                }
+                "m" => {
+                    assert_eq!(cell.fg, Color::Indexed(136));
+                    saw_mid = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_short && saw_mid);
+    }
+
+    #[test]
+    fn detail_scroll_keeps_metadata_pinned_and_reports_position() {
+        let (_temp, cortex) = fixture();
+        let mut model = Model::new(&cortex, "dark").unwrap();
+        let id = model.selected_id().unwrap().to_owned();
+        let (_, mut trace) = cortex.get_trace(&id).unwrap();
+        trace.body = (0..20)
+            .map(|index| format!("line {index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        cortex.update_trace(&id, &mut trace, false).unwrap();
+        model.reload().unwrap();
+        model.focus = FocusPane::Detail;
+        model.detail_scroll = usize::MAX;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 14)).unwrap();
+        terminal.draw(|frame| model.render(frame)).unwrap();
+        let screen = buffer_text(terminal.backend());
+        assert!(screen.contains("id:"));
+        assert!(screen.contains("created:"));
+        assert!(screen.contains("▴ 20/20"));
+        assert!(screen.contains("line 19"));
+        assert!(!screen.contains("line 00"));
+    }
+
+    #[test]
     fn helpers_preserve_tier_vote_and_theme_contracts() {
         assert_eq!(tier_badge("short"), "s");
         assert_eq!(tier_badge("mid"), "m");
@@ -1231,5 +1516,18 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn find_text(backend: &TestBackend, needle: &str) -> Option<(u16, u16)> {
+        let width = backend.buffer().area().width;
+        for y in 0..backend.buffer().area().height {
+            let row = (0..width)
+                .map(|x| backend.buffer().cell((x, y)).unwrap().symbol())
+                .collect::<String>();
+            if let Some(x) = row.find(needle) {
+                return Some((x as u16, y));
+            }
+        }
+        None
     }
 }

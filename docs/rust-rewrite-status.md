@@ -78,7 +78,7 @@ The completion tree passed:
 
 - `make rust-test`
   - rustfmt and Clippy with warnings denied;
-  - 122 Rust unit tests;
+  - 124 Rust unit tests;
   - one killed-config-writer subprocess test;
   - five active mutation crash-recovery scenarios (plus one ignored child
     entry point);
@@ -107,6 +107,12 @@ The completion tree passed:
   Crossterm's macOS `mio` source. Selecting Crossterm's Unix polling backend
   removed the lost-input race; the strengthened scenario then passed 30
   consecutive runs and the complete comparison gate.
+- A same-trace Go/Rust screenshot comparison found remaining renderer-level
+  differences. Rust now right-aligns the trace count, applies the Go tier heat
+  colors and explicit title ellipsis, renders punctuated type/tag chips with
+  wrapping, and keeps metadata pinned above a full-width scroll-aware rule.
+  Fixed-size dark/light buffer tests assert cell placement and colors; the live
+  PTY and complete differential suite pass after the changes.
 
 The Go build can emit a sandbox-only warning when it cannot update the module
 download stat cache outside this workspace. It still exits successfully; do
@@ -157,8 +163,9 @@ These are not missing command or protocol ports:
    closed and preserves corrupt bytes; it does not attempt repair.
 3. Define takeover policy for older Go binaries. Only the Go build on this
    branch understands the pending-Rust-mutation interlock.
-4. Perform multi-emulator human TUI validation and any desired pixel-level
-   comparison.
+4. Capture the patched Rust TUI beside Go at an identical terminal size, then
+   perform multi-emulator human validation for any residual cell-width or color
+   differences.
 5. Extend the now-passing synthetic qualitative gate to a redacted
    representative corpus, additional models, and multiple reviewers.
 6. Before release replacement, choose packaging, binary naming, migration,
