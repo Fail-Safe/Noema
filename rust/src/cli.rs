@@ -632,7 +632,10 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
                 );
             }
         },
-        Command::Tui => crate::tui::run(cx)?,
+        Command::Tui => {
+            let theme = Config::load()?.theme().to_owned();
+            crate::tui::run(cx, &theme)?;
+        }
         Command::Federation { command } => federation_command(cx, command).await?,
         Command::Keygen { force } => keygen(cx, force)?,
         Command::Verify { command } => verify(cx, command)?,

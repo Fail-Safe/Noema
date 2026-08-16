@@ -1971,6 +1971,14 @@ impl Cortex {
         Ok(())
     }
 
+    pub fn tier_votes(&self, id: &str) -> Result<i64> {
+        Ok(self
+            .connection
+            .query_row("SELECT tier_votes FROM traces WHERE id=?1", [id], |row| {
+                row.get(0)
+            })?)
+    }
+
     pub fn history(&self, id: &str) -> Result<Vec<Event>> {
         let mut statement = self.connection.prepare(
             "SELECT id,action,trace_id,cortex_id,origin,timestamp,data,vclock,signature,pubkey FROM events WHERE trace_id=?1 ORDER BY id",

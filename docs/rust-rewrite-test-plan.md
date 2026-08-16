@@ -20,7 +20,7 @@ integrity, or security requirements.
 | Semantic search | Contract + integration | Mock embedding endpoint, codec, stale detection, backfill, cosine ranking, and hybrid RRF match | `semantic_search.py` covers request/auth/order/text limits, exact BLOBs, freshness, bounded/idempotent backfill, ranking, archive/source rules, corrupt vectors, MCP degradation, and automatic maintenance |
 | Consolidation | Deterministic + bounded real-model integration | Fake LLM covers election, gating, clustering, success/failure events, and idempotency; real model preserves planted synthetic facts and rejects unrelated buckets | Rank/election/watchdog/cadence, heuristic promotion, graduation, all three model profiles, CLI overrides/dry-run/JSON, distilled lineage/telemetry, malformed/offline fallback, restart idempotency, signed bidirectional replay, and seven-run synthetic real-model comparison automated |
 | Plugins | File integration | Embedded payload hashes, install/check/force rules, target resolution, and drift reporting match | `plugin_lifecycle.py` covers all six payloads, independent CLI dispatch, target guards, dry-run non-mutation, idempotency, drift hashes/refusal, forced atomic file/symlink replacement, unmanaged files, and temp cleanup |
-| TUI | State-machine + snapshot | Navigation, filters, tier actions, themes, resize, and error recovery match | Minimal smoke implementation only |
+| TUI | State-machine + snapshot | Navigation, filters, tier actions, themes, resize, and error recovery match | Six Rust suites cover navigation/focus/scroll, search/tier/help transitions, lifecycle and vote mutations, sticky live refresh/highlights, dark/light render snapshot, Unicode truncation, and wrapping; exact visual and live-terminal comparison remains |
 | Fault tolerance | Fault injection | Interrupted writes, malformed Markdown, corrupt DB, unavailable endpoints, and lock contention fail safely | Background-lock single-owner/reacquisition unit coverage; broader fault injection pending |
 | Security | Negative integration | Path traversal, source-lock bypass, forged signatures, bearer auth, TLS expiry, and secret redaction match | Signing/source-lock, bearer rejection, private-CA rejection, plaintext-auth refusal, and secret-redaction cases present; TLS expiry pending |
 
@@ -50,5 +50,6 @@ and otherwise permits unauthenticated HTTP only on loopback. Semantic backfill,
 ranking, MCP routing, and automatic maintenance now pass the deterministic Go
 oracle. MCP discovery, successful advanced-tool results, invalid inputs,
 missing resources, and federation-mode transport boundaries are automated.
-Certificate-expiry monitoring, full TUI behavior, and broader adversarial
-real-model quality evaluation still require ports and parity fixtures.
+Certificate-expiry monitoring, pixel-level/live-terminal TUI validation, and
+broader adversarial real-model quality evaluation still require ports and
+parity fixtures.

@@ -1,13 +1,13 @@
 # Rust rewrite handoff
 
-Updated: 2026-08-15
+Updated: 2026-08-16
 
 ## Pause point
 
 - Branch: `experiment/rust-rewrite`
-- Latest completed milestone: advanced MCP result/error and transport-mode
-  parity (this handoff commit).
-- Previous milestone: `6712b39 feat(rust): add plugin lifecycle parity`.
+- Latest completed milestone: functional TUI state/render parity (this handoff
+  commit).
+- Previous milestone: `29cd610 feat(rust): complete advanced MCP parity`.
 - Earlier MCP milestone: `0a6e721 feat(rust): tighten MCP contract parity`.
 - Earlier semantic milestone: `b73a089 feat(rust): add semantic search parity`.
 - Earlier watcher milestone: `c0f8c8a feat(rust): add watcher parity`.
@@ -42,6 +42,11 @@ Updated: 2026-08-15
 - HTTP serving enforces Go's federation-mode boundary: publish cortexes reject
   every remote mutation while retaining local stdio writes, and subscribe
   cortexes refuse event and usage-signal publication.
+- The Rust TUI now has the Go interaction model rather than a static quit-only
+  list: two-pane navigation and detail scrolling, search, short/mid/long and
+  archive/trash filters, help, confirmation, archive/trash/recover/purge,
+  session-scoped vote cycling, live/manual refresh, sticky selection, fading
+  new-row highlights, editor handoff, theme loading, and terminal restoration.
 - The Rust binary compile-time embeds the same three Hermes and three Obsidian
   runtime files as Go. Plugin list/status/install/check/force commands run
   without requiring a configured cortex and use the same target resolution.
@@ -147,9 +152,9 @@ Updated: 2026-08-15
 
 ## Latest validation
 
-The following passed for the advanced MCP milestone:
+The following passed for the combined advanced MCP and functional TUI tree:
 
-- `make rust-test` — formatting, clippy with warnings denied, and 66 Rust tests.
+- `make rust-test` — formatting, clippy with warnings denied, and 72 Rust tests.
 - `go test ./...`
 - `go test -race ./...`
 - `go vet ./...`
@@ -191,6 +196,14 @@ The following passed for the advanced MCP milestone:
     target resolution, status/check/install/idempotency, drift refusal,
     force-check, forced replacement, unmanaged-file preservation, symlink
     safety, and temporary-file cleanup.
+- Six focused TUI suites cover navigation/focus and detail scrolling,
+  search/tier/help transitions, vote and visibility lifecycle mutations,
+  sticky selection with fading live highlights, a 120x28 off-screen renderer,
+  explicit dark/light themes, Unicode truncation, and body wrapping.
+- An isolated managed-PTY launch restored the alternate screen safely but could
+  not complete because the harness does not answer the terminal cursor-position
+  query. Treat live-terminal behavior as unverified, not failed application
+  behavior.
 - The expanded model-driven scenario passed five consecutive repetitions. The
   mixed three-node ring and all earlier consolidation gates retained their full
   passing coverage.
@@ -267,7 +280,8 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
 
 ## Remaining replacement gaps
 
-1. Full TUI behavior.
+1. Pixel-level TUI parity and live human terminal validation across resize,
+   dark/light auto-detection, and external-editor workflows.
 2. Broader adversarial real-model quality evaluation beyond the current bounded
    synthetic corpus.
 3. Certificate expiry validation/monitoring, dynamic peer-worker addition without
@@ -276,9 +290,10 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
 
 ## Recommended next milestone
 
-Port Go's TLS certificate validity gate and add deterministic expired,
-not-yet-valid, near-expiry, and override coverage to the existing mixed-runtime
-TLS fixture. Keep certificate contents and private-key material out of output.
+With approval to add `x509-parser`, port Go's TLS certificate validity gate and
+add deterministic expired, not-yet-valid, near-expiry, and override coverage
+to the existing mixed-runtime TLS fixture. Keep certificate contents and
+private-key material out of output.
 
 Any new Rust packages still require explicit approval before adding them.
 

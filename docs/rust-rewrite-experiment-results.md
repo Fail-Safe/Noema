@@ -310,6 +310,24 @@ outside the plugin directory. Both builds refuse it without force and replace
 the symlink directory entry when forced, leaving the external file unchanged.
 The fixture also checks that no atomic-write temporary files remain.
 
+## Functional TUI parity
+
+The original Rust TUI was a static full-screen list with only quit handling.
+It now uses a testable state model for the same operational workflow as Go:
+list/detail focus, bounded detail scrolling, search, tier and visibility
+filters, help, confirmations, archive/trash/recover/purge, session-scoped vote
+cycling, manual/live refresh, sticky selection, and two-tick arrival
+highlights. New and existing traces can round-trip through the configured
+external editor while raw mode and the alternate screen are suspended, and a
+drop guard restores the terminal on every exit path.
+
+Six Rust suites exercise the state transitions and SQLite/file mutations plus
+a 120x28 off-screen render containing the brand header, list, detail metadata,
+filters, footer, and help surface. Explicit dark/light palettes, Unicode-safe
+truncation, and word wrapping are covered. This is functional state/render
+evidence, not a pixel-for-pixel comparison or a human validation across real
+terminal emulators and resize sequences.
+
 ## Bounded federation soak
 
 Equivalent homogeneous three-node clusters ran 80 paced create mutations over
@@ -345,8 +363,8 @@ remain competitive for smaller cortexes, and now sustain lower measured RSS and
 CPU during a short replicated workload. The real-model fixture also indicates
 that Rust's shorter consolidation prompt can preserve the tested information at
 about half the prompt-token cost. Watcher behavior now also matches the tested
-Go outcomes, as do deterministic semantic indexing/ranking and the
-advanced MCP contract. It still does not justify an all-in rewrite
-because larger-result throughput is not better and certificate-lifecycle
-checks, full TUI behavior, broader distillation-quality evaluation, and
-operator recovery behavior remain incomplete.
+Go outcomes, as do deterministic semantic indexing/ranking, the advanced MCP
+contract, and the functional TUI state model. It still does not justify an
+all-in rewrite because larger-result throughput is not better and certificate-lifecycle
+checks, pixel-level/live-terminal TUI validation, broader distillation-quality
+evaluation, and operator recovery behavior remain incomplete.
