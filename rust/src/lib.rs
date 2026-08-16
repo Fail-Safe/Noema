@@ -9,6 +9,7 @@ pub mod eventsig;
 pub mod federation;
 pub mod lock;
 pub mod mcp;
+pub mod migration;
 pub mod plugin;
 pub mod restore;
 pub mod tlsutil;

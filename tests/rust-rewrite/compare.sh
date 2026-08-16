@@ -162,6 +162,116 @@ rm "$cortex_parent/shared/traces/$orphan_id.md"
 assert_contains "$(rust_noema sync --recover)" "Recovered: 1  Orphaned: 0" "Rust sync recovers a Go event snapshot"
 assert_contains "$(go_noema get "$orphan_id")" "event snapshot recovery" "Go reads Rust-recovered snapshot"
 
+guided_output=$(printf '%s\n' \
+    'Guided Rust trace' \
+    'fact' \
+    'rust' \
+    'guided, interop' \
+    'body from guided input' |
+    rust_noema add)
+guided_id=$(printf '%s\n' "$guided_output" | sed -n 's/.*Trace added: //p')
+test -n "$guided_id"
+assert_contains "$(go_noema get "$guided_id")" "body from guided input" "Go reads Rust guided-add trace"
+
+backfill_id=$(go_noema add \
+    --title "Rust event backfill trace" \
+    --type fact \
+    --author go \
+    --tag backfill \
+    --body "backfill interoperability" | sed -n 's/^Trace added: //p')
+test -n "$backfill_id"
+sqlite3 "$cortex_parent/shared/db/noema.db" \
+    "DELETE FROM events WHERE action='create' AND trace_id='$backfill_id';"
+assert_contains "$(rust_noema events backfill --dry-run)" "$backfill_id" "Rust previews missing create events"
+rust_noema events backfill --yes >/dev/null
+assert_contains "$(go_noema events "$backfill_id")" "create" "Go reads Rust-backfilled create event"
+
+rust_noema memory stats --output json | jq -e '.tiers.Short >= 1 and .tiers.Purged == 0' >/dev/null
+rust_noema memory popular --output json | jq -e '.schema_version == 1 and (.traces | type) == "array"' >/dev/null
+rust_noema memory health --output json | jq -e '.schema_version == 1 and .activity and .latency and .one_source_mid' >/dev/null
+printf 'ok - Rust memory observability emits the Go-compatible JSON envelopes\n'
+
+purge_id=$(go_noema add \
+    --title "Rust ceremonial purge trace" \
+    --type fact \
+    --author go \
+    --tag purge \
+    --body "purge interoperability" | sed -n 's/^Trace added: //p')
+go_noema memory promote "$purge_id" >/dev/null
+go_noema memory promote "$purge_id" >/dev/null
+rust_noema memory purge "$purge_id" --tier long --reason interop --confirm >/dev/null
+test "$(sqlite3 "$cortex_parent/shared/db/noema.db" "SELECT purge_reason FROM traces WHERE id='$purge_id';")" = interop
+assert_contains "$(go_noema events "$purge_id")" "purge_long_term" "Go reads Rust long-term purge event"
+rust_noema memory purge "$purge_id" --tier long --reason erasure --confirm --hard >/dev/null
+test "$(sqlite3 "$cortex_parent/shared/db/noema.db" "SELECT count(*) FROM traces WHERE id='$purge_id';")" -eq 0
+printf 'ok - Rust ceremonial soft and hard purge stays readable by Go\n'
+
+force_id=$(go_noema add \
+    --title "Rust force remove trace" \
+    --type note \
+    --author go \
+    --tag remove \
+    --body "force remove interoperability" | sed -n 's/^Trace added: //p')
+rust_noema remove --force "$force_id" >/dev/null
+test "$(sqlite3 "$cortex_parent/shared/db/noema.db" "SELECT count(*) FROM traces WHERE id='$force_id';")" -eq 0
+printf 'ok - Rust remove --force performs Go-compatible hard deletion\n'
+
+collision_id=$(rust_noema add \
+    --title "Rust collision trace" \
+    --type note \
+    --author rust \
+    --tag collision \
+    --body "first collision body" | sed -n 's/^Trace added: //p')
+collision_output=$(printf '%s\n' v 'Rust collision alternate' | rust_noema add \
+    --title "Rust collision trace" \
+    --type note \
+    --author rust \
+    --tag collision \
+    --body "second collision body" 2>/dev/null)
+collision_alternate_id=$(printf '%s\n' "$collision_output" | sed -n 's/.*Trace added: //p')
+test -n "$collision_id"
+test -n "$collision_alternate_id"
+test "$collision_id" != "$collision_alternate_id"
+assert_contains "$(go_noema get "$collision_alternate_id")" "second collision body" "Rust collision workflow preserves new content"
+
+env HOME="$comparison_home" "$go_bin" init --name migration --path "$cortex_parent" >/dev/null
+migration_id=$(env HOME="$comparison_home" "$go_bin" --cortex migration add \
+    --title "Migration interoperability trace" \
+    --type fact \
+    --author go \
+    --tag migration \
+    --body "identity migration body" | sed -n 's/^Trace added: //p')
+test -n "$migration_id"
+migration_manifest="$cortex_parent/migration/cortex.md"
+sed -e 's/^id: .*/id: ""/' -e 's/^version: 2$/version: 1/' \
+    "$migration_manifest" >"$migration_manifest.tmp"
+mv "$migration_manifest.tmp" "$migration_manifest"
+sqlite3 "$cortex_parent/migration/db/noema.db" \
+    "UPDATE traces SET cortex_id=''; UPDATE events SET cortex_id=''; INSERT INTO federation_state(key,value) VALUES ('vclock','{\"migration\":1}') ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
+migration_output=$(env HOME="$comparison_home" "$rust_bin" --cortex migration migrate cortex-id --yes)
+assert_contains "$migration_output" "Migration complete." "Rust migrates a Go-created v1 cortex"
+assert_contains "$(env HOME="$comparison_home" "$go_bin" --cortex migration get "$migration_id")" \
+    "identity migration body" "Go opens the Rust-migrated cortex"
+migrated_manifest_id=$(sed -n 's/^id: //p' "$migration_manifest")
+migrated_row_id=$(sqlite3 "$cortex_parent/migration/db/noema.db" \
+    "SELECT cortex_id FROM traces WHERE id='$migration_id';")
+if [ -f "$comparison_home/Library/Application Support/noema/config.yaml" ]; then
+    migration_config="$comparison_home/Library/Application Support/noema/config.yaml"
+else
+    migration_config="$comparison_home/.config/noema/config.yaml"
+fi
+migrated_config_id=$(awk '
+    $0 == "  migration:" { in_migration = 1; next }
+    in_migration && /^    id: / { sub(/^    id: /, ""); print; exit }
+    in_migration && /^  [^ ]/ { in_migration = 0 }
+' "$migration_config")
+test -n "$migrated_manifest_id"
+test "$migrated_manifest_id" = "$migrated_row_id"
+test "$migrated_manifest_id" = "$migrated_config_id"
+test "$(find "$cortex_parent/migration" -maxdepth 1 -name 'cortex.md.*.bak' -type f | wc -l | tr -d ' ')" -eq 1
+test "$(find "$cortex_parent/migration/db" -maxdepth 1 -name 'noema.db.*.bak' -type f | wc -l | tr -d ' ')" -eq 1
+printf 'ok - migration identity, rows, config, and backups stay coherent\n'
+
 database="$cortex_parent/shared/db/noema.db"
 integrity=$(sqlite3 "$database" 'PRAGMA integrity_check;')
 test "$integrity" = "ok"
@@ -169,7 +279,7 @@ printf 'ok - SQLite integrity check\n'
 
 trace_count=$(sqlite3 "$database" 'SELECT count(*) FROM traces;')
 event_count=$(sqlite3 "$database" 'SELECT count(*) FROM events;')
-test "$trace_count" -eq 3
+test "$trace_count" -eq 7
 test "$event_count" -ge 10
 printf 'ok - shared schema contains %s traces and %s mutation events\n' "$trace_count" "$event_count"
 

@@ -18,11 +18,12 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6.6", features = ["derive", "env", "string"] }
 clap_complete = "4.6"
-crossterm = "0.29"
+crossterm = { version = "0.29", features = ["use-dev-tty"] }
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
 flate2 = "1.1.9"
 fs2 = "0.4"
 include_dir = "0.7"
+libc = "0.2"
 notify = "8.2"
 rand = "0.9"
 ratatui = "0.30.2"

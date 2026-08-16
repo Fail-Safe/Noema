@@ -144,12 +144,21 @@ def exercise(binary: Path, root: Path) -> None:
         wait_until(
             "32-row resize redraw", lambda: b"\x1b[32;1H" in output[before_resize:]
         )
+        quit_offset = len(output)
         os.write(master, b"q")
         deadline = time.monotonic() + 10
         while process.poll() is None and time.monotonic() < deadline:
             pump()
         if process.poll() is None:
-            raise RuntimeError("TUI did not exit after q")
+            terminal_flags = termios.tcgetattr(slave)[3]
+            raise RuntimeError(
+                "TUI did not exit after q; "
+                f"cursor_queries={output.count(CURSOR_QUERY)}, "
+                f"answered_queries={answered_queries}, "
+                f"canonical={bool(terminal_flags & termios.ICANON)}, "
+                f"echo={bool(terminal_flags & termios.ECHO)}, "
+                f"terminal_tail={bytes(output[-2000:])!r}"
+            )
         while select.select([master], [], [], 0)[0]:
             pump()
     finally:
@@ -174,7 +183,7 @@ def exercise(binary: Path, root: Path) -> None:
         ("alternate-screen exit", LEAVE_ALTERNATE),
         ("cursor restore", SHOW_CURSOR),
     ]:
-        if sequence not in output:
+        if sequence not in output[quit_offset:]:
             raise RuntimeError(f"TUI output omitted {label}")
 
 

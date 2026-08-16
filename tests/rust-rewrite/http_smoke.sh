@@ -57,4 +57,43 @@ probe() {
 
 probe Go "$go_bin" "$base_port"
 probe Rust "$rust_bin" "$((base_port + 1))"
+
+probe_rust_listener_set() {
+    label=$1
+    port=$2
+    shift 2
+    log="$test_root/$label.log"
+    env HOME="$test_home" "$rust_bin" --cortex shared serve \
+        --transport http --port "$port" "$@" >"$log" 2>&1 &
+    server_pid=$!
+
+    for endpoint in "http://127.0.0.1:$port/mcp" "http://[::1]:$port/mcp"; do
+        attempts=0
+        while ! curl --noproxy '*' -g -fsS -X POST "$endpoint" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"http-listener-smoke","version":"1"}}}' \
+            2>/dev/null \
+            | sed -n 's/^data: //p' \
+            | jq -e '.result.protocolVersion == "2025-03-26"' >/dev/null 2>&1; do
+            attempts=$((attempts + 1))
+            if [ "$attempts" -ge 100 ]; then
+                echo "FAIL: $label listener $endpoint did not become ready" >&2
+                sed -n '1,120p' "$log" >&2
+                exit 1
+            fi
+            sleep 0.1
+        done
+    done
+
+    kill "$server_pid"
+    wait "$server_pid" 2>/dev/null || true
+    server_pid=
+    printf 'ok - Rust %s listeners accept IPv4 and IPv6 initialize\n' "$label"
+}
+
+probe_rust_listener_set static-multi "$((base_port + 2))" \
+    --host 127.0.0.1 --host ::1
+probe_rust_listener_set static-dynamic "$((base_port + 3))" \
+    --host 127.0.0.1 --host-dynamic ::1
 printf '\nPASS: Go/Rust HTTP transport smoke suite\n'

@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt,
     fs::{self, File, OpenOptions},
+    io::Write,
     path::{Component, Path, PathBuf},
 };
 
@@ -416,6 +418,47 @@ pub struct Row {
     pub source_hash: String,
 }
 
+#[derive(Debug)]
+pub struct TraceIdExists {
+    pub id: String,
+    pub state: String,
+}
+
+impl fmt::Display for TraceIdExists {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            formatter,
+            "trace id {:?} already exists (currently {}).",
+            self.id, self.state
+        )?;
+        writeln!(formatter, "fix one of:")?;
+        writeln!(
+            formatter,
+            "  - vary the title (different slug -> different id)"
+        )?;
+        match self.state.as_str() {
+            "trashed" => write!(
+                formatter,
+                "  - noema recover {}\n  - noema memory purge {}",
+                self.id, self.id
+            ),
+            "archived" => write!(
+                formatter,
+                "  - noema unarchive {}\n  - noema memory purge {}",
+                self.id, self.id
+            ),
+            "purged" => write!(
+                formatter,
+                "  - noema memory purge --hard {} (only this frees the slot)",
+                self.id
+            ),
+            _ => write!(formatter, "  - read it first: noema get {}", self.id),
+        }
+    }
+}
+
+impl std::error::Error for TraceIdExists {}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct PromotionCandidate {
     pub id: String,
@@ -513,6 +556,38 @@ pub struct TagSummary {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct TierStats {
+    pub short: i64,
+    pub mid: i64,
+    pub long: i64,
+    pub purged: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct EngagementStats {
+    pub total_reads: i64,
+    pub total_search_hits: i64,
+    pub total_modifies: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MidLineageBreakdown {
+    pub no_sources: i64,
+    pub single_source: i64,
+    pub multi_source: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MidEngagementSnapshot {
+    pub zero_engagement: i64,
+    pub zero_engagement_older: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ConsolidationDay {
     pub date: String,
     pub success: i64,
@@ -568,6 +643,12 @@ pub struct SyncResult {
     pub orphaned: usize,
     pub drifted: usize,
     pub drifted_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventBackfillResult {
+    pub backfilled_ids: Vec<String>,
+    pub skipped_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1544,8 +1625,15 @@ impl Cortex {
             trace.frontmatter.tier = "short".into();
         }
         trace.frontmatter.content_hash = trace::content_hash(&trace.body);
-        if self.get(&trace.frontmatter.id).is_ok() {
-            bail!("trace ID {:?} already exists", trace.frontmatter.id);
+        if let Some((content_hash, state)) = self.trace_id_collision(&trace.frontmatter.id)? {
+            if content_hash == trace.frontmatter.content_hash {
+                return Ok(());
+            }
+            return Err(TraceIdExists {
+                id: trace.frontmatter.id.clone(),
+                state,
+            }
+            .into());
         }
         let path = self.trace_file(&trace.frontmatter.id, false);
         trace.frontmatter.updated = trace::now_rfc3339();
@@ -1557,6 +1645,29 @@ impl Cortex {
         self.create_trace_transactionally(&path, trace, |pending_key| {
             self.insert_trace_with_pending(trace, true, Some(pending_key))
         })
+    }
+
+    fn trace_id_collision(&self, id: &str) -> Result<Option<(String, String)>> {
+        let existing: Option<(String, String, String, String)> = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(content_hash,''),COALESCE(archived_at,''),COALESCE(trashed_at,''),COALESCE(purged_at,'') FROM traces WHERE id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        Ok(existing.map(|(hash, archived, trashed, purged)| {
+            let state = if !purged.is_empty() {
+                "purged"
+            } else if !trashed.is_empty() {
+                "trashed"
+            } else if !archived.is_empty() {
+                "archived"
+            } else {
+                "active"
+            };
+            (hash, state.into())
+        }))
     }
 
     fn insert_trace_with_pending(
@@ -1681,6 +1792,84 @@ impl Cortex {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn tier_stats(&self) -> Result<TierStats> {
+        let mut stats = TierStats::default();
+        let mut statement = self.connection.prepare(
+            "SELECT tier,COUNT(*) FROM traces
+             WHERE archived_at IS NULL AND trashed_at IS NULL AND purged_at IS NULL
+             GROUP BY tier",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (tier, count) = row?;
+            match tier.as_str() {
+                "short" => stats.short = count,
+                "mid" => stats.mid = count,
+                "long" => stats.long = count,
+                _ => {}
+            }
+        }
+        stats.purged = self.connection.query_row(
+            "SELECT COUNT(*) FROM traces WHERE purged_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(stats)
+    }
+
+    pub fn engagement_stats(&self) -> Result<EngagementStats> {
+        Ok(self.connection.query_row(
+            "SELECT COALESCE(SUM(u.read_count),0),COALESCE(SUM(u.search_hit_count),0),COALESCE(SUM(u.modify_count),0)
+             FROM trace_usage u JOIN traces t ON t.id=u.trace_id
+             WHERE t.archived_at IS NULL AND t.trashed_at IS NULL AND t.purged_at IS NULL",
+            [],
+            |row| Ok(EngagementStats {
+                total_reads: row.get(0)?,
+                total_search_hits: row.get(1)?,
+                total_modifies: row.get(2)?,
+            }),
+        )?)
+    }
+
+    pub fn mid_lineage_breakdown(&self) -> Result<MidLineageBreakdown> {
+        Ok(self.connection.query_row(
+            "SELECT
+               COALESCE(SUM(CASE WHEN COALESCE(l.n,0)=0 THEN 1 ELSE 0 END),0),
+               COALESCE(SUM(CASE WHEN COALESCE(l.n,0)=1 THEN 1 ELSE 0 END),0),
+               COALESCE(SUM(CASE WHEN COALESCE(l.n,0)>=2 THEN 1 ELSE 0 END),0)
+             FROM traces t
+             LEFT JOIN (SELECT trace_id,COUNT(*) n FROM trace_lineage GROUP BY trace_id) l ON l.trace_id=t.id
+             WHERE t.tier='mid' AND t.archived_at IS NULL AND t.trashed_at IS NULL AND t.purged_at IS NULL",
+            [],
+            |row| Ok(MidLineageBreakdown {
+                no_sources: row.get(0)?,
+                single_source: row.get(1)?,
+                multi_source: row.get(2)?,
+            }),
+        )?)
+    }
+
+    pub fn mid_engagement_snapshot(&self, older_than: Duration) -> Result<MidEngagementSnapshot> {
+        let cutoff = (Utc::now() - older_than).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        Ok(self.connection.query_row(
+            "SELECT COUNT(*),COALESCE(SUM(CASE WHEN t.created_at<=?1 THEN 1 ELSE 0 END),0)
+             FROM traces t
+             LEFT JOIN (
+               SELECT trace_id,SUM(read_count) reads,SUM(search_hit_count) hits,SUM(modify_count) mods
+               FROM trace_usage GROUP BY trace_id
+             ) u ON u.trace_id=t.id
+             WHERE t.tier='mid' AND t.archived_at IS NULL AND t.trashed_at IS NULL AND t.purged_at IS NULL
+               AND COALESCE(u.reads,0)=0 AND COALESCE(u.hits,0)=0 AND COALESCE(u.mods,0)=0",
+            [cutoff],
+            |row| Ok(MidEngagementSnapshot {
+                zero_engagement: row.get(0)?,
+                zero_engagement_older: row.get(1)?,
+            }),
+        )?)
     }
 
     pub fn consolidation_activity(&self, since: Duration) -> Result<ConsolidationActivity> {
@@ -2773,19 +2962,128 @@ impl Cortex {
         })
     }
 
+    pub fn admin_purge(
+        &self,
+        id: &str,
+        reason: &str,
+        expected_tier: &str,
+        hard: bool,
+    ) -> Result<()> {
+        let row = self.get(id)?;
+        if row.tier != expected_tier {
+            bail!(
+                "tier mismatch: trace is {:?}, caller asserted {:?}",
+                row.tier,
+                expected_tier
+            );
+        }
+        if reason.is_empty() {
+            bail!("purge requires a reason (audit trail needs it)");
+        }
+        let path = self.file_path(&row);
+        let now = trace::now_rfc3339();
+        let action = if hard {
+            "purge_hard"
+        } else if row.tier == "long" {
+            "purge_long_term"
+        } else {
+            "purge"
+        };
+        let mut event_data = serde_json::Map::new();
+        event_data.insert("reason".into(), json!(reason));
+        event_data.insert("tier".into(), json!(&row.tier));
+        if !row.content_hash.is_empty() {
+            event_data.insert("content_hash".into(), json!(&row.content_hash));
+        }
+        event_data.insert("actor".into(), json!("human"));
+        if hard {
+            event_data.insert("hard".into(), json!(true));
+        }
+        self.delete_trace_transactionally(&path, |pending_key| {
+            let tx = self.connection.unchecked_transaction()?;
+            let update_trigger: Option<String> = if row.tier == "long" {
+                tx.query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_long_term_immutable'",
+                    [],
+                    |result| result.get(0),
+                )
+                .optional()?
+            } else {
+                None
+            };
+            let delete_trigger: Option<String> = if row.tier == "long" && hard {
+                tx.query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_long_term_no_delete'",
+                    [],
+                    |result| result.get(0),
+                )
+                .optional()?
+            } else {
+                None
+            };
+            if row.tier == "long" {
+                tx.execute("DROP TRIGGER IF EXISTS trg_long_term_immutable", [])?;
+                if hard {
+                    tx.execute("DROP TRIGGER IF EXISTS trg_long_term_no_delete", [])?;
+                }
+            }
+            if hard {
+                tx.execute("DELETE FROM trace_lineage WHERE trace_id=?1", [id])?;
+                tx.execute("DELETE FROM trace_lineage WHERE derived_from=?1", [id])?;
+                tx.execute("DELETE FROM trace_tags WHERE trace_id=?1", [id])?;
+                tx.execute("DELETE FROM traces_fts WHERE id=?1", [id])?;
+                tx.execute("DELETE FROM traces WHERE id=?1", [id])?;
+            } else {
+                tx.execute(
+                    "UPDATE traces SET purged_at=?1,purge_reason=?2,updated_at=?1 WHERE id=?3",
+                    params![now, reason, id],
+                )?;
+                tx.execute("DELETE FROM trace_tags WHERE trace_id=?1", [id])?;
+                tx.execute("DELETE FROM traces_fts WHERE id=?1", [id])?;
+                tx.execute(
+                    "INSERT INTO traces_fts(id,title,body) VALUES (?1,?2,?3)",
+                    params![id, row.title, format!("[purged: {reason}]")],
+                )?;
+            }
+            if let Some(trigger) = update_trigger {
+                tx.execute_batch(&trigger)?;
+            }
+            if let Some(trigger) = delete_trigger {
+                tx.execute_batch(&trigger)?;
+            }
+            self.emit_event(
+                &tx,
+                action,
+                id,
+                &now,
+                serde_json::Value::Object(event_data),
+            )?;
+            if let Some(pending_key) = pending_key {
+                Self::clear_pending_in_transaction(&tx, pending_key)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     pub fn purge_expired(&mut self, days: u32) -> Result<usize> {
+        let days = if days == 0 { 30 } else { days };
         let cutoff = (Utc::now() - Duration::days(days.into())).to_rfc3339();
         let ids: Vec<String> = {
-            let mut statement = self.connection.prepare("SELECT id FROM traces WHERE trashed_at IS NOT NULL AND trashed_at < ?1 AND tier != 'long'")?;
+            let mut statement = self.connection.prepare(
+                "SELECT id FROM traces WHERE trashed_at IS NOT NULL AND trashed_at < ?1",
+            )?;
             statement
                 .query_map([cutoff], |row| row.get(0))?
                 .collect::<rusqlite::Result<_>>()?
         };
+        let now = trace::now_rfc3339();
         for id in &ids {
             let path = self.trash_dir().join(format!("{id}.md"));
             self.delete_trace_transactionally(&path, |pending_key| {
                 let tx = self.connection.unchecked_transaction()?;
                 tx.execute("DELETE FROM traces WHERE id=?1", [id])?;
+                self.emit_event(&tx, "purge", id, &now, json!({}))?;
                 if let Some(pending_key) = pending_key {
                     Self::clear_pending_in_transaction(&tx, pending_key)?;
                 }
@@ -2974,8 +3272,38 @@ impl Cortex {
         Ok(events)
     }
 
+    pub fn backfill_create_events(&self, dry_run: bool) -> Result<EventBackfillResult> {
+        let candidates: Vec<(String, bool, bool)> = {
+            let mut statement = self.connection.prepare(
+                "SELECT id,archived_at IS NOT NULL,trashed_at IS NOT NULL FROM traces
+                 WHERE id NOT IN (SELECT trace_id FROM events WHERE action='create')
+                 ORDER BY created_at,id",
+            )?;
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut result = EventBackfillResult::default();
+        for (id, archived, trashed) in candidates {
+            if archived || trashed {
+                result.skipped_ids.push(id);
+                continue;
+            }
+            if !dry_run {
+                let trace = Trace::parse_file(&self.trace_file(&id, false))?;
+                let now = trace::now_rfc3339();
+                let tx = self.connection.unchecked_transaction()?;
+                self.emit_event(&tx, "create", &id, &now, trace_snapshot(&trace))?;
+                tx.commit()?;
+            }
+            result.backfilled_ids.push(id);
+        }
+        Ok(result)
+    }
+
     pub fn replay_event(&self, event: &Event) -> Result<()> {
         self.verify_replay_event(event)?;
+        self.check_replay_source_lock(event)?;
         let exists: bool = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM events WHERE id=?1)",
             [&event.id],
@@ -2991,6 +3319,9 @@ impl Cortex {
             return self.store_remote_event(event);
         }
         if !trace::is_valid_id(&event.trace_id) {
+            if event.action == "purge" {
+                return self.replay_purge_db_only(event);
+            }
             bail!(
                 "rejecting remote event with invalid trace ID {:?}",
                 event.trace_id
@@ -3009,20 +3340,26 @@ impl Cortex {
             "archive" | "unarchive" | "trash" | "recover" => self.replay_visibility(event),
             "promote" | "demote" => self.replay_tier_change(event),
             "consolidate" => self.replay_consolidate(event),
+            "consolidate_fallback" | "divergence_long_term" => self.store_remote_event(event),
             "vote" => self.replay_vote(event),
             "purge" => self.replay_purge(event),
-            action => bail!("federation experiment does not replay action {action:?}"),
+            "purge_long_term" => self.replay_purge_long_term(event),
+            "purge_hard" => self.replay_purge_hard(event),
+            action => bail!("unknown event action {action:?}"),
         }
     }
 
-    fn verify_replay_event(&self, event: &Event) -> Result<()> {
-        let mode = self
-            .manifest
+    fn federation_verify_mode(&self) -> &str {
+        self.manifest
             .federation
             .as_ref()
             .map(|config| config.verify.as_str())
             .filter(|mode| !mode.is_empty())
-            .unwrap_or("off");
+            .unwrap_or("off")
+    }
+
+    fn verify_replay_event(&self, event: &Event) -> Result<()> {
+        let mode = self.federation_verify_mode();
         if mode == "off" {
             return Ok(());
         }
@@ -3081,6 +3418,45 @@ impl Cortex {
                 params![key_name, event.pubkey],
             )?;
         }
+        Ok(())
+    }
+
+    fn check_replay_source_lock(&self, event: &Event) -> Result<()> {
+        let mode = self.federation_verify_mode();
+        if mode == "off"
+            || !matches!(
+                event.action.as_str(),
+                "update" | "tag_update" | "trash" | "purge"
+            )
+        {
+            return Ok(());
+        }
+        let owner: Option<(i64, String)> = self
+            .connection
+            .query_row(
+                "SELECT source_locked,cortex_id FROM traces WHERE id=?1",
+                [&event.trace_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((source_locked, owner)) = owner else {
+            return Ok(());
+        };
+        if source_locked == 0 || owner == event.cortex_id {
+            return Ok(());
+        }
+        let problem = anyhow::anyhow!(
+            "event {} ({}) targets source-locked trace {} owned by cortex {} but originates from cortex {}",
+            event.id,
+            event.action,
+            event.trace_id,
+            owner,
+            event.cortex_id
+        );
+        if mode == "enforce" {
+            return Err(problem).context("rejecting source-lock violation");
+        }
+        eprintln!("federation source-lock warning: {problem:#} — accepted (verify=warn)");
         Ok(())
     }
 
@@ -3285,6 +3661,114 @@ impl Cortex {
             tx.commit()?;
             Ok(())
         })
+    }
+
+    fn replay_purge_db_only(&self, event: &Event) -> Result<()> {
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute("DELETE FROM traces WHERE id=?1", [&event.trace_id])?;
+        self.store_remote_event_tx(&tx, event)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn replay_purge_long_term(&self, event: &Event) -> Result<()> {
+        if self.get(&event.trace_id).is_err() {
+            return self.store_remote_event(event);
+        }
+        let reason = event
+            .data
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .filter(|reason| !reason.is_empty())
+            .unwrap_or("remote purge");
+        let tx = self.connection.unchecked_transaction()?;
+        let trigger: Option<String> = tx
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_long_term_immutable'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        tx.execute("DROP TRIGGER IF EXISTS trg_long_term_immutable", [])?;
+        tx.execute(
+            "UPDATE traces SET purged_at=?1,purge_reason=?2,updated_at=?1 WHERE id=?3",
+            params![event.timestamp, reason, event.trace_id],
+        )?;
+        tx.execute(
+            "DELETE FROM trace_tags WHERE trace_id=?1",
+            [&event.trace_id],
+        )?;
+        tx.execute("DELETE FROM traces_fts WHERE id=?1", [&event.trace_id])?;
+        tx.execute(
+            "INSERT INTO traces_fts(id,title,body) VALUES (?1,'',?2)",
+            params![event.trace_id, format!("[purged: {reason}]")],
+        )?;
+        if let Some(trigger) = trigger {
+            tx.execute_batch(&trigger)?;
+        }
+        self.store_remote_event_tx(&tx, event)?;
+        tx.commit()?;
+        self.remove_trace_files_best_effort(&event.trace_id);
+        Ok(())
+    }
+
+    fn replay_purge_hard(&self, event: &Event) -> Result<()> {
+        if self.get(&event.trace_id).is_err() {
+            return self.store_remote_event(event);
+        }
+        let tx = self.connection.unchecked_transaction()?;
+        let update_trigger: Option<String> = tx
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_long_term_immutable'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let delete_trigger: Option<String> = tx
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_long_term_no_delete'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        tx.execute("DROP TRIGGER IF EXISTS trg_long_term_immutable", [])?;
+        tx.execute("DROP TRIGGER IF EXISTS trg_long_term_no_delete", [])?;
+        tx.execute(
+            "DELETE FROM trace_lineage WHERE trace_id=?1",
+            [&event.trace_id],
+        )?;
+        tx.execute(
+            "DELETE FROM trace_lineage WHERE derived_from=?1",
+            [&event.trace_id],
+        )?;
+        tx.execute(
+            "DELETE FROM trace_tags WHERE trace_id=?1",
+            [&event.trace_id],
+        )?;
+        tx.execute("DELETE FROM traces_fts WHERE id=?1", [&event.trace_id])?;
+        tx.execute("DELETE FROM traces WHERE id=?1", [&event.trace_id])?;
+        if let Some(trigger) = update_trigger {
+            tx.execute_batch(&trigger)?;
+        }
+        if let Some(trigger) = delete_trigger {
+            tx.execute_batch(&trigger)?;
+        }
+        self.store_remote_event_tx(&tx, event)?;
+        tx.commit()?;
+        self.remove_trace_files_best_effort(&event.trace_id);
+        Ok(())
+    }
+
+    fn remove_trace_files_best_effort(&self, id: &str) {
+        for path in [
+            self.trace_file(id, false),
+            self.trace_file(id, true),
+            self.trash_dir().join(format!("{id}.md")),
+        ] {
+            if path.exists() {
+                let _ = remove_file_durable(&path);
+            }
+        }
     }
 
     fn materialize_remote_snapshot(&self, event: &Event, existing: Option<Row>) -> Result<()> {
@@ -4148,7 +4632,32 @@ pub fn write_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
     } else {
         format!("\n{body}\n")
     };
-    fs::write(dir.join("cortex.md"), format!("---\n{yaml}---\n{suffix}"))?;
+    let path = dir.join("cortex.md");
+    if path.exists() {
+        drop(OpenOptions::new().write(true).open(&path)?);
+    }
+    let temporary = dir.join(format!(".noema-manifest-{}.tmp", ulid::Ulid::new()));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o640))?;
+        }
+        file.write_all(format!("---\n{yaml}---\n{suffix}").as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, &path)?;
+        trace::sync_directory(dir)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result?;
     Ok(())
 }
 
@@ -5304,6 +5813,189 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|event| event.id == purge.id)
+        );
+    }
+
+    #[test]
+    fn admin_purge_enforces_tier_and_preserves_auditable_long_term_semantics() {
+        let (_temp, cx) = cortex();
+        let mut trace = Trace::new("Ceremonial purge", "fact", "", vec!["keep".into()], "body");
+        trace.frontmatter.tier = "long".into();
+        cx.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        let path = cx.trace_file(&id, false);
+
+        let mismatch = cx
+            .admin_purge(&id, "retention request", "mid", false)
+            .unwrap_err();
+        assert!(mismatch.to_string().contains("tier mismatch"));
+        assert!(path.exists());
+
+        cx.admin_purge(&id, "retention request", "long", false)
+            .unwrap();
+        let (purged_at, reason): (String, String) = cx
+            .connection
+            .query_row(
+                "SELECT purged_at,purge_reason FROM traces WHERE id=?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(!purged_at.is_empty());
+        assert_eq!(reason, "retention request");
+        assert!(!path.exists());
+        assert_eq!(
+            cx.history(&id).unwrap().last().unwrap().action,
+            "purge_long_term"
+        );
+        assert!(
+            cx.connection
+                .execute("UPDATE traces SET title='forbidden' WHERE id=?1", [&id])
+                .is_err()
+        );
+
+        cx.admin_purge(&id, "erase tombstone", "long", true)
+            .unwrap();
+        assert!(cx.get(&id).is_err());
+        assert_eq!(
+            cx.history(&id).unwrap().last().unwrap().action,
+            "purge_hard"
+        );
+    }
+
+    #[test]
+    fn event_backfill_previews_skips_and_commits_idempotently() {
+        let (_temp, cx) = cortex();
+        let mut active = Trace::new("Backfill active", "fact", "", vec![], "body");
+        let mut archived = Trace::new("Backfill archived", "fact", "", vec![], "body");
+        cx.add(&mut active).unwrap();
+        cx.add(&mut archived).unwrap();
+        cx.archive(&archived.frontmatter.id).unwrap();
+        cx.connection.execute("DELETE FROM events", []).unwrap();
+
+        let preview = cx.backfill_create_events(true).unwrap();
+        assert_eq!(preview.backfilled_ids, vec![active.frontmatter.id.clone()]);
+        assert_eq!(preview.skipped_ids, vec![archived.frontmatter.id.clone()]);
+        assert!(cx.history(&active.frontmatter.id).unwrap().is_empty());
+
+        let committed = cx.backfill_create_events(false).unwrap();
+        assert_eq!(committed, preview);
+        assert_eq!(
+            cx.history(&active.frontmatter.id).unwrap()[0].action,
+            "create"
+        );
+        let second = cx.backfill_create_events(false).unwrap();
+        assert!(second.backfilled_ids.is_empty());
+        assert_eq!(second.skipped_ids, vec![archived.frontmatter.id.clone()]);
+    }
+
+    #[test]
+    fn expiry_purge_emits_replayable_event_and_zero_days_uses_default_retention() {
+        let (_temp, mut cx) = cortex();
+        let mut trace = Trace::new("Expired trash", "note", "", vec![], "body");
+        cx.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        cx.trash(&id).unwrap();
+        cx.connection
+            .execute(
+                "UPDATE traces SET trashed_at='2000-01-01T00:00:00Z' WHERE id=?1",
+                [&id],
+            )
+            .unwrap();
+
+        assert_eq!(cx.purge_expired(0).unwrap(), 1);
+        assert!(cx.get(&id).is_err());
+        assert_eq!(cx.history(&id).unwrap().last().unwrap().action, "purge");
+        assert!(!cx.trash_dir().join(format!("{id}.md")).exists());
+    }
+
+    #[test]
+    fn replay_handles_long_term_hard_purge_and_telemetry_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        Cortex::create("alpha", temp.path()).unwrap();
+        Cortex::create("beta", temp.path()).unwrap();
+        let alpha = Cortex::open("alpha", temp.path().join("alpha")).unwrap();
+        let beta = Cortex::open("beta", temp.path().join("beta")).unwrap();
+
+        let mut trace = Trace::new("Federated purge", "fact", "", vec![], "body");
+        trace.frontmatter.tier = "long".into();
+        alpha.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        beta.replay_event(&event_for(&alpha, &id, "create", &alpha.id))
+            .unwrap();
+        alpha
+            .admin_purge(&id, "remote retention", "long", false)
+            .unwrap();
+        beta.replay_event(&event_for(&alpha, &id, "purge_long_term", &alpha.id))
+            .unwrap();
+        let purged: String = beta
+            .connection
+            .query_row("SELECT purged_at FROM traces WHERE id=?1", [&id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(!purged.is_empty());
+
+        alpha
+            .admin_purge(&id, "remote erasure", "long", true)
+            .unwrap();
+        beta.replay_event(&event_for(&alpha, &id, "purge_hard", &alpha.id))
+            .unwrap();
+        assert!(beta.get(&id).is_err());
+
+        for action in ["consolidate_fallback", "divergence_long_term"] {
+            let event = Event::new(
+                action,
+                &id,
+                &alpha.id,
+                &alpha.name,
+                json!({}),
+                BTreeMap::new(),
+            );
+            beta.replay_event(&event).unwrap();
+            assert!(
+                beta.history(&id)
+                    .unwrap()
+                    .iter()
+                    .any(|item| item.id == event.id)
+            );
+        }
+    }
+
+    #[test]
+    fn signed_replay_rejects_foreign_mutation_of_source_locked_trace() {
+        let temp = tempfile::tempdir().unwrap();
+        let alpha = signed_cortex(temp.path(), "alpha");
+        let beta = signed_cortex(temp.path(), "beta");
+        let gamma = signed_cortex(temp.path(), "gamma");
+        let mut trace = Trace::new("Locked source", "fact", "", vec![], "original");
+        trace.frontmatter.source_locked = true;
+        alpha.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        beta.replay_event(&event_for(&alpha, &id, "create", &alpha.id))
+            .unwrap();
+
+        trace.body = "unauthorized".into();
+        trace.frontmatter.content_hash = trace::content_hash(&trace.body);
+        let mut attack = Event::new(
+            "update",
+            &id,
+            &gamma.id,
+            &gamma.name,
+            trace_snapshot(&trace),
+            gamma.get_clock().unwrap(),
+        );
+        attack.pubkey = gamma.manifest.signing.as_ref().unwrap().public_key.clone();
+        attack.signature = eventsig::sign(gamma.signing_key.as_ref().unwrap(), &attack);
+        let error = beta.replay_event(&attack).unwrap_err();
+        assert!(error.to_string().contains("source-lock violation"));
+        assert_eq!(beta.get_trace(&id).unwrap().1.body, "original");
+        assert!(
+            !beta
+                .history(&id)
+                .unwrap()
+                .iter()
+                .any(|event| event.id == attack.id)
         );
     }
 

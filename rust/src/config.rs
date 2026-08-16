@@ -125,7 +125,7 @@ impl Config {
         Ok(())
     }
 
-    fn save_to_path(&self, path: &Path) -> Result<()> {
+    pub(crate) fn save_to_path(&self, path: &Path) -> Result<()> {
         let directory = path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("config path has no parent directory"))?;

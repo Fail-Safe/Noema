@@ -1,6 +1,10 @@
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use axum::{
     body::Body,
     extract::State,
@@ -1071,15 +1075,66 @@ pub async fn serve_stdio(
     Ok(())
 }
 
+pub struct HttpListenConfig {
+    pub hosts: Vec<String>,
+    pub dynamic_hosts: Vec<String>,
+    pub port: u16,
+}
+
+struct DynamicListener {
+    address: std::net::SocketAddr,
+    handle: axum_server::Handle<std::net::SocketAddr>,
+    task: tokio::task::JoinHandle<Result<()>>,
+}
+
+#[cfg(unix)]
+fn local_interface_addresses() -> Result<HashSet<std::net::IpAddr>> {
+    let mut interfaces = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut interfaces) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("enumerating local interfaces");
+    }
+    let mut output = HashSet::new();
+    let mut current = interfaces;
+    while !current.is_null() {
+        let address = unsafe { (*current).ifa_addr };
+        if !address.is_null() {
+            let family = unsafe { (*address).sa_family as i32 };
+            if family == libc::AF_INET {
+                let address = unsafe { &*(address.cast::<libc::sockaddr_in>()) };
+                output.insert(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                    address.sin_addr.s_addr.to_ne_bytes(),
+                )));
+            } else if family == libc::AF_INET6 {
+                let address = unsafe { &*(address.cast::<libc::sockaddr_in6>()) };
+                output.insert(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                    address.sin6_addr.s6_addr,
+                )));
+            }
+        }
+        current = unsafe { (*current).ifa_next };
+    }
+    unsafe { libc::freeifaddrs(interfaces) };
+    Ok(output)
+}
+
+#[cfg(not(unix))]
+fn local_interface_addresses() -> Result<HashSet<std::net::IpAddr>> {
+    bail!("dynamic interface discovery is not implemented on this platform")
+}
+
 pub async fn serve_http(
     name: String,
     path: PathBuf,
-    host: String,
-    port: u16,
+    listen: HttpListenConfig,
     access_key: AccessKey,
     tls: Option<(PathBuf, PathBuf)>,
     watcher_settings: Option<crate::watch::Settings>,
 ) -> Result<()> {
+    let HttpListenConfig {
+        hosts,
+        dynamic_hosts,
+        port,
+    } = listen;
     let server = NoemaServer::new(&name, &path, true)?;
     let (cortex_id, federation, manifest) = {
         let cortex = server.cortex.lock().await;
@@ -1094,12 +1149,18 @@ pub async fn serve_http(
         StreamableHttpService::new(
             move || Ok(server.clone()),
             Default::default(),
-            StreamableHttpServerConfig::default().with_allowed_hosts([
-                host.clone(),
-                "localhost".to_owned(),
-                "127.0.0.1".to_owned(),
-                "::1".to_owned(),
-            ]),
+            StreamableHttpServerConfig::default().with_allowed_hosts(
+                hosts
+                    .iter()
+                    .cloned()
+                    .chain(dynamic_hosts.iter().cloned())
+                    .chain([
+                        "localhost".to_owned(),
+                        "127.0.0.1".to_owned(),
+                        "::1".to_owned(),
+                    ])
+                    .collect::<Vec<_>>(),
+            ),
         );
     let certificate_path = tls.as_ref().map(|(certificate, _)| certificate.clone());
     let tls_config = match tls {
@@ -1108,9 +1169,12 @@ pub async fn serve_http(
         ),
         None => None,
     };
-    let listener = std::net::TcpListener::bind((host.as_str(), port))?;
-    listener.set_nonblocking(true)?;
-    let address = listener.local_addr()?;
+    let mut listeners = Vec::with_capacity(hosts.len());
+    for host in &hosts {
+        let listener = std::net::TcpListener::bind((host.as_str(), port))?;
+        listener.set_nonblocking(true)?;
+        listeners.push(listener);
+    }
     let cancellation = CancellationToken::new();
     let registry = Arc::new(crate::consolidation::InFlightRegistry::default());
     let (scheduler, eligibility, cadence, watchdog, watcher, embedder) =
@@ -1177,30 +1241,167 @@ pub async fn serve_http(
     } else {
         "http"
     };
-    eprintln!("Noema MCP listening on {scheme}://{address}/mcp");
+    for listener in &listeners {
+        eprintln!(
+            "Noema MCP listening on {scheme}://{}/mcp",
+            listener.local_addr()?
+        );
+    }
     let mut router = axum::Router::new().nest_service("/mcp", service);
     if access_key.keyed() {
         let expected = BearerDigest::new(&access_key.value);
         router = router.layer(axum::middleware::from_fn_with_state(expected, bearer_auth));
     }
-    let server_handle = axum_server::Handle::new();
-    let shutdown_handle = server_handle.clone();
+    let server_handles = listeners
+        .iter()
+        .map(|_| axum_server::Handle::new())
+        .collect::<Vec<_>>();
+    let shutdown_handles = server_handles.clone();
     let server_cancellation = cancellation.clone();
     let shutdown_task = tokio::spawn(async move {
         server_cancellation.cancelled().await;
-        shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+        for handle in shutdown_handles {
+            handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+        }
     });
-    let result = if let Some(tls_config) = tls_config {
-        axum_server::from_tcp_rustls(listener, tls_config)?
-            .handle(server_handle)
-            .serve(router.into_make_service())
-            .await
+    let mut servers = tokio::task::JoinSet::new();
+    for (listener, handle) in listeners.into_iter().zip(server_handles) {
+        let router = router.clone();
+        let tls_config = tls_config.clone();
+        servers.spawn(async move {
+            if let Some(tls_config) = tls_config {
+                axum_server::from_tcp_rustls(listener, tls_config)?
+                    .handle(handle)
+                    .serve(router.into_make_service())
+                    .await?;
+            } else {
+                axum_server::from_tcp(listener)?
+                    .handle(handle)
+                    .serve(router.into_make_service())
+                    .await?;
+            }
+            anyhow::Ok(())
+        });
+    }
+    let dynamic_cancellation = cancellation.clone();
+    let dynamic_router = router.clone();
+    let dynamic_tls = tls_config.clone();
+    let mut dynamic_server = (!dynamic_hosts.is_empty()).then(|| {
+        tokio::spawn(async move {
+            let mut active: HashMap<String, DynamicListener> = HashMap::new();
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = dynamic_cancellation.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
+                let local_addresses = local_interface_addresses()?;
+                for host in &dynamic_hosts {
+                    let resolved = match tokio::net::lookup_host((host.as_str(), port)).await {
+                        Ok(addresses) => addresses
+                            .filter(|address| local_addresses.contains(&address.ip()))
+                            .collect::<Vec<_>>(),
+                        Err(error) => {
+                            eprintln!(
+                                "dynamic address {host} is unavailable ({error}); will retry"
+                            );
+                            Vec::new()
+                        }
+                    };
+                    let keep = active.get(host).is_some_and(|listener| {
+                        resolved.contains(&listener.address) && !listener.task.is_finished()
+                    });
+                    if keep {
+                        continue;
+                    }
+                    if let Some(listener) = active.remove(host) {
+                        listener
+                            .handle
+                            .graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+                        listener.task.abort();
+                        eprintln!(
+                            "dynamic address {host} disappeared or changed; stopping listener"
+                        );
+                    }
+                    let mut listener = None;
+                    for address in resolved {
+                        match std::net::TcpListener::bind(address) {
+                            Ok(candidate) => {
+                                candidate.set_nonblocking(true)?;
+                                listener = Some((address, candidate));
+                                break;
+                            }
+                            Err(error)
+                                if matches!(error.kind(), std::io::ErrorKind::AddrNotAvailable) => {
+                            }
+                            Err(error) => {
+                                return Err(error).with_context(|| {
+                                    format!("binding dynamic address {host} ({address})")
+                                });
+                            }
+                        }
+                    }
+                    let Some((address, listener)) = listener else {
+                        continue;
+                    };
+                    let handle = axum_server::Handle::new();
+                    let task_handle = handle.clone();
+                    let router = dynamic_router.clone();
+                    let tls = dynamic_tls.clone();
+                    let task = tokio::spawn(async move {
+                        if let Some(tls) = tls {
+                            axum_server::from_tcp_rustls(listener, tls)?
+                                .handle(task_handle)
+                                .serve(router.into_make_service())
+                                .await?;
+                        } else {
+                            axum_server::from_tcp(listener)?
+                                .handle(task_handle)
+                                .serve(router.into_make_service())
+                                .await?;
+                        }
+                        Ok(())
+                    });
+                    eprintln!("Noema MCP listening on {scheme}://{address}/mcp (dynamic {host})");
+                    active.insert(
+                        host.clone(),
+                        DynamicListener {
+                            address,
+                            handle,
+                            task,
+                        },
+                    );
+                }
+                for (host, listener) in &active {
+                    if listener.task.is_finished() {
+                        bail!("dynamic listener for {host} terminated unexpectedly");
+                    }
+                }
+            }
+            for (_, listener) in active {
+                listener
+                    .handle
+                    .graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+                listener.task.abort();
+            }
+            Ok(())
+        })
+    });
+    if let Some(dynamic_server) = dynamic_server.as_mut() {
+        tokio::select! {
+            result = servers.join_next() => {
+                result.context("HTTP listener set terminated unexpectedly")???
+            }
+            result = dynamic_server => {
+                result.context("dynamic-listener supervisor failed")??
+            }
+        }
     } else {
-        axum_server::from_tcp(listener)?
-            .handle(server_handle)
-            .serve(router.into_make_service())
+        servers
+            .join_next()
             .await
-    };
+            .context("HTTP listener set terminated unexpectedly")???;
+    }
     cancellation.cancel();
     if let Some(scheduler) = scheduler {
         scheduler.stop().await;
@@ -1225,7 +1426,7 @@ pub async fn serve_http(
     }
     signal_task.abort();
     shutdown_task.abort();
-    result?;
+    servers.abort_all();
     Ok(())
 }
 
@@ -1585,7 +1786,7 @@ fn json_text<T: Serialize>(value: T) -> String {
     serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".into())
 }
 
-fn render_federation_status(cx: &Cortex) -> Result<String> {
+pub(crate) fn render_federation_status(cx: &Cortex) -> Result<String> {
     let manifest = &cx.manifest;
     let config = manifest.federation.as_ref();
     let mode = config
@@ -1721,5 +1922,13 @@ mod tests {
         assert!(!digest.matches(b"bearer test-secret"));
         assert!(!digest.matches(b"Bearer wrong"));
         assert!(!digest.matches(b""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dynamic_listener_inventory_contains_loopback_interfaces() {
+        let addresses = local_interface_addresses().unwrap();
+        assert!(addresses.contains(&std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)));
+        assert!(addresses.contains(&std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
     }
 }
