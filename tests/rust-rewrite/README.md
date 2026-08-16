@@ -25,6 +25,11 @@ graceful SIGTERM handling, and fail-closed signing-key rotation.
 The rotation case then stages an explicit hard pin without resetting the event
 cursor, resumes the peer, and verifies recovery under the new key.
 
+`federation_dynamic.py` starts a Rust server with no configured peers and a live
+Go source. It adds, removes, and re-adds that source without restarting Rust,
+verifying worker start/retirement counts, sync suppression while removed,
+cursor preservation, pending-event recovery, and graceful shutdown.
+
 `federation_tls.py` runs signed Go↔Rust federation over HTTPS with a temporary
 private CA, CA-signed server certificate, and shared bearer key. It verifies
 missing/wrong/correct authorization, custom-CA failure and recovery, secret-free

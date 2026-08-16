@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
     time::Duration,
 };
@@ -107,7 +107,12 @@ pub struct PeerError {
 
 pub struct FederationScheduler {
     cancellation: CancellationToken,
-    workers: Vec<JoinHandle<()>>,
+    manager: JoinHandle<()>,
+}
+
+struct PeerWorker {
+    cancellation: CancellationToken,
+    task: JoinHandle<()>,
 }
 
 pub fn status(cx: &Cortex) -> Result<serde_json::Value> {
@@ -180,143 +185,240 @@ impl FederationScheduler {
         cancellation: CancellationToken,
     ) -> Result<Self> {
         let interval = parse_interval(&config.interval)?;
-        let mut workers = Vec::new();
-        for peer in config.peers {
-            let mut cx = Cortex::open(&name, &path)?;
-            let manifest_path = path.clone();
-            let worker_cancellation = cancellation.clone();
-            workers.push(tokio::spawn(async move {
-                let mut backoff = interval;
-                let mut was_failing = false;
-                let mut next_attempt = tokio::time::Instant::now();
-                let mut last_configuration = None;
-                loop {
-                    if worker_cancellation.is_cancelled() {
-                        break;
-                    }
-                    let manifest = match read_manifest(&manifest_path) {
-                        Ok(manifest) => manifest,
-                        Err(error) => {
-                            eprintln!(
-                                "federation configuration warning for peer {}: {error:#}",
-                                peer.name
-                            );
-                            tokio::select! {
-                                _ = worker_cancellation.cancelled() => break,
-                                _ = tokio::time::sleep(interval) => {}
-                            }
-                            continue;
-                        }
-                    };
-                    let live_access = manifest.access.clone();
-                    let live_config = manifest.federation.unwrap_or_default();
-                    let live_interval = parse_interval(&live_config.interval).unwrap_or(interval);
-                    let Some(live_peer) = live_config
-                        .peers
-                        .iter()
-                        .find(|candidate| candidate.name == peer.name)
-                        .cloned()
-                    else {
-                        tokio::select! {
-                            _ = worker_cancellation.cancelled() => break,
-                            _ = tokio::time::sleep(live_interval) => {}
-                        }
-                        continue;
-                    };
-                    let access_fingerprint = load_access_key(&manifest_path, live_access.as_ref())
-                        .map(|key| key.fingerprint)
-                        .unwrap_or_else(|_| "invalid".into());
-                    let configuration = (
-                        live_config.mode.clone(),
-                        live_peer.endpoint.clone(),
-                        live_peer.ca.clone(),
-                        live_peer.mode.clone(),
-                        live_peer.pubkey.clone(),
-                        access_fingerprint,
-                    );
-                    if last_configuration.as_ref() != Some(&configuration) {
-                        last_configuration = Some(configuration);
-                        backoff = live_interval;
-                        next_attempt = tokio::time::Instant::now();
-                    }
-                    if live_config.mode == "publish" || live_peer.mode == "paused" {
-                        backoff = live_interval;
-                        tokio::select! {
-                            _ = worker_cancellation.cancelled() => break,
-                            _ = tokio::time::sleep(live_interval) => {}
-                        }
-                        continue;
-                    }
-                    let now = tokio::time::Instant::now();
-                    if now < next_attempt {
-                        let wait = live_interval.min(next_attempt.duration_since(now));
-                        tokio::select! {
-                            _ = worker_cancellation.cancelled() => break,
-                            _ = tokio::time::sleep(wait) => {}
-                        }
-                        continue;
-                    }
-                    cx.manifest.access = live_access;
-                    cx.manifest.federation = Some(live_config);
-                    match sync_peer(&mut cx, &live_peer).await {
-                        Ok(report) => {
-                            if let Err(error) =
-                                record_health(&cx, &peer.name, Some(&report.peer_version), None)
-                            {
-                                eprintln!(
-                                    "federation health warning for peer {}: {error:#}",
-                                    peer.name
-                                );
-                            }
-                            if was_failing {
-                                eprintln!("federation peer {} reachable again", peer.name);
-                            }
-                            was_failing = false;
-                            backoff = live_interval;
-                            next_attempt = tokio::time::Instant::now() + live_interval;
-                        }
-                        Err(error) => {
-                            if let Err(health_error) =
-                                record_health(&cx, &peer.name, None, Some(&error))
-                            {
-                                eprintln!(
-                                    "federation health warning for peer {}: {health_error:#}",
-                                    peer.name
-                                );
-                            }
-                            backoff = backoff.saturating_mul(2).min(Duration::from_secs(300));
-                            next_attempt = tokio::time::Instant::now() + backoff;
-                            eprintln!(
-                                "federation peer {} poll failed; retrying in {:?}: {error:#}",
-                                peer.name, backoff
-                            );
-                            was_failing = true;
-                        }
-                    }
-                    let wait = live_interval.min(
-                        next_attempt
-                            .checked_duration_since(tokio::time::Instant::now())
-                            .unwrap_or_default(),
-                    );
-                    tokio::select! {
-                        _ = worker_cancellation.cancelled() => break,
-                        _ = tokio::time::sleep(wait) => {}
-                    }
+        Cortex::open(&name, &path)?;
+        let manager_cancellation = cancellation.clone();
+        let manager = tokio::spawn(async move {
+            let mut workers = HashMap::new();
+            let mut next_config = Some(config);
+            loop {
+                if manager_cancellation.is_cancelled() {
+                    break;
                 }
-            }));
-        }
+                let live_config = match next_config.take() {
+                    Some(config) => Some(config),
+                    None => match read_manifest(&path) {
+                        Ok(manifest) => Some(manifest.federation.unwrap_or_default()),
+                        Err(error) => {
+                            eprintln!("federation configuration warning: {error:#}");
+                            None
+                        }
+                    },
+                };
+                let wait = live_config
+                    .as_ref()
+                    .and_then(|config| parse_interval(&config.interval).ok())
+                    .unwrap_or(interval);
+                if let Some(config) = live_config {
+                    reconcile_peer_workers(&name, &path, &config, interval, &mut workers).await;
+                }
+                tokio::select! {
+                    _ = manager_cancellation.cancelled() => break,
+                    _ = tokio::time::sleep(wait) => {}
+                }
+            }
+            stop_peer_workers(&mut workers).await;
+        });
         Ok(Self {
             cancellation,
-            workers,
+            manager,
         })
     }
 
     pub async fn stop(self) {
         self.cancellation.cancel();
-        for worker in self.workers {
-            if let Err(error) = worker.await {
-                eprintln!("federation worker join warning: {error}");
+        if let Err(error) = self.manager.await {
+            eprintln!("federation manager join warning: {error}");
+        }
+    }
+}
+
+async fn reconcile_peer_workers(
+    name: &str,
+    path: &std::path::Path,
+    config: &FederationConfig,
+    fallback_interval: Duration,
+    workers: &mut HashMap<String, PeerWorker>,
+) {
+    let finished: Vec<_> = workers
+        .iter()
+        .filter(|(_, worker)| worker.task.is_finished())
+        .map(|(peer_name, _)| peer_name.clone())
+        .collect();
+    for peer_name in finished {
+        if let Some(worker) = workers.remove(&peer_name)
+            && let Err(error) = worker.task.await
+        {
+            eprintln!("federation worker join warning for peer {peer_name}: {error}");
+        }
+    }
+    let desired: BTreeSet<_> = config.peers.iter().map(|peer| peer.name.clone()).collect();
+    let removed: Vec<_> = workers
+        .keys()
+        .filter(|peer_name| !desired.contains(*peer_name))
+        .cloned()
+        .collect();
+    for peer_name in removed {
+        if let Some(worker) = workers.remove(&peer_name) {
+            stop_peer_worker(&peer_name, worker).await;
+        }
+    }
+    for peer in &config.peers {
+        if workers.contains_key(&peer.name) {
+            continue;
+        }
+        match spawn_peer_worker(name, path, peer.name.clone(), fallback_interval) {
+            Ok(worker) => {
+                eprintln!("federation worker started for peer {}", peer.name);
+                workers.insert(peer.name.clone(), worker);
             }
+            Err(error) => {
+                eprintln!(
+                    "federation worker startup warning for peer {}: {error:#}",
+                    peer.name
+                );
+            }
+        }
+    }
+}
+
+fn spawn_peer_worker(
+    name: &str,
+    path: &std::path::Path,
+    peer_name: String,
+    fallback_interval: Duration,
+) -> Result<PeerWorker> {
+    let mut cx = Cortex::open(name, path)?;
+    let manifest_path = path.to_path_buf();
+    let cancellation = CancellationToken::new();
+    let worker_cancellation = cancellation.clone();
+    let task = tokio::spawn(async move {
+        let mut backoff = fallback_interval;
+        let mut was_failing = false;
+        let mut next_attempt = tokio::time::Instant::now();
+        let mut last_configuration = None;
+        loop {
+            if worker_cancellation.is_cancelled() {
+                break;
+            }
+            let manifest = match read_manifest(&manifest_path) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    eprintln!("federation configuration warning for peer {peer_name}: {error:#}");
+                    tokio::select! {
+                        _ = worker_cancellation.cancelled() => break,
+                        _ = tokio::time::sleep(fallback_interval) => {}
+                    }
+                    continue;
+                }
+            };
+            let live_access = manifest.access.clone();
+            let live_config = manifest.federation.unwrap_or_default();
+            let live_interval = parse_interval(&live_config.interval).unwrap_or(fallback_interval);
+            let Some(live_peer) = live_config
+                .peers
+                .iter()
+                .find(|candidate| candidate.name == peer_name)
+                .cloned()
+            else {
+                tokio::select! {
+                    _ = worker_cancellation.cancelled() => break,
+                    _ = tokio::time::sleep(live_interval) => {}
+                }
+                continue;
+            };
+            let access_fingerprint = load_access_key(&manifest_path, live_access.as_ref())
+                .map(|key| key.fingerprint)
+                .unwrap_or_else(|_| "invalid".into());
+            let configuration = (
+                live_config.mode.clone(),
+                live_peer.endpoint.clone(),
+                live_peer.ca.clone(),
+                live_peer.mode.clone(),
+                live_peer.pubkey.clone(),
+                access_fingerprint,
+            );
+            if last_configuration.as_ref() != Some(&configuration) {
+                last_configuration = Some(configuration);
+                backoff = live_interval;
+                next_attempt = tokio::time::Instant::now();
+            }
+            if live_config.mode == "publish" || live_peer.mode == "paused" {
+                backoff = live_interval;
+                tokio::select! {
+                    _ = worker_cancellation.cancelled() => break,
+                    _ = tokio::time::sleep(live_interval) => {}
+                }
+                continue;
+            }
+            let now = tokio::time::Instant::now();
+            if now < next_attempt {
+                let wait = live_interval.min(next_attempt.duration_since(now));
+                tokio::select! {
+                    _ = worker_cancellation.cancelled() => break,
+                    _ = tokio::time::sleep(wait) => {}
+                }
+                continue;
+            }
+            cx.manifest.access = live_access;
+            cx.manifest.federation = Some(live_config);
+            match sync_peer(&mut cx, &live_peer).await {
+                Ok(report) => {
+                    if let Err(error) =
+                        record_health(&cx, &peer_name, Some(&report.peer_version), None)
+                    {
+                        eprintln!("federation health warning for peer {peer_name}: {error:#}");
+                    }
+                    if was_failing {
+                        eprintln!("federation peer {peer_name} reachable again");
+                    }
+                    was_failing = false;
+                    backoff = live_interval;
+                    next_attempt = tokio::time::Instant::now() + live_interval;
+                }
+                Err(error) => {
+                    if let Err(health_error) = record_health(&cx, &peer_name, None, Some(&error)) {
+                        eprintln!(
+                            "federation health warning for peer {peer_name}: {health_error:#}"
+                        );
+                    }
+                    backoff = backoff.saturating_mul(2).min(Duration::from_secs(300));
+                    next_attempt = tokio::time::Instant::now() + backoff;
+                    eprintln!(
+                        "federation peer {peer_name} poll failed; retrying in {backoff:?}: {error:#}"
+                    );
+                    was_failing = true;
+                }
+            }
+            let wait = live_interval.min(
+                next_attempt
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .unwrap_or_default(),
+            );
+            tokio::select! {
+                _ = worker_cancellation.cancelled() => break,
+                _ = tokio::time::sleep(wait) => {}
+            }
+        }
+    });
+    Ok(PeerWorker { cancellation, task })
+}
+
+async fn stop_peer_worker(peer_name: &str, worker: PeerWorker) {
+    worker.cancellation.cancel();
+    if let Err(error) = worker.task.await {
+        eprintln!("federation worker join warning for peer {peer_name}: {error}");
+    } else {
+        eprintln!("federation worker stopped for peer {peer_name}");
+    }
+}
+
+async fn stop_peer_workers(workers: &mut HashMap<String, PeerWorker>) {
+    for worker in workers.values() {
+        worker.cancellation.cancel();
+    }
+    for (peer_name, worker) in workers.drain() {
+        if let Err(error) = worker.task.await {
+            eprintln!("federation worker join warning for peer {peer_name}: {error}");
         }
     }
 }
@@ -708,5 +810,45 @@ mod tests {
             )),
             "network_refused"
         );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_restarts_a_finished_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        Cortex::create("local", temp.path()).unwrap();
+        let path = temp.path().join("local");
+        let cancellation = CancellationToken::new();
+        let completed_task = tokio::spawn(async {});
+        tokio::task::yield_now().await;
+        assert!(completed_task.is_finished());
+        let mut workers = HashMap::from([(
+            "peer-a".to_owned(),
+            PeerWorker {
+                cancellation,
+                task: completed_task,
+            },
+        )]);
+        let config = FederationConfig {
+            interval: "10ms".into(),
+            peers: vec![PeerEntry {
+                name: "peer-a".into(),
+                endpoint: "http://127.0.0.1:1".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        reconcile_peer_workers(
+            "local",
+            &path,
+            &config,
+            Duration::from_millis(10),
+            &mut workers,
+        )
+        .await;
+
+        assert_eq!(workers.len(), 1);
+        assert!(!workers["peer-a"].task.is_finished());
+        stop_peer_workers(&mut workers).await;
     }
 }

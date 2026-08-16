@@ -105,6 +105,9 @@ compare-rust: build rust-build
 	python3 ./tests/rust-rewrite/federation_ring.py \
 		--go "$(CURDIR)/noema" \
 		--rust "$(CURDIR)/rust/target/debug/noema-rs"
+	python3 ./tests/rust-rewrite/federation_dynamic.py \
+		--go "$(CURDIR)/noema" \
+		--rust "$(CURDIR)/rust/target/debug/noema-rs"
 	python3 ./tests/rust-rewrite/federation_tls.py \
 		--go "$(CURDIR)/noema" \
 		--rust "$(CURDIR)/rust/target/debug/noema-rs"

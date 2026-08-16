@@ -63,7 +63,9 @@ and mixed-process tests cover:
 - expired and not-yet-valid leaf refusal, seven-day startup warning,
   CLI-over-manifest certificate precedence, and explicit bypass parity; and
 - an hourly single-owner certificate monitor with immediate, transition-only
-  90/30/7-day, expired, and unreadable observations.
+  90/30/7-day, expired, and unreadable observations; and
+- live peer-set reconciliation under one supervisor, including zero-peer
+  startup, worker addition/removal/restart, and cursor-preserving re-addition.
 
 The network experiment found two interoperability defects that in-process tests
 did not expose. Rust's first identity response did not use Go's `version` and
@@ -351,7 +353,7 @@ Rust scheduler retained its earlier memory advantage under active replication
 and recovery rather than only under a single-process search benchmark.
 
 This remains a complexity probe, not complete federation parity. The Rust path
-does not yet dynamically add new workers without restart or provide
+now dynamically reconciles workers without restart but does not yet provide
 crash-atomic file rollback. Its consolidation election and
 coordination wire, pass gate, watchdog recovery, full cadence, heuristic pass,
 graduation, and model-driven distillation are now present. A bounded real-model

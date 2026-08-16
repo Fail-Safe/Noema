@@ -5,9 +5,10 @@ Updated: 2026-08-16
 ## Pause point
 
 - Branch: `experiment/rust-rewrite`
-- Latest completed milestone: TLS certificate lifecycle parity (this handoff
+- Latest completed milestone: dynamic federation worker reconciliation (this handoff
   commit).
-- Previous milestone: `a7e7196 feat(rust): add functional TUI parity`.
+- Previous milestone: `33424c0 feat(rust): add TLS certificate lifecycle parity`.
+- Earlier TUI milestone: `a7e7196 feat(rust): add functional TUI parity`.
 - Earlier advanced MCP milestone: `29cd610 feat(rust): complete advanced MCP parity`.
 - Earlier MCP contract milestone: `0a6e721 feat(rust): tighten MCP contract parity`.
 - Earlier semantic milestone: `b73a089 feat(rust): add semantic search parity`.
@@ -59,6 +60,10 @@ Updated: 2026-08-16
   divergence creation, source locks, and duplicate-event idempotency.
 - Background federation workers with pause/resume, bounded exponential backoff,
   health state, usage-signal sync, configuration refresh, and graceful shutdown.
+- A single supervisor now reconciles the live peer-name set: zero-peer servers
+  can add peers without restart, removed peers cancel their workers, re-added
+  peers resume from preserved cursors, unchanged workers retain their backoff
+  state, and unexpectedly exited workers restart on the next interval.
 - Explicit signing-key rotation recovery through `federation re-pin-peer`, while
   preserving the event cursor and keeping the peer paused until resumed.
 - Rustls HTTPS serving, shared bearer authentication, custom peer CA trust, a
@@ -158,10 +163,10 @@ Updated: 2026-08-16
 
 ## Latest validation
 
-The following passed for the combined TLS lifecycle, advanced MCP, and
-functional TUI tree:
+The following passed for the combined dynamic federation, TLS lifecycle,
+advanced MCP, and functional TUI tree:
 
-- `make rust-test` — formatting, clippy with warnings denied, and 75 Rust tests.
+- `make rust-test` — formatting, clippy with warnings denied, and 76 Rust tests.
 - `go test ./...`
 - `go test -race ./...`
 - `go vet ./...`
@@ -171,6 +176,9 @@ functional TUI tree:
   - signed two-way federation and 205-event pagination;
   - three-node convergence, pause/recovery, outage handling, divergence, and
     signing-key rejection/recovery; and
+  - live zero-peer startup, peer addition/removal/re-addition, exact worker
+    start/stop counts, sync suppression while removed, cursor preservation,
+    pending-event recovery, and graceful shutdown; and
   - authenticated Go/Rust HTTPS federation, CA rejection, bearer rejection,
     access-key recovery, plaintext refusal, and secret redaction; and
   - identical expired and not-yet-valid startup refusal, seven-day warnings,
@@ -294,15 +302,14 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
    dark/light auto-detection, and external-editor workflows.
 2. Broader adversarial real-model quality evaluation beyond the current bounded
    synthetic corpus.
-3. Dynamic peer-worker addition without restart, crash-atomic file rollback,
-   lock contention, and broader fault injection.
+3. Crash-atomic file rollback, lock contention, and broader fault injection.
 
 ## Recommended next milestone
 
-Exercise the fault-tolerance rows next. Start with dynamic federation peer
-addition/removal without restart and retain the existing one-worker-per-peer,
-cursor, signing, and shutdown invariants. Then add bounded lock-contention and
-interrupted-file-write fixtures before changing file mutation internals.
+Continue the fault-tolerance rows with bounded lock-contention and interrupted-
+file-write fixtures. Establish the Go oracle and exact recovery boundary before
+changing file mutation internals, then preserve editor-owned bytes and database
+consistency under injected failures.
 
 Any new Rust packages still require explicit approval before adding them.
 
