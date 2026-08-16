@@ -564,7 +564,10 @@ pub struct OneSourceMidCount {
 pub struct SyncResult {
     pub added: usize,
     pub updated: usize,
+    pub recovered: usize,
     pub orphaned: usize,
+    pub drifted: usize,
+    pub drifted_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1554,10 +1557,6 @@ impl Cortex {
         self.create_trace_transactionally(&path, trace, |pending_key| {
             self.insert_trace_with_pending(trace, true, Some(pending_key))
         })
-    }
-
-    fn insert_trace(&self, trace: &Trace, emit: bool) -> Result<()> {
-        self.insert_trace_with_pending(trace, emit, None)
     }
 
     fn insert_trace_with_pending(
@@ -3488,35 +3487,170 @@ impl Cortex {
     }
 
     pub fn sync(&self) -> Result<SyncResult> {
+        self.sync_with_recovery(false)
+    }
+
+    pub fn sync_with_recovery(&self, recover: bool) -> Result<SyncResult> {
         let mut result = SyncResult::default();
         let mut found = BTreeSet::new();
+        let now = trace::now_rfc3339();
         for (directory, archived, trashed) in [
             (self.traces_dir(), false, false),
             (self.archive_dir(), true, false),
             (self.trash_dir(), false, true),
         ] {
-            for entry in fs::read_dir(directory)? {
+            let entries = match fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            for entry in entries {
                 let path = entry?.path();
                 if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
                     continue;
                 }
-                let trace = Trace::parse_file(&path)?;
-                trace.validate()?;
+                let mut trace = match Trace::parse_file(&path) {
+                    Ok(trace) => trace,
+                    Err(_) => continue,
+                };
                 let id = trace.frontmatter.id.clone();
                 found.insert(id.clone());
-                if self.get(&id).is_ok() {
-                    self.reindex_trace(&trace, archived, trashed)?;
+                let existing = self.get(&id).ok();
+                if let Some(row) = &existing
+                    && trace.effective_tier() != row.tier
+                {
+                    trace.frontmatter.tier = row.tier.clone();
+                    trace
+                        .write_preserving_updated(&path)
+                        .with_context(|| format!("repairing tier for {id}"))?;
+                }
+                trace.validate()?;
+
+                let archived_at = if archived {
+                    Some(
+                        existing
+                            .as_ref()
+                            .map(|row| row.archived_at.as_str())
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or(&now)
+                            .to_owned(),
+                    )
+                } else {
+                    None
+                };
+                let trashed_at = if trashed {
+                    Some(
+                        existing
+                            .as_ref()
+                            .map(|row| row.trashed_at.as_str())
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or(&now)
+                            .to_owned(),
+                    )
+                } else {
+                    None
+                };
+
+                let cortex_id = existing
+                    .as_ref()
+                    .map(|row| row.cortex_id.clone())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| {
+                        if trace.frontmatter.origin.is_empty()
+                            || trace.frontmatter.origin == self.name
+                        {
+                            self.id.clone()
+                        } else {
+                            self.lookup_cortex_id_for_trace(&id)
+                        }
+                    });
+                let content_hash = trace::content_hash(&trace.body);
+
+                if let Some(row) = existing {
+                    if row.tier == "long" {
+                        let drifted = row.title != trace.frontmatter.title
+                            || row.trace_type != trace.frontmatter.trace_type
+                            || row.author != trace.frontmatter.author
+                            || row.origin != trace.frontmatter.origin
+                            || row.cortex_id != cortex_id
+                            || row.content_hash != content_hash
+                            || row.updated_at != trace.frontmatter.updated
+                            || row.created_at != trace.frontmatter.created
+                            || row.source_locked != trace.frontmatter.source_locked
+                            || row.source_hash != trace.frontmatter.source_hash;
+                        self.connection.execute(
+                            "UPDATE traces SET archived_at=?1,trashed_at=?2 WHERE id=?3",
+                            params![archived_at, trashed_at, id],
+                        )?;
+                        if drifted {
+                            result.drifted += 1;
+                            if result.drifted_ids.len() < 10 {
+                                result.drifted_ids.push(id);
+                            }
+                        } else {
+                            result.updated += 1;
+                        }
+                        continue;
+                    }
+
+                    let needs_file_repair = trace.frontmatter.content_hash != content_hash;
+                    if needs_file_repair {
+                        trace.frontmatter.content_hash = content_hash.clone();
+                        trace.frontmatter.updated = trace::now_rfc3339();
+                    }
+                    let update_db = |pending_key: Option<&str>| -> Result<()> {
+                        let tx = self.connection.unchecked_transaction()?;
+                        let f = &trace.frontmatter;
+                        tx.execute(
+                            "UPDATE traces SET title=?1,type=?2,author=?3,origin=?4,cortex_id=?5,updated_at=?6,archived_at=?7,trashed_at=?8,content_hash=?9,source_locked=?10,source_hash=?11 WHERE id=?12",
+                            params![f.title,f.trace_type,f.author,f.origin,cortex_id,f.updated,archived_at,trashed_at,content_hash,i64::from(f.source_locked),nullable(&f.source_hash),id],
+                        )?;
+                        replace_tags(&tx, &id, &f.tags)?;
+                        replace_lineage(&tx, &id, &f.derived_from)?;
+                        upsert_fts(&tx, &id, &f.title, &trace.body, &f.tags)?;
+                        if let Some(pending_key) = pending_key {
+                            Self::clear_pending_in_transaction(&tx, pending_key)?;
+                        }
+                        tx.commit()?;
+                        Ok(())
+                    };
+                    if needs_file_repair {
+                        self.replace_trace_transactionally(&path, &trace, |pending_key| {
+                            update_db(Some(pending_key))
+                        })?;
+                    } else {
+                        update_db(None)?;
+                    }
                     result.updated += 1;
                 } else {
-                    self.insert_trace(&trace, false)?;
-                    self.connection.execute(
-                        "UPDATE traces SET archived_at=?1,trashed_at=?2 WHERE id=?3",
-                        params![
-                            archived.then(trace::now_rfc3339),
-                            trashed.then(trace::now_rfc3339),
-                            id
-                        ],
-                    )?;
+                    let needs_file_repair = trace.frontmatter.content_hash != content_hash;
+                    if needs_file_repair {
+                        trace.frontmatter.content_hash = content_hash.clone();
+                        trace.frontmatter.updated = trace::now_rfc3339();
+                    }
+                    let insert_db = |pending_key: Option<&str>| -> Result<()> {
+                        let tx = self.connection.unchecked_transaction()?;
+                        let f = &trace.frontmatter;
+                        tx.execute(
+                            "INSERT INTO traces (id,title,type,tier,author,origin,cortex_id,created_at,updated_at,archived_at,trashed_at,content_hash,source_locked,source_hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                            params![id,f.title,f.trace_type,trace.effective_tier(),f.author,f.origin,cortex_id,f.created,f.updated,archived_at,trashed_at,content_hash,i64::from(f.source_locked),nullable(&f.source_hash)],
+                        )?;
+                        replace_tags(&tx, &id, &f.tags)?;
+                        replace_lineage(&tx, &id, &f.derived_from)?;
+                        upsert_fts(&tx, &id, &f.title, &trace.body, &f.tags)?;
+                        if let Some(pending_key) = pending_key {
+                            Self::clear_pending_in_transaction(&tx, pending_key)?;
+                        }
+                        tx.commit()?;
+                        Ok(())
+                    };
+                    if needs_file_repair {
+                        self.replace_trace_transactionally(&path, &trace, |pending_key| {
+                            insert_db(Some(pending_key))
+                        })?;
+                    } else {
+                        insert_db(None)?;
+                    }
                     result.added += 1;
                 }
             }
@@ -3527,22 +3661,84 @@ impl Cortex {
                 .query_map([], |row| row.get(0))?
                 .collect::<rusqlite::Result<_>>()?
         };
-        result.orphaned = db_ids.iter().filter(|id| !found.contains(*id)).count();
+        for id in db_ids.into_iter().filter(|id| !found.contains(id)) {
+            if !recover {
+                result.orphaned += 1;
+                continue;
+            }
+            if self
+                .recover_orphan_from_event_log(&id)
+                .with_context(|| format!("recovering {id}"))?
+            {
+                result.recovered += 1;
+            } else {
+                result.orphaned += 1;
+            }
+        }
         Ok(result)
     }
 
-    fn reindex_trace(&self, trace: &Trace, archived: bool, trashed: bool) -> Result<()> {
-        let f = &trace.frontmatter;
-        let tx = self.connection.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE traces SET title=?1,type=?2,tier=?3,author=?4,origin=?5,updated_at=?6,content_hash=?7,source_locked=?8,source_hash=?9,archived_at=?10,trashed_at=?11 WHERE id=?12",
-            params![f.title,f.trace_type,trace.effective_tier(),f.author,f.origin,f.updated,trace::content_hash(&trace.body),i64::from(f.source_locked),nullable(&f.source_hash),archived.then(trace::now_rfc3339),trashed.then(trace::now_rfc3339),f.id],
-        )?;
-        replace_tags(&tx, &f.id, &f.tags)?;
-        replace_lineage(&tx, &f.id, &f.derived_from)?;
-        upsert_fts(&tx, &f.id, &f.title, &trace.body, &f.tags)?;
-        tx.commit()?;
-        Ok(())
+    fn lookup_cortex_id_for_trace(&self, id: &str) -> String {
+        self.connection
+            .query_row(
+                "SELECT cortex_id FROM events WHERE trace_id=?1 AND cortex_id!='' ORDER BY id DESC LIMIT 1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap_or_default()
+    }
+
+    fn recover_orphan_from_event_log(&self, id: &str) -> Result<bool> {
+        let Some(event) = self
+            .history(id)?
+            .into_iter()
+            .rev()
+            .find(|event| matches!(event.action.as_str(), "create" | "update"))
+        else {
+            return Ok(false);
+        };
+        let data: TraceEventData =
+            serde_json::from_value(event.data).context("parsing event snapshot")?;
+        let row = self.get(id)?;
+        let trace = Trace {
+            frontmatter: trace::Frontmatter {
+                id: id.to_owned(),
+                title: data.title,
+                trace_type: data.trace_type,
+                tier: row.tier,
+                author: data.author,
+                tags: data.tags,
+                derived_from: data.derived_from,
+                origin: data.origin,
+                created: row.created_at,
+                updated: event.timestamp,
+                content_hash: data.content_hash,
+                source_hash: data.source_hash,
+                source_locked: data.source_locked,
+            },
+            body: data.body,
+        };
+        let path = if !row.trashed_at.is_empty() {
+            self.trash_dir().join(format!("{id}.md"))
+        } else {
+            self.trace_file(id, !row.archived_at.is_empty())
+        };
+        if path.exists() {
+            self.replace_trace_transactionally(&path, &trace, |pending_key| {
+                let tx = self.connection.unchecked_transaction()?;
+                Self::clear_pending_in_transaction(&tx, pending_key)?;
+                tx.commit()?;
+                Ok(())
+            })?;
+        } else {
+            self.create_trace_transactionally(&path, &trace, |pending_key| {
+                let tx = self.connection.unchecked_transaction()?;
+                Self::clear_pending_in_transaction(&tx, pending_key)?;
+                tx.commit()?;
+                Ok(())
+            })?;
+        }
+        Ok(true)
     }
 
     pub fn get_clock(&self) -> Result<BTreeMap<String, u64>> {
@@ -3557,6 +3753,18 @@ impl Cortex {
         Ok(value
             .and_then(|value| serde_json::from_str(&value).ok())
             .unwrap_or_default())
+    }
+
+    pub fn database_health(&self) -> Result<(i64, String)> {
+        let version = self.connection.query_row(
+            "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        let journal = self
+            .connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        Ok((version, journal))
     }
 
     pub fn local_usage_since(
@@ -4800,6 +5008,81 @@ mod tests {
                 > 10
         );
         assert!(cx.history(&id).unwrap().len() >= 3);
+    }
+
+    #[test]
+    fn sync_recovery_rebuilds_latest_snapshot_in_current_visibility() {
+        let (_temp, cx) = cortex();
+        let mut trace = Trace::new(
+            "Recover snapshot",
+            "note",
+            "agent-1",
+            vec!["recovery".into()],
+            "original body",
+        );
+        trace.frontmatter.tier = "mid".into();
+        cx.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        trace.body = "latest body".into();
+        cx.update_trace(&id, &mut trace, false).unwrap();
+        cx.archive(&id).unwrap();
+        let path = cx.trace_file(&id, true);
+        fs::remove_file(&path).unwrap();
+
+        let ordinary = cx.sync().unwrap();
+        assert_eq!((ordinary.recovered, ordinary.orphaned), (0, 1));
+        let recovered = cx.sync_with_recovery(true).unwrap();
+        assert_eq!((recovered.recovered, recovered.orphaned), (1, 0));
+
+        let rebuilt = Trace::parse_file(&path).unwrap();
+        let row = cx.get(&id).unwrap();
+        assert_eq!(rebuilt.body, "latest body");
+        assert_eq!(rebuilt.frontmatter.author, "agent-1");
+        assert_eq!(rebuilt.frontmatter.tags, vec!["recovery"]);
+        assert_eq!(rebuilt.frontmatter.tier, "mid");
+        assert_eq!(rebuilt.frontmatter.updated, row.updated_at);
+        assert!(!row.archived_at.is_empty());
+    }
+
+    #[test]
+    fn sync_reports_long_tier_drift_without_reindexing_content() {
+        let (_temp, cx) = cortex();
+        let mut trace = Trace::new("Immutable", "fact", "", vec![], "committed");
+        cx.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        cx.promote(&id, "mid").unwrap();
+        cx.promote(&id, "long").unwrap();
+        let before = cx.get(&id).unwrap();
+        let path = cx.trace_file(&id, false);
+        let mut edited = Trace::parse_file(&path).unwrap();
+        edited.body = "out-of-band edit".into();
+        edited.write_preserving_updated(&path).unwrap();
+
+        let result = cx.sync().unwrap();
+        assert_eq!(result.drifted, 1);
+        assert_eq!(result.drifted_ids, vec![id.clone()]);
+        let after = cx.get(&id).unwrap();
+        assert_eq!(after.content_hash, before.content_hash);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(Trace::parse_file(&path).unwrap().body, "out-of-band edit");
+    }
+
+    #[test]
+    fn sync_atomically_heals_hash_for_new_files() {
+        let (_temp, cx) = cortex();
+        let mut trace = Trace::new("Direct file", "note", "", vec![], "on disk");
+        trace.frontmatter.origin = cx.name.clone();
+        let id = trace.frontmatter.id.clone();
+        let path = cx.trace_file(&id, false);
+        trace.write_preserving_updated(&path).unwrap();
+        assert!(trace.frontmatter.content_hash.is_empty());
+
+        let result = cx.sync().unwrap();
+        assert_eq!(result.added, 1);
+        let repaired = Trace::parse_file(&path).unwrap();
+        let expected = trace::content_hash("on disk");
+        assert_eq!(repaired.frontmatter.content_hash, expected);
+        assert_eq!(cx.get(&id).unwrap().content_hash, expected);
     }
 
     #[test]

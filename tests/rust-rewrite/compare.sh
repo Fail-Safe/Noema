@@ -145,7 +145,22 @@ assert_contains "$(go_noema get "$go_id")" "alpha bravo shared format" "Go opens
 go_noema sync >/dev/null
 rust_noema sync >/dev/null
 assert_contains "$(go_noema verify)" "All hashes OK." "Go integrity verifier accepts shared cortex"
-assert_contains "$(rust_noema verify)" "All traces verified." "Rust integrity verifier accepts shared cortex"
+assert_contains "$(rust_noema verify)" "All hashes OK." "Rust integrity verifier accepts shared cortex"
+assert_contains "$(go_noema verify cortex)" "0 fail" "Go cortex doctor accepts shared cortex"
+assert_contains "$(rust_noema verify cortex)" "0 fail" "Rust cortex doctor accepts shared cortex"
+assert_contains "$(go_noema verify drift)" "No federated traces with source hashes found." "Go drift verifier handles local-only cortex"
+assert_contains "$(rust_noema verify drift)" "No federated traces with source hashes found." "Rust drift verifier handles local-only cortex"
+
+orphan_id=$(go_noema add \
+    --title "Recoverable interoperability trace" \
+    --type note \
+    --author go \
+    --tag interop \
+    --body "event snapshot recovery" | sed -n 's/^Trace added: //p')
+test -n "$orphan_id"
+rm "$cortex_parent/shared/traces/$orphan_id.md"
+assert_contains "$(rust_noema sync --recover)" "Recovered: 1  Orphaned: 0" "Rust sync recovers a Go event snapshot"
+assert_contains "$(go_noema get "$orphan_id")" "event snapshot recovery" "Go reads Rust-recovered snapshot"
 
 database="$cortex_parent/shared/db/noema.db"
 integrity=$(sqlite3 "$database" 'PRAGMA integrity_check;')
@@ -154,7 +169,7 @@ printf 'ok - SQLite integrity check\n'
 
 trace_count=$(sqlite3 "$database" 'SELECT count(*) FROM traces;')
 event_count=$(sqlite3 "$database" 'SELECT count(*) FROM events;')
-test "$trace_count" -eq 2
+test "$trace_count" -eq 3
 test "$event_count" -ge 10
 printf 'ok - shared schema contains %s traces and %s mutation events\n' "$trace_count" "$event_count"
 

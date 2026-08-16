@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::PathBuf,
 };
 
@@ -87,7 +87,10 @@ enum Command {
         hybrid: bool,
     },
     /// Re-index trace files
-    Sync,
+    Sync {
+        #[arg(long)]
+        recover: bool,
+    },
     /// Show the event log
     Events {
         trace_id: Option<String>,
@@ -594,12 +597,60 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
                 print_rows(cx.find_similar(&trace_id, limit, archived)?);
             }
         }
-        Command::Sync => {
-            let result = cx.sync()?;
-            println!(
-                "Sync complete: {} added, {} updated, {} orphaned",
-                result.added, result.updated, result.orphaned
-            );
+        Command::Sync { recover } => {
+            let result = cx.sync_with_recovery(recover)?;
+            if recover {
+                println!(
+                    "Added: {}  Updated: {}  Drifted: {}  Recovered: {}  Orphaned: {}",
+                    result.added, result.updated, result.drifted, result.recovered, result.orphaned
+                );
+            } else {
+                println!(
+                    "Added: {}  Updated: {}  Drifted: {}  Orphaned: {}",
+                    result.added, result.updated, result.drifted, result.orphaned
+                );
+            }
+            if result.recovered > 0 {
+                println!(
+                    "Note: recovered entries had missing files that were rebuilt from the local event log."
+                );
+            }
+            if result.drifted > 0 {
+                println!(
+                    "Note: drifted entries are long-tier traces whose on-disk files differ from the DB."
+                );
+                println!(
+                    "      The DB row is left untouched (long-tier is immutable). Visibility was still reconciled."
+                );
+                println!(
+                    "      Use `noema get <id>` to inspect each trace's current file body. Drifted IDs:"
+                );
+                for id in &result.drifted_ids {
+                    println!("        {id}");
+                }
+                if result.drifted > result.drifted_ids.len() {
+                    println!(
+                        "        … and {} more",
+                        result.drifted - result.drifted_ids.len()
+                    );
+                }
+            }
+            if result.orphaned > 0 {
+                println!("Note: orphaned entries are in the database but have no file on disk.");
+                if recover {
+                    println!("      The local event log had no usable snapshot for these IDs.");
+                    println!(
+                        "      Use `noema list` + `noema remove --force <id>` to clean them up."
+                    );
+                } else {
+                    println!(
+                        "      Try `noema sync --recover` to rebuild them from the local event log,"
+                    );
+                    println!(
+                        "      or use `noema list` + `noema remove --force <id>` to clean them up."
+                    );
+                }
+            }
         }
         Command::Events {
             trace_id,
@@ -678,8 +729,19 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
         Command::Federation { command } => federation_command(cx, command).await?,
         Command::Keygen { force } => keygen(cx, force)?,
         Command::Verify { command } => verify(cx, command)?,
-        Command::Resolve { divergence_id, .. } => {
-            bail!("divergence {divergence_id} requires explicit conflict-body resolution support")
+        Command::Resolve {
+            divergence_id,
+            accept,
+            custom,
+        } => {
+            let accept = accept.unwrap_or_default();
+            let custom = custom.unwrap_or_default();
+            cx.resolve_divergence(&divergence_id, &accept, &custom)?;
+            if accept.is_empty() {
+                println!("Divergence {divergence_id} resolved (custom merge).");
+            } else {
+                println!("Divergence {divergence_id} resolved (accepted {accept}).");
+            }
         }
         Command::Migrate {
             command: MigrateCommand::CortexId { reset },
@@ -1257,33 +1319,647 @@ fn repin_peer(cx: &mut Cortex, name: &str, public_key: &str) -> Result<()> {
 }
 
 fn verify(cx: &Cortex, command: Option<VerifyCommand>) -> Result<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
     match command.unwrap_or(VerifyCommand::Traces { backfill: false }) {
-        VerifyCommand::Traces { backfill: _ } => {
-            let mut failures = 0;
-            for row in cx.list(&ListOptions {
-                all: true,
-                ..Default::default()
-            })? {
-                let (_, trace) = cx.get_trace(&row.id)?;
-                if crate::trace::content_hash(&trace.body) != row.content_hash {
-                    eprintln!("FAIL {} content hash mismatch", row.id);
-                    failures += 1;
-                }
-            }
-            if failures > 0 {
-                bail!("{failures} trace(s) failed verification")
-            };
-            println!("All traces verified.");
-        }
-        VerifyCommand::Cortex => {
-            println!(
-                "Cortex {} manifest v{} and database schema are readable.",
-                cx.name, cx.manifest.version
-            );
-        }
-        VerifyCommand::Drift => println!("No federated source drift detected."),
+        VerifyCommand::Traces { backfill } => verify_traces(cx, backfill, &mut out)?,
+        VerifyCommand::Cortex => verify_cortex(cx, &mut out)?,
+        VerifyCommand::Drift => verify_drift(cx, &mut out)?,
     }
     Ok(())
+}
+
+fn verify_traces(cx: &Cortex, backfill: bool, out: &mut dyn Write) -> Result<()> {
+    let mut checked = 0;
+    let mut mismatches = 0;
+    let mut backfilled = 0;
+
+    for directory in [cx.traces_dir(), cx.archive_dir()] {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", directory.display()));
+            }
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir()
+                || path.extension().and_then(|extension| extension.to_str()) != Some("md")
+            {
+                continue;
+            }
+            let mut trace = match Trace::parse_file(&path) {
+                Ok(trace) => trace,
+                Err(error) => {
+                    writeln!(
+                        out,
+                        "  SKIP     {} (parse error: {error})",
+                        entry.file_name().to_string_lossy()
+                    )?;
+                    continue;
+                }
+            };
+            let computed = crate::trace::content_hash(&trace.body);
+            checked += 1;
+
+            if trace.frontmatter.content_hash.is_empty() {
+                if backfill {
+                    trace.frontmatter.content_hash = computed;
+                    trace
+                        .write_preserving_updated(&path)
+                        .with_context(|| format!("backfilling {}", trace.frontmatter.id))?;
+                    backfilled += 1;
+                    writeln!(out, "  BACKFILL {}", trace.frontmatter.id)?;
+                }
+                continue;
+            }
+
+            if trace.frontmatter.content_hash != computed {
+                mismatches += 1;
+                writeln!(out, "  MISMATCH {}", trace.frontmatter.id)?;
+                writeln!(
+                    out,
+                    "           expected: {}",
+                    trace.frontmatter.content_hash
+                )?;
+                writeln!(out, "           actual:   {computed}")?;
+                if backfill {
+                    trace.frontmatter.content_hash = computed;
+                    trace
+                        .write_preserving_updated(&path)
+                        .with_context(|| format!("backfilling {}", trace.frontmatter.id))?;
+                    backfilled += 1;
+                    writeln!(out, "  FIXED    {}", trace.frontmatter.id)?;
+                }
+            }
+        }
+    }
+
+    writeln!(out, "\nChecked {checked} trace(s).")?;
+    if mismatches > 0 {
+        writeln!(out, "{mismatches} mismatch(es) found.")?;
+    } else {
+        writeln!(out, "All hashes OK.")?;
+    }
+    if backfill && backfilled > 0 {
+        writeln!(out, "{backfilled} trace(s) backfilled.")?;
+    }
+    Ok(())
+}
+
+fn verify_drift(cx: &Cortex, out: &mut dyn Write) -> Result<()> {
+    let mut checked = 0;
+    let mut drifted = 0;
+    for row in cx.list(&ListOptions {
+        all: true,
+        ..Default::default()
+    })? {
+        if row.cortex_id.is_empty() || row.cortex_id == cx.id || row.source_hash.is_empty() {
+            continue;
+        }
+        let path = cx.trace_file(&row.id, !row.archived_at.is_empty());
+        let trace = match Trace::parse_file(&path) {
+            Ok(trace) => trace,
+            Err(error) => {
+                writeln!(out, "  SKIP     {} (parse error: {error})", row.id)?;
+                continue;
+            }
+        };
+        checked += 1;
+        let current = crate::trace::content_hash(&trace.body);
+        if current == row.source_hash {
+            continue;
+        }
+        drifted += 1;
+        writeln!(
+            out,
+            "  DRIFTED  {} (source: {}, locked: {})",
+            row.id,
+            row.origin,
+            if row.source_locked { "yes" } else { "no" }
+        )?;
+        writeln!(out, "           local:  {current}")?;
+        writeln!(out, "           source: {}", row.source_hash)?;
+    }
+
+    writeln!(out, "\nChecked {checked} federated trace(s).")?;
+    if drifted > 0 {
+        writeln!(out, "{drifted} trace(s) have drifted from their source.")?;
+    } else if checked > 0 {
+        writeln!(out, "No drift detected.")?;
+    } else {
+        writeln!(out, "No federated traces with source hashes found.")?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheckLevel {
+    Ok,
+    Warn,
+    Fail,
+}
+
+impl CheckLevel {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Ok => "[ok]  ",
+            Self::Warn => "[warn]",
+            Self::Fail => "[fail]",
+        }
+    }
+}
+
+struct CheckResult {
+    name: &'static str,
+    level: CheckLevel,
+    summary: String,
+    detail: String,
+}
+
+impl CheckResult {
+    fn new(name: &'static str, level: CheckLevel, summary: impl Into<String>) -> Self {
+        Self {
+            name,
+            level,
+            summary: summary.into(),
+            detail: String::new(),
+        }
+    }
+
+    fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = detail.into();
+        self
+    }
+}
+
+fn verify_cortex(cx: &Cortex, out: &mut dyn Write) -> Result<()> {
+    let config = Config::load();
+    let mut checks = vec![
+        check_user_config(&config),
+        CheckResult::new(
+            "cortex selection",
+            CheckLevel::Ok,
+            format!(
+                "{} (source: {})",
+                cx.name,
+                if std::env::var_os("NOEMA_CORTEX").is_some_and(|value| !value.is_empty()) {
+                    "$NOEMA_CORTEX"
+                } else {
+                    "config default"
+                }
+            ),
+        ),
+        check_cortex_layout(cx),
+    ];
+    checks.extend(check_manifest(cx));
+    checks.push(check_database(cx));
+    checks.push(check_access(cx));
+    checks.push(check_tls(cx, Utc::now()));
+    checks.extend(check_federation(cx));
+    checks.push(check_watch(cx));
+    checks.push(check_consolidation(cx));
+
+    let header = format!("noema verify cortex — {} ({})", cx.name, cx.dir.display());
+    writeln!(out, "{header}")?;
+    writeln!(out, "{}", "─".repeat(header.chars().count()))?;
+    let width = checks
+        .iter()
+        .map(|check| check.name.len())
+        .max()
+        .unwrap_or(0);
+    for check in &checks {
+        writeln!(
+            out,
+            "{} {:width$}  {}",
+            check.level.tag(),
+            check.name,
+            check.summary,
+            width = width
+        )?;
+        for line in check.detail.lines() {
+            writeln!(out, "       {line}")?;
+        }
+    }
+    let ok = checks
+        .iter()
+        .filter(|check| check.level == CheckLevel::Ok)
+        .count();
+    let warn = checks
+        .iter()
+        .filter(|check| check.level == CheckLevel::Warn)
+        .count();
+    let fail = checks
+        .iter()
+        .filter(|check| check.level == CheckLevel::Fail)
+        .count();
+    writeln!(out, "\n{ok} ok, {warn} warn, {fail} fail")?;
+    if fail > 0 {
+        bail!("cortex doctor: fail-level checks reported");
+    }
+    Ok(())
+}
+
+fn check_user_config(config: &Result<Config>) -> CheckResult {
+    let config = match config {
+        Ok(config) => config,
+        Err(error) => {
+            return CheckResult::new(
+                "user config",
+                CheckLevel::Fail,
+                format!("could not load: {error:#}"),
+            );
+        }
+    };
+    if !config.default.is_empty() && !config.cortexes.contains_key(&config.default) {
+        return CheckResult::new(
+            "user config",
+            CheckLevel::Fail,
+            format!("default {:?} not in registered cortexes", config.default),
+        );
+    }
+    CheckResult::new(
+        "user config",
+        CheckLevel::Ok,
+        format!(
+            "{} cortex(es) registered, default={}",
+            config.cortexes.len(),
+            if config.default.is_empty() {
+                "(unset)"
+            } else {
+                &config.default
+            }
+        ),
+    )
+}
+
+fn check_cortex_layout(cx: &Cortex) -> CheckResult {
+    let required = [
+        ("traces/", cx.traces_dir()),
+        ("archive/traces/", cx.archive_dir()),
+        ("trash/traces/", cx.trash_dir()),
+        ("db/", cx.dir.join("db")),
+    ];
+    let missing = required
+        .into_iter()
+        .filter_map(|(label, path)| {
+            fs::metadata(path)
+                .ok()
+                .filter(|metadata| metadata.is_dir())
+                .is_none()
+                .then_some(label)
+        })
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        CheckResult::new("cortex layout", CheckLevel::Ok, "all required dirs present")
+    } else {
+        CheckResult::new(
+            "cortex layout",
+            CheckLevel::Fail,
+            format!("missing required dirs: {}", missing.join(", ")),
+        )
+    }
+}
+
+fn check_manifest(cx: &Cortex) -> Vec<CheckResult> {
+    let raw = match fs::read(cx.dir.join("cortex.md")) {
+        Ok(raw) => raw,
+        Err(error) => {
+            return vec![CheckResult::new(
+                "manifest",
+                CheckLevel::Fail,
+                format!("cannot read cortex.md: {error}"),
+            )];
+        }
+    };
+    let mut checks = vec![
+        if raw.starts_with(b"---\n") || raw.starts_with(b"---\r\n") {
+            CheckResult::new("manifest", CheckLevel::Ok, "framed YAML frontmatter")
+        } else {
+            CheckResult::new("manifest", CheckLevel::Warn, "legacy bare-YAML format")
+                .detail("Will silently upgrade to framed form on the next manifest mutation.")
+        },
+    ];
+    checks.push(
+        match cx.manifest.version.cmp(&crate::cortex::MANIFEST_VERSION) {
+            std::cmp::Ordering::Equal => CheckResult::new(
+                "manifest version",
+                CheckLevel::Ok,
+                format!("v{} (current)", cx.manifest.version),
+            ),
+            std::cmp::Ordering::Less => CheckResult::new(
+                "manifest version",
+                CheckLevel::Fail,
+                format!(
+                    "v{} behind current v{}",
+                    cx.manifest.version,
+                    crate::cortex::MANIFEST_VERSION
+                ),
+            )
+            .detail("Run `noema migrate cortex-id` to upgrade."),
+            std::cmp::Ordering::Greater => CheckResult::new(
+                "manifest version",
+                CheckLevel::Warn,
+                format!(
+                    "v{} ahead of binary's v{} (newer noema?)",
+                    cx.manifest.version,
+                    crate::cortex::MANIFEST_VERSION
+                ),
+            ),
+        },
+    );
+    checks.push(if cx.manifest.id.is_empty() {
+        CheckResult::new(
+            "manifest id",
+            CheckLevel::Fail,
+            "missing — required since manifest v2",
+        )
+        .detail("Run `noema migrate cortex-id` to assign one.")
+    } else if ulid::Ulid::from_string(&cx.manifest.id).is_err() {
+        CheckResult::new(
+            "manifest id",
+            CheckLevel::Fail,
+            format!("not a valid ULID: {:?}", cx.manifest.id),
+        )
+    } else {
+        CheckResult::new("manifest id", CheckLevel::Ok, cx.manifest.id.clone())
+    });
+    if cx.manifest.name.is_empty() {
+        checks.push(CheckResult::new("manifest name", CheckLevel::Fail, "empty"));
+    }
+    checks
+}
+
+fn check_database(cx: &Cortex) -> CheckResult {
+    match cx.database_health() {
+        Err(error) => CheckResult::new(
+            "db",
+            CheckLevel::Fail,
+            format!("schema health query failed: {error:#}"),
+        ),
+        Ok((version, journal)) if !journal.eq_ignore_ascii_case("wal") => CheckResult::new(
+            "db",
+            CheckLevel::Warn,
+            format!("schema v{version}, journal_mode={journal} (expected wal)"),
+        ),
+        Ok((version, _)) => CheckResult::new(
+            "db",
+            CheckLevel::Ok,
+            format!("schema v{version}, WAL enabled"),
+        ),
+    }
+}
+
+fn check_access(cx: &Cortex) -> CheckResult {
+    let key = match crate::cortex::load_access_key(&cx.dir, cx.manifest.access.as_ref()) {
+        Ok(key) => key,
+        Err(error) => return CheckResult::new("access", CheckLevel::Fail, error.to_string()),
+    };
+    if !key.keyed() {
+        return CheckResult::new(
+            "access",
+            CheckLevel::Ok,
+            "open mode (no shared key)",
+        )
+        .detail(
+            "Open mode is loopback-only. Set NOEMA_MCP_KEY or access.shared_key_file before exposing the HTTP transport.",
+        );
+    }
+    let check = CheckResult::new(
+        "access",
+        CheckLevel::Ok,
+        format!("keyed (source={}, fp={})", key.source, key.fingerprint),
+    );
+    if key.env_override() {
+        check.detail(format!(
+            "$NOEMA_MCP_KEY overrides configured shared_key_file ({}).",
+            key.path.display()
+        ))
+    } else {
+        check
+    }
+}
+
+fn check_tls(cx: &Cortex, now: chrono::DateTime<Utc>) -> CheckResult {
+    let (cert, key) = crate::cortex::resolve_tls_paths(&cx.dir, cx.manifest.access.as_ref());
+    if cert.as_os_str().is_empty() && key.as_os_str().is_empty() {
+        return CheckResult::new(
+            "tls",
+            CheckLevel::Ok,
+            "no TLS configured (loopback-only OK; keyed federation requires TLS)",
+        );
+    }
+    if cert.as_os_str().is_empty() || key.as_os_str().is_empty() {
+        let (present, missing) = if cert.as_os_str().is_empty() {
+            ("tls_key_path", "tls_cert_path")
+        } else {
+            ("tls_cert_path", "tls_key_path")
+        };
+        return CheckResult::new(
+            "tls",
+            CheckLevel::Fail,
+            format!("access.{present} is set but access.{missing} is empty — configure both"),
+        );
+    }
+    if let Err(error) = fs::metadata(&key) {
+        return CheckResult::new(
+            "tls",
+            CheckLevel::Fail,
+            format!("tls_key_path unreadable: {error}"),
+        );
+    }
+    let validity = match crate::tlsutil::load_leaf(&cert) {
+        Ok(validity) => validity,
+        Err(error) => return CheckResult::new("tls", CheckLevel::Fail, error.to_string()),
+    };
+    let classification = crate::tlsutil::classify(validity, now);
+    let not_after = chrono::DateTime::<Utc>::from_timestamp(classification.not_after, 0)
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| classification.not_after.to_string());
+    match classification.status {
+        crate::tlsutil::ExpiryStatus::Expired => CheckResult::new(
+            "tls",
+            CheckLevel::Fail,
+            format!(
+                "expired {} day(s) ago (NotAfter={not_after})",
+                -classification.days_remaining
+            ),
+        )
+        .detail(format!(
+            "Path: {}. Rotate the cert before restarting `noema serve`.",
+            cert.display()
+        )),
+        crate::tlsutil::ExpiryStatus::NotYetValid => CheckResult::new(
+            "tls",
+            CheckLevel::Fail,
+            format!("NotBefore is in the future (NotAfter={not_after})"),
+        )
+        .detail(format!(
+            "Path: {}. Clock skew, or the wrong cert is configured.",
+            cert.display()
+        )),
+        crate::tlsutil::ExpiryStatus::NearExpiry => CheckResult::new(
+            "tls",
+            CheckLevel::Warn,
+            format!(
+                "expires in {} day(s) (NotAfter={not_after})",
+                classification.days_remaining
+            ),
+        )
+        .detail(format!(
+            "Path: {}. Rotate within the next week.",
+            cert.display()
+        )),
+        crate::tlsutil::ExpiryStatus::Ok => CheckResult::new(
+            "tls",
+            CheckLevel::Ok,
+            format!(
+                "{} days until NotAfter={not_after}",
+                classification.days_remaining
+            ),
+        ),
+    }
+}
+
+fn check_federation(cx: &Cortex) -> Vec<CheckResult> {
+    let Some(federation) = &cx.manifest.federation else {
+        return vec![CheckResult::new(
+            "federation",
+            CheckLevel::Ok,
+            "no peers configured",
+        )];
+    };
+    if federation.peers.is_empty() {
+        return vec![CheckResult::new(
+            "federation",
+            CheckLevel::Ok,
+            "no peers configured",
+        )];
+    }
+    let mode = if federation.mode.is_empty() {
+        "sync"
+    } else {
+        &federation.mode
+    };
+    let mut checks = vec![CheckResult::new(
+        "federation mode",
+        CheckLevel::Ok,
+        format!("{mode} ({} peer(s))", federation.peers.len()),
+    )];
+    let mut seen = std::collections::BTreeMap::<&str, usize>::new();
+    let mut duplicates = Vec::new();
+    let mut collisions = Vec::new();
+    let mut incomplete = Vec::new();
+    for peer in &federation.peers {
+        let count = seen.entry(&peer.name).or_default();
+        *count += 1;
+        if *count == 2 {
+            duplicates.push(peer.name.clone());
+        }
+        if !peer.name.is_empty() && peer.name == cx.manifest.name {
+            collisions.push(peer.name.clone());
+        }
+        if peer.name.is_empty() || peer.endpoint.is_empty() {
+            incomplete.push(format!("{:?}@{:?}", peer.name, peer.endpoint));
+        }
+    }
+    for (summary, values) in [
+        ("duplicate peer labels", duplicates),
+        ("peer label(s) collide with this cortex's name", collisions),
+        ("peer entries missing name or endpoint", incomplete),
+    ] {
+        if !values.is_empty() {
+            checks.push(CheckResult::new(
+                "federation peers",
+                CheckLevel::Fail,
+                format!("{summary}: {}", values.join(", ")),
+            ));
+        }
+    }
+    checks
+}
+
+fn check_watch(cx: &Cortex) -> CheckResult {
+    let Some(watch) = &cx.manifest.watch else {
+        return CheckResult::new(
+            "watch",
+            CheckLevel::Ok,
+            "default settings (enabled, debounce 300ms)",
+        );
+    };
+    let enabled = watch.enabled.unwrap_or(true);
+    let debounce = if watch.debounce_ms == 0 {
+        300
+    } else {
+        watch.debounce_ms
+    };
+    if watch.debounce_ms != 0 && !(50..=10_000).contains(&watch.debounce_ms) {
+        CheckResult::new(
+            "watch",
+            CheckLevel::Warn,
+            format!(
+                "enabled={enabled}, debounce_ms={} (outside sane range 50–10000)",
+                watch.debounce_ms
+            ),
+        )
+    } else {
+        CheckResult::new(
+            "watch",
+            CheckLevel::Ok,
+            format!("enabled={enabled}, debounce_ms={debounce}"),
+        )
+    }
+}
+
+fn check_consolidation(cx: &Cortex) -> CheckResult {
+    if cx.manifest.consolidation.is_none() {
+        return CheckResult::new("consolidation", CheckLevel::Ok, "not configured");
+    }
+    let config = match cx.manifest.consolidation_config() {
+        Ok(Some(config)) => config,
+        Ok(None) => return CheckResult::new("consolidation", CheckLevel::Ok, "not configured"),
+        Err(error) => {
+            return CheckResult::new("consolidation", CheckLevel::Fail, error.to_string());
+        }
+    };
+    if config.llm_enabled && config.local_llm_endpoint.is_empty() {
+        return CheckResult::new(
+            "consolidation",
+            CheckLevel::Warn,
+            "llm_enabled but local_llm_endpoint is empty",
+        );
+    }
+    if config.llm_enabled
+        && !config.local_llm_endpoint.is_empty()
+        && reqwest::Url::parse(&config.local_llm_endpoint).is_err()
+    {
+        return CheckResult::new(
+            "consolidation",
+            CheckLevel::Fail,
+            "local_llm_endpoint not a valid URL",
+        );
+    }
+    if config
+        .graduation
+        .as_ref()
+        .is_some_and(|graduation| graduation.min_age_days < 0 || graduation.min_read_count < 0)
+    {
+        return CheckResult::new(
+            "consolidation",
+            CheckLevel::Fail,
+            "graduation thresholds must be non-negative",
+        );
+    }
+    CheckResult::new(
+        "consolidation",
+        CheckLevel::Ok,
+        format!(
+            "enabled={}, llm_enabled={}",
+            config.enabled, config.llm_enabled
+        ),
+    )
 }
 
 fn plugin_command(command: PluginCommand) -> Result<()> {
@@ -1639,6 +2315,133 @@ fn read_stdin() -> Result<String> {
 mod tests {
     use super::*;
     use crate::cortex::{AccessConfig, FederationConfig, Manifest, PeerEntry, read_manifest};
+
+    fn cortex(parent: &std::path::Path, name: &str) -> Cortex {
+        Cortex::create(name, parent).unwrap();
+        Cortex::open(name, parent.join(name)).unwrap()
+    }
+
+    #[test]
+    fn trace_verifier_reports_and_backfills_files_without_changing_updated() {
+        let temp = tempfile::tempdir().unwrap();
+        let cx = cortex(temp.path(), "verify");
+        let mut trace = Trace::new("Verify", "fact", "", vec![], "body");
+        cx.add(&mut trace).unwrap();
+        let path = cx.trace_file(&trace.frontmatter.id, false);
+        let mut on_disk = Trace::parse_file(&path).unwrap();
+        let updated = on_disk.frontmatter.updated.clone();
+        on_disk.frontmatter.content_hash.clear();
+        on_disk.write_preserving_updated(&path).unwrap();
+
+        let mut output = Vec::new();
+        verify_traces(&cx, false, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Checked 1 trace(s)."));
+        assert!(output.contains("All hashes OK."));
+        assert!(
+            Trace::parse_file(&path)
+                .unwrap()
+                .frontmatter
+                .content_hash
+                .is_empty()
+        );
+
+        let mut output = Vec::new();
+        verify_traces(&cx, true, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("BACKFILL"));
+        assert!(output.contains("1 trace(s) backfilled."));
+        let repaired = Trace::parse_file(&path).unwrap();
+        assert_eq!(repaired.frontmatter.updated, updated);
+        assert_eq!(
+            repaired.frontmatter.content_hash,
+            crate::trace::content_hash("body")
+        );
+    }
+
+    #[test]
+    fn drift_verifier_uses_foreign_source_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = cortex(temp.path(), "source");
+        let target = cortex(temp.path(), "target");
+        let mut trace = Trace::new("Federated", "fact", "", vec![], "published");
+        trace.frontmatter.source_hash = crate::trace::content_hash("published");
+        trace.frontmatter.source_locked = true;
+        source.add(&mut trace).unwrap();
+        let event = source
+            .history(&trace.frontmatter.id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.action == "create")
+            .unwrap();
+        target.replay_event(&event).unwrap();
+        let path = target.trace_file(&trace.frontmatter.id, false);
+        let mut local = Trace::parse_file(&path).unwrap();
+        local.body = "locally changed".into();
+        local.write_preserving_updated(&path).unwrap();
+
+        let mut output = Vec::new();
+        verify_drift(&target, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("DRIFTED"));
+        assert!(output.contains("locked: yes"));
+        assert!(output.contains("1 trace(s) have drifted from their source."));
+    }
+
+    #[test]
+    fn cortex_doctor_reports_health_and_missing_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        let cx = cortex(temp.path(), "doctor");
+        let mut output = Vec::new();
+        verify_cortex(&cx, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("framed YAML frontmatter"));
+        assert!(output.contains("WAL enabled"));
+        assert!(output.contains("0 fail"));
+
+        fs::remove_dir_all(cx.trash_dir()).unwrap();
+        let mut output = Vec::new();
+        assert!(verify_cortex(&cx, &mut output).is_err());
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("[fail] cortex layout"));
+        assert!(output.contains("trash/traces/"));
+    }
+
+    #[tokio::test]
+    async fn cli_resolve_dispatches_to_the_cortex_engine() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cx = cortex(temp.path(), "resolve");
+        let mut original = Trace::new("Original", "fact", "", vec![], "old body");
+        cx.add(&mut original).unwrap();
+        let body = format!(
+            "## Concurrent edits detected\n\n**Trace:** {}\n**Conflicting origins:** resolve (LOCAL123), peer (REMOTE12)\n\n### Version from resolve (LOCAL123)\n**Vector clock:** {{}}\n\nlocal body\n\n### Version from peer (REMOTE12)\n**Vector clock:** {{}}\n\nremote body",
+            original.frontmatter.id
+        );
+        let mut divergence = Trace::new("Divergence: Original", "divergence", "", vec![], body);
+        divergence.frontmatter.derived_from = vec![original.frontmatter.id.clone()];
+        cx.add(&mut divergence).unwrap();
+
+        execute_cortex_command(
+            &mut cx,
+            Command::Resolve {
+                divergence_id: divergence.frontmatter.id.clone(),
+                accept: Some("peer".into()),
+                custom: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cx.get_trace(&original.frontmatter.id).unwrap().1.body,
+            "remote body"
+        );
+        assert!(
+            !cx.get(&divergence.frontmatter.id)
+                .unwrap()
+                .trashed_at
+                .is_empty()
+        );
+    }
 
     #[test]
     fn experimental_http_transport_fails_closed() {
