@@ -390,17 +390,26 @@ SHA-256 and record only the cortex identity, destination parent, prior default,
 and expected filesystem state. A stable per-destination kernel lock rejects
 concurrent replacement while allowing recovery after a killed owner.
 
+Configuration persistence no longer truncates the live YAML. Rust serializes
+saves with a stable kernel lock, writes an owner-private same-directory temp,
+syncs its bytes and permissions, atomically renames it, and syncs the directory.
+The next locked writer safely removes a stale regular temp left by process
+death; read-only targets and non-file temp artifacts still fail closed.
+
 `cortex restore-status` lists transaction IDs, labels, phases, and coarse
 recovery states without paths or hashes. `cortex restore-recover` performs an
 explicit resume or rollback only after the current tree and configuration
 match the recorded state. Tampered or ambiguous state remains untouched.
 
-Eight subprocess scenarios now cover `SIGKILL` after preservation, placement,
+Nine restore subprocess scenarios now cover `SIGKILL` after preservation, placement,
 and configuration save; resume and rollback of the resulting states; committed
 cleanup; rollback when no destination previously existed; tamper refusal;
 malformed-journal redaction; owner-only permissions; concurrent-target
-rejection; and killed-owner lock release. These establish process-death
-reconciliation, not automatic startup recovery or power-loss durability.
+rejection; killed-owner lock release; and death after config-temp sync but
+before atomic rename. An independent config scenario proves the prior YAML is
+byte-identical after that kill and a retry commits the new complete YAML while
+cleaning the stale temp. These establish process-death reconciliation, not
+automatic startup recovery or power-loss durability.
 
 ## Bounded federation soak
 
@@ -428,9 +437,9 @@ replace, move, delete, purge replay, and watcher reconstruction paths on the
 next Rust open. The branch Go build now refuses mixed-runtime takeover until
 Rust recovery completes, and database corruption fails without rewriting data.
 Explicit restore from a prior archive and hash-bound recovery of interrupted
-restore transactions are now available, while atomic configuration
-persistence, corrupt-database salvage/status, compatibility with older unaware
-Go binaries, and power-loss qualification remain open. Its consolidation election and
+restore transactions plus atomic configuration persistence are now available,
+while corrupt-database salvage/status, compatibility with older unaware Go
+binaries, and power-loss qualification remain open. Its consolidation election and
 coordination wire, pass gate, watchdog recovery, full cadence, heuristic pass,
 graduation, and model-driven distillation are now present. A bounded real-model
 comparison also passes, but broader distillation-quality evaluation remains
@@ -454,6 +463,6 @@ path from a known-good archive, and non-mutating status plus explicit
 resume/rollback reconciles interrupted restore transactions without exposing
 journal contents. It still does not justify an all-in rewrite because
 larger-result throughput is not better and pixel-level/live-terminal TUI
-validation, broader distillation-quality evaluation, atomic configuration
-persistence, automatic startup restore recovery, power-loss fault injection,
-older-Go recovery, and corrupt-database salvage remain incomplete.
+validation, broader distillation-quality evaluation, automatic startup restore
+recovery, power-loss fault injection, older-Go recovery, and corrupt-database
+salvage remain incomplete.

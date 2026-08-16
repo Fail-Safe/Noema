@@ -5,9 +5,10 @@ Updated: 2026-08-16
 ## Pause point
 
 - Branch: `experiment/rust-rewrite`
-- Latest completed milestone: durable restore transactions with explicit,
-  secret-safe resume and rollback (this handoff commit).
-- Previous milestone: `9b2bfe9 feat(rust): expose safe recovery status`.
+- Latest completed milestone: synced atomic configuration persistence with
+  killed-writer recovery (this handoff commit).
+- Previous milestone: `4f04c6d feat(rust): recover interrupted cortex restore`.
+- Earlier restore milestone: `9b2bfe9 feat(rust): expose safe recovery status`.
 - Earlier restore milestone: `b95b14c feat(rust): add safe cortex restore`.
 - Earlier recovery milestone: `bc21b8d fix(recovery): guard mixed-runtime takeover`.
 - Earlier recovery milestone: `5a9337e fix(rust): recover interrupted trace deletion`.
@@ -137,15 +138,22 @@ Updated: 2026-08-16
   validates the recorded tree hashes and configuration identity before making
   an explicit change. Ambiguous or tampered state fails closed, and a new
   restore cannot overlap an unfinished transaction for the same destination.
+- Rust configuration saves are now serialized by a stable kernel lock and use
+  an owner-private same-directory temporary file, file sync, atomic rename, and
+  directory sync. A killed writer leaves the prior complete YAML untouched;
+  the next locked save removes the stale regular temp and proceeds. Read-only
+  targets still refuse replacement, and a non-file temp artifact fails closed.
 - `cortex recovery-status <name>` inspects the configured database read-only
   and reports only clean, pending count, malformed-journal count, or unreadable
   database. It does not open the Cortex, consume a journal record, expose trace
   IDs or paths, or print SQLite/parser error text.
-- Eight subprocess scenarios cover forced restore after destination
+- Nine subprocess scenarios cover forced restore after destination
   preservation, placement, and configuration save; resume and rollback from
   each recoverable state; rollback into an initially empty destination;
   tampered incoming data; malformed-journal redaction; and concurrent restore
-  rejection with post-`SIGKILL` lock release.
+  rejection with post-`SIGKILL` lock release. The ninth kills the config writer
+  after syncing its temp but before rename, then resumes from the restore
+  journal and cleans the stale temp.
 - A reusable pass gate with initial election, signed claim, cancellable quiet
   wait, re-election, distinct preemption reasons, in-flight tracking, pass-error
   closure, and signed success.
@@ -226,9 +234,9 @@ The following passed for the combined backup/restore, crash recovery,
 transaction rollback, fault-safety, dynamic federation, TLS lifecycle,
 advanced MCP, and functional TUI tree:
 
-- `make rust-test` — formatting, clippy with warnings denied, 97 unit tests,
-  five mutation crash-recovery scenarios, five recovery-safety tests, and eight
-  restore crash/recovery scenarios.
+- `make rust-test` — formatting, clippy with warnings denied, 100 unit tests,
+  one config crash-recovery scenario, five mutation crash-recovery scenarios,
+  five recovery-safety tests, and nine restore crash/recovery scenarios.
 - Eight focused SQLite-abort tests prove byte- and permission-identical rollback
   for local update/tier/visibility/hard-delete operations, watcher
   reconstruction, and remote update/create/purge replay, including removal of
@@ -250,10 +258,16 @@ advanced MCP, and functional TUI tree:
 - Ten restore unit tests cover round trips, metadata normalization, long paths,
   self-inclusion, forced replacement rollback, identity collisions, unsafe
   names, duplicate paths, multiple roots, links, and traversal.
-- Eight restore subprocess scenarios prove explicit resume/rollback from each
+- Nine restore subprocess scenarios prove explicit resume/rollback from each
   `SIGKILL` boundary, committed cleanup, rollback into an empty destination,
   hash-bound tamper refusal, malformed-record redaction, journal permissions,
-  concurrent-target exclusion, and kernel-lock release after process death.
+  concurrent-target exclusion, kernel-lock release after process death, and
+  recovery when config replacement is killed between temp sync and rename.
+- One independent config subprocess test proves a killed writer preserves the
+  prior YAML byte-for-byte, leaves only an owner-private temp, releases its
+  kernel lock, and permits a retry that commits valid `0640` YAML and removes
+  the stale temp. Three unit tests cover complete replacement, read-only
+  refusal, and fail-closed handling of a non-file temp artifact.
 - `go test ./...`
 - `go test -race ./...`
 - `go vet ./...`
@@ -326,13 +340,15 @@ One sandbox-only warning appeared while Go tried to update its module-download
 stat cache outside the writable workspace. The Go build still succeeded and the
 complete comparison target exited successfully.
 
-The restore-journal validation exposed two pre-existing fixture races. The
+The restore-journal validation exposed three pre-existing fixture races. The
 key-rotation scenario now waits until receivers have observed the stopped peer
 before freezing their cursors, and the watchdog scenario explicitly removes
 every terminal event before asserting orphan recovery. A local coordination
-checkpoint now distinguishes emission failure from replay failure. Both mixed
-runtime scenarios passed three consecutive focused repetitions, followed by
-one uninterrupted complete `make compare-rust` run.
+checkpoint revealed that the final promotion could be authored by the still-
+live Go peer and replayed to Rust. The fixture now stops Go, proves the local
+Rust promotion plus claim/success pair, restarts Go, and then proves replay.
+The exclusive-winner election scenario passed five consecutive focused runs,
+followed by one uninterrupted complete `make compare-rust` run.
 
 ## Performance evidence so far
 
@@ -432,18 +448,17 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
 2. Broader adversarial real-model quality evaluation beyond the current bounded
    synthetic corpus.
 3. Backup restore now has hash-bound, explicit resume/rollback for every tested
-   process-death boundary. Configuration-file replacement is still not atomic,
-   automatic startup reconciliation is deliberately absent, and real
+   process-death boundary, and configuration replacement is synced and atomic.
+   Automatic startup reconciliation is deliberately absent, and real
    power-loss durability remains unqualified. Corrupt-database salvage is also
    absent. Older Go binaries cannot safely take over until Rust mutation
    recovery has completed.
 
 ## Recommended next milestone
 
-Make configuration persistence use a synced temporary file, atomic rename, and
-parent-directory sync while preserving the current rollback behavior. Then
-qualify archive replacement, restore placement, configuration persistence, and
-SQLite under a real power-loss simulation. Corrupt-database salvage and a safe
+Qualify archive replacement, restore placement, configuration persistence, and
+SQLite under a disposable real-power-loss harness rather than treating
+`SIGKILL` as equivalent to storage loss. Corrupt-database salvage and a safe
 policy for takeover by older Go builds remain separate later decisions.
 
 ## Resume commands

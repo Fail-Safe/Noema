@@ -427,6 +427,7 @@ def exercise(go: Path, rust: Path, root: Path) -> None:
         assert status["consolidation"]["winner"] == identities[peer_b.name], status
 
         assert stop(peer_b)
+        assert stop(peer_a)
         set_threshold(cortex_dir(root, peer_b) / "cortex.md", 1)
         promoted_id = add_trace(
             peer_b, env, "rust-threshold-promotion", "real gated pass payload"
@@ -449,11 +450,6 @@ def exercise(go: Path, rust: Path, root: Path) -> None:
             and action_count(database(root, peer_b), promoted_id, "promote") == 1,
         )
         wait_until(
-            "Rust promotion replays to Go",
-            lambda: trace_tier(database(root, peer_a), promoted_id) == "mid"
-            and action_count(database(root, peer_a), promoted_id, "promote") == 1,
-        )
-        wait_until(
             "Rust records its gated claim and success locally",
             lambda: bool(
                 coordination_windows(
@@ -467,6 +463,12 @@ def exercise(go: Path, rust: Path, root: Path) -> None:
                     identities[peer_b.name],
                 )
             ),
+        )
+        start(peer_a, env)
+        wait_until(
+            "Rust promotion replays to Go",
+            lambda: trace_tier(database(root, peer_a), promoted_id) == "mid"
+            and action_count(database(root, peer_a), promoted_id, "promote") == 1,
         )
         wait_until(
             "Rust gated claim and success replay to Go",

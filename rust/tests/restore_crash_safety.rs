@@ -70,6 +70,25 @@ fn spawn_restore(fixture: &Fixture, point: &str, marker: &Path) -> Child {
         .unwrap()
 }
 
+fn spawn_restore_before_config_rename(fixture: &Fixture, marker: &Path) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_noema-rs"))
+        .env("XDG_CONFIG_HOME", &fixture.config_home)
+        .env("NOEMA_RUST_TEST_CONFIG_PAUSE_POINT", "before-rename")
+        .env("NOEMA_RUST_TEST_CONFIG_PAUSE_MARKER", marker)
+        .args([
+            "cortex",
+            "restore",
+            fixture.archive.to_str().unwrap(),
+            "--path",
+            fixture.destination_parent.to_str().unwrap(),
+            "--force",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
 fn wait_for_marker(child: &mut Child, marker: &Path) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !marker.exists() && Instant::now() < deadline {
@@ -279,6 +298,37 @@ fn committed_restore_can_be_explicitly_rolled_back() {
     assert!(!config.cortexes.contains_key("source"));
     assert!(config.default.is_empty());
     assert!(transaction_paths(&fixture.destination_parent, "backup").is_empty());
+    assert_eq!(restore_status(&fixture), "Restore transactions: clean\n");
+}
+
+#[test]
+fn killed_before_atomic_config_replace_resumes_from_restore_journal() {
+    let fixture = fixture();
+    let marker = fixture._temp.path().join("config-before-rename.marker");
+    let mut child = spawn_restore_before_config_rename(&fixture, &marker);
+    wait_for_marker(&mut child, &marker);
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+
+    assert_restored_destination(&fixture);
+    let backups = transaction_paths(&fixture.destination_parent, "backup");
+    assert_eq!(backups.len(), 1);
+    assert_old_destination(&backups[0]);
+    assert!(load_saved_config(&fixture).is_none());
+    assert!(fixture.config_home.join("noema/.config.yaml.tmp").is_file());
+
+    let id = transaction_id(&fixture);
+    assert!(restore_status(&fixture).contains("state=resumable"));
+    recover(&fixture, &id, "resume");
+    assert_restored_destination(&fixture);
+    assert!(
+        load_saved_config(&fixture)
+            .unwrap()
+            .cortexes
+            .contains_key("source")
+    );
+    assert!(transaction_paths(&fixture.destination_parent, "backup").is_empty());
+    assert!(!fixture.config_home.join("noema/.config.yaml.tmp").exists());
     assert_eq!(restore_status(&fixture), "Restore transactions: clean\n");
 }
 
