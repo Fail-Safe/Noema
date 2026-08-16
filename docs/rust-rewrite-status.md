@@ -5,9 +5,9 @@ Updated: 2026-08-16
 ## Pause point
 
 - Branch: `experiment/rust-rewrite`
-- Latest completed milestone: bounded lock and I/O failure experiments (this
-  handoff commit).
-- Previous milestone: `c117b61 feat(rust): reconcile live federation workers`.
+- Latest completed milestone: returned database-failure rollback for Rust trace
+  mutations (this handoff commit).
+- Previous milestone: `752d6da test(rust): add lock and I/O fault gates`.
 - Earlier TLS milestone: `33424c0 feat(rust): add TLS certificate lifecycle parity`.
 - Earlier TUI milestone: `a7e7196 feat(rust): add functional TUI parity`.
 - Earlier advanced MCP milestone: `29cd610 feat(rust): complete advanced MCP parity`.
@@ -91,6 +91,12 @@ Updated: 2026-08-16
 - Multi-process contention now proves that both builds keep lock losers in
   MCP-only mode, release the kernel lock after a killed owner, and allow a new
   owner to acquire it while the original loser remains alive.
+- Rust local updates, visibility moves, and tier changes now roll their
+  filesystem mutation back when the corresponding SQLite transaction returns
+  an error. Federation replay applies the same rule to snapshots, tags,
+  visibility, tiers, and consolidation: existing files regain their exact
+  bytes and permissions, moves are reversed, new files are removed, and
+  pre-existing orphan files are preserved.
 - A reusable pass gate with initial election, signed claim, cancellable quiet
   wait, re-election, distinct preemption reasons, in-flight tracking, pass-error
   closure, and signed success.
@@ -167,10 +173,13 @@ Updated: 2026-08-16
 
 ## Latest validation
 
-The following passed for the combined fault-safety, dynamic federation, TLS
-lifecycle, advanced MCP, and functional TUI tree:
+The following passed for the combined transaction rollback, fault-safety,
+dynamic federation, TLS lifecycle, advanced MCP, and functional TUI tree:
 
-- `make rust-test` — formatting, clippy with warnings denied, and 76 Rust tests.
+- `make rust-test` — formatting, clippy with warnings denied, and 81 Rust tests.
+- Five focused SQLite-abort tests prove byte- and permission-identical rollback
+  for local update/tier/visibility operations and remote update/create replay,
+  including removal of a new file and preservation of an orphan file.
 - `go test ./...`
 - `go test -race ./...`
 - `go vet ./...`
@@ -312,16 +321,20 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
    dark/light auto-detection, and external-editor workflows.
 2. Broader adversarial real-model quality evaluation beyond the current bounded
    synthetic corpus.
-3. Crash-atomic file rollback after a successful filesystem mutation but before
-   database commit, corrupt-database recovery, and broader fault injection.
+3. Abrupt-process-death safety during direct file replacement, hard-purge and
+   external-delete recovery, corrupt-database recovery, and broader fault
+   injection. Returned SQLite failures in non-destructive local and replay
+   mutation paths now roll the filesystem back, but `SIGKILL` cannot run that
+   rollback code.
 
 ## Recommended next milestone
 
-Add a deterministic post-write/pre-commit failure seam around Rust trace
-mutations. First demonstrate the current file/database split-brain window, then
-add rollback or startup repair without weakening editor-owned byte preservation.
-Keep the new pre-write failure and multi-process lock fixtures as regression
-gates.
+Design the abrupt-process-death boundary before changing more mutation code.
+Evaluate same-directory atomic replacement plus either a small mutation journal
+or deterministic startup repair, then inject `SIGKILL` between replacement and
+SQLite commit. Preserve exact editor-owned bytes and cover hard purge and
+external-delete reconstruction separately. Keep the returned-failure,
+pre-write I/O, and multi-process lock fixtures as regression gates.
 
 Any new Rust packages still require explicit approval before adding them.
 

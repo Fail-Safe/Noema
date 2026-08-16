@@ -21,7 +21,7 @@ integrity, or security requirements.
 | Consolidation | Deterministic + bounded real-model integration | Fake LLM covers election, gating, clustering, success/failure events, and idempotency; real model preserves planted synthetic facts and rejects unrelated buckets | Rank/election/watchdog/cadence, heuristic promotion, graduation, all three model profiles, CLI overrides/dry-run/JSON, distilled lineage/telemetry, malformed/offline fallback, restart idempotency, signed bidirectional replay, and seven-run synthetic real-model comparison automated |
 | Plugins | File integration | Embedded payload hashes, install/check/force rules, target resolution, and drift reporting match | `plugin_lifecycle.py` covers all six payloads, independent CLI dispatch, target guards, dry-run non-mutation, idempotency, drift hashes/refusal, forced atomic file/symlink replacement, unmanaged files, and temp cleanup |
 | TUI | State-machine + snapshot | Navigation, filters, tier actions, themes, resize, and error recovery match | Six Rust suites cover navigation/focus/scroll, search/tier/help transitions, lifecycle and vote mutations, sticky live refresh/highlights, dark/light render snapshot, Unicode truncation, and wrapping; exact visual and live-terminal comparison remains |
-| Fault tolerance | Fault injection | Interrupted writes, malformed Markdown, corrupt DB, unavailable endpoints, and lock contention fail safely | `background_lock_contention.py` covers MCP-only losers, killed-owner release, and replacement acquisition; `io_failure_safety.py` covers pre-mutation trace, lifecycle, and manifest I/O refusal with unchanged bytes/DB/events; post-write crash windows and corrupt-DB recovery remain pending |
+| Fault tolerance | Fault injection | Interrupted writes, malformed Markdown, corrupt DB, unavailable endpoints, and lock contention fail safely | `background_lock_contention.py` covers MCP-only losers, killed-owner release, and replacement acquisition; `io_failure_safety.py` covers pre-mutation trace, lifecycle, and manifest I/O refusal with unchanged bytes/DB/events; Rust unit tests inject returned SQLite aborts after local and replay filesystem mutations and require exact rollback; abrupt-process-death windows, destructive lifecycle paths, and corrupt-DB recovery remain pending |
 | Security | Negative integration | Path traversal, source-lock bypass, forged signatures, bearer auth, TLS expiry, and secret redaction match | Signing/source-lock, bearer rejection, private-CA rejection, plaintext-auth refusal, expired/future validity refusal, explicit bypass, monitor transitions, and secret/certificate-content redaction automated |
 
 ## Performance protocol
@@ -50,6 +50,6 @@ and otherwise permits unauthenticated HTTP only on loopback. Semantic backfill,
 ranking, MCP routing, and automatic maintenance now pass the deterministic Go
 oracle. MCP discovery, successful advanced-tool results, invalid inputs,
 missing resources, and federation-mode transport boundaries are automated.
-Pixel-level/live-terminal TUI validation, broader fault injection, and broader
-adversarial real-model quality evaluation still require ports and parity
-fixtures.
+Pixel-level/live-terminal TUI validation, abrupt-process-death and corrupt-DB
+fault injection, and broader adversarial real-model quality evaluation still
+require ports and parity fixtures.

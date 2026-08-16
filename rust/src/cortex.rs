@@ -581,6 +581,55 @@ pub struct Cortex {
     signing_key: Option<SigningKey>,
 }
 
+struct FileSnapshot {
+    bytes: Vec<u8>,
+    permissions: fs::Permissions,
+}
+
+impl FileSnapshot {
+    fn capture(path: &Path) -> Result<Self> {
+        Ok(Self {
+            bytes: fs::read(path)
+                .with_context(|| format!("reading {} for rollback", path.display()))?,
+            permissions: fs::metadata(path)
+                .with_context(|| format!("reading permissions for {}", path.display()))?
+                .permissions(),
+        })
+    }
+
+    fn restore_after<T>(self, path: &Path, result: Result<T>) -> Result<T> {
+        let Err(error) = result else {
+            return result;
+        };
+        let rollback =
+            fs::write(path, self.bytes).and_then(|()| fs::set_permissions(path, self.permissions));
+        match rollback {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(error.context(format!(
+                "also failed to restore {} after database error: {rollback_error}",
+                path.display()
+            ))),
+        }
+    }
+}
+
+fn restore_move_after<T>(source: &Path, target: &Path, result: Result<T>) -> Result<T> {
+    let Err(error) = result else {
+        return result;
+    };
+    if source == target {
+        return Err(error);
+    }
+    match fs::rename(target, source) {
+        Ok(()) => Err(error),
+        Err(rollback_error) => Err(error.context(format!(
+            "also failed to move {} back to {}: {rollback_error}",
+            target.display(),
+            source.display()
+        ))),
+    }
+}
+
 impl Cortex {
     pub fn create(name: &str, parent: &Path) -> Result<Manifest> {
         let root = parent.join(name);
@@ -1665,18 +1714,23 @@ impl Cortex {
         trace.frontmatter.content_hash = trace::content_hash(&trace.body);
         trace.validate()?;
         let path = self.file_path(&existing);
+        let snapshot = FileSnapshot::capture(&path)?;
         trace.write_preserving_updated(&path)?;
-        let tx = self.connection.unchecked_transaction()?;
-        let f = &trace.frontmatter;
-        tx.execute(
-            "UPDATE traces SET title=?1,type=?2,author=?3,updated_at=?4,content_hash=?5,source_locked=?6,source_hash=?7 WHERE id=?8",
-            params![f.title, f.trace_type, f.author, f.updated, f.content_hash, i64::from(f.source_locked), nullable(&f.source_hash), id],
-        )?;
-        replace_tags(&tx, id, &f.tags)?;
-        replace_lineage(&tx, id, &f.derived_from)?;
-        upsert_fts(&tx, id, &f.title, &trace.body, &f.tags)?;
-        self.emit_event(&tx, "update", id, &f.updated, trace_snapshot(trace))?;
-        tx.commit()?;
+        let database_result: Result<()> = (|| {
+            let tx = self.connection.unchecked_transaction()?;
+            let f = &trace.frontmatter;
+            tx.execute(
+                "UPDATE traces SET title=?1,type=?2,author=?3,updated_at=?4,content_hash=?5,source_locked=?6,source_hash=?7 WHERE id=?8",
+                params![f.title, f.trace_type, f.author, f.updated, f.content_hash, i64::from(f.source_locked), nullable(&f.source_hash), id],
+            )?;
+            replace_tags(&tx, id, &f.tags)?;
+            replace_lineage(&tx, id, &f.derived_from)?;
+            upsert_fts(&tx, id, &f.title, &trace.body, &f.tags)?;
+            self.emit_event(&tx, "update", id, &f.updated, trace_snapshot(trace))?;
+            tx.commit()?;
+            Ok(())
+        })();
+        snapshot.restore_after(&path, database_result)?;
         if actor_agent {
             self.bump_usage(id, false, true)?;
         }
@@ -1881,14 +1935,17 @@ impl Cortex {
             Visibility::Archive => ("archive", Some(now.as_str()), None),
             Visibility::Trash => ("trash", None, Some(now.as_str())),
         };
-        let tx = self.connection.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE traces SET archived_at=?1,trashed_at=?2 WHERE id=?3",
-            params![archived, trashed, id],
-        )?;
-        self.emit_event(&tx, action, id, &now, json!({}))?;
-        tx.commit()?;
-        Ok(())
+        let database_result: Result<()> = (|| {
+            let tx = self.connection.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE traces SET archived_at=?1,trashed_at=?2 WHERE id=?3",
+                params![archived, trashed, id],
+            )?;
+            self.emit_event(&tx, action, id, &now, json!({}))?;
+            tx.commit()?;
+            Ok(())
+        })();
+        restore_move_after(&source, &target, database_result)
     }
 
     pub fn remove_hard(&self, id: &str) -> Result<()> {
@@ -1933,21 +1990,26 @@ impl Cortex {
     }
 
     fn change_tier(&self, row: &Row, to: &str, action: &str) -> Result<()> {
-        let mut trace = Trace::parse_file(&self.file_path(row))?;
+        let path = self.file_path(row);
+        let snapshot = FileSnapshot::capture(&path)?;
+        let mut trace = Trace::parse_file(&path)?;
         trace.frontmatter.tier = to.to_owned();
         trace.frontmatter.updated = row.updated_at.clone();
-        trace.write_preserving_updated(&self.file_path(row))?;
-        let tx = self.connection.unchecked_transaction()?;
-        tx.execute("UPDATE traces SET tier=?1 WHERE id=?2", params![to, row.id])?;
-        self.emit_event(
-            &tx,
-            action,
-            &row.id,
-            &trace::now_rfc3339(),
-            json!({"from": row.tier, "to": to}),
-        )?;
-        tx.commit()?;
-        Ok(())
+        trace.write_preserving_updated(&path)?;
+        let database_result: Result<()> = (|| {
+            let tx = self.connection.unchecked_transaction()?;
+            tx.execute("UPDATE traces SET tier=?1 WHERE id=?2", params![to, row.id])?;
+            self.emit_event(
+                &tx,
+                action,
+                &row.id,
+                &trace::now_rfc3339(),
+                json!({"from": row.tier, "to": to}),
+            )?;
+            tx.commit()?;
+            Ok(())
+        })();
+        snapshot.restore_after(&path, database_result)
     }
 
     pub fn vote(&self, id: &str, delta: i64, actor: &str) -> Result<()> {
@@ -2233,19 +2295,24 @@ impl Cortex {
         trace.frontmatter.tags = dedupe(data.tags);
         trace.frontmatter.tier = row.tier.clone();
         trace.frontmatter.updated = row.updated_at.clone();
-        trace.write_preserving_updated(&self.file_path(&row))?;
-        let tx = self.connection.unchecked_transaction()?;
-        replace_tags(&tx, &event.trace_id, &trace.frontmatter.tags)?;
-        upsert_fts(
-            &tx,
-            &event.trace_id,
-            &row.title,
-            &trace.body,
-            &trace.frontmatter.tags,
-        )?;
-        self.store_remote_event_tx(&tx, event)?;
-        tx.commit()?;
-        Ok(())
+        let path = self.file_path(&row);
+        let snapshot = FileSnapshot::capture(&path)?;
+        trace.write_preserving_updated(&path)?;
+        let database_result: Result<()> = (|| {
+            let tx = self.connection.unchecked_transaction()?;
+            replace_tags(&tx, &event.trace_id, &trace.frontmatter.tags)?;
+            upsert_fts(
+                &tx,
+                &event.trace_id,
+                &row.title,
+                &trace.body,
+                &trace.frontmatter.tags,
+            )?;
+            self.store_remote_event_tx(&tx, event)?;
+            tx.commit()?;
+            Ok(())
+        })();
+        snapshot.restore_after(&path, database_result)
     }
 
     fn replay_visibility(&self, event: &Event) -> Result<()> {
@@ -2294,14 +2361,17 @@ impl Cortex {
             fs::rename(&source, &target)
                 .with_context(|| format!("moving {} to {}", source.display(), target.display()))?;
         }
-        let tx = self.connection.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE traces SET archived_at=?1,trashed_at=?2 WHERE id=?3",
-            params![archived, trashed, event.trace_id],
-        )?;
-        self.store_remote_event_tx(&tx, event)?;
-        tx.commit()?;
-        Ok(())
+        let database_result: Result<()> = (|| {
+            let tx = self.connection.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE traces SET archived_at=?1,trashed_at=?2 WHERE id=?3",
+                params![archived, trashed, event.trace_id],
+            )?;
+            self.store_remote_event_tx(&tx, event)?;
+            tx.commit()?;
+            Ok(())
+        })();
+        restore_move_after(&source, &target, database_result)
     }
 
     fn replay_tier_change(&self, event: &Event) -> Result<()> {
@@ -2316,18 +2386,23 @@ impl Cortex {
         let Ok(row) = self.get(&event.trace_id) else {
             return self.store_remote_event(event);
         };
-        let mut trace = Trace::parse_file(&self.file_path(&row))?;
+        let path = self.file_path(&row);
+        let snapshot = FileSnapshot::capture(&path)?;
+        let mut trace = Trace::parse_file(&path)?;
         trace.frontmatter.tier = data.to.clone();
         trace.frontmatter.updated = row.updated_at.clone();
-        trace.write_preserving_updated(&self.file_path(&row))?;
-        let tx = self.connection.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE traces SET tier=?1 WHERE id=?2",
-            params![data.to, event.trace_id],
-        )?;
-        self.store_remote_event_tx(&tx, event)?;
-        tx.commit()?;
-        Ok(())
+        trace.write_preserving_updated(&path)?;
+        let database_result: Result<()> = (|| {
+            let tx = self.connection.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE traces SET tier=?1 WHERE id=?2",
+                params![data.to, event.trace_id],
+            )?;
+            self.store_remote_event_tx(&tx, event)?;
+            tx.commit()?;
+            Ok(())
+        })();
+        snapshot.restore_after(&path, database_result)
     }
 
     fn replay_consolidate(&self, event: &Event) -> Result<()> {
@@ -2348,15 +2423,20 @@ impl Cortex {
         if row.tier != "short" {
             return self.store_remote_event(event);
         }
-        let mut trace = Trace::parse_file(&self.file_path(&row))?;
+        let path = self.file_path(&row);
+        let snapshot = FileSnapshot::capture(&path)?;
+        let mut trace = Trace::parse_file(&path)?;
         trace.frontmatter.tier = "mid".into();
         trace.frontmatter.updated = row.updated_at.clone();
-        trace.write_preserving_updated(&self.file_path(&row))?;
-        let tx = self.connection.unchecked_transaction()?;
-        tx.execute("UPDATE traces SET tier='mid' WHERE id=?1", [id])?;
-        self.store_remote_event_tx(&tx, event)?;
-        tx.commit()?;
-        Ok(())
+        trace.write_preserving_updated(&path)?;
+        let database_result: Result<()> = (|| {
+            let tx = self.connection.unchecked_transaction()?;
+            tx.execute("UPDATE traces SET tier='mid' WHERE id=?1", [id])?;
+            self.store_remote_event_tx(&tx, event)?;
+            tx.commit()?;
+            Ok(())
+        })();
+        snapshot.restore_after(&path, database_result)
     }
 
     fn replay_vote(&self, event: &Event) -> Result<()> {
@@ -2451,26 +2531,46 @@ impl Cortex {
             .as_ref()
             .map(|row| self.file_path(row))
             .unwrap_or_else(|| self.trace_file(&event.trace_id, false));
+        let snapshot = path
+            .exists()
+            .then(|| FileSnapshot::capture(&path))
+            .transpose()?;
         trace.write_preserving_updated(&path)?;
-        let tx = self.connection.unchecked_transaction()?;
-        let f = &trace.frontmatter;
-        if existing.is_some() {
-            tx.execute(
-                "UPDATE traces SET title=?1,type=?2,author=?3,origin=?4,updated_at=?5,content_hash=?6,source_locked=?7,source_hash=?8 WHERE id=?9",
-                params![f.title,f.trace_type,f.author,f.origin,f.updated,f.content_hash,i64::from(f.source_locked),nullable(&f.source_hash),f.id],
-            )?;
-        } else {
-            tx.execute(
-                "INSERT INTO traces(id,title,type,tier,author,origin,cortex_id,created_at,updated_at,content_hash,source_locked,source_hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-                params![f.id,f.title,f.trace_type,f.tier,f.author,f.origin,event.cortex_id,f.created,f.updated,f.content_hash,i64::from(f.source_locked),nullable(&f.source_hash)],
-            )?;
+        let database_result: Result<()> = (|| {
+            let tx = self.connection.unchecked_transaction()?;
+            let f = &trace.frontmatter;
+            if existing.is_some() {
+                tx.execute(
+                    "UPDATE traces SET title=?1,type=?2,author=?3,origin=?4,updated_at=?5,content_hash=?6,source_locked=?7,source_hash=?8 WHERE id=?9",
+                    params![f.title,f.trace_type,f.author,f.origin,f.updated,f.content_hash,i64::from(f.source_locked),nullable(&f.source_hash),f.id],
+                )?;
+            } else {
+                tx.execute(
+                    "INSERT INTO traces(id,title,type,tier,author,origin,cortex_id,created_at,updated_at,content_hash,source_locked,source_hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                    params![f.id,f.title,f.trace_type,f.tier,f.author,f.origin,event.cortex_id,f.created,f.updated,f.content_hash,i64::from(f.source_locked),nullable(&f.source_hash)],
+                )?;
+            }
+            replace_tags(&tx, &f.id, &f.tags)?;
+            replace_lineage(&tx, &f.id, &f.derived_from)?;
+            upsert_fts(&tx, &f.id, &f.title, &trace.body, &f.tags)?;
+            self.store_remote_event_tx(&tx, event)?;
+            tx.commit()?;
+            Ok(())
+        })();
+        match snapshot {
+            Some(snapshot) => snapshot.restore_after(&path, database_result),
+            None if database_result.is_err() => {
+                let error = database_result.unwrap_err();
+                match fs::remove_file(&path) {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(error.context(format!(
+                        "also failed to remove newly materialized {}: {rollback_error}",
+                        path.display()
+                    ))),
+                }
+            }
+            None => database_result,
         }
-        replace_tags(&tx, &f.id, &f.tags)?;
-        replace_lineage(&tx, &f.id, &f.derived_from)?;
-        upsert_fts(&tx, &f.id, &f.title, &trace.body, &f.tags)?;
-        self.store_remote_event_tx(&tx, event)?;
-        tx.commit()?;
-        Ok(())
     }
 
     fn create_divergence(&self, local: &Row, remote: &Event) -> Result<()> {
@@ -4279,5 +4379,192 @@ mod tests {
             distinctive_terms("the beta alpha beta 123 gamma alpha", 3),
             ["alpha", "beta", "gamma"]
         );
+    }
+
+    #[test]
+    fn failed_database_update_restores_exact_trace_bytes() {
+        let (_temp, cx) = cortex();
+        let mut trace = Trace::new("Stable", "fact", "", vec!["before".into()], "original body");
+        cx.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        let path = cx.trace_file(&id, false);
+        let original_bytes = fs::read(&path).unwrap();
+        let original_permissions = fs::metadata(&path).unwrap().permissions();
+        let original_row = cx.get(&id).unwrap();
+        let original_events = cx.history(&id).unwrap().len();
+        cx.connection
+            .execute_batch(
+                "CREATE TRIGGER fail_trace_update
+                 BEFORE UPDATE OF title ON traces
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected update failure');
+                 END;",
+            )
+            .unwrap();
+
+        let (_, mut changed) = cx.get_trace(&id).unwrap();
+        changed.frontmatter.title = "Must Roll Back".into();
+        changed.frontmatter.tags = vec!["after".into()];
+        changed.body = "replacement body".into();
+        assert!(cx.update_trace(&id, &mut changed, true).is_err());
+
+        assert_eq!(fs::read(&path).unwrap(), original_bytes);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions(),
+            original_permissions
+        );
+        let current = cx.get(&id).unwrap();
+        assert_eq!(current.title, original_row.title);
+        assert_eq!(current.updated_at, original_row.updated_at);
+        assert_eq!(current.content_hash, original_row.content_hash);
+        assert_eq!(current.tags, original_row.tags);
+        assert_eq!(cx.history(&id).unwrap().len(), original_events);
+    }
+
+    #[test]
+    fn failed_visibility_transaction_moves_trace_back() {
+        let (_temp, cx) = cortex();
+        let mut trace = Trace::new("Visible", "fact", "", vec![], "active body");
+        cx.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        let active = cx.trace_file(&id, false);
+        let archived = cx.trace_file(&id, true);
+        let original_bytes = fs::read(&active).unwrap();
+        let original_events = cx.history(&id).unwrap().len();
+        cx.connection
+            .execute_batch(
+                "CREATE TRIGGER fail_visibility_update
+                 BEFORE UPDATE OF archived_at, trashed_at ON traces
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected visibility failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(cx.archive(&id).is_err());
+
+        assert_eq!(fs::read(&active).unwrap(), original_bytes);
+        assert!(!archived.exists());
+        let current = cx.get(&id).unwrap();
+        assert!(current.archived_at.is_empty());
+        assert!(current.trashed_at.is_empty());
+        assert_eq!(cx.history(&id).unwrap().len(), original_events);
+    }
+
+    #[test]
+    fn failed_tier_transaction_restores_trace_frontmatter() {
+        let (_temp, cx) = cortex();
+        let mut trace = Trace::new("Tiered", "fact", "", vec![], "short body");
+        cx.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        let path = cx.trace_file(&id, false);
+        let original_bytes = fs::read(&path).unwrap();
+        let original_events = cx.history(&id).unwrap().len();
+        cx.connection
+            .execute_batch(
+                "CREATE TRIGGER fail_tier_update
+                 BEFORE UPDATE OF tier ON traces
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected tier failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(cx.promote(&id, "mid").is_err());
+
+        assert_eq!(fs::read(&path).unwrap(), original_bytes);
+        assert_eq!(cx.get(&id).unwrap().tier, "short");
+        assert_eq!(cx.history(&id).unwrap().len(), original_events);
+    }
+
+    #[test]
+    fn failed_remote_update_restores_materialized_trace() {
+        let temp = tempfile::tempdir().unwrap();
+        let alpha = signed_cortex(temp.path(), "alpha");
+        let beta = signed_cortex(temp.path(), "beta");
+        let mut trace = Trace::new(
+            "Remote stable",
+            "fact",
+            "",
+            vec!["before".into()],
+            "original remote body",
+        );
+        alpha.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        beta.replay_event(&event_for(&alpha, &id, "create", &alpha.id))
+            .unwrap();
+        let path = beta.trace_file(&id, false);
+        let original_bytes = fs::read(&path).unwrap();
+        let original_permissions = fs::metadata(&path).unwrap().permissions();
+        let original_row = beta.get(&id).unwrap();
+        let original_events = beta.history(&id).unwrap().len();
+
+        trace.frontmatter.title = "Remote replacement".into();
+        trace.frontmatter.tags = vec!["after".into()];
+        trace.body = "replacement remote body".into();
+        alpha.update_trace(&id, &mut trace, false).unwrap();
+        let update = event_for(&alpha, &id, "update", &alpha.id);
+        beta.connection
+            .execute_batch(
+                "CREATE TRIGGER fail_remote_trace_update
+                 BEFORE UPDATE OF title ON traces
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected remote update failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(beta.replay_event(&update).is_err());
+
+        assert_eq!(fs::read(&path).unwrap(), original_bytes);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions(),
+            original_permissions
+        );
+        let current = beta.get(&id).unwrap();
+        assert_eq!(current.title, original_row.title);
+        assert_eq!(current.updated_at, original_row.updated_at);
+        assert_eq!(current.content_hash, original_row.content_hash);
+        assert_eq!(current.tags, original_row.tags);
+        assert_eq!(beta.history(&id).unwrap().len(), original_events);
+    }
+
+    #[test]
+    fn failed_remote_create_removes_newly_materialized_trace() {
+        let temp = tempfile::tempdir().unwrap();
+        let alpha = signed_cortex(temp.path(), "alpha");
+        let beta = signed_cortex(temp.path(), "beta");
+        let mut trace = Trace::new("Remote new", "fact", "", vec![], "remote body");
+        alpha.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        let create = event_for(&alpha, &id, "create", &alpha.id);
+        let path = beta.trace_file(&id, false);
+        beta.connection
+            .execute_batch(
+                "CREATE TRIGGER fail_remote_trace_insert
+                 BEFORE INSERT ON traces
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected remote create failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(beta.replay_event(&create).is_err());
+
+        assert!(!path.exists());
+        assert!(beta.get(&id).is_err());
+        assert!(beta.history(&id).unwrap().is_empty());
+
+        let orphan_bytes = b"orphan content that must survive rollback\n";
+        fs::write(&path, orphan_bytes).unwrap();
+        let orphan_permissions = fs::metadata(&path).unwrap().permissions();
+        assert!(beta.replay_event(&create).is_err());
+        assert_eq!(fs::read(&path).unwrap(), orphan_bytes);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions(),
+            orphan_permissions
+        );
+        assert!(beta.get(&id).is_err());
+        assert!(beta.history(&id).unwrap().is_empty());
     }
 }
