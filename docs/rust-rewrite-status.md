@@ -5,9 +5,10 @@ Updated: 2026-08-15
 ## Pause point
 
 - Branch: `experiment/rust-rewrite`
-- Latest completed milestone: embedded-plugin lifecycle parity (this handoff
-  commit).
-- Previous milestone: `0a6e721 feat(rust): tighten MCP contract parity`.
+- Latest completed milestone: advanced MCP result/error and transport-mode
+  parity (this handoff commit).
+- Previous milestone: `6712b39 feat(rust): add plugin lifecycle parity`.
+- Earlier MCP milestone: `0a6e721 feat(rust): tighten MCP contract parity`.
 - Earlier semantic milestone: `b73a089 feat(rust): add semantic search parity`.
 - Earlier watcher milestone: `c0f8c8a feat(rust): add watcher parity`.
 - Earlier experiment milestone: `aa5a5ee test(rust): compare real-model consolidation`.
@@ -34,6 +35,13 @@ Updated: 2026-08-15
 - Divergence resolution accepts a named stored version or a custom merge,
   updates the original through normal source-lock and immutability checks, and
   moves the resolved conflict trace to recoverable trash.
+- Advanced MCP federation and consolidation surfaces now match Go: rolling
+  candidates retain usage/lineage signals, distillation preserves short-tier
+  sources and telemetry, identity/status/sync wire shapes match, and peer
+  announcements validate and acknowledge without mutating the manifest.
+- HTTP serving enforces Go's federation-mode boundary: publish cortexes reject
+  every remote mutation while retaining local stdio writes, and subscribe
+  cortexes refuse event and usage-signal publication.
 - The Rust binary compile-time embeds the same three Hermes and three Obsidian
   runtime files as Go. Plugin list/status/install/check/force commands run
   without requiring a configured cortex and use the same target resolution.
@@ -139,9 +147,9 @@ Updated: 2026-08-15
 
 ## Latest validation
 
-The following passed for the embedded-plugin milestone:
+The following passed for the advanced MCP milestone:
 
-- `make rust-test` — formatting, clippy with warnings denied, and 65 Rust tests.
+- `make rust-test` — formatting, clippy with warnings denied, and 66 Rust tests.
 - `go test ./...`
 - `go test -race ./...`
 - `go vet ./...`
@@ -175,7 +183,10 @@ The following passed for the embedded-plugin milestone:
   - identical MCP tool names, parameter/required/enum schemas, documented
     fields, output-schema presence, structured usage/tag results, policy-read
     accounting, tag/append/archive/search/history behavior, search activity,
-    consolidation health, and custom divergence resolution; and
+    consolidation health, custom divergence resolution, consolidation
+    candidates/distillation/lineage, identity/status/sync results,
+    non-mutating announcements, invalid-argument behavior, and HTTP
+    publish/subscribe restrictions; and
   - byte-identical embedded Hermes/Obsidian payloads plus matching inventory,
     target resolution, status/check/install/idempotency, drift refusal,
     force-check, forced replacement, unmanaged-file preservation, symlink
@@ -256,23 +267,18 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
 
 ## Remaining replacement gaps
 
-1. Exhaustive MCP result/error parity for the remaining advanced tools,
-   especially consolidation candidate/result paths, federation sync/status,
-   and read-only mode restrictions. Discovery schema and representative core
-   behavior are now automated.
-2. Full TUI behavior.
-3. Broader adversarial real-model quality evaluation beyond the current bounded
+1. Full TUI behavior.
+2. Broader adversarial real-model quality evaluation beyond the current bounded
    synthetic corpus.
-4. Certificate expiry validation/monitoring, dynamic peer-worker addition without
+3. Certificate expiry validation/monitoring, dynamic peer-worker addition without
    restart, crash-atomic file rollback, lock contention, and broader fault
    injection.
 
 ## Recommended next milestone
 
-Extend `mcp_contract.py` across the remaining advanced federation and
-consolidation tools, invalid-argument cases, and read-only mode restrictions.
-Preserve the current generic semantic fallback and stricter Rust type
-validation.
+Port Go's TLS certificate validity gate and add deterministic expired,
+not-yet-valid, near-expiry, and override coverage to the existing mixed-runtime
+TLS fixture. Keep certificate contents and private-key material out of output.
 
 Any new Rust packages still require explicit approval before adding them.
 
@@ -286,5 +292,6 @@ make rust-test
 make compare-rust
 ```
 
-After confirming the baseline, continue from the MCP stdio row in
-`docs/rust-rewrite-test-plan.md` and keep the Go implementation as the oracle.
+After confirming the baseline, continue from the security and fault-tolerance
+rows in `docs/rust-rewrite-test-plan.md` and keep the Go implementation as the
+oracle.

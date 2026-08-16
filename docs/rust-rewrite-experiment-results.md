@@ -279,9 +279,17 @@ that policy restored identical tag-activity output. Rust deliberately retains
 stricter runtime rejection for trace types outside the enum that both servers
 advertise; Go currently accepts such input despite its discovery schema.
 
-This is representative contract parity, not exhaustive coverage of every
-successful and failing result from all 28 tools. Advanced federation and
-consolidation surfaces plus read-only mode restrictions remain to be added.
+The advanced pass now compares rolling consolidation candidates and their
+usage/lineage signals, one-source rejection, distilled trace tier/source/event
+telemetry, human-readable lineage, identity and federation status, sync cursor
+and usage rows, invalid and self announcements, and missing-resource/error
+behavior. It also proves announcements do not rewrite `cortex.md`.
+
+For HTTP, every mutating tool is rejected on a publish-mode cortex, reads and
+event publication remain available, and local stdio writes still succeed.
+Subscribe mode rejects both event and usage-signal publication. These checks
+close the known MCP behavior gaps; they do not claim exhaustive combinatorial
+coverage of every argument permutation across all 28 tools.
 
 ## Embedded-plugin lifecycle parity
 
@@ -338,8 +346,7 @@ CPU during a short replicated workload. The real-model fixture also indicates
 that Rust's shorter consolidation prompt can preserve the tested information at
 about half the prompt-token cost. Watcher behavior now also matches the tested
 Go outcomes, as do deterministic semantic indexing/ranking and the
-representative MCP contract. It still does not justify an all-in rewrite
+advanced MCP contract. It still does not justify an all-in rewrite
 because larger-result throughput is not better and certificate-lifecycle
-checks, exhaustive advanced MCP errors, full TUI behavior, broader
-distillation-quality evaluation, and operator recovery behavior remain
-incomplete.
+checks, full TUI behavior, broader distillation-quality evaluation, and
+operator recovery behavior remain incomplete.

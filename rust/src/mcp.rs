@@ -26,8 +26,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     VERSION,
     cortex::{
-        AccessKey, Cortex, DistilledTraceSpec, ListOptions, PeerEntry, SemanticOptions,
-        parse_since, write_manifest,
+        AccessKey, Cortex, DistilledTraceSpec, ListOptions, SemanticOptions, load_access_key,
+        parse_since,
     },
     embedding::HttpEmbedder,
     lock::CortexLock,
@@ -37,21 +37,49 @@ use crate::{
 #[derive(Clone)]
 pub struct NoemaServer {
     cortex: Arc<Mutex<Cortex>>,
+    federation_mode: String,
     tool_router: ToolRouter<Self>,
 }
 
 impl NoemaServer {
-    pub fn new(name: impl Into<String>, path: impl Into<PathBuf>) -> Result<Self> {
+    pub fn new(
+        name: impl Into<String>,
+        path: impl Into<PathBuf>,
+        remote_transport: bool,
+    ) -> Result<Self> {
         let name = name.into();
         let cortex = Cortex::open(&name, path.into())?;
+        let federation_mode = if remote_transport {
+            cortex
+                .manifest
+                .federation
+                .as_ref()
+                .map(|config| config.mode.as_str())
+                .filter(|mode| !mode.is_empty())
+                .unwrap_or("sync")
+                .to_owned()
+        } else {
+            String::new()
+        };
         Ok(Self {
             cortex: Arc::new(Mutex::new(cortex)),
+            federation_mode,
             tool_router: Self::tool_router(),
         })
     }
 
     async fn open(&self) -> Result<OwnedMutexGuard<Cortex>, ErrorData> {
         Ok(self.cortex.clone().lock_owned().await)
+    }
+
+    fn ensure_writable(&self) -> Result<(), ErrorData> {
+        if self.federation_mode == "publish" {
+            return Err(ErrorData::invalid_params(
+                "this cortex is in publish mode (read-only for remote peers); use a local stdio transport for writes",
+                None,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -385,6 +413,7 @@ impl NoemaServer {
         &self,
         Parameters(p): Parameters<CreateParams>,
     ) -> Result<String, ErrorData> {
+        self.ensure_writable()?;
         let cx = self.open().await?;
         let mut trace = Trace::new(p.title, p.trace_type, p.author, csv(&p.tags), p.body);
         trace.frontmatter.derived_from = csv(&p.derived_from);
@@ -511,16 +540,19 @@ impl NoemaServer {
         description = "Move a trace to trash (soft-delete, recoverable for 30 days). Use recover_trace to restore it."
     )]
     async fn delete_trace(&self, Parameters(p): Parameters<IdParam>) -> Result<String, ErrorData> {
+        self.ensure_writable()?;
         self.open().await?.trash(&p.id).map_err(mcp_error)?;
         Ok("Trace moved to trash".into())
     }
     #[tool(description = "Restore a trace from trash back to active")]
     async fn recover_trace(&self, Parameters(p): Parameters<IdParam>) -> Result<String, ErrorData> {
+        self.ensure_writable()?;
         self.open().await?.recover(&p.id).map_err(mcp_error)?;
         Ok("Trace recovered".into())
     }
     #[tool(description = "Archive a trace")]
     async fn archive_trace(&self, Parameters(p): Parameters<IdParam>) -> Result<String, ErrorData> {
+        self.ensure_writable()?;
         self.open().await?.archive(&p.id).map_err(mcp_error)?;
         Ok("Trace archived".into())
     }
@@ -529,6 +561,7 @@ impl NoemaServer {
         &self,
         Parameters(p): Parameters<IdParam>,
     ) -> Result<String, ErrorData> {
+        self.ensure_writable()?;
         self.open().await?.unarchive(&p.id).map_err(mcp_error)?;
         Ok("Trace unarchived".into())
     }
@@ -538,6 +571,7 @@ impl NoemaServer {
         &self,
         Parameters(p): Parameters<UpdateParams>,
     ) -> Result<String, ErrorData> {
+        self.ensure_writable()?;
         let cx = self.open().await?;
         let (_, mut trace) = cx.get_trace(&p.id).map_err(mcp_error)?;
         if let Some(v) = p.title {
@@ -570,6 +604,7 @@ impl NoemaServer {
         &self,
         Parameters(p): Parameters<TagsParam>,
     ) -> Result<Json<TagMutationOutput>, ErrorData> {
+        self.ensure_writable()?;
         let tags = csv(&p.tags);
         self.open()
             .await?
@@ -588,6 +623,7 @@ impl NoemaServer {
         &self,
         Parameters(p): Parameters<TagsParam>,
     ) -> Result<Json<TagMutationOutput>, ErrorData> {
+        self.ensure_writable()?;
         let tags = self
             .open()
             .await?
@@ -603,6 +639,7 @@ impl NoemaServer {
         description = "Cast a tier-preference vote on a trace. Use sparingly: only when the user has clearly indicated preference. Votes accumulate across calls and are preferences, not overrides."
     )]
     async fn vote_trace(&self, Parameters(p): Parameters<VoteParam>) -> Result<String, ErrorData> {
+        self.ensure_writable()?;
         let delta = match p.direction.as_str() {
             "up" => 1,
             "down" => -1,
@@ -617,23 +654,47 @@ impl NoemaServer {
             .await?
             .vote(&p.id, delta, "agent")
             .map_err(mcp_error)?;
-        Ok("Vote recorded".into())
+        Ok(format!("Vote recorded: {} {}.", p.direction, p.id))
     }
 
-    #[tool(description = "Return short-tier consolidation candidates")]
+    #[tool(
+        description = "Internal tool. Returns short-term traces within the rolling consolidation window along with their usage signals (read_count, modify_count, tier_votes, derived_from_count). Consumer scores these and submits distilled mid-tier traces via record_consolidation_result."
+    )]
     async fn list_consolidation_candidates(
         &self,
         _: Parameters<CandidateParam>,
     ) -> Result<String, ErrorData> {
-        let rows = self
-            .open()
-            .await?
-            .list(&ListOptions {
-                tiers: vec!["short".into()],
-                ..Default::default()
-            })
+        let cx = self.open().await?;
+        let window = cx
+            .manifest
+            .consolidation_config()
+            .map_err(mcp_error)?
+            .unwrap_or_default()
+            .effective_window();
+        let candidates = cx
+            .promotion_candidates("short", window)
             .map_err(mcp_error)?;
-        Ok(json_text(rows))
+        let candidates = candidates
+            .into_iter()
+            .map(|candidate| {
+                json!({
+                    "ID": candidate.id,
+                    "Tier": candidate.tier,
+                    "Type": candidate.trace_type,
+                    "ReadCount": candidate.read_count,
+                    "ModifyCount": candidate.modify_count,
+                    "SearchHitCount": candidate.search_hit_count,
+                    "TierVotes": candidate.tier_votes,
+                    "DerivedFromCount": candidate.derived_from_count,
+                    "SourceCount": candidate.source_count,
+                    "CreatedAt": candidate.created_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json_text(json!({
+            "window_hours": window.as_secs() / 3600,
+            "candidates": candidates,
+        })))
     }
     #[tool(
         description = "Recent consolidation pipeline health: daily success/fail/promote/distill counts within the lookback window, short→mid and mid→long promotion-latency percentiles, and the 1-source mid leak detector. Lets an agent or operator answer 'is consolidation actually happening, and is anything leaking?' without raw SQL against the events table."
@@ -672,11 +733,14 @@ impl NoemaServer {
             "tags": cx.tag_activity(top).map_err(mcp_error)?,
         })))
     }
-    #[tool(description = "Materialize a distilled mid-tier trace")]
+    #[tool(
+        description = "Internal tool. Materialises a distilled mid-tier trace from a set of short-term sources. Validates the source IDs exist (>=2 required), creates the new trace with derived_from lineage pointing at the sources, and emits an ActionConsolidate event carrying model/profile/confidence telemetry for the quality dashboard."
+    )]
     async fn record_consolidation_result(
         &self,
         Parameters(p): Parameters<ConsolidateParam>,
     ) -> Result<String, ErrorData> {
+        self.ensure_writable()?;
         let cx = self.open().await?;
         let id = cx
             .create_distilled_trace(DistilledTraceSpec {
@@ -690,32 +754,61 @@ impl NoemaServer {
                 cohesion_confidence: p.cohesion_confidence.unwrap_or_default(),
             })
             .map_err(mcp_error)?;
-        Ok(json_text(
-            json!({"distilled_id":id,"model_name":p.model_name,"model_tier_profile":p.model_tier_profile,"cohesion_confidence":p.cohesion_confidence}),
+        Ok(format!(
+            "Distilled trace created: {} (from {} sources)",
+            id,
+            csv(&p.source_ids).len()
         ))
     }
-    #[tool(description = "Append content to an existing trace")]
+    #[tool(
+        description = "Append content to an existing trace's body without reading the full trace first. Ideal for fire-and-forget logging, running journals, or any case where an agent needs to add to a trace without consuming its current content."
+    )]
     async fn append_trace(
         &self,
         Parameters(p): Parameters<AppendParam>,
     ) -> Result<String, ErrorData> {
+        self.ensure_writable()?;
         self.open()
             .await?
             .append(&p.id, &p.content, false)
             .map_err(mcp_error)?;
-        Ok("Content appended".into())
+        Ok(format!("Content appended to trace {}.", p.id))
     }
-    #[tool(description = "Show the event log for a trace")]
+    #[tool(
+        description = "Show the event log (audit trail) for a trace: all mutations in chronological order."
+    )]
     async fn trace_history(&self, Parameters(p): Parameters<IdParam>) -> Result<String, ErrorData> {
-        Ok(json_text(
-            self.open().await?.history(&p.id).map_err(mcp_error)?,
-        ))
+        let events = self.open().await?.history(&p.id).map_err(mcp_error)?;
+        if events.is_empty() {
+            return Ok(format!("No events found for trace {}", p.id));
+        }
+        let mut output = String::new();
+        for event in events {
+            output.push_str(&format!(
+                "{}  {:<10}  {}  origin={}\n",
+                event.id, event.action, event.timestamp, event.origin
+            ));
+        }
+        Ok(output)
     }
-    #[tool(description = "Show the derivation graph for a trace")]
+    #[tool(
+        description = "Show the derivation graph for a trace: what it was derived from and what was derived from it."
+    )]
     async fn trace_lineage(&self, Parameters(p): Parameters<IdParam>) -> Result<String, ErrorData> {
         let (from, by) = self.open().await?.lineage(&p.id).map_err(mcp_error)?;
-        Ok(json_text(
-            json!({"id":p.id,"derived_from":from,"derived_by":by}),
+        Ok(format!(
+            "Trace: {}\nDerived from: {}\nDerived by:   {}\n",
+            p.id,
+            if from.is_empty() {
+                "(none)".into()
+            } else {
+                from.join(", ")
+            },
+            if by.is_empty() {
+                "(none)".into()
+            } else {
+                by.join(", ")
+            }
         ))
     }
     #[tool(
@@ -725,6 +818,7 @@ impl NoemaServer {
         &self,
         Parameters(p): Parameters<ResolveParam>,
     ) -> Result<String, ErrorData> {
+        self.ensure_writable()?;
         let accept = p.accept.unwrap_or_default();
         let body = p.body.unwrap_or_default();
         self.open()
@@ -740,17 +834,38 @@ impl NoemaServer {
             Ok(format!("Divergence {} resolved (custom merge).", p.id))
         }
     }
-    #[tool(description = "Return this cortex stable identity")]
+    #[tool(
+        description = "Returns this cortex's stable identity (ULID, name, manifest version). Federation peers call this on every sync to verify the remote endpoint still belongs to the cortex they originally paired with."
+    )]
     async fn cortex_identity(&self, _: Parameters<Empty>) -> Result<String, ErrorData> {
         let cx = self.open().await?;
-        let mut payload = json!({"id":cx.id,"name":cx.name,"version":cx.manifest.version,"binary_version":VERSION,"pubkey":cx.manifest.signing.as_ref().map(|signing| signing.public_key.as_str()).unwrap_or("")});
+        let mode = cx
+            .manifest
+            .federation
+            .as_ref()
+            .map(|federation| federation.mode.as_str())
+            .filter(|mode| !mode.is_empty())
+            .unwrap_or("sync");
+        let mut payload =
+            json!({"id":cx.id,"name":cx.name,"version":cx.manifest.version,"mode":mode});
+        if let Some(public_key) = cx
+            .manifest
+            .signing
+            .as_ref()
+            .map(|signing| signing.public_key.as_str())
+            .filter(|public_key| !public_key.is_empty())
+        {
+            payload["pubkey"] = json!(public_key);
+        }
         let rank = crate::consolidation::get_local_rank(&cx).map_err(mcp_error)?;
         if !rank.cortex_id.is_empty() {
             payload["rank"] = serde_json::to_value(rank).map_err(mcp_error)?;
         }
         Ok(json_text(payload))
     }
-    #[tool(description = "Return events for federation sync")]
+    #[tool(
+        description = "Returns events from this cortex for federation sync. Remote peers call this to pull new events. Returns a JSON array of event objects."
+    )]
     async fn sync_events(
         &self,
         Parameters(p): Parameters<SinceParam>,
@@ -773,13 +888,18 @@ impl NoemaServer {
         } else {
             100
         };
-        serde_json::to_string(
-            &cx.events_since(p.since.as_deref().unwrap_or(""), limit)
-                .map_err(mcp_error)?,
-        )
-        .map_err(mcp_error)
+        let since = p.since.as_deref().unwrap_or("");
+        if !since.is_empty() && ulid::Ulid::from_string(since).is_err() {
+            return Err(ErrorData::invalid_params(
+                "since must be a valid ULID cursor (26-char Crockford base32)",
+                None,
+            ));
+        }
+        serde_json::to_string(&cx.events_since(since, limit).map_err(mcp_error)?).map_err(mcp_error)
     }
-    #[tool(description = "Return per-peer usage deltas")]
+    #[tool(
+        description = "Returns per-peer tier-usage deltas (read_count, modify_count, search_hit_count, last_read_at) for federation sync. Each peer publishes only its own rows — the ring aggregates by SUMing over every peer's contribution, so consolidation decisions operate on a federation-wide signal rather than the local slice. Returns a JSON array of trace_usage rows owned by this cortex with updated_at > since. search_hit_count is omitted when zero for wire compatibility with pre-migration-015 peers."
+    )]
     async fn sync_read_signal(
         &self,
         Parameters(p): Parameters<SinceParam>,
@@ -808,29 +928,54 @@ impl NoemaServer {
         )
         .map_err(mcp_error)
     }
-    #[tool(description = "Show federation configuration and vector clock")]
+    #[tool(description = "Show federation configuration, peer sync state, and local vector clock.")]
     async fn federation_status(&self, _: Parameters<Empty>) -> Result<String, ErrorData> {
         let cx = self.open().await?;
-        Ok(json_text(
-            crate::federation::status(&cx).map_err(mcp_error)?,
-        ))
+        render_federation_status(&cx).map_err(mcp_error)
     }
-    #[tool(description = "Accept a peer announcement")]
+    #[tool(
+        description = "Accept a peer announcement from a remote cortex. Returns this cortex's identity for mutual discovery."
+    )]
     async fn announce_peer(
         &self,
         Parameters(p): Parameters<AnnounceParam>,
     ) -> Result<String, ErrorData> {
-        let mut cx = self.open().await?;
-        let federation = cx.manifest.federation.get_or_insert_with(Default::default);
-        if !federation.peers.iter().any(|peer| peer.name == p.name) {
-            federation.peers.push(PeerEntry {
-                name: p.name,
-                endpoint: p.endpoint,
-                ..Default::default()
-            });
-            write_manifest(&cx.dir, &cx.manifest).map_err(mcp_error)?;
+        let endpoint = reqwest::Url::parse(&p.endpoint).map_err(|_| {
+            ErrorData::invalid_params("endpoint must be a valid http:// or https:// URL", None)
+        })?;
+        if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host().is_none() {
+            return Err(ErrorData::invalid_params(
+                "endpoint must be a valid http:// or https:// URL",
+                None,
+            ));
         }
-        Ok(json_text(json!({"id":cx.id,"name":cx.name})))
+        let cx = self.open().await?;
+        if p.name == cx.manifest.name {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "refusing announcement: name {:?} matches this cortex's own name. The announcing peer must rename its cortex (in its cortex.md) to a unique value before federation can proceed.",
+                    p.name
+                ),
+                None,
+            ));
+        }
+        let known = cx
+            .manifest
+            .federation
+            .as_ref()
+            .is_some_and(|federation| federation.peers.iter().any(|peer| peer.name == p.name));
+        let detail = if known {
+            format!("Peer {:?} is already configured.", p.name)
+        } else {
+            format!(
+                "Peer {:?} ({}) is not yet configured. Add it to cortex.md to enable sync.",
+                p.name, p.endpoint
+            )
+        };
+        Ok(format!(
+            "Acknowledged. This cortex is {:?}.\n{}\n",
+            cx.manifest.name, detail
+        ))
     }
 }
 
@@ -839,7 +984,7 @@ pub async fn serve_stdio(
     path: PathBuf,
     watcher_settings: Option<crate::watch::Settings>,
 ) -> Result<()> {
-    let server = NoemaServer::new(&name, &path)?;
+    let server = NoemaServer::new(&name, &path, false)?;
     let (cortex_id, federation, manifest) = {
         let cortex = server.cortex.lock().await;
         (
@@ -935,7 +1080,7 @@ pub async fn serve_http(
     tls: Option<(PathBuf, PathBuf)>,
     watcher_settings: Option<crate::watch::Settings>,
 ) -> Result<()> {
-    let server = NoemaServer::new(&name, &path)?;
+    let server = NoemaServer::new(&name, &path, true)?;
     let (cortex_id, federation, manifest) = {
         let cortex = server.cortex.lock().await;
         (
@@ -1428,6 +1573,128 @@ fn csv(value: &str) -> Vec<String> {
 fn json_text<T: Serialize>(value: T) -> String {
     serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".into())
 }
+
+fn render_federation_status(cx: &Cortex) -> Result<String> {
+    let manifest = &cx.manifest;
+    let config = manifest.federation.as_ref();
+    let mode = config
+        .map(|federation| federation.mode.as_str())
+        .filter(|mode| !mode.is_empty())
+        .unwrap_or("sync");
+    let mut output = format!("Cortex: {}\nMode: {}\n", manifest.name, mode);
+    match load_access_key(&cx.dir, manifest.access.as_ref()) {
+        Ok(key) if key.keyed() => output.push_str(&format!(
+            "Access: keyed (source={}, fingerprint={})\n",
+            key.source, key.fingerprint
+        )),
+        Ok(_) => output.push_str("Access: open\n"),
+        Err(error) => output.push_str(&format!("Access: error loading key: {error}\n")),
+    }
+    output.push('\n');
+
+    let peers = config
+        .map(|federation| federation.peers.as_slice())
+        .unwrap_or(&[]);
+    if peers.is_empty() {
+        output.push_str("Federation: not configured (no peers in cortex.md)\n");
+    } else {
+        output.push_str(&format!("Peers: {}\n", peers.len()));
+        if let Some(interval) = config
+            .map(|federation| federation.interval.as_str())
+            .filter(|interval| !interval.is_empty())
+        {
+            output.push_str(&format!("Interval: {interval}\n"));
+        }
+        output.push_str(&format!(
+            "Consolidation Rank: {}\n\n",
+            format_rank(&crate::consolidation::get_local_rank(cx)?)
+        ));
+        for peer in peers {
+            let cortex_id = display_state(
+                &cx.federation_state(&format!("peer:{}:cortex_id", peer.name))?,
+                "(unverified)",
+            );
+            let last_seen = display_state(
+                &cx.federation_state(&format!("peer:{}:last_seen", peer.name))?,
+                "(never)",
+            );
+            let last_event = display_state(
+                &cx.federation_state(&format!("peer:{}:last_event", peer.name))?,
+                "(none)",
+            );
+            let rank = crate::consolidation::get_peer_rank(cx, &peer.name)?;
+            let peer_rank = if rank.observed_at.is_empty() {
+                "(none)".into()
+            } else {
+                format_rank(&rank)
+            };
+            output.push_str(&format!(
+                "  {}\n    endpoint:   {}\n    mode:       {}\n    cortex_id:  {}\n    rank:       {}\n    last_seen:  {}\n    last_event: {}\n",
+                peer.name,
+                peer.endpoint,
+                if peer.mode.is_empty() {
+                    "sync"
+                } else {
+                    peer.mode.as_str()
+                },
+                cortex_id,
+                peer_rank,
+                last_seen,
+                last_event
+            ));
+        }
+    }
+
+    let clock = cx.get_clock()?;
+    if !clock.is_empty() {
+        output.push_str("\nVector Clock:\n");
+        let mut peer_names = BTreeMap::new();
+        peer_names.insert(cx.id.clone(), format!("{} (local)", manifest.name));
+        for peer in peers {
+            let id = cx.federation_state(&format!("peer:{}:cortex_id", peer.name))?;
+            if !id.is_empty() {
+                peer_names.insert(id, peer.name.clone());
+            }
+        }
+        for (cortex_id, tick) in clock {
+            let label = peer_names
+                .get(&cortex_id)
+                .map(String::as_str)
+                .unwrap_or("(unknown peer)");
+            output.push_str(&format!("  {cortex_id} [{label}]: {tick}\n"));
+        }
+    }
+
+    let divergence_count = cx
+        .list(&ListOptions {
+            trace_type: "divergence".into(),
+            ..Default::default()
+        })?
+        .len();
+    if divergence_count > 0 {
+        output.push_str(&format!(
+            "\nUnresolved Divergences: {divergence_count}\n  Use resolve_divergence or `noema resolve` to resolve them.\n"
+        ));
+    }
+    Ok(output)
+}
+
+fn display_state(value: &str, empty: &str) -> String {
+    if value.is_empty() {
+        empty.into()
+    } else {
+        value.into()
+    }
+}
+
+fn format_rank(rank: &crate::consolidation::RankEntry) -> String {
+    if rank.rank == 0 || rank.observed_at.is_empty() {
+        "(ineligible)".into()
+    } else {
+        format!("{} (observed {})", rank.rank, rank.observed_at)
+    }
+}
+
 fn mcp_error(error: impl std::fmt::Display) -> ErrorData {
     ErrorData::internal_error(error.to_string(), None)
 }

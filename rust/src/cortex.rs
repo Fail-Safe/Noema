@@ -107,6 +107,15 @@ impl ConsolidationConfig {
             &self.model_tier
         }
     }
+
+    pub fn effective_window(&self) -> std::time::Duration {
+        let hours = if self.window_hours > 0 {
+            self.window_hours as u64
+        } else {
+            24
+        };
+        std::time::Duration::from_secs(hours.saturating_mul(60 * 60))
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -3579,6 +3588,22 @@ mod tests {
         assert_eq!(parse_since("1h30m").unwrap(), Duration::minutes(90));
         assert_eq!(format_go_duration(Duration::minutes(90)), "1h30m0s");
         assert!(parse_since("tomorrow").is_err());
+    }
+
+    #[test]
+    fn consolidation_window_defaults_to_twenty_four_hours() {
+        assert_eq!(
+            ConsolidationConfig::default().effective_window(),
+            std::time::Duration::from_secs(24 * 60 * 60)
+        );
+        assert_eq!(
+            ConsolidationConfig {
+                window_hours: 72,
+                ..Default::default()
+            }
+            .effective_window(),
+            std::time::Duration::from_secs(72 * 60 * 60)
+        );
     }
 
     #[test]

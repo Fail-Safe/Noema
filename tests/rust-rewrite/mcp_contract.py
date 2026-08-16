@@ -4,13 +4,23 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 from pathlib import Path
 import sqlite3
 import subprocess
 import tempfile
 
-from federation_ring import Node, cortex_dir, database, environment, free_port, run
+from federation_ring import (
+    Node,
+    cortex_dir,
+    database,
+    environment,
+    free_port,
+    run,
+    start,
+    stop,
+)
 
 
 DEFAULT_ANNOTATIONS = {
@@ -134,6 +144,10 @@ def result_json(result: dict[str, object]) -> dict[str, object]:
     return value
 
 
+def result_json_value(result: dict[str, object]) -> object:
+    return json.loads(result_text(result))
+
+
 def created_trace_id(result: dict[str, object]) -> str:
     text = result_text(result)
     try:
@@ -145,7 +159,82 @@ def created_trace_id(result: dict[str, object]) -> str:
     trace_id = text.rsplit(": ", 1)[-1]
     if not trace_id.startswith("20"):
         raise AssertionError(f"could not parse created trace ID from {text!r}")
-    return trace_id
+    return trace_id.split(" ", 1)[0]
+
+
+class HttpMcpClient:
+    def __init__(self, node: Node) -> None:
+        self.node = node
+        self.session_id = ""
+
+    def request(self, payload: dict[str, object]) -> dict[str, object]:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", self.node.port, timeout=5
+        )
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        connection.request("POST", "/mcp", json.dumps(payload), headers)
+        response = connection.getresponse()
+        body = response.read().decode()
+        session_id = response.getheader("Mcp-Session-Id")
+        connection.close()
+        if session_id:
+            self.session_id = session_id
+        if response.status >= 400:
+            raise AssertionError(
+                f"{self.node.name}: HTTP {response.status} from MCP: {body}"
+            )
+        if "id" not in payload:
+            return {}
+        if not body:
+            return {}
+        data_lines = [
+            line.removeprefix("data:").strip()
+            for line in body.splitlines()
+            if line.startswith("data:")
+        ]
+        return json.loads(data_lines[-1] if data_lines else body)
+
+    def initialize(self) -> None:
+        response = self.request(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "mcp-contract-http", "version": "1"},
+                },
+            }
+        )
+        if response.get("id") != 1 or "error" in response:
+            raise AssertionError(f"{self.node.name}: initialize failed: {response}")
+        self.request({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def tool_call(
+        self, name: str, arguments: dict[str, object]
+    ) -> dict[str, object]:
+        return self.request(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            }
+        )
+
+
+def rejection_text(response: dict[str, object]) -> str:
+    error = response.get("error")
+    if isinstance(error, dict):
+        return str(error.get("message", ""))
+    result = response.get("result")
+    return result_text(result) if isinstance(result, dict) else ""
 
 
 def seed_observability(path: Path, trace_id: str) -> None:
@@ -205,6 +294,72 @@ def is_trashed(path: Path, trace_id: str) -> bool:
             "SELECT trashed_at IS NOT NULL FROM traces WHERE id=?", (trace_id,)
         ).fetchone()
     return bool(row[0])
+
+
+def normalize_candidates(
+    payload: dict[str, object], labels: dict[str, str]
+) -> dict[str, object]:
+    raw = payload.get("candidates")
+    if not isinstance(raw, list):
+        raise AssertionError(f"candidate response has no list: {payload!r}")
+    candidates: list[dict[str, object]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise AssertionError(f"candidate is not an object: {item!r}")
+        candidate = dict(item)
+        candidate["ID"] = labels.get(str(candidate.get("ID")), "unknown")
+        candidate["CreatedAt"] = "<timestamp>"
+        candidates.append(candidate)
+    candidates.sort(key=lambda item: str(item.get("ID")))
+    return {"window_hours": payload.get("window_hours"), "candidates": candidates}
+
+
+def distilled_state(
+    path: Path, distilled_id: str, labels: dict[str, str]
+) -> dict[str, object]:
+    with sqlite3.connect(path) as connection:
+        trace_row = connection.execute(
+            "SELECT tier,type FROM traces WHERE id=?", (distilled_id,)
+        ).fetchone()
+        source_ids = [
+            labels.get(str(row[0]), "unknown")
+            for row in connection.execute(
+                "SELECT derived_from FROM trace_lineage WHERE trace_id=? "
+                "ORDER BY derived_from",
+                (distilled_id,),
+            )
+        ]
+        event_row = connection.execute(
+            "SELECT data FROM events WHERE trace_id=? AND action='consolidate'",
+            (distilled_id,),
+        ).fetchone()
+        source_tiers = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT tier FROM traces WHERE id IN (?,?) ORDER BY id",
+                tuple(labels),
+            )
+        ]
+    if trace_row is None or event_row is None:
+        raise AssertionError("distillation did not persist trace and telemetry event")
+    telemetry = json.loads(str(event_row[0]))
+    telemetry["source_ids"] = [
+        labels.get(str(source_id), "unknown")
+        for source_id in telemetry.get("source_ids", [])
+    ]
+    telemetry["distilled_id"] = "distilled"
+    return {
+        "tier": trace_row[0],
+        "type": trace_row[1],
+        "source_ids": sorted(source_ids),
+        "source_tiers": source_tiers,
+        "telemetry": telemetry,
+    }
+
+
+def trace_count(path: Path) -> int:
+    with sqlite3.connect(path) as connection:
+        return int(connection.execute("SELECT count(*) FROM traces").fetchone()[0])
 
 
 def resolve_enum(schema: dict[str, object], field: dict[str, object]) -> list[str] | None:
@@ -351,6 +506,151 @@ def exercise(node: Node, env: dict[str, str], root: Path) -> dict[str, object]:
         )
     )
 
+    second_source_id = created_trace_id(
+        successful_result(
+            tool_call(
+                node,
+                env,
+                "create_trace",
+                {
+                    "title": "MCP Consolidation Source",
+                    "type": "fact",
+                    "body": "A second deterministic source for MCP consolidation.",
+                    "tags": "consolidation-source",
+                },
+            )
+        )
+    )
+    source_labels = {trace_id: "source-a", second_source_id: "source-b"}
+    candidates = normalize_candidates(
+        result_json(
+            successful_result(
+                tool_call(node, env, "list_consolidation_candidates", {})
+            )
+        ),
+        source_labels,
+    )
+    one_source_rejected = rejected(
+        tool_call(
+            node,
+            env,
+            "record_consolidation_result",
+            {
+                "title": "Invalid Distillation",
+                "body": "One source is not a consolidation.",
+                "source_ids": trace_id,
+            },
+        )
+    )
+    distilled_id = created_trace_id(
+        successful_result(
+            tool_call(
+                node,
+                env,
+                "record_consolidation_result",
+                {
+                    "title": "MCP Distilled Result",
+                    "body": "A deterministic distilled result.",
+                    "source_ids": f"{trace_id},{second_source_id}",
+                    "tags": "distilled,mcp-contract",
+                    "author": "test-agent",
+                    "model_name": "fixture-model",
+                    "model_tier_profile": "frontier",
+                    "cohesion_confidence": 0.875,
+                },
+            )
+        )
+    )
+    distilled = distilled_state(db, distilled_id, source_labels)
+    lineage = result_text(
+        successful_result(tool_call(node, env, "trace_lineage", {"id": distilled_id}))
+    )
+
+    identity = result_json(
+        successful_result(tool_call(node, env, "cortex_identity", {}))
+    )
+    identity_report = {
+        "keys": sorted(identity),
+        "id_nonempty": bool(identity.get("id")),
+        "name_matches": identity.get("name") == node.name,
+        "version": identity.get("version"),
+        "mode": identity.get("mode"),
+        "pubkey_present": "pubkey" in identity,
+        "rank_present": "rank" in identity,
+    }
+    status = result_text(
+        successful_result(tool_call(node, env, "federation_status", {}))
+    )
+    normalized_status = status.replace(node.name, "<node>").replace(
+        str(identity["id"]), "<cortex-id>"
+    )
+
+    manifest = cortex_dir(root, node) / "cortex.md"
+    manifest_before_announce = manifest.read_bytes()
+    invalid_announce = rejected(
+        tool_call(
+            node,
+            env,
+            "announce_peer",
+            {"name": "peer-invalid", "endpoint": "file:///tmp/not-http"},
+        )
+    )
+    self_announce = rejected(
+        tool_call(
+            node,
+            env,
+            "announce_peer",
+            {"name": node.name, "endpoint": "https://peer.example.com"},
+        )
+    )
+    announce = result_text(
+        successful_result(
+            tool_call(
+                node,
+                env,
+                "announce_peer",
+                {"name": "peer-new", "endpoint": "https://peer.example.com"},
+            )
+        )
+    ).replace(node.name, "<node>")
+    announce_manifest_unchanged = manifest.read_bytes() == manifest_before_announce
+
+    invalid_sync_cursor = rejected(
+        tool_call(node, env, "sync_events", {"since": "not-a-ulid"})
+    )
+    one_event = result_json_value(
+        successful_result(tool_call(node, env, "sync_events", {"limit": 1}))
+    )
+    if not isinstance(one_event, list) or len(one_event) != 1:
+        raise AssertionError(f"{node.name}: sync_events limit was not honored")
+    event = one_event[0]
+    if not isinstance(event, dict):
+        raise AssertionError(f"{node.name}: sync_events returned a non-object")
+    all_events = result_json_value(
+        successful_result(tool_call(node, env, "sync_events", {"limit": 0}))
+    )
+    if not isinstance(all_events, list):
+        raise AssertionError(f"{node.name}: sync_events returned a non-list")
+    usage_rows = result_json_value(
+        successful_result(tool_call(node, env, "sync_read_signal", {"limit": 100}))
+    )
+    if not isinstance(usage_rows, list):
+        raise AssertionError(f"{node.name}: sync_read_signal returned a non-list")
+    normalized_usage = []
+    for raw_row in usage_rows:
+        if not isinstance(raw_row, dict):
+            raise AssertionError(f"{node.name}: usage row is not an object")
+        row = dict(raw_row)
+        row["trace_id"] = source_labels.get(str(row.get("trace_id")), "other")
+        row["peer_cortex_id"] = (
+            "self" if row.get("peer_cortex_id") == identity.get("id") else "other"
+        )
+        if "last_read_at" in row:
+            row["last_read_at"] = "<timestamp>"
+        row["updated_at"] = "<timestamp>"
+        normalized_usage.append(row)
+    normalized_usage.sort(key=lambda row: str(row.get("trace_id")))
+
     divergence_id = created_trace_id(
         successful_result(
             tool_call(
@@ -392,6 +692,36 @@ def exercise(node: Node, env: dict[str, str], root: Path) -> dict[str, object]:
             env,
             "create_trace",
             {"title": "Invalid", "type": "unknown", "body": "invalid"},
+        )
+    )
+    invalid_health_since = rejected(
+        tool_call(node, env, "consolidation_health", {"since": "not-a-duration"})
+    )
+    missing_get = rejected(
+        tool_call(node, env, "get_trace", {"id": "20990101-missing"})
+    )
+    missing_lineage = rejected(
+        tool_call(node, env, "trace_lineage", {"id": "20990101-missing"})
+    )
+    missing_history = result_text(
+        successful_result(
+            tool_call(node, env, "trace_history", {"id": "20990101-missing"})
+        )
+    )
+    resolve_missing_choice = rejected(
+        tool_call(
+            node,
+            env,
+            "resolve_divergence",
+            {"id": "20990101-missing"},
+        )
+    )
+    resolve_both_choices = rejected(
+        tool_call(
+            node,
+            env,
+            "resolve_divergence",
+            {"id": "20990101-missing", "accept": "peer-a", "body": "merged"},
         )
     )
 
@@ -442,6 +772,28 @@ def exercise(node: Node, env: dict[str, str], root: Path) -> dict[str, object]:
             "latency": health.get("latency"),
             "one_source_mid": health.get("one_source_mid"),
         },
+        "consolidation_candidates": candidates,
+        "one_source_rejected": one_source_rejected,
+        "distilled": distilled,
+        "lineage_contains_sources": all(
+            source_id in lineage for source_id in source_labels
+        ),
+        "identity": identity_report,
+        "federation_status": normalized_status,
+        "invalid_announce_rejected": invalid_announce,
+        "self_announce_rejected": self_announce,
+        "announce": announce,
+        "announce_manifest_unchanged": announce_manifest_unchanged,
+        "invalid_sync_cursor_rejected": invalid_sync_cursor,
+        "sync_event": {
+            "keys": sorted(event),
+            "action": event.get("action"),
+            "trace_id": source_labels.get(str(event.get("trace_id")), "other"),
+            "cortex_id_matches": event.get("cortex_id") == identity.get("id"),
+            "origin_matches": event.get("origin") == node.name,
+        },
+        "sync_default_limit_count": len(all_events),
+        "sync_read_signal": normalized_usage,
         "divergence_resolved": "Merged MCP body." in result_text(resolved),
         "divergence_trashed": is_trashed(db, divergence_id),
         "event_count": events,
@@ -457,6 +809,115 @@ def exercise(node: Node, env: dict[str, str], root: Path) -> dict[str, object]:
         ),
         "invalid_vote_rejected": invalid_vote,
         "invalid_type_rejected": invalid_type,
+        "invalid_health_since_rejected": invalid_health_since,
+        "missing_get_rejected": missing_get,
+        "missing_lineage_rejected": missing_lineage,
+        "missing_history": missing_history,
+        "resolve_missing_choice_rejected": resolve_missing_choice,
+        "resolve_both_choices_rejected": resolve_both_choices,
+    }
+
+
+def exercise_http_modes(
+    node: Node, env: dict[str, str], root: Path
+) -> dict[str, object]:
+    initialize(node, env, root / "cortexes")
+    seed_id = add_seed(node, env)
+    db = database(root, node)
+    run(node, env, "federation", "set-mode", "publish")
+
+    fake_id = "20990101-missing"
+    mutation_calls = {
+        "create_trace": {
+            "title": "Blocked Remote Creation",
+            "type": "fact",
+            "body": "This must not be persisted over HTTP in publish mode.",
+        },
+        "delete_trace": {"id": fake_id},
+        "recover_trace": {"id": fake_id},
+        "archive_trace": {"id": fake_id},
+        "unarchive_trace": {"id": fake_id},
+        "update_trace": {"id": fake_id, "body": "blocked"},
+        "set_trace_tags": {"id": fake_id, "tags": "blocked"},
+        "append_trace_tags": {"id": fake_id, "tags": "blocked"},
+        "vote_trace": {"id": fake_id, "direction": "up"},
+        "record_consolidation_result": {
+            "title": "Blocked Distillation",
+            "body": "blocked",
+            "source_ids": f"{fake_id},20990101-also-missing",
+        },
+        "append_trace": {"id": fake_id, "content": "blocked"},
+        "resolve_divergence": {"id": fake_id, "body": "blocked"},
+    }
+    before_publish_calls = trace_count(db)
+    publish_client: HttpMcpClient | None = None
+    try:
+        start(node, env)
+        publish_client = HttpMcpClient(node)
+        publish_client.initialize()
+        successful_result(publish_client.tool_call("list_traces", {}))
+        successful_result(publish_client.tool_call("sync_events", {"limit": 1}))
+        guarded = {
+            name: rejected(response)
+            and "publish mode" in rejection_text(response)
+            for name, arguments in mutation_calls.items()
+            for response in [publish_client.tool_call(name, arguments)]
+        }
+        if not all(guarded.values()):
+            raise AssertionError(f"{node.name}: incomplete publish guards: {guarded}")
+        after_publish_calls = trace_count(db)
+        local_id = created_trace_id(
+            successful_result(
+                tool_call(
+                    node,
+                    env,
+                    "create_trace",
+                    {
+                        "title": "Allowed Local Creation",
+                        "type": "fact",
+                        "body": "Local stdio remains writable in publish mode.",
+                    },
+                )
+            )
+        )
+    finally:
+        stop(node)
+
+    if before_publish_calls != after_publish_calls:
+        raise AssertionError(f"{node.name}: publish-mode HTTP call mutated traces")
+    if trace_count(db) != after_publish_calls + 1:
+        raise AssertionError(f"{node.name}: publish-mode stdio write did not persist")
+
+    run(node, env, "federation", "set-mode", "subscribe")
+    try:
+        start(node, env)
+        subscribe_client = HttpMcpClient(node)
+        subscribe_client.initialize()
+        successful_result(subscribe_client.tool_call("list_traces", {}))
+        events_response = subscribe_client.tool_call("sync_events", {})
+        usage_response = subscribe_client.tool_call("sync_read_signal", {})
+        subscribe_guards = {
+            "sync_events": rejected(events_response)
+            and "subscribe mode" in rejection_text(events_response),
+            "sync_read_signal": rejected(usage_response)
+            and "subscribe mode" in rejection_text(usage_response),
+        }
+        if not all(subscribe_guards.values()):
+            raise AssertionError(
+                f"{node.name}: incomplete subscribe guards: {subscribe_guards}"
+            )
+    finally:
+        stop(node)
+
+    return {
+        "publish_guarded_tools": sorted(mutation_calls),
+        "publish_read_succeeded": True,
+        "publish_sync_succeeded": True,
+        "publish_remote_unchanged": before_publish_calls == after_publish_calls,
+        "publish_local_write_succeeded": local_id.startswith("20"),
+        "subscribe_guarded_tools": sorted(subscribe_guards),
+        "subscribe_read_succeeded": True,
+        "seed_preserved": trace_count(db) >= 2 and bool(seed_id),
     }
 
 
@@ -481,6 +942,16 @@ def main() -> None:
         reports = {
             label: exercise(node, env, root) for label, node in nodes.items()
         }
+        http_nodes = {
+            "go": Node("go-mcp-http-modes", args.go.resolve(), False, free_port()),
+            "rust": Node(
+                "rust-mcp-http-modes", args.rust.resolve(), True, free_port()
+            ),
+        }
+        http_reports = {
+            label: exercise_http_modes(node, env, root)
+            for label, node in http_nodes.items()
+        }
 
     deliberately_stricter = {"invalid_type_rejected"}
     for key in reports["go"]:
@@ -502,13 +973,22 @@ def main() -> None:
         for details in reports["rust"]["shape"].values()  # type: ignore[union-attr]
     ):
         raise AssertionError("Rust discovery has undocumented input fields")
+    if http_reports["go"] != http_reports["rust"]:
+        raise AssertionError(
+            "MCP HTTP mode mismatch: "
+            f"Go={http_reports['go']!r}, Rust={http_reports['rust']!r}"
+        )
 
     print("ok - Go/Rust MCP tool names, parameters, required fields, and enums")
     print("ok - Go/Rust output-schema and structured-content surfaces")
     print("ok - Go/Rust get_trace record_usage semantics")
     print("ok - Go/Rust tag, append, archive, search, and history behavior")
     print("ok - Go/Rust search activity and consolidation health aggregation")
+    print("ok - Go/Rust consolidation candidates, distillation, and lineage")
     print("ok - Go/Rust custom divergence resolution lifecycle")
+    print("ok - Go/Rust identity, federation status, sync, and announcement behavior")
+    print("ok - Go/Rust publish/subscribe HTTP transport guards")
+    print("ok - Go/Rust missing-resource and invalid-argument behavior")
     print("ok - Go/Rust invalid vote rejection; Rust retains stricter type validation")
     print("ok - Go/Rust instruction and structured usage contracts")
     print("PASS: deterministic MCP contract parity fixture")

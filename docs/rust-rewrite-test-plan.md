@@ -12,8 +12,8 @@ integrity, or security requirements.
 | Database and migrations | Unit + integration | Exact Go migration chain through schema 19; SQLite integrity remains `ok` | Rust migration test and differential suite |
 | CRUD lifecycle | Differential | Either build can create, read, search, append, archive, trash, recover, sync, and verify the same cortex | `compare.sh` |
 | Events and signing | Unit + differential | Canonical signatures verify across languages; mutation clocks remain monotonic | Rust signing tests, Go Rust-wire fixture, mixed signed federation |
-| MCP stdio | Contract | Exact tool-name set, compatible input schemas, result semantics, and errors | `mcp_contract.py` covers names, parameters, required fields, enums, descriptions, output schemas, structured results, read signals, core lifecycle, observability, and custom divergence resolution; advanced federation/consolidation and read-only errors remain |
-| MCP HTTP | Integration | Both transports initialize and serve calls; auth, TLS, host validation, and shutdown match | `http_smoke.sh`; `federation_tls.py` covers authenticated HTTPS, custom CA, and plaintext refusal |
+| MCP stdio | Contract | Exact tool-name set, compatible input schemas, result semantics, and errors | `mcp_contract.py` covers names, schemas, structured results, lifecycle, observability, candidates/distillation/lineage, identity/status/sync, non-mutating announcements, and invalid/missing-resource behavior |
+| MCP HTTP | Integration | Both transports initialize and serve calls; auth, TLS, host validation, shutdown, and federation-mode restrictions match | `http_smoke.sh`; `federation_tls.py` covers authenticated HTTPS, custom CA, and plaintext refusal; `mcp_contract.py` covers every publish-mode mutation guard, local stdio exemption, and subscribe-mode publication guards |
 | Watcher | Integration | External create/edit/rename is debounced, onboarded, indexed once, and healed after atomic save | `watcher_parity.py` covers edit bytes, metadata reindex, burst debounce, create, archive/unarchive, atomic save, heal, onboarding, delete/purge, and source locks |
 | Federation | Multi-process | Multiple nodes converge under normal, duplicate, reordered, concurrent, signed, paused, and unavailable-peer cases | `federation_network.py` covers signed bidirectional batching/lifecycle; `federation_ring.py` covers three nodes, background sync, pause/recovery, concurrency, shutdown, and key-rotation recovery; `federation_tls.py` covers authenticated mixed-runtime TLS |
 | Memory tiers | Unit + differential | Usage counters, scoring, promotion, graduation, votes, purge, and health output match | Per-peer usage publication/merge, short-to-mid scoring/promotion, strict mid-to-long graduation, search activity, promotion latency, election/failure totals, and one-source leak reporting automated |
@@ -48,8 +48,7 @@ performance comparison, but is not yet a release replacement. The Rust HTTP
 server serves shared-key-authenticated HTTPS, refuses authenticated plaintext,
 and otherwise permits unauthenticated HTTP only on loopback. Semantic backfill,
 ranking, MCP routing, and automatic maintenance now pass the deterministic Go
-oracle. MCP discovery schemas plus representative lifecycle, observability, and
-divergence behavior are also automated. Certificate-expiry monitoring,
-exhaustive advanced-tool/error parity, full TUI behavior, and broader
-adversarial real-model quality evaluation still require ports and parity
-fixtures.
+oracle. MCP discovery, successful advanced-tool results, invalid inputs,
+missing resources, and federation-mode transport boundaries are automated.
+Certificate-expiry monitoring, full TUI behavior, and broader adversarial
+real-model quality evaluation still require ports and parity fixtures.
