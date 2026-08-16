@@ -1205,6 +1205,10 @@ func Open(name, dir string) (*Cortex, error) {
 		return nil, err
 	}
 	cx := &Cortex{Name: name, Dir: dir, DB: conn}
+	if err := cx.rejectPendingRustMutation(); err != nil {
+		conn.Close()
+		return nil, err
+	}
 
 	// Load the manifest to pick up the cortex ID and enforce versioning.
 	m, mErr := ReadManifest(dir)
@@ -1320,6 +1324,25 @@ func Open(name, dir string) (*Cortex, error) {
 	}
 
 	return cx, nil
+}
+
+func (c *Cortex) rejectPendingRustMutation() error {
+	var pending int
+	if err := c.DB.QueryRow(
+		`SELECT EXISTS(
+			SELECT 1 FROM federation_state
+			WHERE key GLOB 'rust_pending_mutation:*'
+		)`,
+	).Scan(&pending); err != nil {
+		return fmt.Errorf("checking for interrupted Rust trace mutations: %w", err)
+	}
+	if pending == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"cortex %q has an interrupted Rust trace mutation; open it once with the Rust build to recover it before using the Go build",
+		c.Name,
+	)
 }
 
 func (c *Cortex) pruneLegacyVectorClockBuckets() error {

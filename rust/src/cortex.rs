@@ -1192,11 +1192,11 @@ impl Cortex {
     }
 
     fn recover_pending_mutations(&mut self) -> Result<()> {
-        let pattern = format!("{PENDING_MUTATION_PREFIX}%");
+        let pattern = format!("{PENDING_MUTATION_PREFIX}*");
         let pending: Vec<(String, String)> = {
             let mut statement = self
                 .connection
-                .prepare("SELECT key,value FROM federation_state WHERE key LIKE ?1 ORDER BY key")?;
+                .prepare("SELECT key,value FROM federation_state WHERE key GLOB ?1 ORDER BY key")?;
             statement
                 .query_map([pattern], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?

@@ -47,6 +47,14 @@ and requires the next Rust open to restore the exact prior transaction state.
 The archive and watcher cases also open the Cortex concurrently to prove that
 recovery skips a live mutation owner.
 
+`rust/tests/recovery_safety.rs` verifies that corrupt SQLite bytes, malformed
+pending JSON, and pending path traversal all fail closed without rewriting the
+database, trace, recovery record, or an outside path.
+
+`compare.sh` also kills Rust after an uncommitted trace replacement, requires
+the branch Go build to refuse takeover while the Rust recovery record exists,
+opens Rust to recover the committed state, and then requires Go to open it.
+
 `federation_tls.py` runs signed Go↔Rust federation over HTTPS with a temporary
 private CA, CA-signed server certificate, and shared bearer key. It verifies
 missing/wrong/correct authorization, custom-CA failure and recovery, secret-free

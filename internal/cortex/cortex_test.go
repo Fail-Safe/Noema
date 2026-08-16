@@ -111,6 +111,58 @@ func TestOpen_GeneratesAgentsMDIfMissing(t *testing.T) {
 	}
 }
 
+func TestOpen_RefusesPendingRustMutation(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := cortex.Create("mixed", dir); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	root := filepath.Join(dir, "mixed")
+	cx, err := cortex.Open("mixed", root)
+	if err != nil {
+		t.Fatalf("initial Open: %v", err)
+	}
+	if _, err := cx.DB.Exec(
+		`INSERT INTO federation_state(key, value) VALUES (?, ?)`,
+		"rust_pending_mutation:01M00000000000000000000000",
+		`{"opaque":"must not appear in the error"}`,
+	); err != nil {
+		t.Fatalf("insert pending mutation: %v", err)
+	}
+	if err := cx.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	_, err = cortex.Open("mixed", root)
+	if err == nil {
+		t.Fatal("Open succeeded with an interrupted Rust mutation")
+	}
+	if !strings.Contains(err.Error(), "interrupted Rust trace mutation") {
+		t.Fatalf("Open error = %q, want recovery guidance", err)
+	}
+	if strings.Contains(err.Error(), "opaque") {
+		t.Fatalf("Open error exposed pending mutation contents: %q", err)
+	}
+
+	database, err := sql.Open("sqlite", filepath.Join(root, "db", "noema.db"))
+	if err != nil {
+		t.Fatalf("open database for cleanup: %v", err)
+	}
+	if _, err := database.Exec(
+		`DELETE FROM federation_state WHERE key GLOB 'rust_pending_mutation:*'`,
+	); err != nil {
+		database.Close()
+		t.Fatalf("clear pending mutation: %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("close cleanup database: %v", err)
+	}
+	reopened, err := cortex.Open("mixed", root)
+	if err != nil {
+		t.Fatalf("Open after recovery record cleared: %v", err)
+	}
+	reopened.Close()
+}
+
 // TestOpen_RemovesLegacyAgentMD verifies that a cortex upgraded from the
 // older AGENT.md naming has the legacy file removed when AGENTS.md is
 // regenerated. The agents.md convention is one-file-per-cortex; leaving

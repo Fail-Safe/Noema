@@ -5,9 +5,10 @@ Updated: 2026-08-16
 ## Pause point
 
 - Branch: `experiment/rust-rewrite`
-- Latest completed milestone: crash recovery for destructive lifecycle and
-  watcher reconstruction paths (this handoff commit).
-- Previous milestone: `0a753e5 fix(rust): recover interrupted trace mutations`.
+- Latest completed milestone: mixed-runtime recovery interlock and fail-closed
+  corrupt-database/recovery-record probes (this handoff commit).
+- Previous milestone: `5a9337e fix(rust): recover interrupted trace deletion`.
+- Earlier recovery milestone: `0a753e5 fix(rust): recover interrupted trace mutations`.
 - Earlier TLS milestone: `33424c0 feat(rust): add TLS certificate lifecycle parity`.
 - Earlier TUI milestone: `a7e7196 feat(rust): add functional TUI parity`.
 - Earlier advanced MCP milestone: `29cd610 feat(rust): complete advanced MCP parity`.
@@ -105,6 +106,12 @@ Updated: 2026-08-16
   an exact journaled backup until their row transaction commits. Watcher repair
   journals its reconstructed trash copy with the matching visibility update,
   so failed or killed repair does not leave an uncommitted file behind.
+- The Go build on this branch refuses to open a Cortex with a pending Rust
+  mutation record. The Rust build must recover it first; after recovery, Go
+  opens normally. The guard never parses or prints the journal value.
+- Rust startup fails closed on an unreadable SQLite database, malformed pending
+  record, or pending path traversal without rewriting the database, trace, or
+  an outside path. Corrupt-database repair is not implemented.
 - A reusable pass gate with initial election, signed claim, cancellable quiet
   wait, re-election, distinct preemption reasons, in-flight tracking, pass-error
   closure, and signed success.
@@ -185,8 +192,8 @@ The following passed for the combined crash recovery, transaction rollback,
 fault-safety, dynamic federation, TLS lifecycle, advanced MCP, and functional
 TUI tree:
 
-- `make rust-test` — formatting, clippy with warnings denied, 87 unit tests, and
-  five subprocess crash-recovery scenarios.
+- `make rust-test` — formatting, clippy with warnings denied, 87 unit tests,
+  five subprocess crash-recovery scenarios, and three recovery-safety tests.
 - Eight focused SQLite-abort tests prove byte- and permission-identical rollback
   for local update/tier/visibility/hard-delete operations, watcher
   reconstruction, and remote update/create/purge replay, including removal of
@@ -196,6 +203,12 @@ TUI tree:
   update, archive move, new trace creation, hard deletion, and watcher trash
   reconstruction. The move and watcher cases also prove that a concurrent open
   leaves the still-live writer alone.
+- The differential compatibility fixture kills Rust after an uncommitted file
+  replacement, proves Go refuses the pending recovery state, opens Rust to
+  restore the committed bytes, and then proves Go opens normally.
+- Three recovery-safety tests prove corrupt SQLite bytes are not rewritten,
+  malformed records remain available for operator diagnosis, and traversal in
+  a pending path cannot escape the Cortex.
 - `go test ./...`
 - `go test -race ./...`
 - `go vet ./...`
@@ -337,6 +350,10 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
   mixed ring exposed duplicate create replay where the losing rollback removed
   the winner's file; a stable lock derived from the trace path must be acquired
   before the recovery record or filesystem mutation.
+- An unaware Go build will read Rust's uncommitted file after a killed Rust
+  writer because it does not recognize the recovery record. The current branch
+  Go build therefore needs a narrow fail-closed startup interlock; older Go
+  binaries remain unsafe for takeover until Rust has recovered first.
 
 ## Remaining replacement gaps
 
@@ -344,18 +361,19 @@ See `docs/rust-rewrite-experiment-results.md` for the full tables and caveats.
    dark/light auto-detection, and external-editor workflows.
 2. Broader adversarial real-model quality evaluation beyond the current bounded
    synthetic corpus.
-3. Corrupt-database recovery, power-loss durability, and a Go process taking
-   over a Cortex before Rust consumes a pending Rust recovery record remain
-   unverified.
+3. Corrupt-database operator repair/restore and power-loss durability remain
+   unverified. Corruption and malformed recovery records now fail closed, but
+   the Rust `cortex restore` command is still disabled. Older Go binaries also
+   cannot safely take over until the Rust recovery record has been consumed.
 
 ## Recommended next milestone
 
-Design corrupt-database/operator recovery and mixed-runtime takeover behavior;
-do not assume Go understands the Rust recovery records. First determine whether
-startup should fail closed, offer an explicit repair command, or export a
-standalone recovery artifact when SQLite cannot open. Keep the returned-failure,
-read-only I/O, duplicate-replay, destructive lifecycle, and subprocess crash
-fixtures as regression gates.
+Port and harden the Go backup-restore workflow for the Rust comparison binary,
+then add an explicit recovery-status surface that can distinguish a pending
+mutation, malformed journal, and unreadable database without exposing journal
+contents. Keep automatic startup fail-closed: database reconstruction or backup
+replacement should remain an explicit operator action. Qualify filesystem and
+SQLite durability under real power-loss simulation separately.
 
 Any new Rust packages still require explicit approval before adding them.
 

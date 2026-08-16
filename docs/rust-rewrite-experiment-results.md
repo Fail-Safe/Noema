@@ -82,6 +82,10 @@ and mixed-process tests cover:
   the old row/file/event state, including hard delete and watcher trash
   reconstruction. Owner locks skip live mutations; stable per-trace locks reject
   concurrent duplicate materialization before file replacement.
+- Mixed-runtime takeover now fails closed: the branch's Go build detects a
+  pending Rust mutation without parsing its value, Rust performs recovery, and
+  Go then opens normally. Corrupt SQLite bytes, malformed recovery JSON, and
+  pending path traversal also fail without rewriting protected data.
 
 The network experiment found two interoperability defects that in-process tests
 did not expose. Rust's first identity response did not use Go's `version` and
@@ -373,8 +377,10 @@ now dynamically reconciles workers without restart and rolls filesystem state
 back when a non-destructive trace transaction returns an error. Atomic writes
 and durable recovery records now cover process death for transactional create,
 replace, move, delete, purge replay, and watcher reconstruction paths on the
-next Rust open. Corrupt-database recovery, mixed-runtime takeover, and power-loss
-qualification remain open. Its consolidation election and
+next Rust open. The branch Go build now refuses mixed-runtime takeover until
+Rust recovery completes, and database corruption fails without rewriting data.
+Operator repair/restore, compatibility with older unaware Go binaries, and
+power-loss qualification remain open. Its consolidation election and
 coordination wire, pass gate, watchdog recovery, full cadence, heuristic pass,
 graduation, and model-driven distillation are now present. A bounded real-model
 comparison also passes, but broader distillation-quality evaluation remains
@@ -395,5 +401,5 @@ now also match the deterministic Go oracle, while returned database failures
 and tested process death have stronger filesystem recovery in the Rust
 experiment. It still does not justify an all-in rewrite because larger-result
 throughput is not better and pixel-level/live-terminal TUI validation, broader
-distillation-quality evaluation, corrupt-database fault injection, mixed-runtime
-recovery, and operator recovery behavior remain incomplete.
+distillation-quality evaluation, power-loss fault injection, older-Go recovery,
+and operator repair behavior remain incomplete.

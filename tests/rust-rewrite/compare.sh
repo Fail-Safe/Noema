@@ -107,6 +107,41 @@ assert_contains "$(rust_noema list --trashed)" "$rust_id" "Rust sees Go trash tr
 rust_noema recover "$rust_id" >/dev/null
 assert_contains "$(go_noema get "$rust_id")" "charlie delta" "Go sees Rust recovery"
 
+takeover_marker="$comparison_root/rust-mutation-complete"
+env HOME="$comparison_home" \
+    NOEMA_RUST_TEST_PAUSE_AFTER_FILESYSTEM_MUTATION="$takeover_marker" \
+    "$rust_bin" --cortex shared append "$go_id" \
+    --content "uncommitted mixed-runtime body" >/dev/null 2>&1 &
+takeover_pid=$!
+takeover_ready=false
+takeover_attempt=0
+while [ "$takeover_attempt" -lt 1000 ]; do
+    if [ -f "$takeover_marker" ]; then
+        takeover_ready=true
+        break
+    fi
+    if ! kill -0 "$takeover_pid" 2>/dev/null; then
+        break
+    fi
+    takeover_attempt=$((takeover_attempt + 1))
+    sleep 0.01
+done
+if [ "$takeover_ready" != true ]; then
+    kill -KILL "$takeover_pid" 2>/dev/null || true
+    wait "$takeover_pid" 2>/dev/null || true
+    echo "FAIL: Rust writer did not reach the mixed-runtime fault boundary" >&2
+    exit 1
+fi
+kill -KILL "$takeover_pid"
+wait "$takeover_pid" 2>/dev/null || true
+if takeover_error=$(go_noema get "$go_id" 2>&1); then
+    echo "FAIL: Go opened a Cortex with an interrupted Rust mutation" >&2
+    exit 1
+fi
+assert_contains "$takeover_error" "interrupted Rust trace mutation" "Go refuses pending Rust recovery"
+assert_contains "$(rust_noema get "$go_id")" "alpha bravo shared format" "Rust repairs killed mutation before takeover"
+assert_contains "$(go_noema get "$go_id")" "alpha bravo shared format" "Go opens after Rust recovery"
+
 go_noema sync >/dev/null
 rust_noema sync >/dev/null
 assert_contains "$(go_noema verify)" "All hashes OK." "Go integrity verifier accepts shared cortex"
