@@ -268,7 +268,7 @@ noema federation key fingerprint          Print the SHA-256 fingerprint of the a
 noema keygen [--force]                    Generate this cortex's Ed25519 federation signing key so it can sign
                                           the events it emits (--force rotates it; peers must re-pin)
 
-noema serve [--transport stdio|http] [--host <addr>] [--host-dynamic <addr>] [--tls-cert <file> --tls-key <file>]
+noema serve [--transport stdio|http] [--host <addr>] [--host-dynamic <addr>] [--allowed-host <name>] [--tls-cert <file> --tls-key <file>]
                                           Start the MCP server (http requires --host; endpoint is /mcp)
 noema serve --print-config                Print a ready-to-use .mcp.json snippet and exit
 noema serve ... --print-systemd-unit      Print a systemd service unit for the current serve flags
@@ -382,7 +382,7 @@ noema serve --cortex my-cortex --transport http --host 10.0.0.5 --port 3000 \
             --tls-cert /path/server.crt --tls-key /path/server.key
 ```
 
-`--host` is **required** in HTTP mode and must be an explicit address — `0.0.0.0`/`::` are rejected to avoid accidentally exposing a Cortex on every interface. `--host-dynamic` accepts an IP address or hostname and rechecks it every five seconds: it adds the listener when an address it resolves to belongs to the machine and removes it when it no longer does, while required `--host` listeners remain available. Pair `--tls-cert` with `--tls-key` to serve over HTTPS. The endpoint is `/mcp` (not configurable).
+`--host` is **required** in HTTP mode and must be an explicit address — `0.0.0.0`/`::` are rejected to avoid accidentally exposing a Cortex on every interface. `--host-dynamic` accepts an IP address or hostname and rechecks it every five seconds: it adds the listener when an address it resolves to belongs to the machine and removes it when it no longer does, while required `--host` listeners remain available. Listener addresses, dynamic listener names, and loopback names are also accepted in HTTP `Host` headers. Add repeatable `--allowed-host <hostname-or-authority>` values when clients use another DNS name for an existing listener; this expands Host-header validation without binding another socket. Pair `--tls-cert` with `--tls-key` to serve over HTTPS. The endpoint is `/mcp` (not configurable).
 
 When `--print-config` is used with HTTP transport, the generated client URL uses the first `--host-dynamic` value when one is present; otherwise it uses the first `--host` value. This keeps a loopback listener available to local clients while producing a configuration that remote clients can dial on the conditional network.
 

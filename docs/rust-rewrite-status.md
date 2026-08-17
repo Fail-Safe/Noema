@@ -49,9 +49,10 @@ Updated: 2026-08-17
   output schemas, usage semantics, errors, federation restrictions, and
   semantic-search fallback behavior.
 - HTTP supports repeated static listeners, dynamically reconciled local
-  addresses, shared-key authentication, Rustls HTTPS, custom peer CAs, TLS 1.2
-  minimum outbound federation, certificate validity gates, lifecycle warnings,
-  and secret-safe diagnostics.
+  addresses, a separate explicit DNS Host-header allowlist, shared-key
+  authentication, Rustls HTTPS, custom peer CAs, TLS 1.2 minimum outbound
+  federation, certificate validity gates, lifecycle warnings, and secret-safe
+  diagnostics.
 - The TUI supports navigation, detail scrolling, search, filters, help,
   lifecycle actions, vote cycling, live refresh, editor handoff, themes,
   Unicode-safe rendering, resize, and complete terminal restoration.

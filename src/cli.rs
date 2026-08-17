@@ -523,6 +523,9 @@ struct ServeArgs {
     host: Vec<String>,
     #[arg(long, action = clap::ArgAction::Append)]
     host_dynamic: Vec<String>,
+    /// Additional DNS names or authorities accepted in HTTP Host headers
+    #[arg(long, action = clap::ArgAction::Append)]
+    allowed_host: Vec<String>,
     #[arg(long)]
     port: Option<u16>,
     #[arg(long)]
@@ -2878,6 +2881,9 @@ fn serve_arguments(selected: Option<&str>, args: &ServeArgs, port: u16) -> Resul
     for host in &args.host_dynamic {
         output.extend(["--host-dynamic".into(), host.clone()]);
     }
+    for host in &args.allowed_host {
+        output.extend(["--allowed-host".into(), host.clone()]);
+    }
     output.extend(["--port".into(), port.to_string()]);
     if let (Some(certificate), Some(private_key)) = (&args.tls_cert, &args.tls_key) {
         output.extend([
@@ -3011,11 +3017,14 @@ async fn serve(selected: Option<&str>, args: ServeArgs) -> Result<()> {
     if args.transport == "stdio"
         && (!args.host.is_empty()
             || !args.host_dynamic.is_empty()
+            || !args.allowed_host.is_empty()
             || args.port.is_some()
             || args.tls_cert.is_some()
             || args.tls_key.is_some())
     {
-        bail!("--host/--host-dynamic/--port/--tls-cert/--tls-key require --transport http");
+        bail!(
+            "--host/--host-dynamic/--allowed-host/--port/--tls-cert/--tls-key require --transport http"
+        );
     }
     if args.log_stderr && args.log_file.is_some() {
         bail!("--log-file and --log-stderr are mutually exclusive");
@@ -3104,6 +3113,7 @@ async fn serve(selected: Option<&str>, args: ServeArgs) -> Result<()> {
                 crate::mcp::HttpListenConfig {
                     hosts: args.host,
                     dynamic_hosts: args.host_dynamic,
+                    allowed_hosts: args.allowed_host,
                     port,
                 },
                 access_key,
@@ -3685,6 +3695,25 @@ mod tests {
             } if theme == "light"
         ));
         assert!(Cli::try_parse_from(["noema", "tui", "--theme", "sepia"]).is_err());
+
+        let cli = Cli::try_parse_from([
+            "noema",
+            "serve",
+            "--transport",
+            "http",
+            "--host",
+            "127.0.0.1",
+            "--allowed-host",
+            "memory.example.com",
+            "--allowed-host",
+            "memory.example.com:3000",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Serve(ServeArgs { ref allowed_host, .. })
+                if allowed_host == &["memory.example.com", "memory.example.com:3000"]
+        ));
     }
 
     #[test]

@@ -1077,7 +1077,26 @@ pub async fn serve_stdio(
 pub struct HttpListenConfig {
     pub hosts: Vec<String>,
     pub dynamic_hosts: Vec<String>,
+    pub allowed_hosts: Vec<String>,
     pub port: u16,
+}
+
+fn allowed_http_hosts(
+    hosts: &[String],
+    dynamic_hosts: &[String],
+    allowed_hosts: &[String],
+) -> Vec<String> {
+    hosts
+        .iter()
+        .chain(dynamic_hosts)
+        .chain(allowed_hosts)
+        .cloned()
+        .chain([
+            "localhost".to_owned(),
+            "127.0.0.1".to_owned(),
+            "::1".to_owned(),
+        ])
+        .collect()
 }
 
 struct DynamicListener {
@@ -1132,6 +1151,7 @@ pub async fn serve_http(
     let HttpListenConfig {
         hosts,
         dynamic_hosts,
+        allowed_hosts,
         port,
     } = listen;
     let server = NoemaServer::new(&name, &path, true)?;
@@ -1148,18 +1168,11 @@ pub async fn serve_http(
         StreamableHttpService::new(
             move || Ok(server.clone()),
             Default::default(),
-            StreamableHttpServerConfig::default().with_allowed_hosts(
-                hosts
-                    .iter()
-                    .cloned()
-                    .chain(dynamic_hosts.iter().cloned())
-                    .chain([
-                        "localhost".to_owned(),
-                        "127.0.0.1".to_owned(),
-                        "::1".to_owned(),
-                    ])
-                    .collect::<Vec<_>>(),
-            ),
+            StreamableHttpServerConfig::default().with_allowed_hosts(allowed_http_hosts(
+                &hosts,
+                &dynamic_hosts,
+                &allowed_hosts,
+            )),
         );
     let certificate_path = tls.as_ref().map(|(certificate, _)| certificate.clone());
     let tls_config = match tls {
@@ -1971,6 +1984,29 @@ mod tests {
         assert!(!digest.matches(b"bearer test-secret"));
         assert!(!digest.matches(b"Bearer wrong"));
         assert!(!digest.matches(b""));
+    }
+
+    #[test]
+    fn host_header_allowlist_includes_names_without_binding_them() {
+        let hosts = vec!["127.0.0.1".to_owned()];
+        let dynamic_hosts = vec!["192.0.2.10".to_owned()];
+        let allowed_hosts = vec![
+            "memory.example.com".to_owned(),
+            "memory.example.com:3000".to_owned(),
+        ];
+        let actual = allowed_http_hosts(&hosts, &dynamic_hosts, &allowed_hosts);
+        assert_eq!(
+            actual,
+            [
+                "127.0.0.1",
+                "192.0.2.10",
+                "memory.example.com",
+                "memory.example.com:3000",
+                "localhost",
+                "127.0.0.1",
+                "::1",
+            ]
+        );
     }
 
     #[cfg(unix)]
