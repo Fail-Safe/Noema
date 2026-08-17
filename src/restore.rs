@@ -1038,7 +1038,7 @@ fn validate_archive_path(path: &Path) -> Result<()> {
             .components()
             .all(|component| matches!(component, Component::Normal(_)))
     {
-        bail!("tar entry {:?} has an unsafe path", path)
+        bail!("tar entry {path:?} has an unsafe path")
     }
     Ok(())
 }

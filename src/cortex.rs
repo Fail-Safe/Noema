@@ -1621,8 +1621,7 @@ impl Cortex {
         }
         let entry = config.cortexes.get(&selected).ok_or_else(|| {
             anyhow::anyhow!(
-                "unknown cortex {:?} — run `noema init --name {selected}` first",
-                selected
+                "unknown cortex {selected:?} — run `noema init --name {selected}` first"
             )
         })?;
         Self::open(selected, &entry.path)

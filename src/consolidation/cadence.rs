@@ -82,10 +82,10 @@ impl CadenceState {
             return false;
         };
         self.last_cron_day != clock.day
-            && !self
+            && self
                 .cron_retry
                 .as_ref()
-                .is_some_and(|retry| retry.target_day == clock.day)
+                .is_none_or(|retry| retry.target_day != clock.day)
             && clock.minute_of_day >= scheduled
     }
 

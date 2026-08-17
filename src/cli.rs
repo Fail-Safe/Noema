@@ -580,7 +580,7 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
         Command::Get { id } => {
             let (row, trace) = cx
                 .get_trace(&id)
-                .map_err(|_| anyhow::anyhow!("trace {:?} not found", id))?;
+                .map_err(|_| anyhow::anyhow!("trace {id:?} not found"))?;
             print_trace(&row, &trace);
         }
         Command::Append { id, content, force } => {
@@ -1092,11 +1092,11 @@ fn init(name: &str, path: Option<PathBuf>) -> Result<()> {
 fn use_cortex(name: &str) -> Result<()> {
     let mut cfg = Config::load()?;
     if !cfg.cortexes.contains_key(name) {
-        bail!("unknown cortex {:?}", name)
+        bail!("unknown cortex {name:?}")
     }
     cfg.default = name.into();
     cfg.save()?;
-    println!("Now using cortex {:?}.", name);
+    println!("Now using cortex {name:?}.");
     Ok(())
 }
 
@@ -1190,7 +1190,7 @@ fn cortex_command(command: CortexCommand) -> Result<()> {
             let entry = cfg
                 .cortexes
                 .get(&name)
-                .ok_or_else(|| anyhow::anyhow!("unknown cortex {:?}", name))?;
+                .ok_or_else(|| anyhow::anyhow!("unknown cortex {name:?}"))?;
             match crate::cortex::inspect_recovery_status(&entry.path) {
                 crate::cortex::RecoveryStatus::Clean => {
                     println!("Recovery status for cortex {name:?}: clean");
@@ -2717,7 +2717,7 @@ fn resolve_hermes_target(flag: Option<PathBuf>) -> Result<PathBuf> {
 
 fn resolve_obsidian_target(vault: &std::path::Path) -> Result<PathBuf> {
     Ok(std::path::absolute(vault)
-        .with_context(|| format!("resolving Obsidian vault {:?}", vault))?
+        .with_context(|| format!("resolving Obsidian vault {vault:?}"))?
         .join(".obsidian/plugins/noema"))
 }
 
