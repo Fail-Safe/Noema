@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "updated": "2026-08-17",
   "context": {
     "platform": "Apple Silicon macOS",
@@ -22,14 +22,20 @@
   },
   "source_size": {
     "baseline": "rust-cutover-baseline",
-    "method": "Physical lines, including comments and blanks; dedicated test files and top-level Rust cfg(test) modules excluded.",
+    "method": "cloc 2.10; production runtime only. Dedicated test files, top-level Rust cfg(test) modules, migrations, plugins, and shared benchmark harnesses excluded.",
     "go": {
-      "files": 99,
-      "lines": 26986
+      "files": 97,
+      "blank": 2218,
+      "comment": 4973,
+      "code": 19775,
+      "physical": 26966
     },
     "rust": {
       "files": 25,
-      "lines": 18784
+      "blank": 1012,
+      "comment": 108,
+      "code": 17664,
+      "physical": 18784
     }
   },
   "scale": [

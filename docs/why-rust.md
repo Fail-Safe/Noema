@@ -35,7 +35,7 @@ for that decision.
 | Default durability | `standard` matches Go's mutation and crash posture | Migration does not impose an immediate performance regression |
 | Enhanced durability | `strong` passes process-death and APFS detach/remount recovery, with a large write cost | Useful opt-in; hard power-cut/device-cache qualification remains |
 | Release artifact | Rust is 27.8% larger in the current local release build | Favors Go, but operational impact is small |
-| Production source | Rust implements the production runtime in 30.4% fewer physical lines | Smaller maintenance surface; not proof of correctness or a language-wide result |
+| Production source | Rust uses 10.7% fewer code-only lines and 30.3% fewer physical lines | Smaller implementation; not proof of correctness or a language-wide result |
 | Release readiness | Rust-only source, CI, six-platform release packaging, checksums, plugins, and Homebrew metadata are configured | Cutover accepted; remote workflow and first-release validation remain operational gates |
 
 ## Performance at scale
@@ -194,28 +194,32 @@ and defect-prevention argument, not a measured performance percentage.
 ## A smaller production implementation
 
 At the signed final comparison baseline, Noema's production implementation
-decreased from 26,986 physical lines across 99 Go files to 18,784 lines across
-25 Rust source files. That is 8,202 fewer lines, a 30.4% reduction.
+decreased from 19,775 code-only lines across 97 Go files to 17,664 lines across
+25 Rust source files. That is 2,111 fewer code lines, a 10.7% reduction. The
+physical source decreased from 26,966 to 18,784 lines, a 30.3% reduction.
 
-![Horizontal bars show the Go production implementation at 26,986 lines and Rust at 18,784 lines, a reduction of 8,202 lines or 30.4 percent.](assets/rust-rewrite/source-loc.svg)
+![Two horizontal bar charts compare the production implementations. Code-only LOC falls from 19,775 in Go to 17,664 in Rust, or 10.7 percent. Physical LOC falls from 26,966 to 18,784, or 30.3 percent.](assets/rust-rewrite/source-loc.svg)
 
-| Production implementation | Files | Physical lines | Change from Go |
-| --- | ---: | ---: | ---: |
-| Go | 99 | 26,986 | baseline |
-| Rust | 25 | 18,784 | 30.4% fewer |
+| Production implementation | Files | Code-only | Blank | Comment-only | Physical |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Go | 97 | 19,775 | 2,218 | 4,973 | 26,966 |
+| Rust | 25 | 17,664 | 1,012 | 108 | 18,784 |
+| Rust change | — | 10.7% fewer | 54.4% fewer | 97.8% fewer | 30.3% fewer |
 
-The count comes from `rust-cutover-baseline` and includes comments and blank
-lines. It excludes Go `*_test.go` files, top-level Rust `#[cfg(test)]` modules,
-Rust integration tests, migrations, plugins, and shared benchmark harnesses.
-This makes it a comparison of the maintained runtime implementations rather
-than their differently sized test suites.
+The count comes from `rust-cutover-baseline` using cloc 2.10. Code-only LOC
+excludes blank and comment-only lines; physical LOC includes both. The scope
+excludes Go `*_test.go` files, top-level Rust `#[cfg(test)]` modules, Rust
+integration tests, migrations, plugins, and shared benchmark harnesses. This
+makes it a comparison of the maintained runtime implementations rather than
+their differently sized test suites.
 
 > **★ Insight**
 >
-> The useful conclusion is not that Rust is inherently more concise. It is
-> that Noema's tested behavior now occupies a roughly 30% smaller production
-> implementation surface. That supports the maintainability case, while the
-> compatibility and resilience suites remain the evidence for correctness.
+> The useful conclusion is not that Rust is inherently more concise. Noema's
+> production behavior occupies 10.7% fewer code lines in Rust; the larger
+> physical-line reduction mainly reflects Go's much heavier commentary. Both
+> support a smaller maintenance surface, while compatibility and resilience
+> suites remain the evidence for correctness.
 
 ## Why the final results differ from the first results
 

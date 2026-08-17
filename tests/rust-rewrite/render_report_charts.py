@@ -464,32 +464,44 @@ def render_artifact_size(data: dict) -> None:
 
 def render_source_size(data: dict) -> None:
     source = data["source_size"]
-    values = [source[name]["lines"] for name in ("go", "rust")]
-    reduction = 100 * (1 - values[1] / values[0])
+    code_values = [source[name]["code"] for name in ("go", "rust")]
+    physical_values = [source[name]["physical"] for name in ("go", "rust")]
+    panels = [
+        ("Code-only LOC", code_values),
+        ("Physical LOC", physical_values),
+    ]
+    shared_maximum = max(physical_values) * 1.27
 
-    fig, ax = plt.subplots(figsize=(9, 4.4))
-    bars = ax.barh([1, 0], values, color=[BASELINE, FAVORABLE], height=0.5)
-    ax.set_yticks([1, 0], ["Go", "Rust"])
-    ax.set_xlabel("Production implementation lines")
-    ax.set_xlim(0, max(values) * 1.28)
-    ax.xaxis.set_major_formatter(mticker.StrMethodFormatter("{x:,.0f}"))
-    ax.set_title(f"Rust cut the production implementation by {reduction:.1f}%")
-    ax.grid(axis="x", color=GRID, linewidth=0.7, alpha=0.7)
-    ax.set_axisbelow(True)
-    ax.bar_label(
-        bars,
-        labels=[f"{value:,} lines" for value in values],
-        padding=5,
+    fig, axes = plt.subplots(1, 2, figsize=(13.5, 4.8), sharex=True)
+    for ax, (label, values) in zip(axes, panels, strict=True):
+        reduction = 100 * (1 - values[1] / values[0])
+        bars = ax.barh([1, 0], values, color=[BASELINE, FAVORABLE], height=0.5)
+        ax.set_yticks([1, 0], ["Go", "Rust"])
+        ax.set_xlabel("Production implementation lines")
+        ax.set_xlim(0, shared_maximum)
+        ax.xaxis.set_major_formatter(mticker.StrMethodFormatter("{x:,.0f}"))
+        ax.set_title(f"{label} — {reduction:.1f}% fewer")
+        ax.grid(axis="x", color=GRID, linewidth=0.7, alpha=0.7)
+        ax.set_axisbelow(True)
+        ax.bar_label(
+            bars,
+            labels=[f"{value:,} lines" for value in values],
+            padding=5,
+            fontweight="bold",
+        )
+    fig.suptitle(
+        "Noema's Rust implementation is smaller by both measures",
+        fontsize=16,
         fontweight="bold",
     )
     fig.text(
         0.5,
         0.02,
-        "Physical lines at the signed cutover baseline; comments and blanks included, test code excluded.",
+        "Production runtime at the signed cutover baseline. Code-only excludes blank and comment-only lines.",
         ha="center",
         color=NEUTRAL,
     )
-    fig.subplots_adjust(left=0.12, right=0.94, top=0.82, bottom=0.2)
+    fig.subplots_adjust(left=0.08, right=0.95, wspace=0.28, top=0.76, bottom=0.2)
     save(fig, "source-loc.svg")
 
 
