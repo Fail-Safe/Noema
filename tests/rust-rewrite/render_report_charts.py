@@ -17,7 +17,6 @@ os.environ.setdefault(
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
 import numpy as np
 
 
@@ -171,43 +170,67 @@ def render_workload_ratios(data: dict) -> None:
 def render_durability(data: dict) -> None:
     values = data["durability_10k"]
     fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.8))
+    profiles = [
+        ("Go\ncurrent", values["go_current"], GO, 0.0),
+        ("Rust\nstandard", values["rust_standard"], STANDARD, 1.0),
+        ("Rust strong\n(opt-in only)", values["rust_strong"], STRONG, 2.7),
+    ]
     metrics = [
         ("seed_seconds", "10k seed time", "Seconds", "{:.1f}"),
         ("mixed_ops_per_second", "Mixed throughput", "Operations per second", "{:,.0f}"),
         ("median_write_latency_ms", "Median write latency", "Milliseconds", "{:.3f}"),
     ]
     for ax, (key, title, ylabel, formatter) in zip(axes, metrics, strict=True):
-        x = np.arange(2)
-        width = 0.34
-        go_values = [values["go_standard_control"][key], values["go_strong_control"][key]]
-        rust_values = [values["rust_standard"][key], values["rust_strong"][key]]
-        go_bars = ax.bar(x - width / 2, go_values, width, color=GO)
-        rust_bars = ax.bar(x + width / 2, rust_values, width, color=[STANDARD, STRONG])
+        x = np.array([position for _, _, _, position in profiles])
+        metric_values = [profile[key] for _, profile, _, _ in profiles]
+        ax.axvspan(2.15, 3.25, color="#FDF2F8", zorder=0)
+        ax.axvline(2.05, color=NEUTRAL, linewidth=1, linestyle="--")
+        bars = ax.bar(
+            x,
+            metric_values,
+            width=0.7,
+            color=[color for _, _, color, _ in profiles],
+            zorder=2,
+        )
         ax.set_title(title)
         ax.set_ylabel(ylabel)
         ax.set_ylim(bottom=0)
-        ax.set_xticks(x, ["Standard", "Strong"])
+        ax.set_xlim(-0.6, 3.3)
+        ax.set_xticks(x, [label for label, _, _, _ in profiles])
         ax.grid(axis="y", color=GRID, linewidth=0.7, alpha=0.7)
         ax.set_axisbelow(True)
-        ax.bar_label(go_bars, labels=[formatter.format(value) for value in go_values], padding=3)
-        ax.bar_label(rust_bars, labels=[formatter.format(value) for value in rust_values], padding=3)
+        ax.bar_label(
+            bars,
+            labels=[formatter.format(value) for value in metric_values],
+            padding=3,
+        )
+        ax.text(
+            2.7,
+            0.98,
+            "RUST-ONLY OPTION",
+            transform=ax.get_xaxis_transform(),
+            ha="center",
+            va="top",
+            fontsize=8,
+            color=STRONG,
+            fontweight="bold",
+        )
 
     fig.suptitle(
-        "Strong durability exchanges write performance for recovery guarantees",
+        "Like-for-like default performance plus Rust's opt-in strong mode",
         fontsize=16,
         fontweight="bold",
     )
-    fig.legend(
-        handles=[
-            Patch(facecolor=GO, label="Paired Go control"),
-            Patch(facecolor=STANDARD, label="Rust standard"),
-            Patch(facecolor=STRONG, label="Rust strong"),
-        ],
-        loc="lower center",
-        ncol=3,
-        bbox_to_anchor=(0.5, 0.01),
+    fig.text(
+        0.5,
+        0.02,
+        "Go has no strong mode; the separated bars show the cost of an additional Rust-only recovery protocol.",
+        ha="center",
+        fontsize=10,
+        color=NEUTRAL,
+        fontweight="bold",
     )
-    fig.subplots_adjust(wspace=0.38, top=0.79, bottom=0.18)
+    fig.subplots_adjust(wspace=0.38, top=0.79, bottom=0.2)
     save(fig, "durability-tradeoff.svg")
 
 

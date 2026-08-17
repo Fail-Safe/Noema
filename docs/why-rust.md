@@ -32,7 +32,7 @@ oracle and rollback path until that rollout is complete.
 | Federation soak | Rust uses 37.4% less peak aggregate RSS and 18.8% less mean sampled CPU | Favors Rust in the bounded test |
 | Consolidation quality | Exact-artifact and frontier blind reviews are effectively tied | Parity, not a language advantage |
 | Default durability | `standard` matches Go's mutation and crash posture | Migration does not impose an immediate performance regression |
-| Enhanced durability | `strong` passes tested process-death recovery, with a large write cost | Useful opt-in, still awaiting real power-loss qualification |
+| Enhanced durability | `strong` passes process-death and APFS detach/remount recovery, with a large write cost | Useful opt-in; hard power-cut/device-cache qualification remains |
 | Release artifact | Rust is 27.8% larger in the current local release build | Favors Go, but operational impact is small |
 | Release readiness | Packaging, rollback, real-power-loss behavior, older-Go takeover, and broader human/model validation remain | Candidate, not unconditional replacement |
 
@@ -144,19 +144,28 @@ The canonical profiles are:
 `compatible` remains accepted as a legacy alias for `standard`, but runtime
 introspection reports the canonical name.
 
-![Three bar charts compare each Rust durability profile with its paired Go control at 10k traces. Standard is competitive or faster, while strong has much higher seed time and write latency and much lower mixed throughput.](assets/rust-rewrite/durability-tradeoff.svg)
+![Three bar charts compare current Go, Rust standard, and Rust strong at 10k traces. Rust standard is the like-for-like comparison; Rust strong shows the cost of recovery guarantees unavailable in Go.](assets/rust-rewrite/durability-tradeoff.svg)
 
-| 10k mutation metric | Go standard control | Rust standard | Go strong control | Rust strong |
-| --- | ---: | ---: | ---: | ---: |
-| Seed time | 6.596 s | 3.096 s | 6.491 s | 92.987 s |
-| Mixed throughput | 3,412.50 ops/s | 4,311.13 ops/s | 3,299.16 ops/s | 252.75 ops/s |
-| Median write latency | 0.354 ms | 0.301 ms | 0.348 ms | 9.128 ms |
+| Runtime and profile | Seed time | Mixed throughput | Median write latency | Durability posture |
+| --- | ---: | ---: | ---: | --- |
+| Go current | 6.596 s | 3,412.50 ops/s | 0.354 ms | Current/default posture |
+| Rust standard | 3.096 s | 4,311.13 ops/s | 0.301 ms | Matches Go's posture |
+| Rust strong | 92.987 s | 252.75 ops/s | 9.128 ms | Adds journaled recovery and explicit flushes |
+
+A second ordinary Go control was recorded during the Rust-strong campaign
+(6.491 seconds seed, 3,299.16 mixed ops/s, and 0.348 ms median write latency).
+It confirms that the Go baseline was stable; it is not a Go strong profile and
+is therefore not plotted as one.
 
 Strong mode is not a fair drop-in performance comparison with Go because it
 performs a different durability protocol. Its cost is still operationally
 important: users selecting it should understand the write amplification. The
-strong subprocess suite validates process-death recovery, not literal power
-loss or storage-controller behavior.
+strong subprocess suite validates process-death recovery. A separate macOS
+APFS gate forcibly detaches and remounts disposable images at restore,
+configuration, and mutation boundaries; four complete runs preserved explicit
+restore recovery, cleared the strong journal, and retained SQLite integrity.
+Forced detach may still honor completed flushes, so this does not prove
+behavior when hardware loses an already-acknowledged volatile write cache.
 
 The stronger protocol is also not an intrinsic Rust feature. It could be
 implemented in Go. Rust made the protocol practical to express and test within
@@ -208,8 +217,11 @@ Go-versus-Rust evidence.
 The port should not become the unconditional release binary until the remaining
 qualification and rollout decisions are closed:
 
-1. Exercise archive placement, configuration rename, journal cleanup, and
-   SQLite recovery in a disposable real-power-loss or storage-fault harness.
+1. Repeat the passing macOS APFS forced-detach qualification on a hard-powered
+   VM or disposable hardware target. The local gate covers restore placement,
+   configuration rename, journal cleanup, SQLite recovery, and acknowledged
+   standard-mode state, but cannot force a device to lose already-acknowledged
+   cache writes.
 2. Decide whether corrupt-database salvage belongs in Noema; Rust currently
    fails closed and preserves the bytes.
 3. Define takeover behavior for older Go binaries that do not understand Rust

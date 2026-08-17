@@ -155,6 +155,28 @@ replacement, and per-mutation file/directory fsyncs. Strong mode exercises and
 retains those additional guarantees. `compatible` remains accepted as a legacy
 alias for `standard` during the transition.
 
+`storage_fault_macos.py` runs the Rust debug binary on four independent,
+disposable APFS sparse images. It forcibly detaches and reattaches each image
+at a selected durability boundary and verifies:
+
+- explicit rollback after interrupted restore placement;
+- explicit resume after interruption before atomic config replacement;
+- strong-mode archive rollback, pending-journal cleanup, and SQLite integrity;
+  and
+- persistence and integrity of an acknowledged standard-mode archive.
+
+Run it separately from the portable comparison gate because it requires macOS
+DiskImages access:
+
+```sh
+make storage-fault-rust
+```
+
+Forced image detach tests storage disappearance and remount recovery, but it
+may still honor completed flushes. It does not emulate a device/controller
+that loses volatile cache after acknowledging `fsync`; that last boundary
+requires a hard-powered VM or dedicated disposable hardware target.
+
 `federation_soak.py` gives homogeneous three-node Go and Rust clusters the same
 bounded mutation schedule, restarts one node halfway through, verifies exact
 event convergence, and reports sampled cluster RSS and CPU as JSON. Its default

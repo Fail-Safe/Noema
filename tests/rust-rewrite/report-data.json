@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "updated": "2026-08-17",
   "context": {
     "platform": "Apple Silicon macOS",
@@ -10,7 +10,8 @@
     "notes": [
       "Local measurements are comparative evidence, not portable performance guarantees.",
       "The 100k campaign used independent byte-identical clones of one verified 100,150-trace corpus.",
-      "The original scale artifacts called the standard profile compatible; compatible remains a legacy alias."
+      "The original scale artifacts called the standard profile compatible; compatible remains a legacy alias.",
+      "The Go repeat recorded during the Rust-strong campaign is a stability control, not a Go strong profile."
     ]
   },
   "artifacts": {
@@ -118,12 +119,12 @@
     }
   ],
   "durability_10k": {
-    "go_standard_control": {
+    "go_current": {
       "seed_seconds": 6.596,
       "mixed_ops_per_second": 3412.50,
       "median_write_latency_ms": 0.354
     },
-    "go_strong_control": {
+    "go_current_repeat_during_strong_campaign": {
       "seed_seconds": 6.491,
       "mixed_ops_per_second": 3299.16,
       "median_write_latency_ms": 0.348

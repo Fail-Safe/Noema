@@ -668,19 +668,24 @@ for selective and mixed workloads. Full-corpus broad output is the exception:
 one Rust process retained about 642 MiB versus Go's 298 MiB at 100,000 traces,
 while four-process aggregate broad RSS was effectively tied near 957 MiB.
 
-The final mutation comparison separates durability policy from implementation
-efficiency:
+The final mutation comparison separates the like-for-like runtime result from
+the cost of Rust's additional durability option:
 
-| Metric | Go | Rust | Gap |
+| Runtime and profile | 10k seed | 10k mixed throughput | Median write latency |
 | --- | ---: | ---: | ---: |
-| 10k strong seed | 6.491 s | 92.987 s | Rust 14.3x slower |
-| 10k strong mixed throughput | 3,299.16 ops/s | 252.75 ops/s | Go 13.1x faster |
-| 10k strong median write latency | 0.348 ms | 9.128 ms | Rust 26.2x slower |
-| 10k standard seed | 6.596 s | 3.096 s | Rust 2.13x faster |
-| 10k standard mixed throughput | 3,412.50 ops/s | 4,311.13 ops/s | Rust 1.26x faster |
-| 10k standard median write latency | 0.354 ms | 0.301 ms | Rust 15% lower |
-| 100k standard mixed throughput | 2,977.24 ops/s | 4,203.50 ops/s | Rust 1.41x faster |
-| 100k standard median write latency | 0.393 ms | 0.301 ms | Rust 23% lower |
+| Go current | 6.596 s | 3,412.50 ops/s | 0.354 ms |
+| Rust standard | 3.096 s | 4,311.13 ops/s | 0.301 ms |
+| Rust strong | 92.987 s | 252.75 ops/s | 9.128 ms |
+
+Rust standard is the Go-equivalent comparison: it seeded 2.13x faster,
+sustained 1.26x the mixed throughput, and had 15% lower median write latency at
+10,000 traces. At 100,000 traces it sustained 1.41x the mixed throughput with
+23% lower median write latency.
+
+The Rust-strong campaign also recorded an ordinary Go repeat at 6.491 seconds,
+3,299.16 mixed ops/s, and 0.348 ms median write latency. That repeat confirms
+the baseline was stable; Go does not implement the recovery protocol and the
+repeat is not a `strong` profile.
 
 Inspection confirmed a policy difference rather than a language-runtime limit.
 For each mutation Rust durably inserts a recovery record, acquires trace and

@@ -177,7 +177,7 @@ not treat that warning as a failed build.
   used much less RSS for selective and mixed work; single-process full-corpus
   broad search retained about 642 MiB versus Go's 298 MiB, while four-process
   broad RSS was tied near 957 MiB.
-- The optimized strong control still pays for its enhanced crash consistency:
+- The optimized Rust `strong` profile still pays for its enhanced crash consistency:
   10,000-trace seed was 92.987 versus 6.491 seconds, mixed throughput was 253
   versus 3,299 ops/s, and median writes were 9.128 versus 0.348 ms. This is now
   an explicit durability-policy tradeoff rather than an unresolved Rust
@@ -186,6 +186,12 @@ not treat that warning as a failed build.
   emitted pretty full-row JSON while Go emitted compact rows, and later
   scenarios reused broad-search processes. Rust now matches Go's compact MCP
   list/search rows, and the harness isolates each scenario.
+- The macOS APFS storage-fault harness passed four complete runs, including
+  three consecutive qualification cycles. Forced detach/remount preserved an
+  explicitly rollbackable restore after placement, an explicitly resumable
+  restore interrupted before config rename, strong-mode archive rollback and
+  pending-journal cleanup with SQLite integrity, and an acknowledged
+  standard-mode archive. No disposable images remained attached afterward.
 
 See `docs/rust-rewrite-experiment-results.md` for tables and caveats.
 
@@ -193,9 +199,11 @@ See `docs/rust-rewrite-experiment-results.md` for tables and caveats.
 
 These are not missing command or protocol ports:
 
-1. Run archive placement, config rename, journal cleanup, and SQLite recovery
-   under a disposable real-power-loss/storage harness. `SIGKILL` validates
-   process-death recovery but does not prove persistence across power loss.
+1. Repeat the now-passing APFS forced-detach qualification on a hard-powered
+   VM or dedicated disposable target that can discard volatile device-cache
+   writes. Forced detach exercises real storage disappearance and remount, but
+   may still honor completed flushes and cannot model a controller that lies
+   about `fsync` completion.
 2. Decide whether to implement corrupt-database salvage. Rust currently fails
    closed and preserves corrupt bytes; it does not attempt repair.
 3. Define takeover policy for older Go binaries. Only the Go build on this
@@ -205,11 +213,11 @@ These are not missing command or protocol ports:
    terminal visually matches Go after the one-cell pane-geometry correction.
 5. Extend the now-passing synthetic qualitative gate to a redacted
    representative corpus, additional models, and multiple reviewers.
-6. Qualify the selected `standard` default and opt-in `strong` profile under
-   real power loss. Standard avoids a migration-time performance regression
-   and intentionally shares Go's weaker process-death window; strong preserves
-   the tested pending-record/fsync recovery protocol at a substantial write
-   cost.
+6. Define the final physical-power-loss promises for the selected `standard`
+   default and opt-in `strong` profile. Standard avoids a migration-time
+   performance regression and intentionally shares Go's weaker mid-operation
+   window; strong preserves the tested pending-record/fsync recovery protocol
+   at a substantial write cost.
 7. Before release replacement, choose packaging, binary naming, migration,
    rollback, and staged deployment policy, then repeat the mutation benchmark
    after the durability decision.
@@ -225,6 +233,7 @@ git status --short --branch
 git log --show-signature -3
 make rust-test
 make compare-rust
+make storage-fault-rust  # macOS; requires DiskImages access
 ```
 
 Use `docs/rust-rewrite-test-plan.md` for acceptance gates and keep Go as the

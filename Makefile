@@ -31,7 +31,8 @@ HOST_ARCH := $(shell go env GOARCH)
 
 .PHONY: help build release release-linux test vet obsidian-publish clean \
 	rust-build rust-release rust-test comparison-release compare-rust benchmark-rust \
-	benchmark-mcp-rust benchmark-scale-rust soak-rust rust-report
+	benchmark-mcp-rust benchmark-scale-rust soak-rust rust-report \
+	storage-fault-rust
 
 help:
 	@echo "Noema build targets:"
@@ -50,6 +51,8 @@ help:
 	@echo "  make benchmark-scale-rust"
 	@echo "                       Benchmark isolated MCP workloads at 10k traces"
 	@echo "  make rust-report     Regenerate Why Rust benchmark charts"
+	@echo "  make storage-fault-rust"
+	@echo "                       Run disposable macOS APFS detach/recovery tests"
 	@echo "  make obsidian-publish"
 	@echo "                       Build and copy Obsidian plugin into the active cortex vault"
 	@echo "  make clean           Remove ./$(BIN) and ./$(DIST_DIR)/"
@@ -172,6 +175,10 @@ benchmark-scale-rust: comparison-release
 
 rust-report:
 	$(REPORT_PYTHON) ./tests/rust-rewrite/render_report_charts.py
+
+storage-fault-rust: rust-build
+	python3 -u ./tests/rust-rewrite/storage_fault_macos.py \
+		--rust "$(CURDIR)/rust/target/debug/noema-rs"
 
 soak-rust: comparison-release
 	python3 ./tests/rust-rewrite/federation_soak.py \
