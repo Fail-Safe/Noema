@@ -32,6 +32,7 @@ NEUTRAL = "#6B7280"
 GRID = "#D1D5DB"
 FAVORABLE = "#4477AA"
 REGRESSION = "#EE7733"
+BASELINE = "#94A3B8"
 
 
 def configure() -> None:
@@ -98,28 +99,68 @@ def render_mixed_scale(data: dict) -> None:
     labels = [f'{entry["traces"] // 1000}k traces' for entry in scales]
     mixed = [entry["workloads"]["mixed_selective_read_write"] for entry in scales]
 
-    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.4))
-    grouped_bars(
-        axes[0],
-        labels,
-        [entry["go_ops_per_second"] for entry in mixed],
-        [entry["rust_ops_per_second"] for entry in mixed],
-        "Operations per second",
-        "{:,.0f}",
-    )
-    axes[0].set_title("Rust sustains higher mixed-workload throughput", fontsize=12)
+    fig, axes = plt.subplots(1, 2, figsize=(13.5, 4.8))
+    x = np.arange(len(labels))
+    width = 0.34
+    panels = [
+        (
+            axes[0],
+            [entry["go_ops_per_second"] for entry in mixed],
+            [entry["rust_ops_per_second"] for entry in mixed],
+            "Throughput",
+            "Operations per second",
+            "{:,.0f}",
+            "faster",
+            False,
+        ),
+        (
+            axes[1],
+            [entry["go_rss_kib"] / 1024 for entry in mixed],
+            [entry["rust_rss_kib"] / 1024 for entry in mixed],
+            "Peak memory",
+            "Peak sampled RSS (MiB)",
+            "{:.0f}",
+            "less",
+            True,
+        ),
+    ]
+    for ax, go_values, rust_values, title, ylabel, formatter, comparison, lower_better in panels:
+        go_bars = ax.bar(x - width / 2, go_values, width, color=BASELINE, label="Go")
+        rust_bars = ax.bar(x + width / 2, rust_values, width, color=FAVORABLE, label="Rust")
+        ax.set_xticks(x, labels)
+        ax.set_ylabel(ylabel)
+        ax.set_ylim(bottom=0)
+        ax.set_title(title)
+        ax.grid(axis="y", color=GRID, linewidth=0.7, alpha=0.7)
+        ax.set_axisbelow(True)
+        ax.bar_label(go_bars, labels=[formatter.format(value) for value in go_values], padding=3)
+        ax.bar_label(rust_bars, labels=[formatter.format(value) for value in rust_values], padding=3)
+        for index, (go_value, rust_value) in enumerate(zip(go_values, rust_values, strict=True)):
+            delta = 100 * (1 - rust_value / go_value) if lower_better else 100 * (rust_value / go_value - 1)
+            ax.text(
+                index,
+                max(go_value, rust_value) * 1.13,
+                f"Rust {delta:.0f}% {comparison}",
+                ha="center",
+                color=FAVORABLE,
+                fontweight="bold",
+            )
+        ax.set_ylim(top=max(max(go_values), max(rust_values)) * 1.28)
 
-    grouped_bars(
-        axes[1],
-        labels,
-        [entry["go_rss_kib"] / 1024 for entry in mixed],
-        [entry["rust_rss_kib"] / 1024 for entry in mixed],
-        "Peak sampled RSS (MiB)",
-        "{:.0f}",
+    axes[0].legend(ncol=2, loc="upper left")
+    fig.suptitle(
+        "Rust's mixed-workload lead grows with the corpus",
+        fontsize=16,
+        fontweight="bold",
     )
-    axes[1].set_title("Rust uses less memory as the corpus grows", fontsize=12)
-    fig.suptitle("Mixed selective-read/write workload", fontsize=16, fontweight="bold")
-    fig.subplots_adjust(wspace=0.32, top=0.78)
+    fig.text(
+        0.5,
+        0.02,
+        "Standard durability profile; identical verified corpora at each scale.",
+        ha="center",
+        color=NEUTRAL,
+    )
+    fig.subplots_adjust(wspace=0.3, top=0.78, bottom=0.17)
     save(fig, "mixed-scale.svg")
 
 
@@ -304,12 +345,49 @@ def render_quality(data: dict) -> None:
     go_scores = [100 * entry["go_score"] / entry["maximum_score"] for entry in quality]
     rust_scores = [100 * entry["rust_score"] / entry["maximum_score"] for entry in quality]
 
-    fig, ax = plt.subplots(figsize=(7.8, 4.6))
-    grouped_bars(ax, labels, go_scores, rust_scores, "Share of maximum blind-review score", "{:.1f}%")
-    ax.set_ylim(0, 105)
-    ax.set_title("Blinded consolidation quality is effectively tied")
-    ax.legend(ncol=1, loc="upper left", bbox_to_anchor=(1.01, 1))
-    fig.subplots_adjust(right=0.84, top=0.85)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    for ax, entry, label_text, go_score, rust_score in zip(
+        axes, quality, labels, go_scores, rust_scores, strict=True
+    ):
+        bars = ax.barh([1, 0], [go_score, rust_score], color=[BASELINE, FAVORABLE], height=0.5)
+        ax.set_yticks([1, 0], ["Go", "Rust"])
+        ax.set_xlim(0, 100)
+        ax.set_title(label_text)
+        ax.grid(axis="x", color=GRID, linewidth=0.7, alpha=0.7)
+        ax.set_axisbelow(True)
+        ax.bar_label(
+            bars,
+            labels=[f"{go_score:.1f}%", f"{rust_score:.1f}%"],
+            label_type="edge",
+            padding=-42,
+            color="white",
+            fontweight="bold",
+        )
+        gap = go_score - rust_score
+        ax.text(
+            50,
+            -0.75,
+            f"{gap:.2f}-point score gap; {entry['go_decisions']} decisions correct in both",
+            ha="center",
+            color=NEUTRAL,
+            fontsize=9,
+        )
+        ax.set_ylim(-1, 1.6)
+    axes[0].set_xlabel("Share of maximum blind-review score")
+    axes[1].set_xlabel("Share of maximum blind-review score")
+    fig.suptitle(
+        "Blind-review quality remains within 1.25 points",
+        fontsize=16,
+        fontweight="bold",
+    )
+    fig.text(
+        0.5,
+        0.02,
+        "Equal decision accuracy and near-identical retention support bounded parity, not a runtime winner.",
+        ha="center",
+        color=NEUTRAL,
+    )
+    fig.subplots_adjust(wspace=0.28, top=0.78, bottom=0.2)
     save(fig, "quality-parity.svg")
 
 
@@ -322,24 +400,64 @@ def render_federation(data: dict) -> None:
         100 * soak["rust"]["mean_cpu_percent"] / soak["go"]["mean_cpu_percent"],
     ]
 
-    fig, ax = plt.subplots(figsize=(7.6, 4.6))
-    grouped_bars(ax, labels, go_values, rust_values, "Go baseline (%)", "{:.1f}%")
-    ax.set_ylim(0, 115)
-    ax.set_title("Rust used fewer resources in the bounded federation soak")
-    fig.subplots_adjust(top=0.85)
+    fig, ax = plt.subplots(figsize=(10, 4.8))
+    y = np.arange(len(labels))
+    height = 0.3
+    go_bars = ax.barh(y - height / 2, go_values, height, color=BASELINE, label="Go baseline")
+    rust_bars = ax.barh(y + height / 2, rust_values, height, color=FAVORABLE, label="Rust")
+    ax.set_yticks(y, labels)
+    ax.invert_yaxis()
+    ax.set_xlim(0, 110)
+    ax.set_xlabel("Resource use relative to Go")
+    ax.set_xticks([0, 25, 50, 75, 100], ["0%", "25%", "50%", "75%", "100%"])
+    ax.grid(axis="x", color=GRID, linewidth=0.7, alpha=0.7)
+    ax.set_axisbelow(True)
+    ax.bar_label(go_bars, labels=["Go 100%"] * len(go_bars), padding=-55, color="white")
+    savings = [100 - value for value in rust_values]
+    ax.bar_label(
+        rust_bars,
+        labels=[f"Rust {saving:.1f}% less" for saving in savings],
+        padding=5,
+        color=FAVORABLE,
+        fontweight="bold",
+    )
+    ax.legend(ncol=2, loc="lower right")
+    ax.set_title("Rust cut federation memory 37% and mean CPU 19%")
+    fig.text(
+        0.5,
+        0.02,
+        "Three-node, 80-mutation bounded soak with restart and exact convergence verification.",
+        ha="center",
+        color=NEUTRAL,
+    )
+    fig.subplots_adjust(left=0.14, right=0.94, top=0.82, bottom=0.2)
     save(fig, "federation-resources.svg")
 
 
 def render_artifact_size(data: dict) -> None:
     sizes = [data["artifacts"][name]["bytes"] / (1024 * 1024) for name in ("go", "rust")]
-    fig, ax = plt.subplots(figsize=(6.4, 4.2))
-    bars = ax.bar(["Go", "Rust"], sizes, color=[GO, RUST], width=0.55)
-    ax.set_ylabel("Release binary size (MiB)")
-    ax.set_ylim(bottom=0)
-    ax.set_title("The Rust release artifact is 27.8% larger")
-    ax.grid(axis="y", color=GRID, linewidth=0.7, alpha=0.7)
+    fig, ax = plt.subplots(figsize=(9, 4.4))
+    bars = ax.barh([1, 0], sizes, color=[BASELINE, REGRESSION], height=0.5)
+    ax.set_yticks([1, 0], ["Go", "Rust"])
+    ax.set_xlabel("Release binary size (MiB)")
+    ax.set_xlim(0, max(sizes) * 1.35)
+    ax.set_title("Rust adds 3.9 MiB to the release artifact (+27.8%)")
+    ax.grid(axis="x", color=GRID, linewidth=0.7, alpha=0.7)
     ax.set_axisbelow(True)
-    ax.bar_label(bars, labels=[f"{value:.1f} MiB" for value in sizes], padding=3)
+    ax.bar_label(
+        bars,
+        labels=[f"{value:.1f} MiB" for value in sizes],
+        padding=5,
+        fontweight="bold",
+    )
+    fig.text(
+        0.5,
+        0.02,
+        "Both remain single local binaries; the size increase is a real but modest distribution cost.",
+        ha="center",
+        color=NEUTRAL,
+    )
+    fig.subplots_adjust(left=0.12, right=0.94, top=0.82, bottom=0.2)
     save(fig, "artifact-size.svg")
 
 

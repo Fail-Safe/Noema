@@ -1,254 +1,51 @@
-<?xml version="1.0" encoding="utf-8" standalone="no"?>
-<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
-  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
-<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="498.261094pt" height="292.803937pt" viewBox="0 0 498.261094 292.803937" xmlns="http://www.w3.org/2000/svg" version="1.1">
- <metadata>
-  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
-   <cc:Work>
-    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
-    <dc:format>image/svg+xml</dc:format>
-    <dc:creator>
-     <cc:Agent>
-      <dc:title>Noema Rust rewrite report generator</dc:title>
-     </cc:Agent>
-    </dc:creator>
-   </cc:Work>
-  </rdf:RDF>
- </metadata>
- <defs>
-  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
- </defs>
- <g id="figure_1">
-  <g id="patch_1">
-   <path d="M 0 292.803937
-L 498.261094 292.803937
-L 498.261094 0
-L 0 0
-z
-" style="fill: #ffffff"/>
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="470" viewBox="0 0 1100 470" role="img" aria-labelledby="title desc">
+  <title id="title">Noema federation resource comparison</title>
+  <desc id="desc">In a bounded three-node federation soak, Rust used 37.4 percent less peak memory and 18.8 percent less mean sampled CPU than Go while reaching exact convergence.</desc>
+  <style>
+    text { fill: #1f2937; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .title { font-size: 24px; font-weight: 700; text-anchor: middle; }
+    .subtitle { fill: #4b5563; font-size: 14px; text-anchor: middle; }
+    .category { font-size: 15px; font-weight: 700; text-anchor: end; }
+    .bar-label { font-size: 12px; font-weight: 700; }
+    .inverse { fill: #ffffff; }
+    .tick { fill: #6b7280; font-size: 11px; text-anchor: middle; }
+    .axis-label, .note { fill: #4b5563; font-size: 12px; text-anchor: middle; }
+    .grid { stroke: #d1d5db; stroke-width: 1; }
+    .baseline { fill: #94a3b8; }
+    .favorable { fill: #4477aa; }
+  </style>
+  <rect width="1100" height="470" fill="#ffffff"/>
+  <text class="title" x="550" y="36">Rust cut federation memory 37% and mean CPU 19%</text>
+  <text class="subtitle" x="550" y="61">Three nodes, 80 mutations, one restart, and exact event convergence</text>
+
+  <g aria-hidden="true">
+    <line class="grid" x1="240" y1="100" x2="240" y2="350"/>
+    <line class="grid" x1="405" y1="100" x2="405" y2="350"/>
+    <line class="grid" x1="570" y1="100" x2="570" y2="350"/>
+    <line class="grid" x1="735" y1="100" x2="735" y2="350"/>
+    <line class="grid" x1="900" y1="100" x2="900" y2="350"/>
   </g>
-  <g id="axes_1">
-   <g id="patch_2">
-    <path d="M 46.965625 268.925812
-L 471.045625 268.925812
-L 471.045625 23.837812
-L 46.965625 23.837812
-z
-" style="fill: #ffffff"/>
-   </g>
-   <g id="matplotlib.axis_1">
-    <g id="xtick_1">
-     <g id="line2d_1">
-      <defs>
-       <path id="m4e29404987" d="M 0 0
-L 0 3.5
-" style="stroke: #000000; stroke-width: 0.8"/>
-      </defs>
-      <g>
-       <use xlink:href="#m4e29404987" x="144.265365" y="268.925812" style="stroke: #000000; stroke-width: 0.8"/>
-      </g>
-     </g>
-     <g id="text_1">
-      <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: middle" x="144.265365" y="283.52425" transform="rotate(-0 144.265365 283.52425)">Peak RSS</text>
-     </g>
-    </g>
-    <g id="xtick_2">
-     <g id="line2d_2">
-      <g>
-       <use xlink:href="#m4e29404987" x="373.745885" y="268.925812" style="stroke: #000000; stroke-width: 0.8"/>
-      </g>
-     </g>
-     <g id="text_2">
-      <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: middle" x="373.745885" y="283.52425" transform="rotate(-0 373.745885 283.52425)">Mean CPU</text>
-     </g>
-    </g>
-   </g>
-   <g id="matplotlib.axis_2">
-    <g id="ytick_1">
-     <g id="line2d_3">
-      <path d="M 46.965625 268.925812
-L 471.045625 268.925812
-" clip-path="url(#p1df47f8c2d)" style="fill: none; stroke: #d1d5db; stroke-opacity: 0.7; stroke-width: 0.7; stroke-linecap: square"/>
-     </g>
-     <g id="line2d_4">
-      <defs>
-       <path id="me7877c84d4" d="M 0 0
-L -3.5 0
-" style="stroke: #000000; stroke-width: 0.8"/>
-      </defs>
-      <g>
-       <use xlink:href="#me7877c84d4" x="46.965625" y="268.925812" style="stroke: #000000; stroke-width: 0.8"/>
-      </g>
-     </g>
-     <g id="text_3">
-      <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: end" x="39.965625" y="272.725031" transform="rotate(-0 39.965625 272.725031)">0</text>
-     </g>
-    </g>
-    <g id="ytick_2">
-     <g id="line2d_5">
-      <path d="M 46.965625 226.301812
-L 471.045625 226.301812
-" clip-path="url(#p1df47f8c2d)" style="fill: none; stroke: #d1d5db; stroke-opacity: 0.7; stroke-width: 0.7; stroke-linecap: square"/>
-     </g>
-     <g id="line2d_6">
-      <g>
-       <use xlink:href="#me7877c84d4" x="46.965625" y="226.301812" style="stroke: #000000; stroke-width: 0.8"/>
-      </g>
-     </g>
-     <g id="text_4">
-      <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: end" x="39.965625" y="230.101031" transform="rotate(-0 39.965625 230.101031)">20</text>
-     </g>
-    </g>
-    <g id="ytick_3">
-     <g id="line2d_7">
-      <path d="M 46.965625 183.677812
-L 471.045625 183.677812
-" clip-path="url(#p1df47f8c2d)" style="fill: none; stroke: #d1d5db; stroke-opacity: 0.7; stroke-width: 0.7; stroke-linecap: square"/>
-     </g>
-     <g id="line2d_8">
-      <g>
-       <use xlink:href="#me7877c84d4" x="46.965625" y="183.677812" style="stroke: #000000; stroke-width: 0.8"/>
-      </g>
-     </g>
-     <g id="text_5">
-      <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: end" x="39.965625" y="187.477031" transform="rotate(-0 39.965625 187.477031)">40</text>
-     </g>
-    </g>
-    <g id="ytick_4">
-     <g id="line2d_9">
-      <path d="M 46.965625 141.053812
-L 471.045625 141.053812
-" clip-path="url(#p1df47f8c2d)" style="fill: none; stroke: #d1d5db; stroke-opacity: 0.7; stroke-width: 0.7; stroke-linecap: square"/>
-     </g>
-     <g id="line2d_10">
-      <g>
-       <use xlink:href="#me7877c84d4" x="46.965625" y="141.053812" style="stroke: #000000; stroke-width: 0.8"/>
-      </g>
-     </g>
-     <g id="text_6">
-      <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: end" x="39.965625" y="144.853031" transform="rotate(-0 39.965625 144.853031)">60</text>
-     </g>
-    </g>
-    <g id="ytick_5">
-     <g id="line2d_11">
-      <path d="M 46.965625 98.429812
-L 471.045625 98.429812
-" clip-path="url(#p1df47f8c2d)" style="fill: none; stroke: #d1d5db; stroke-opacity: 0.7; stroke-width: 0.7; stroke-linecap: square"/>
-     </g>
-     <g id="line2d_12">
-      <g>
-       <use xlink:href="#me7877c84d4" x="46.965625" y="98.429812" style="stroke: #000000; stroke-width: 0.8"/>
-      </g>
-     </g>
-     <g id="text_7">
-      <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: end" x="39.965625" y="102.229031" transform="rotate(-0 39.965625 102.229031)">80</text>
-     </g>
-    </g>
-    <g id="ytick_6">
-     <g id="line2d_13">
-      <path d="M 46.965625 55.805812
-L 471.045625 55.805812
-" clip-path="url(#p1df47f8c2d)" style="fill: none; stroke: #d1d5db; stroke-opacity: 0.7; stroke-width: 0.7; stroke-linecap: square"/>
-     </g>
-     <g id="line2d_14">
-      <g>
-       <use xlink:href="#me7877c84d4" x="46.965625" y="55.805812" style="stroke: #000000; stroke-width: 0.8"/>
-      </g>
-     </g>
-     <g id="text_8">
-      <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: end" x="39.965625" y="59.605031" transform="rotate(-0 39.965625 59.605031)">100</text>
-     </g>
-    </g>
-    <g id="text_9">
-     <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: middle" x="14.798438" y="146.381812" transform="rotate(-90 14.798438 146.381812)">Go baseline (%)</text>
-    </g>
-   </g>
-   <g id="patch_3">
-    <path d="M 66.241989 268.925812
-L 144.265365 268.925812
-L 144.265365 55.805812
-L 66.241989 55.805812
-z
-" clip-path="url(#p1df47f8c2d)" style="fill: #4477aa"/>
-   </g>
-   <g id="patch_4">
-    <path d="M 295.722508 268.925812
-L 373.745885 268.925812
-L 373.745885 55.805812
-L 295.722508 55.805812
-z
-" clip-path="url(#p1df47f8c2d)" style="fill: #4477aa"/>
-   </g>
-   <g id="patch_5">
-    <path d="M 144.265365 268.925812
-L 222.288742 268.925812
-L 222.288742 135.601269
-L 144.265365 135.601269
-z
-" clip-path="url(#p1df47f8c2d)" style="fill: #ee6677"/>
-   </g>
-   <g id="patch_6">
-    <path d="M 373.745885 268.925812
-L 451.769261 268.925812
-L 451.769261 95.774229
-L 373.745885 95.774229
-z
-" clip-path="url(#p1df47f8c2d)" style="fill: #ee6677"/>
-   </g>
-   <g id="patch_7">
-    <path d="M 46.965625 268.925812
-L 46.965625 23.837812
-" style="fill: none; stroke: #000000; stroke-width: 0.8; stroke-linejoin: miter; stroke-linecap: square"/>
-   </g>
-   <g id="patch_8">
-    <path d="M 46.965625 268.925812
-L 471.045625 268.925812
-" style="fill: none; stroke: #000000; stroke-width: 0.8; stroke-linejoin: miter; stroke-linecap: square"/>
-   </g>
-   <g id="text_10">
-    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: middle" x="105.253677" y="50.726125" transform="rotate(-0 105.253677 50.726125)">100.0%</text>
-   </g>
-   <g id="text_11">
-    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: middle" x="334.734196" y="50.726125" transform="rotate(-0 334.734196 50.726125)">100.0%</text>
-   </g>
-   <g id="text_12">
-    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: middle" x="183.277054" y="130.521581" transform="rotate(-0 183.277054 130.521581)">62.6%</text>
-   </g>
-   <g id="text_13">
-    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: middle" x="412.757573" y="90.694542" transform="rotate(-0 412.757573 90.694542)">81.2%</text>
-   </g>
-   <g id="text_14">
-    <text style="font-weight: 700; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: middle" x="259.005625" y="17.837812" transform="rotate(-0 259.005625 17.837812)">Rust used fewer resources in the bounded federation soak</text>
-   </g>
-   <g id="legend_1">
-    <g id="patch_9">
-     <path d="M 55.965625 40.43625
-L 75.965625 40.43625
-L 75.965625 33.43625
-L 55.965625 33.43625
-z
-" style="fill: #4477aa"/>
-    </g>
-    <g id="text_15">
-     <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start" x="83.965625" y="40.43625" transform="rotate(-0 83.965625 40.43625)">Go</text>
-    </g>
-    <g id="patch_10">
-     <path d="M 117.832813 40.43625
-L 137.832813 40.43625
-L 137.832813 33.43625
-L 117.832813 33.43625
-z
-" style="fill: #ee6677"/>
-    </g>
-    <g id="text_16">
-     <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start" x="145.832813" y="40.43625" transform="rotate(-0 145.832813 40.43625)">Rust</text>
-    </g>
-   </g>
-  </g>
- </g>
- <defs>
-  <clipPath id="p1df47f8c2d">
-   <rect x="46.965625" y="23.837812" width="424.08" height="245.088"/>
-  </clipPath>
- </defs>
+
+  <text class="category" x="215" y="170">Peak RSS</text>
+  <rect class="baseline" x="240" y="125" width="660" height="34" rx="3"/>
+  <text class="bar-label inverse" x="255" y="148">Go 90.3 MiB · 100%</text>
+  <rect class="favorable" x="240" y="169" width="413" height="34" rx="3"/>
+  <text class="bar-label inverse" x="255" y="192">Rust 56.5 MiB · 62.6% of Go</text>
+  <text class="bar-label" x="667" y="192" fill="#4477aa">37.4% less</text>
+
+  <text class="category" x="215" y="290">Mean CPU</text>
+  <rect class="baseline" x="240" y="245" width="660" height="34" rx="3"/>
+  <text class="bar-label inverse" x="255" y="268">Go 7.91% · 100%</text>
+  <rect class="favorable" x="240" y="289" width="536" height="34" rx="3"/>
+  <text class="bar-label inverse" x="255" y="312">Rust 6.43% · 81.2% of Go</text>
+  <text class="bar-label" x="790" y="312" fill="#4477aa">18.8% less</text>
+
+  <text class="tick" x="240" y="372">0%</text>
+  <text class="tick" x="405" y="372">25%</text>
+  <text class="tick" x="570" y="372">50%</text>
+  <text class="tick" x="735" y="372">75%</text>
+  <text class="tick" x="900" y="372">100%</text>
+  <text class="axis-label" x="570" y="400">Resource use relative to Go</text>
+  <text class="note" x="550" y="443">Bounded soak evidence, not a long-duration stability claim.</text>
 </svg>

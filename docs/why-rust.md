@@ -43,7 +43,7 @@ alternating-order runs, fresh MCP server processes per scenario, four clients,
 exact post-write trace counts, and `verify` after mutation. The 100k campaign
 used independent byte-identical clones of one verified 100,150-trace corpus.
 
-![Two grouped bar charts show Rust ahead of Go in mixed-workload throughput and below Go in peak RSS at both 10k and 100k traces.](assets/rust-rewrite/mixed-scale.svg)
+![Two grouped bar charts show Rust 26 and 41 percent faster than Go at 10k and 100k traces, while using 22 and 41 percent less peak memory.](assets/rust-rewrite/mixed-scale.svg)
 
 | Mixed workload | Go throughput | Rust throughput | Go RSS | Rust RSS |
 | --- | ---: | ---: | ---: | ---: |
@@ -88,7 +88,7 @@ seconds, restarted one node, verified exact event convergence, and measured the
 three-server aggregate. Both implementations converged to exactly 80 unique
 events per node.
 
-![Grouped bars normalized to Go at 100 percent show Rust using 62.6 percent of Go peak RSS and 81.2 percent of Go mean sampled CPU in the bounded federation soak.](assets/rust-rewrite/federation-resources.svg)
+![Horizontal baseline bars show Rust using 37.4 percent less peak memory and 18.8 percent less mean sampled CPU than Go in the bounded federation soak.](assets/rust-rewrite/federation-resources.svg)
 
 | Three-server aggregate | Go | Rust | Rust/Go |
 | --- | ---: | ---: | ---: |
@@ -108,7 +108,7 @@ leakage, and an insufficient polysemy rule. Porting the complete prompt
 contracts and applying the same grounding changes to both implementations
 closed those defects.
 
-![Grouped bars from zero to 100 percent show Go and Rust close to the maximum blind-review score for both the small exact-artifact and frontier evaluations.](assets/rust-rewrite/quality-parity.svg)
+![Two score cards show Go and Rust within 1.25 percentage points in both blind-review evaluations, with equal decision accuracy and near-identical retention.](assets/rust-rewrite/quality-parity.svg)
 
 | Qualification | Go | Rust | Shared correctness result |
 | --- | ---: | ---: | --- |
@@ -174,7 +174,7 @@ the default behavior.
 
 ## Artifact size and operational shape
 
-![A two-bar chart shows the current Go release binary at 14.2 MiB and Rust release binary at 18.1 MiB.](assets/rust-rewrite/artifact-size.svg)
+![Horizontal bars show the current Go release binary at 14.2 MiB and Rust at 18.1 MiB, an increase of 3.9 MiB or 27.8 percent.](assets/rust-rewrite/artifact-size.svg)
 
 | Release artifact | Bytes | MiB |
 | --- | ---: | ---: |
