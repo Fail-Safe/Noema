@@ -9,7 +9,6 @@
     "notes": [
       "Local measurements are comparative evidence, not portable performance guarantees.",
       "The 100k campaign used independent byte-identical clones of one verified 100,150-trace corpus.",
-      "Early experiment artifacts used the temporary label compatible; the final report canonicalizes it to standard.",
       "The Go repeat recorded during the Rust-strong campaign is a stability control, not a Go strong profile."
     ]
   },

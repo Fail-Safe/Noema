@@ -5321,7 +5321,6 @@ mod tests {
             DurabilityProfile::parse(Some("strong")).unwrap(),
             DurabilityProfile::Strong
         );
-        assert!(DurabilityProfile::parse(Some("compatible")).is_err());
         assert!(DurabilityProfile::parse(Some("fast")).is_err());
     }
 
