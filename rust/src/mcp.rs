@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    fmt::Write as _,
     path::PathBuf,
     sync::Arc,
 };
@@ -397,7 +398,7 @@ impl NoemaServer {
                 ..Default::default()
             })
             .map_err(mcp_error)?;
-        Ok(json_text(rows))
+        Ok(format_rows(&rows))
     }
 
     #[tool(description = "Get a trace by ID, including its full body")]
@@ -438,7 +439,7 @@ impl NoemaServer {
         let mut cx = self.open().await?;
         let (mode, embedder, model, weight) =
             resolve_search_mode(&cx, &p.mode).map_err(mcp_error)?;
-        let mut note = None;
+        let mut note = String::new();
         let rows = if matches!(mode.as_str(), "semantic" | "hybrid") {
             if let Some(embedder) = embedder {
                 let options = SemanticOptions {
@@ -455,9 +456,9 @@ impl NoemaServer {
                 match scored {
                     Ok(scored) => scored.into_iter().map(|item| item.row).collect(),
                     Err(_) => {
-                        note = Some(format!(
-                            "{mode} search temporarily unavailable; showing lexical results"
-                        ));
+                        note = format!(
+                            "[{mode} search temporarily unavailable; showing lexical results]\n"
+                        );
                         cx.search(
                             &p.query,
                             &ListOptions {
@@ -469,7 +470,7 @@ impl NoemaServer {
                     }
                 }
             } else {
-                note = Some("semantic search not configured; showing lexical results".into());
+                note = "[semantic search not configured; showing lexical results]\n".into();
                 cx.search(
                     &p.query,
                     &ListOptions {
@@ -490,7 +491,7 @@ impl NoemaServer {
             .map_err(mcp_error)?
         };
         cx.bump_search_hits(&rows);
-        Ok(json_text(json!({"mode":mode,"note":note,"results":rows})))
+        Ok(note + &format_rows(&rows))
     }
 
     #[tool(description = "Find traces related to a given trace")]
@@ -1707,6 +1708,7 @@ fn build_cortex_usage(cortex: &Cortex) -> Result<CortexUsageOutput> {
             "federation_mode":federation_mode,
             "federation_verify":federation_verify,
             "access":access,
+            "durability_profile":cortex.durability_profile(),
             "filesystem_watch_enabled":watch_enabled,
             "long_tier_content_mutable":false,
             "trash_visible_through_mcp":false,
@@ -1784,6 +1786,36 @@ fn csv(value: &str) -> Vec<String> {
 }
 fn json_text<T: Serialize>(value: T) -> String {
     serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".into())
+}
+
+fn format_rows(rows: &[crate::cortex::Row]) -> String {
+    if rows.is_empty() {
+        return "No traces found.".into();
+    }
+    let mut output = String::new();
+    for row in rows {
+        let tier = match row.tier.as_str() {
+            "short" => "s",
+            "mid" => "m",
+            "long" => "L",
+            _ => "?",
+        };
+        let trace_type = if row.trace_type == "divergence" {
+            "DIVERGENCE"
+        } else {
+            &row.trace_type
+        };
+        let created = row.created_at.get(..10).unwrap_or(&row.created_at);
+        let _ = write!(output, "[{tier}] [{trace_type}] {} ({created})", row.id);
+        if !row.author.is_empty() {
+            let _ = write!(output, " — {}", row.author);
+        }
+        if !row.tags.is_empty() {
+            let _ = write!(output, " [{}]", row.tags.join(", "));
+        }
+        let _ = writeln!(output, "\n  {}", row.title);
+    }
+    output
 }
 
 pub(crate) fn render_federation_status(cx: &Cortex) -> Result<String> {
@@ -1914,6 +1946,25 @@ fn mcp_error(error: impl std::fmt::Display) -> ErrorData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_rows_like_the_go_mcp_oracle() {
+        let rows = vec![crate::cortex::Row {
+            id: "20260817-example".into(),
+            title: "Example title".into(),
+            trace_type: "divergence".into(),
+            tier: "long".into(),
+            author: "benchmark".into(),
+            tags: vec!["alpha".into(), "beta".into()],
+            created_at: "2026-08-17T12:00:00Z".into(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            format_rows(&rows),
+            "[L] [DIVERGENCE] 20260817-example (2026-08-17) — benchmark [alpha, beta]\n  Example title\n"
+        );
+        assert_eq!(format_rows(&[]), "No traces found.");
+    }
 
     #[test]
     fn bearer_digest_requires_the_exact_scheme_and_key() {

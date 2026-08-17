@@ -208,6 +208,16 @@ def event_counts(database_path: Path) -> tuple[int, int]:
     return int(row[0]), int(row[1])
 
 
+def origin_event_ids(database_path: Path, cortex_id: str) -> tuple[str, ...]:
+    with sqlite3.connect(database_path) as connection:
+        return tuple(
+            str(row[0])
+            for row in connection.execute(
+                "SELECT id FROM events WHERE cortex_id=? ORDER BY id", (cortex_id,)
+            )
+        )
+
+
 def latest_event_id(database_path: Path) -> str:
     with sqlite3.connect(database_path) as connection:
         row = connection.execute("SELECT max(id) FROM events").fetchone()
@@ -418,7 +428,24 @@ def exercise(go: Path, rust: Path, root: Path) -> None:
             )
 
         peer_a = nodes[0]
-        pre_rotation_event = latest_event_id(database(root, peer_a))
+        peer_a_id = state(database(root, nodes[1]), "peer:peer-a:cortex_id")
+        if not peer_a_id:
+            raise RuntimeError("peer-a identity was not pinned before key rotation")
+        wait_until(
+            "pre-rotation peer-a event convergence",
+            lambda: len(
+                {
+                    origin_event_ids(database(root, node), peer_a_id)
+                    for node in nodes
+                }
+            )
+            == 1,
+            timeout=30,
+        )
+        peer_a_events = origin_event_ids(database(root, peer_a), peer_a_id)
+        if not peer_a_events:
+            raise RuntimeError("peer-a has no signed events before key rotation")
+        pre_rotation_event = peer_a_events[-1]
         for node in nodes[1:]:
             wait_until(
                 f"direct peer-a cursor catch-up on {node.name}",

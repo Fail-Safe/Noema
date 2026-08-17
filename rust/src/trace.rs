@@ -154,6 +154,11 @@ impl Trace {
             .with_context(|| format!("writing {}", path.display()))
     }
 
+    pub(crate) fn write_preserving_updated_compatible(&self, path: &Path) -> Result<()> {
+        write_bytes_compatible(path, &self.encoded()?)
+            .with_context(|| format!("writing {}", path.display()))
+    }
+
     pub fn effective_tier(&self) -> &str {
         if self.frontmatter.tier.is_empty() {
             "short"
@@ -188,6 +193,20 @@ pub(crate) fn write_bytes_atomic(path: &Path, data: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+fn write_bytes_compatible(path: &Path, data: &[u8]) -> Result<()> {
+    let existed = path.exists();
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    if !existed {
+        set_private_permissions(path)?;
+    }
+    file.write_all(data)?;
+    Ok(())
 }
 
 #[cfg(unix)]

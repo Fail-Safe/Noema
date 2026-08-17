@@ -15,6 +15,7 @@ PKG         := ./cmd/noema
 BIN         := noema
 DIST_DIR    := dist
 VERSION_PKG := github.com/Fail-Safe/Noema/internal/cli
+REPORT_PYTHON ?= python3
 
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
@@ -30,7 +31,7 @@ HOST_ARCH := $(shell go env GOARCH)
 
 .PHONY: help build release release-linux test vet obsidian-publish clean \
 	rust-build rust-release rust-test comparison-release compare-rust benchmark-rust \
-	benchmark-mcp-rust
+	benchmark-mcp-rust benchmark-scale-rust soak-rust rust-report
 
 help:
 	@echo "Noema build targets:"
@@ -46,6 +47,9 @@ help:
 	@echo "  make benchmark-rust  Benchmark both release binaries"
 	@echo "  make benchmark-mcp-rust"
 	@echo "                       Benchmark steady-state MCP request handling"
+	@echo "  make benchmark-scale-rust"
+	@echo "                       Benchmark isolated MCP workloads at 10k traces"
+	@echo "  make rust-report     Regenerate Why Rust benchmark charts"
 	@echo "  make obsidian-publish"
 	@echo "                       Build and copy Obsidian plugin into the active cortex vault"
 	@echo "  make clean           Remove ./$(BIN) and ./$(DIST_DIR)/"
@@ -157,6 +161,17 @@ benchmark-mcp-rust: comparison-release
 	python3 ./tests/rust-rewrite/mcp_benchmark.py \
 		--go "$(CURDIR)/dist/noema-$(HOST_OS)-$(HOST_ARCH)" \
 		--rust "$(CURDIR)/rust/target/release/noema-rs"
+
+benchmark-scale-rust: comparison-release
+	python3 ./tests/rust-rewrite/mcp_scale_benchmark.py \
+		--go "$(CURDIR)/dist/noema-$(HOST_OS)-$(HOST_ARCH)" \
+		--rust "$(CURDIR)/rust/target/release/noema-rs" \
+		--traces "$${NOEMA_SCALE_TRACES:-10000}" \
+		--runs "$${NOEMA_SCALE_RUNS:-5}" \
+		--clients "$${NOEMA_SCALE_CLIENTS:-4}"
+
+rust-report:
+	$(REPORT_PYTHON) ./tests/rust-rewrite/render_report_charts.py
 
 soak-rust: comparison-release
 	python3 ./tests/rust-rewrite/federation_soak.py \

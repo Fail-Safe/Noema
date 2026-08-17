@@ -82,6 +82,7 @@ fn killed_update_is_rolled_back_on_next_open() {
     let marker = temp.path().join("replacement-complete");
     let mut child = Command::new(binary)
         .env("XDG_CONFIG_HOME", &config_home)
+        .env("NOEMA_DURABILITY", "strong")
         .env("NOEMA_RUST_TEST_PAUSE_AFTER_FILESYSTEM_MUTATION", &marker)
         .args([
             "--cortex",
@@ -146,6 +147,7 @@ fn killed_archive_is_moved_back_on_next_open() {
     let marker = temp.path().join("move-complete");
     let mut child = Command::new(env!("CARGO_BIN_EXE_noema-rs"))
         .env("XDG_CONFIG_HOME", &config_home)
+        .env("NOEMA_DURABILITY", "strong")
         .env("NOEMA_RUST_TEST_PAUSE_AFTER_FILESYSTEM_MUTATION", &marker)
         .args(["--cortex", "crash-test", "archive", &id])
         .stdout(Stdio::null())
@@ -176,6 +178,7 @@ fn killed_create_is_removed_on_next_open() {
     let marker = temp.path().join("create-complete");
     let mut child = Command::new(env!("CARGO_BIN_EXE_noema-rs"))
         .env("XDG_CONFIG_HOME", &config_home)
+        .env("NOEMA_DURABILITY", "strong")
         .env("NOEMA_RUST_TEST_PAUSE_AFTER_FILESYSTEM_MUTATION", &marker)
         .args([
             "--cortex",
@@ -233,6 +236,7 @@ fn killed_hard_delete_is_restored_on_next_open() {
     let marker = temp.path().join("delete-complete");
     let mut child = Command::new(env!("CARGO_BIN_EXE_noema-rs"))
         .env("XDG_CONFIG_HOME", &config_home)
+        .env("NOEMA_DURABILITY", "strong")
         .env("NOEMA_RUST_TEST_PAUSE_AFTER_FILESYSTEM_MUTATION", &marker)
         .args([
             "--cortex",
@@ -299,6 +303,7 @@ fn killed_external_delete_reconstruction_is_removed_on_next_open() {
     fs::remove_file(&active).unwrap();
     let marker = temp.path().join("external-delete-reconstruction-complete");
     let mut child = Command::new(std::env::current_exe().unwrap())
+        .env("NOEMA_DURABILITY", "strong")
         .env("NOEMA_RUST_TEST_EXTERNAL_DELETE_ROOT", &root)
         .env("NOEMA_RUST_TEST_EXTERNAL_DELETE_ID", &id)
         .env("NOEMA_RUST_TEST_PAUSE_AFTER_FILESYSTEM_MUTATION", &marker)

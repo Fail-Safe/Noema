@@ -666,6 +666,36 @@ pub struct Cortex {
     connection: Connection,
     force_source_lock: bool,
     signing_key: Option<SigningKey>,
+    durability: DurabilityProfile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurabilityProfile {
+    Strong,
+    Standard,
+}
+
+impl DurabilityProfile {
+    fn parse(value: Option<&str>) -> Result<Self> {
+        match value.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+            "" | "standard" | "compatible" => Ok(Self::Standard),
+            "strong" => Ok(Self::Strong),
+            value => {
+                bail!("invalid NOEMA_DURABILITY value {value:?}; expected standard or strong")
+            }
+        }
+    }
+
+    fn from_environment() -> Result<Self> {
+        Self::parse(std::env::var("NOEMA_DURABILITY").ok().as_deref())
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Strong => "strong",
+            Self::Standard => "standard",
+        }
+    }
 }
 
 struct FileSnapshot {
@@ -959,6 +989,7 @@ impl Cortex {
     pub fn open(name: impl Into<String>, dir: impl Into<PathBuf>) -> Result<Self> {
         let name = name.into();
         let dir = dir.into();
+        let durability = DurabilityProfile::from_environment()?;
         for relative in ["traces", "archive/traces", "trash/traces"] {
             fs::create_dir_all(dir.join(relative))?;
         }
@@ -981,6 +1012,7 @@ impl Cortex {
             connection,
             force_source_lock: false,
             signing_key,
+            durability,
         };
         cortex.recover_pending_mutations()?;
         cortex.rebuild_fts_if_stale()?;
@@ -1270,6 +1302,10 @@ impl Cortex {
     where
         F: FnOnce(&str) -> Result<()>,
     {
+        if self.durability == DurabilityProfile::Standard {
+            trace.write_preserving_updated_compatible(path)?;
+            return database("");
+        }
         let _trace_lock = self.acquire_trace_mutation_lock(path)?;
         let snapshot = FileSnapshot::capture(path)?;
         let replacement = trace.encoded()?;
@@ -1288,6 +1324,14 @@ impl Cortex {
     where
         F: FnOnce(&str) -> Result<()>,
     {
+        if self.durability == DurabilityProfile::Standard {
+            trace.write_preserving_updated_compatible(path)?;
+            let result = database("");
+            if result.is_err() {
+                let _ = fs::remove_file(path);
+            }
+            return result;
+        }
         let _trace_lock = self.acquire_trace_mutation_lock(path)?;
         let replacement = trace.encoded()?;
         let replacement_hash = bytes_hash(&replacement);
@@ -1307,6 +1351,11 @@ impl Cortex {
         F: FnOnce(Option<&str>) -> Result<()>,
     {
         if source == target {
+            return database(None);
+        }
+        if self.durability == DurabilityProfile::Standard {
+            fs::rename(source, target)
+                .with_context(|| format!("moving {} to {}", source.display(), target.display()))?;
             return database(None);
         }
         let _trace_lock = self.acquire_trace_mutation_lock(source)?;
@@ -1329,6 +1378,12 @@ impl Cortex {
     where
         F: FnOnce(Option<&str>) -> Result<()>,
     {
+        if self.durability == DurabilityProfile::Standard {
+            if path.exists() {
+                fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+            }
+            return database(None);
+        }
         let _trace_lock = self.acquire_trace_mutation_lock(path)?;
         if !path.exists() {
             return database(None);
@@ -1346,8 +1401,15 @@ impl Cortex {
     }
 
     fn clear_pending_in_transaction(tx: &Transaction<'_>, key: &str) -> Result<()> {
+        if key.is_empty() {
+            return Ok(());
+        }
         tx.execute("DELETE FROM federation_state WHERE key=?1", [key])?;
         Ok(())
+    }
+
+    pub fn durability_profile(&self) -> &'static str {
+        self.durability.name()
     }
 
     fn recover_pending_mutations(&mut self) -> Result<()> {
@@ -1683,9 +1745,9 @@ impl Cortex {
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             params![f.id, f.title, f.trace_type, trace.effective_tier(), f.author, f.origin, self.id, f.created, f.updated, f.content_hash, i64::from(f.source_locked), nullable(&f.source_hash)],
         )?;
-        replace_tags(&tx, &f.id, &f.tags)?;
-        replace_lineage(&tx, &f.id, &f.derived_from)?;
-        upsert_fts(&tx, &f.id, &f.title, &trace.body, &f.tags)?;
+        insert_tags(&tx, &f.id, &f.tags)?;
+        insert_lineage(&tx, &f.id, &f.derived_from)?;
+        insert_fts(&tx, &f.id, &f.title, &trace.body, &f.tags)?;
         if emit {
             self.emit_event(&tx, "create", &f.id, &f.created, trace_snapshot(trace))?;
         }
@@ -4906,6 +4968,10 @@ fn list_query(
 
 fn replace_tags(tx: &Transaction<'_>, id: &str, tags: &[String]) -> Result<()> {
     tx.execute("DELETE FROM trace_tags WHERE trace_id=?1", [id])?;
+    insert_tags(tx, id, tags)
+}
+
+fn insert_tags(tx: &Transaction<'_>, id: &str, tags: &[String]) -> Result<()> {
     for tag in dedupe(tags.to_vec()) {
         tx.execute(
             "INSERT INTO trace_tags(trace_id,tag) VALUES (?1,?2)",
@@ -4917,6 +4983,10 @@ fn replace_tags(tx: &Transaction<'_>, id: &str, tags: &[String]) -> Result<()> {
 
 fn replace_lineage(tx: &Transaction<'_>, id: &str, sources: &[String]) -> Result<()> {
     tx.execute("DELETE FROM trace_lineage WHERE trace_id=?1", [id])?;
+    insert_lineage(tx, id, sources)
+}
+
+fn insert_lineage(tx: &Transaction<'_>, id: &str, sources: &[String]) -> Result<()> {
     for source in dedupe(sources.to_vec()) {
         tx.execute(
             "INSERT INTO trace_lineage(trace_id,derived_from) VALUES (?1,?2)",
@@ -4934,6 +5004,16 @@ fn upsert_fts(
     tags: &[String],
 ) -> Result<()> {
     tx.execute("DELETE FROM traces_fts WHERE id=?1", [id])?;
+    insert_fts(tx, id, title, body, tags)
+}
+
+fn insert_fts(
+    tx: &Transaction<'_>,
+    id: &str,
+    title: &str,
+    body: &str,
+    tags: &[String],
+) -> Result<()> {
     tx.execute(
         "INSERT INTO traces_fts(id,title,body,tags) VALUES (?1,?2,?3,?4)",
         params![id, title, body, tags.join(" ")],
@@ -5206,7 +5286,9 @@ mod tests {
             ..Default::default()
         });
         write_manifest(&root, &manifest).unwrap();
-        Cortex::open(name, root).unwrap()
+        let mut cortex = Cortex::open(name, root).unwrap();
+        cortex.durability = DurabilityProfile::Strong;
+        cortex
     }
 
     fn event_for(cx: &Cortex, trace_id: &str, action: &str, cortex_id: &str) -> Event {
@@ -5220,8 +5302,65 @@ mod tests {
     fn cortex() -> (tempfile::TempDir, Cortex) {
         let temp = tempfile::tempdir().unwrap();
         Cortex::create("test", temp.path()).unwrap();
-        let cx = Cortex::open("test", temp.path().join("test")).unwrap();
+        let mut cx = Cortex::open("test", temp.path().join("test")).unwrap();
+        cx.durability = DurabilityProfile::Strong;
         (temp, cx)
+    }
+
+    #[test]
+    fn durability_profile_parser_is_explicit_and_fail_closed() {
+        assert_eq!(
+            DurabilityProfile::parse(None).unwrap(),
+            DurabilityProfile::Standard
+        );
+        assert_eq!(
+            DurabilityProfile::parse(Some("standard")).unwrap(),
+            DurabilityProfile::Standard
+        );
+        assert_eq!(
+            DurabilityProfile::parse(Some("strong")).unwrap(),
+            DurabilityProfile::Strong
+        );
+        assert_eq!(
+            DurabilityProfile::parse(Some("COMPATIBLE")).unwrap(),
+            DurabilityProfile::Standard
+        );
+        assert!(DurabilityProfile::parse(Some("fast")).is_err());
+    }
+
+    #[test]
+    fn standard_durability_skips_recovery_records_and_lock_files() {
+        let (_temp, mut cx) = cortex();
+        cx.durability = DurabilityProfile::Standard;
+        let mut trace = Trace::new(
+            "Standard durability",
+            "fact",
+            "",
+            vec!["profile".into()],
+            "first body",
+        );
+        cx.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        trace.body = "updated body".into();
+        cx.update_trace(&id, &mut trace, false).unwrap();
+        cx.archive(&id).unwrap();
+        cx.unarchive(&id).unwrap();
+
+        let pending: i64 = cx
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM federation_state WHERE key GLOB 'rust_pending_mutation:*'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 0);
+        assert!(!cx.pending_mutation_lock_directory().exists());
+        assert_eq!(
+            Trace::parse_file(&cx.trace_file(&id, false)).unwrap().body,
+            "updated body"
+        );
+        assert_eq!(cx.durability_profile(), "standard");
     }
 
     #[test]
@@ -6470,12 +6609,14 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_same_trace_create_is_rejected_before_file_write() {
+    fn strong_durability_rejects_concurrent_same_trace_create_before_file_write() {
         let temp = tempfile::tempdir().unwrap();
         Cortex::create("shared", temp.path()).unwrap();
         let root = temp.path().join("shared");
-        let first = Cortex::open("shared", &root).unwrap();
-        let second = Cortex::open("shared", &root).unwrap();
+        let mut first = Cortex::open("shared", &root).unwrap();
+        let mut second = Cortex::open("shared", &root).unwrap();
+        first.durability = DurabilityProfile::Strong;
+        second.durability = DurabilityProfile::Strong;
         let mut trace = Trace::new("Serialized create", "fact", "", vec![], "body");
         let path = first.trace_file(&trace.frontmatter.id, false);
         let _held = first.acquire_trace_mutation_lock(&path).unwrap();

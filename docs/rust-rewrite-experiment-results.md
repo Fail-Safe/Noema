@@ -100,6 +100,13 @@ slice as `null`, while the original Rust client accepted only `[]`. Rust now
 normalizes either form to an empty batch. The same tolerance applies to empty
 usage-signal results.
 
+Final report validation also exposed a rotation-boundary race in the fixture.
+It took its pre-rotation cursor snapshot while the origin could still receive
+and relay an old-key event, which could strand that event behind the new pin.
+The gate now requires convergence of the rotating origin's signed event set
+before capturing the boundary. Three consecutive mixed-ring runs and the full
+differential suite passed after the correction.
+
 ## Consolidation election foundation
 
 The Rust server now implements the coordination layer below the actual
@@ -506,9 +513,16 @@ truncate explicitly; type and individually wrapped tags use inverted `#`
 chips; metadata labels retain colons; and the full-width separator shows body
 scroll direction and position while metadata stays pinned. Fixed 120x28 dark
 and light buffer tests assert content placement and actual cell colors. An
-80x14 long-body test asserts pinned metadata and bottom-scroll state. A fresh
-same-terminal screenshot and multi-emulator review remain human qualification,
-not automated claims.
+80x14 long-body test asserts pinned metadata and bottom-scroll state.
+
+An identical-size post-change capture then found one residual geometry defect:
+Rust's right border consumed the last cell of the 34% list allocation while Go
+placed its divider after that allocation, and Rust reserved one extra prefix
+cell before each title. The Rust pane now includes a dedicated border cell and
+uses the same three-cell cursor/tier prefix as Go. The fixed-size renderer test
+pins the divider and title-start columns. A final identical-size capture of the
+release binary visually matches Go in the original terminal. Multi-emulator
+review remains human portability qualification, not an automated claim.
 
 A dependency-free PTY fixture now drives the actual Crossterm backend. It
 checks initial rendering, the external-editor leave-alternate/show-cursor/
@@ -609,6 +623,91 @@ graduation, and model-driven distillation are now present. A bounded real-model
 comparison also passes, but broader distillation-quality evaluation remains
 advisable.
 
+## Large-corpus and concurrent MCP comparison
+
+The scale harness uses stripped release binaries, alternating implementation
+order, a warmed stdio connection, exact trace-count checks, and `verify` after
+seeding and every mixed workload. Each measured scenario starts fresh server
+processes so a broad result cannot contaminate later RSS samples. Rust's
+`list_traces` and `search_traces` output was also aligned to Go's compact row
+format after the first campaign exposed that Rust's pretty full-row JSON made
+the response and retained allocations substantially larger.
+
+The final 10,000-trace campaigns used five runs and four clients. The final
+100,000-scale campaign used five runs, four clients, and independent
+byte-identical copies of one verified 100,150-trace corpus. All campaigns
+passed graceful shutdown, database verification, and exact post-write counts.
+
+Two Rust durability profiles were measured. `standard` is the selected
+default and matches Go's mutation posture: direct trace-file writes and one SQLite
+transaction, without per-mutation recovery records, trace/recovery locks,
+atomic temporary-file replacement, or file/directory fsync. The selected
+profile is exposed in `cortex_usage.runtime.durability_profile`; unknown values
+fail closed. `NOEMA_DURABILITY=strong` opts into the recovery protocol
+described above. The original benchmark artifacts recorded this profile as
+`compatible`; that value remains accepted as a legacy alias and is normalized
+to `standard`.
+
+The final standard-profile read and mixed results were:
+
+| Scale and scenario | Go ops/s | Rust ops/s | Go RSS | Rust RSS |
+| --- | ---: | ---: | ---: | ---: |
+| 10k serial broad | 9.77 | 14.58 | 64.3 MiB | 81.2 MiB |
+| 10k serial selective | 6,100.91 | 8,834.44 | 36.5 MiB | 25.8 MiB |
+| 10k four-client broad | 33.08 | 37.63 | 196.4 MiB | 188.0 MiB |
+| 10k four-client selective | 6,099.24 | 7,020.06 | 102.5 MiB | 84.9 MiB |
+| 10k mixed read/write | 3,412.50 | 4,311.13 | 109.6 MiB | 85.8 MiB |
+| 100k serial broad | 0.73 | 1.39 | 298.2 MiB | 642.1 MiB |
+| 100k serial selective | 5,587.46 | 8,154.33 | 98.6 MiB | 44.0 MiB |
+| 100k four-client broad | 2.38 | 3.69 | 956.4 MiB | 957.2 MiB |
+| 100k four-client selective | 5,265.01 | 7,992.39 | 168.0 MiB | 103.0 MiB |
+| 100k mixed read/write | 2,977.24 | 4,203.50 | 175.6 MiB | 104.0 MiB |
+
+Rust is faster in every final throughput median. It uses materially less RSS
+for selective and mixed workloads. Full-corpus broad output is the exception:
+one Rust process retained about 642 MiB versus Go's 298 MiB at 100,000 traces,
+while four-process aggregate broad RSS was effectively tied near 957 MiB.
+
+The final mutation comparison separates durability policy from implementation
+efficiency:
+
+| Metric | Go | Rust | Gap |
+| --- | ---: | ---: | ---: |
+| 10k strong seed | 6.491 s | 92.987 s | Rust 14.3x slower |
+| 10k strong mixed throughput | 3,299.16 ops/s | 252.75 ops/s | Go 13.1x faster |
+| 10k strong median write latency | 0.348 ms | 9.128 ms | Rust 26.2x slower |
+| 10k standard seed | 6.596 s | 3.096 s | Rust 2.13x faster |
+| 10k standard mixed throughput | 3,412.50 ops/s | 4,311.13 ops/s | Rust 1.26x faster |
+| 10k standard median write latency | 0.354 ms | 0.301 ms | Rust 15% lower |
+| 100k standard mixed throughput | 2,977.24 ops/s | 4,203.50 ops/s | Rust 1.41x faster |
+| 100k standard median write latency | 0.393 ms | 0.301 ms | Rust 23% lower |
+
+Inspection confirmed a policy difference rather than a language-runtime limit.
+For each mutation Rust durably inserts a recovery record, acquires trace and
+recovery locks, writes and fsyncs an atomic temporary trace, renames it, fsyncs
+the trace directory, and commits the database while clearing the recovery
+record. Go writes the trace file and performs one SQLite transaction without
+per-trace file or directory fsyncs. Activity Monitor qualitatively showed more
+than 12 GiB of cumulative writes during the Rust 100,000-trace seed, but that
+observation had no controlled Go child counter and is not used as a numeric
+cross-runtime result.
+
+The profile experiment also exposed an independent Rust create-path defect:
+new traces used update-style `DELETE FROM traces_fts WHERE id=?` before every
+FTS insert. Because `id` is a stored FTS column rather than its indexed rowid,
+the delete scanned an increasingly large virtual table. Create now uses
+insert-only tag, lineage, and FTS helpers; update paths retain delete-and-insert
+replacement. This removed the corpus-size regression and moved standard mode
+from below Go to ahead of it at both measured scales.
+
+Standard mode deliberately does not pass the strong process-death guarantee:
+a killed or power-lost writer can leave a truncated/updated trace file without
+its matching database transaction, or vice versa. The opt-in strong profile
+continues to pass the subprocess crash-recovery suite. Standard is the
+release default so migration from Go does not introduce an immediate
+performance regression; users who prioritize the enhanced recovery contract
+can select strong explicitly.
+
 ## Current interpretation
 
 The additional work further weakens the case for stopping immediately: Rust can
@@ -625,8 +724,11 @@ and tested process death have stronger filesystem recovery in the Rust
 experiment. Cross-runtime backup restore now supplies an explicit recovery
 path from a known-good archive, and non-mutating status plus explicit
 resume/rollback reconciles interrupted restore transactions without exposing
-journal contents. It still does not justify an all-in rewrite because
-larger-result throughput is not better and post-fix multi-emulator human TUI
-validation, broader distillation-quality evaluation, automatic startup restore
-recovery, power-loss fault injection, older-Go recovery, and corrupt-database
-salvage remain incomplete.
+journal contents. Corrected 10,000- and 100,000-scale testing now shows that
+large-result read throughput and isolated-scenario memory are strengths, not
+remaining objections. Standard mode also meets the measured mutation
+performance gate, while strong mode preserves the enhanced recovery contract
+at a large write cost. The production default is now resolved as standard.
+It still does not justify an unconditional replacement until multi-emulator
+human TUI validation, broader distillation-quality evaluation, power-loss fault
+injection, older-Go recovery, and corrupt-database salvage also remain.

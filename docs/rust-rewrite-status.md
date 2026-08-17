@@ -1,6 +1,6 @@
 # Rust rewrite status
 
-Updated: 2026-08-16
+Updated: 2026-08-17
 
 ## Current state
 
@@ -78,7 +78,7 @@ The completion tree passed:
 
 - `make rust-test`
   - rustfmt and Clippy with warnings denied;
-  - 124 Rust unit tests;
+  - 127 Rust unit tests;
   - one killed-config-writer subprocess test;
   - five active mutation crash-recovery scenarios (plus one ignored child
     entry point);
@@ -107,12 +107,21 @@ The completion tree passed:
   Crossterm's macOS `mio` source. Selecting Crossterm's Unix polling backend
   removed the lost-input race; the strengthened scenario then passed 30
   consecutive runs and the complete comparison gate.
+- Final report validation exposed a rotation-boundary race in the three-node
+  fixture: it could snapshot its cursor while a same-origin old-key event was
+  still in flight. The gate now waits for that origin's signed event set to
+  converge. Three consecutive ring runs and the full comparison gate passed
+  after the correction.
 - A same-trace Go/Rust screenshot comparison found remaining renderer-level
   differences. Rust now right-aligns the trace count, applies the Go tier heat
   colors and explicit title ellipsis, renders punctuated type/tag chips with
   wrapping, and keeps metadata pinned above a full-width scroll-aware rule.
-  Fixed-size dark/light buffer tests assert cell placement and colors; the live
-  PTY and complete differential suite pass after the changes.
+  A subsequent identical-size capture found the Rust divider one cell left of
+  Go because its border consumed list content and its table reserved an extra
+  prefix cell. The pane and table geometry now match Go, and fixed-size
+  dark/light buffer tests assert the divider, title start, cell placement, and
+  colors. A final identical-size release-binary recapture visually matches Go;
+  the live PTY and complete differential suite also pass after the changes.
 
 The Go build can emit a sandbox-only warning when it cannot update the module
 download stat cache outside this workspace. It still exits successfully; do
@@ -149,6 +158,34 @@ not treat that warning as a failed build.
   same rules to Go and Rust, both reached 24/24 decisions and 102/102 retention.
   Blind frontier review was effectively tied at 239/240 for Go and 238/240 for
   Rust, with one win each and 22 ties.
+- The default `standard` durability profile now matches Go's direct-file and
+  single-SQLite-transaction mutation posture. `NOEMA_DURABILITY=strong` opts
+  into the enhanced recovery protocol, unknown values fail closed, and MCP
+  usage reports the selected profile. `compatible` remains accepted as a legacy
+  alias and is normalized to `standard`.
+- The profile experiment exposed an unrelated create-path FTS scan. Rust used
+  update-style delete-and-insert helpers even for new traces; insert-only tag,
+  lineage, and FTS helpers now match Go's create semantics and retain upserts
+  for updates.
+- Final five-run 10,000-trace standard-profile testing has Rust ahead in every
+  throughput median: seed 3.096 versus 6.596 seconds, mixed 4,311 versus 3,413
+  ops/s, and median writes 0.301 versus 0.354 ms. Rust used less RSS in every
+  isolated scenario except serial broad.
+- Final five-run 100,000-scale standard-profile testing used byte-identical verified
+  corpus clones and four clients. Rust led every throughput median, including
+  mixed 4,203 versus 2,977 ops/s and median writes 0.301 versus 0.393 ms. Rust
+  used much less RSS for selective and mixed work; single-process full-corpus
+  broad search retained about 642 MiB versus Go's 298 MiB, while four-process
+  broad RSS was tied near 957 MiB.
+- The optimized strong control still pays for its enhanced crash consistency:
+  10,000-trace seed was 92.987 versus 6.491 seconds, mixed throughput was 253
+  versus 3,299 ops/s, and median writes were 9.128 versus 0.348 ms. This is now
+  an explicit durability-policy tradeoff rather than an unresolved Rust
+  performance defect.
+- The first scale campaign's large Rust RSS readings are superseded. Rust had
+  emitted pretty full-row JSON while Go emitted compact rows, and later
+  scenarios reused broad-search processes. Rust now matches Go's compact MCP
+  list/search rows, and the harness isolates each scenario.
 
 See `docs/rust-rewrite-experiment-results.md` for tables and caveats.
 
@@ -163,14 +200,19 @@ These are not missing command or protocol ports:
    closed and preserves corrupt bytes; it does not attempt repair.
 3. Define takeover policy for older Go binaries. Only the Go build on this
    branch understands the pending-Rust-mutation interlock.
-4. Capture the patched Rust TUI beside Go at an identical terminal size, then
-   perform multi-emulator human validation for any residual cell-width or color
-   differences.
+4. Perform multi-emulator human validation for any terminal-specific cell-width
+   or color differences. The final identical-size capture in the original
+   terminal visually matches Go after the one-cell pane-geometry correction.
 5. Extend the now-passing synthetic qualitative gate to a redacted
    representative corpus, additional models, and multiple reviewers.
-6. Before release replacement, choose packaging, binary naming, migration,
-   rollback, and staged deployment policy, then repeat benchmarks on stripped
-   release binaries at larger corpus sizes.
+6. Qualify the selected `standard` default and opt-in `strong` profile under
+   real power loss. Standard avoids a migration-time performance regression
+   and intentionally shares Go's weaker process-death window; strong preserves
+   the tested pending-record/fsync recovery protocol at a substantial write
+   cost.
+7. Before release replacement, choose packaging, binary naming, migration,
+   rollback, and staged deployment policy, then repeat the mutation benchmark
+   after the durability decision.
 
 Automatic restore reconciliation remains deliberately absent: ambiguous or
 tampered restore state requires an explicit operator `resume` or `rollback`.

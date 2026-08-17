@@ -509,15 +509,9 @@ impl<'a> Model<'a> {
         if self.mode == Mode::Help {
             self.render_help(frame, vertical[1], palette);
         } else {
-            let panes = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Percentage(LIST_PERCENT),
-                    Constraint::Percentage(100 - LIST_PERCENT),
-                ])
-                .split(vertical[1]);
-            self.render_list(frame, panes[0], palette);
-            self.render_detail(frame, panes[1], palette);
+            let (list_area, detail_area) = pane_areas(vertical[1]);
+            self.render_list(frame, list_area, palette);
+            self.render_detail(frame, detail_area, palette);
         }
         self.render_footer(frame, vertical[2], palette);
         if self.mode == Mode::Confirm {
@@ -643,7 +637,7 @@ impl<'a> Model<'a> {
             Table::new(
                 rows,
                 [
-                    Constraint::Length(4),
+                    Constraint::Length(3),
                     Constraint::Min(6),
                     Constraint::Length(14),
                     Constraint::Length(10),
@@ -1064,8 +1058,23 @@ fn tier_style(tier: &str, dimmed: bool, palette: Palette) -> Style {
 
 fn list_title_width(area_width: u16) -> usize {
     // Right border, three inter-column spaces, and fixed cursor/tier,
-    // type, and date columns consume 32 cells.
-    usize::from(area_width.saturating_sub(32).max(4))
+    // type, and date columns consume 31 cells.
+    usize::from(area_width.saturating_sub(31).max(4))
+}
+
+fn pane_areas(area: Rect) -> (Rect, Rect) {
+    // Go gives the list content 34% of the terminal and places a separate
+    // divider in the next cell. Ratatui draws the divider as the list pane's
+    // right border, so include that border cell in the list area.
+    let list_content_width = area.width.saturating_mul(LIST_PERCENT) / 100;
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(list_content_width.saturating_add(1)),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    (panes[0], panes[1])
 }
 
 fn signed_count(value: i64) -> String {
@@ -1388,16 +1397,17 @@ mod tests {
         assert!(screen.contains("#visual-contract"));
 
         let body = Rect::new(0, 1, 120, 26);
-        let panes = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(LIST_PERCENT),
-                Constraint::Percentage(100 - LIST_PERCENT),
-            ])
-            .split(body);
-        let expected_title = truncate(long_title, list_title_width(panes[0].width));
+        let (list_area, detail_area) = pane_areas(body);
+        assert_eq!(list_area.width, 41);
+        assert_eq!(detail_area.x, 41);
+        assert_eq!(
+            terminal.backend().buffer().cell((40, 1)).unwrap().symbol(),
+            "│"
+        );
+        let expected_title = truncate(long_title, list_title_width(list_area.width));
         assert!(expected_title.ends_with('…'));
         assert!(screen.contains(&expected_title));
+        assert_eq!(find_text(terminal.backend(), &expected_title).unwrap().0, 4);
 
         let (chip_x, chip_y) = find_text(terminal.backend(), "#observation").unwrap();
         let chip_cell = terminal.backend().buffer().cell((chip_x, chip_y)).unwrap();
@@ -1431,7 +1441,7 @@ mod tests {
                 .chars()
                 .filter(|character| *character == '─')
                 .count(),
-            usize::from(panes[1].width.saturating_sub(4))
+            usize::from(detail_area.width.saturating_sub(4))
         );
 
         let light_model = Model::new(&cortex, "light").unwrap();
@@ -1521,11 +1531,13 @@ mod tests {
     fn find_text(backend: &TestBackend, needle: &str) -> Option<(u16, u16)> {
         let width = backend.buffer().area().width;
         for y in 0..backend.buffer().area().height {
-            let row = (0..width)
-                .map(|x| backend.buffer().cell((x, y)).unwrap().symbol())
-                .collect::<String>();
-            if let Some(x) = row.find(needle) {
-                return Some((x as u16, y));
+            for x in 0..width {
+                let suffix = (x..width)
+                    .map(|column| backend.buffer().cell((column, y)).unwrap().symbol())
+                    .collect::<String>();
+                if suffix.starts_with(needle) {
+                    return Some((x, y));
+                }
             }
         }
         None

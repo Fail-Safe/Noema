@@ -128,6 +128,33 @@ latency, along with sampled RSS and CPU use. It alternates implementation order
 and defaults to five runs. Defaults are intentionally quick; set
 `NOEMA_BENCH_TRACES` and `NOEMA_BENCH_READS` for longer runs.
 
+`mcp_scale_benchmark.py` covers larger corpora and concurrent MCP workloads. It
+seeds one verified corpus per implementation, alternates runtime order, and
+uses fresh server processes for each serial broad, serial selective, parallel
+broad, parallel selective, and mixed reader/writer scenario. Fresh processes
+keep broad-result allocation from contaminating later RSS samples. Stdio
+servers receive EOF for graceful shutdown before bounded terminate/kill
+fallbacks. `--clone-cortex` makes independent byte-identical measurement
+copies of one verified corpus; `--reuse-root` resumes explicitly supplied Go
+and Rust benchmark trees after verifying both. Every mixed run finishes with
+`verify` and an exact SQLite trace-count assertion.
+
+Rust defaults to the `standard` direct-write and single-transaction profile,
+which matches Go's mutation posture. Set `NOEMA_DURABILITY=strong` to measure
+the enhanced per-mutation recovery protocol:
+
+```sh
+NOEMA_DURABILITY=strong make benchmark-scale-rust
+```
+
+The harness records the selected Rust profile in its JSON configuration and
+accepts zero mixed reads or writes for focused mutation/read controls. The
+standard profile intentionally retains Go's crash posture: it omits
+pending-mutation records, trace/recovery locks, atomic temporary-file
+replacement, and per-mutation file/directory fsyncs. Strong mode exercises and
+retains those additional guarantees. `compatible` remains accepted as a legacy
+alias for `standard` during the transition.
+
 `federation_soak.py` gives homogeneous three-node Go and Rust clusters the same
 bounded mutation schedule, restarts one node halfway through, verifies exact
 event convergence, and reports sampled cluster RSS and CPU as JSON. Its default
@@ -160,6 +187,7 @@ PYTHONPATH=tests/rust-rewrite \
 make compare-rust
 make benchmark-rust
 make benchmark-mcp-rust
+make benchmark-scale-rust
 make soak-rust
 ```
 

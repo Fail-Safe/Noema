@@ -109,6 +109,7 @@ assert_contains "$(go_noema get "$rust_id")" "charlie delta" "Go sees Rust recov
 
 takeover_marker="$comparison_root/rust-mutation-complete"
 env HOME="$comparison_home" \
+    NOEMA_DURABILITY=strong \
     NOEMA_RUST_TEST_PAUSE_AFTER_FILESYSTEM_MUTATION="$takeover_marker" \
     "$rust_bin" --cortex shared append "$go_id" \
     --content "uncommitted mixed-runtime body" >/dev/null 2>&1 &

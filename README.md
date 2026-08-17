@@ -38,6 +38,7 @@ Contributor and architecture notes:
 - [Repository Guidelines](AGENTS.md)
 - [Architecture](docs/architecture.md)
 - [Development Guide](docs/development.md)
+- [Why switch Noema to Rust?](docs/why-rust.md) — living rewrite assessment
 
 A Trace has a **type** that describes its intent:
 

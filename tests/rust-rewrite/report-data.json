@@ -1,0 +1,183 @@
+{
+  "schema_version": 1,
+  "updated": "2026-08-17",
+  "context": {
+    "platform": "Apple Silicon macOS",
+    "builds": "release optimized",
+    "scale_runs": 5,
+    "scale_clients": 4,
+    "standard_profile_source_label": "compatible",
+    "notes": [
+      "Local measurements are comparative evidence, not portable performance guarantees.",
+      "The 100k campaign used independent byte-identical clones of one verified 100,150-trace corpus.",
+      "The original scale artifacts called the standard profile compatible; compatible remains a legacy alias."
+    ]
+  },
+  "artifacts": {
+    "go": {
+      "bytes": 14887442
+    },
+    "rust": {
+      "bytes": 19019360
+    }
+  },
+  "scale": [
+    {
+      "traces": 10000,
+      "profile": "standard",
+      "seed_seconds": {
+        "go": 6.596,
+        "rust": 3.096
+      },
+      "mixed_write_latency_ms": {
+        "go": 0.354,
+        "rust": 0.301
+      },
+      "workloads": {
+        "serial_broad": {
+          "label": "Serial broad",
+          "go_ops_per_second": 9.77,
+          "rust_ops_per_second": 14.58,
+          "go_rss_kib": 65840,
+          "rust_rss_kib": 83120
+        },
+        "serial_selective": {
+          "label": "Serial selective",
+          "go_ops_per_second": 6100.91,
+          "rust_ops_per_second": 8834.44,
+          "go_rss_kib": 37360,
+          "rust_rss_kib": 26368
+        },
+        "parallel_broad": {
+          "label": "Four-client broad",
+          "go_ops_per_second": 33.08,
+          "rust_ops_per_second": 37.63,
+          "go_rss_kib": 201104,
+          "rust_rss_kib": 192496
+        },
+        "parallel_selective": {
+          "label": "Four-client selective",
+          "go_ops_per_second": 6099.24,
+          "rust_ops_per_second": 7020.06,
+          "go_rss_kib": 104944,
+          "rust_rss_kib": 86976
+        },
+        "mixed_selective_read_write": {
+          "label": "Mixed read/write",
+          "go_ops_per_second": 3412.50,
+          "rust_ops_per_second": 4311.13,
+          "go_rss_kib": 112192,
+          "rust_rss_kib": 87872
+        }
+      }
+    },
+    {
+      "traces": 100000,
+      "profile": "standard",
+      "mixed_write_latency_ms": {
+        "go": 0.393,
+        "rust": 0.301
+      },
+      "workloads": {
+        "serial_broad": {
+          "label": "Serial broad",
+          "go_ops_per_second": 0.73,
+          "rust_ops_per_second": 1.39,
+          "go_rss_kib": 305344,
+          "rust_rss_kib": 657520
+        },
+        "serial_selective": {
+          "label": "Serial selective",
+          "go_ops_per_second": 5587.46,
+          "rust_ops_per_second": 8154.33,
+          "go_rss_kib": 100928,
+          "rust_rss_kib": 45024
+        },
+        "parallel_broad": {
+          "label": "Four-client broad",
+          "go_ops_per_second": 2.38,
+          "rust_ops_per_second": 3.69,
+          "go_rss_kib": 979344,
+          "rust_rss_kib": 980176
+        },
+        "parallel_selective": {
+          "label": "Four-client selective",
+          "go_ops_per_second": 5265.01,
+          "rust_ops_per_second": 7992.39,
+          "go_rss_kib": 172064,
+          "rust_rss_kib": 105504
+        },
+        "mixed_selective_read_write": {
+          "label": "Mixed read/write",
+          "go_ops_per_second": 2977.24,
+          "rust_ops_per_second": 4203.50,
+          "go_rss_kib": 179776,
+          "rust_rss_kib": 106512
+        }
+      }
+    }
+  ],
+  "durability_10k": {
+    "go_standard_control": {
+      "seed_seconds": 6.596,
+      "mixed_ops_per_second": 3412.50,
+      "median_write_latency_ms": 0.354
+    },
+    "go_strong_control": {
+      "seed_seconds": 6.491,
+      "mixed_ops_per_second": 3299.16,
+      "median_write_latency_ms": 0.348
+    },
+    "rust_standard": {
+      "seed_seconds": 3.096,
+      "mixed_ops_per_second": 4311.13,
+      "median_write_latency_ms": 0.301
+    },
+    "rust_strong": {
+      "seed_seconds": 92.987,
+      "mixed_ops_per_second": 252.75,
+      "median_write_latency_ms": 9.128
+    }
+  },
+  "federation_soak": {
+    "nodes": 3,
+    "mutations": 80,
+    "duration_seconds": 8,
+    "go": {
+      "wall_seconds": 9.586,
+      "peak_rss_mib": 90.266,
+      "mean_cpu_percent": 7.913
+    },
+    "rust": {
+      "wall_seconds": 9.112,
+      "peak_rss_mib": 56.469,
+      "mean_cpu_percent": 6.429
+    }
+  },
+  "quality": [
+    {
+      "label": "Small exact-artifact",
+      "go_score": 473,
+      "rust_score": 467,
+      "maximum_score": 480,
+      "go_decisions": "48/48",
+      "rust_decisions": "48/48",
+      "go_retention": "203/204",
+      "rust_retention": "203/204",
+      "go_peak_rss_mib": 23.508,
+      "rust_peak_rss_mib": 14.820
+    },
+    {
+      "label": "Frontier",
+      "go_score": 239,
+      "rust_score": 238,
+      "maximum_score": 240,
+      "go_decisions": "24/24",
+      "rust_decisions": "24/24",
+      "go_retention": "102/102",
+      "rust_retention": "102/102",
+      "go_peak_rss_mib": 23.375,
+      "rust_peak_rss_mib": 14.844
+    }
+  ]
+}
