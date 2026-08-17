@@ -20,6 +20,18 @@
       "bytes": 19019360
     }
   },
+  "source_size": {
+    "baseline": "rust-cutover-baseline",
+    "method": "Physical lines, including comments and blanks; dedicated test files and top-level Rust cfg(test) modules excluded.",
+    "go": {
+      "files": 99,
+      "lines": 26986
+    },
+    "rust": {
+      "files": 25,
+      "lines": 18784
+    }
+  },
   "scale": [
     {
       "traces": 10000,

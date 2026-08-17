@@ -17,6 +17,7 @@ os.environ.setdefault(
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 
 
@@ -461,6 +462,37 @@ def render_artifact_size(data: dict) -> None:
     save(fig, "artifact-size.svg")
 
 
+def render_source_size(data: dict) -> None:
+    source = data["source_size"]
+    values = [source[name]["lines"] for name in ("go", "rust")]
+    reduction = 100 * (1 - values[1] / values[0])
+
+    fig, ax = plt.subplots(figsize=(9, 4.4))
+    bars = ax.barh([1, 0], values, color=[BASELINE, FAVORABLE], height=0.5)
+    ax.set_yticks([1, 0], ["Go", "Rust"])
+    ax.set_xlabel("Production implementation lines")
+    ax.set_xlim(0, max(values) * 1.28)
+    ax.xaxis.set_major_formatter(mticker.StrMethodFormatter("{x:,.0f}"))
+    ax.set_title(f"Rust cut the production implementation by {reduction:.1f}%")
+    ax.grid(axis="x", color=GRID, linewidth=0.7, alpha=0.7)
+    ax.set_axisbelow(True)
+    ax.bar_label(
+        bars,
+        labels=[f"{value:,} lines" for value in values],
+        padding=5,
+        fontweight="bold",
+    )
+    fig.text(
+        0.5,
+        0.02,
+        "Physical lines at the signed cutover baseline; comments and blanks included, test code excluded.",
+        ha="center",
+        color=NEUTRAL,
+    )
+    fig.subplots_adjust(left=0.12, right=0.94, top=0.82, bottom=0.2)
+    save(fig, "source-loc.svg")
+
+
 def main() -> None:
     configure()
     data = json.loads(DATA_PATH.read_text())
@@ -470,6 +502,7 @@ def main() -> None:
     render_quality(data)
     render_federation(data)
     render_artifact_size(data)
+    render_source_size(data)
 
 
 if __name__ == "__main__":

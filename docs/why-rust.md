@@ -35,6 +35,7 @@ for that decision.
 | Default durability | `standard` matches Go's mutation and crash posture | Migration does not impose an immediate performance regression |
 | Enhanced durability | `strong` passes process-death and APFS detach/remount recovery, with a large write cost | Useful opt-in; hard power-cut/device-cache qualification remains |
 | Release artifact | Rust is 27.8% larger in the current local release build | Favors Go, but operational impact is small |
+| Production source | Rust implements the production runtime in 30.4% fewer physical lines | Smaller maintenance surface; not proof of correctness or a language-wide result |
 | Release readiness | Rust-only source, CI, six-platform release packaging, checksums, plugins, and Homebrew metadata are configured | Cutover accepted; remote workflow and first-release validation remain operational gates |
 
 ## Performance at scale
@@ -189,6 +190,32 @@ Rust's language-level contribution is compile-time memory and thread safety for
 a server that combines SQLite access, background federation, watchers,
 consolidation, TLS, and concurrent MCP transports. That is a maintainability
 and defect-prevention argument, not a measured performance percentage.
+
+## A smaller production implementation
+
+At the signed final comparison baseline, Noema's production implementation
+decreased from 26,986 physical lines across 99 Go files to 18,784 lines across
+25 Rust source files. That is 8,202 fewer lines, a 30.4% reduction.
+
+![Horizontal bars show the Go production implementation at 26,986 lines and Rust at 18,784 lines, a reduction of 8,202 lines or 30.4 percent.](assets/rust-rewrite/source-loc.svg)
+
+| Production implementation | Files | Physical lines | Change from Go |
+| --- | ---: | ---: | ---: |
+| Go | 99 | 26,986 | baseline |
+| Rust | 25 | 18,784 | 30.4% fewer |
+
+The count comes from `rust-cutover-baseline` and includes comments and blank
+lines. It excludes Go `*_test.go` files, top-level Rust `#[cfg(test)]` modules,
+Rust integration tests, migrations, plugins, and shared benchmark harnesses.
+This makes it a comparison of the maintained runtime implementations rather
+than their differently sized test suites.
+
+> **★ Insight**
+>
+> The useful conclusion is not that Rust is inherently more concise. It is
+> that Noema's tested behavior now occupies a roughly 30% smaller production
+> implementation surface. That supports the maintainability case, while the
+> compatibility and resilience suites remain the evidence for correctness.
 
 ## Why the final results differ from the first results
 
