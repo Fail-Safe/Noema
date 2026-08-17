@@ -16,6 +16,15 @@ Updated: 2026-08-17
 - Port-completion baseline:
   `8cd9719 feat(rust): complete migration and operational parity`.
   Verify the current signed commits with `git log --show-signature -3`.
+- Production deployment qualification installed Rust v0.20.0 on one macOS
+  arm64 instance and three Linux x86_64 instances. A staged client canary
+  exposed a DNS Host-header name that differed from its listener address;
+  commit `f6043d5` added the explicit `--allowed-host` boundary without
+  disabling Host validation. The repeated canary then passed live MCP,
+  integrity, backup/restore, embedding, federation, service-restart, and
+  warning-log gates. The final homogeneous fleet check was green with no
+  alerts or federation failures, and the prior binaries and data snapshots
+  remain available for rollback.
 
 ## Implemented parity
 
