@@ -61,20 +61,20 @@ Rust led every final throughput median. Memory was more nuanced: selective and
 mixed workloads favored Rust, four-client broad output was nearly tied at
 100k, and single-process broad output favored Go substantially.
 
-![Horizontal ratio charts show Rust above the Go throughput baseline in all ten final scenarios. Rust memory is below the Go baseline in most scenarios, approximately tied for 100k four-client broad output, and 2.15 times Go for 100k serial broad output.](assets/rust-rewrite/workload-ratios.svg)
+![Diverging horizontal bars show Rust faster in all ten final scenarios. Rust uses less peak memory in seven scenarios, approximately the same memory for 100k four-client broad output, and more memory for the two broad serial scans.](assets/rust-rewrite/workload-ratios.svg)
 
-| Scale and scenario | Rust/Go throughput | Rust/Go RSS |
+| Scale and scenario | Throughput vs. Go | Peak memory vs. Go |
 | --- | ---: | ---: |
-| 10k serial broad | 1.49x | 1.26x |
-| 10k serial selective | 1.45x | 0.71x |
-| 10k four-client broad | 1.14x | 0.96x |
-| 10k four-client selective | 1.15x | 0.83x |
-| 10k mixed read/write | 1.26x | 0.78x |
-| 100k serial broad | 1.90x | 2.15x |
-| 100k serial selective | 1.46x | 0.45x |
-| 100k four-client broad | 1.55x | 1.00x |
-| 100k four-client selective | 1.52x | 0.61x |
-| 100k mixed read/write | 1.41x | 0.59x |
+| 10k serial broad | 49% faster | 26% more |
+| 10k serial selective | 45% faster | 29% less |
+| 10k four-client broad | 14% faster | 4% less |
+| 10k four-client selective | 15% faster | 17% less |
+| 10k mixed read/write | 26% faster | 22% less |
+| 100k serial broad | 90% faster | 115% more |
+| 100k serial selective | 46% faster | 55% less |
+| 100k four-client broad | 55% faster | approximately equal |
+| 100k four-client selective | 52% faster | 39% less |
+| 100k mixed read/write | 41% faster | 41% less |
 
 The 100k serial-broad result is the clearest remaining performance target. It
 does not erase the gains elsewhere, but it prevents a claim that Rust always

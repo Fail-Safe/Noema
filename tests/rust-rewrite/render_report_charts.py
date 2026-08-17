@@ -30,6 +30,8 @@ STANDARD = "#228833"
 STRONG = "#AA3377"
 NEUTRAL = "#6B7280"
 GRID = "#D1D5DB"
+FAVORABLE = "#4477AA"
+REGRESSION = "#EE7733"
 
 
 def configure() -> None:
@@ -122,48 +124,110 @@ def render_mixed_scale(data: dict) -> None:
 
 
 def render_workload_ratios(data: dict) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6.4))
+    fig, axes = plt.subplots(1, 2, figsize=(13.5, 6.8), sharey=True)
     entries: list[tuple[str, float, float]] = []
     for scale in data["scale"]:
         for workload in scale["workloads"].values():
             entries.append(
                 (
                     f'{scale["traces"] // 1000}k  {workload["label"]}',
-                    workload["rust_ops_per_second"] / workload["go_ops_per_second"],
-                    workload["rust_rss_kib"] / workload["go_rss_kib"],
+                    100
+                    * (
+                        workload["rust_ops_per_second"]
+                        / workload["go_ops_per_second"]
+                        - 1
+                    ),
+                    100
+                    * (
+                        1
+                        - workload["rust_rss_kib"]
+                        / workload["go_rss_kib"]
+                    ),
                 )
             )
 
     labels = [entry[0] for entry in entries]
     y = np.arange(len(entries))
-    throughput = [entry[1] for entry in entries]
-    memory = [entry[2] for entry in entries]
+    throughput_advantage = [entry[1] for entry in entries]
+    memory_advantage = [entry[2] for entry in entries]
 
-    axes[0].barh(y, throughput, color=RUST)
-    axes[0].axvline(1, color=NEUTRAL, linewidth=1.2)
+    def colors(values: list[float]) -> list[str]:
+        return [
+            NEUTRAL if abs(value) < 0.5 else FAVORABLE if value > 0 else REGRESSION
+            for value in values
+        ]
+
+    def label(ax: plt.Axes, index: int, value: float, text: str) -> None:
+        if abs(value) < 0.5:
+            ax.text(3, index, text, va="center", ha="left", fontweight="bold")
+        elif value > 0:
+            ax.text(value + 3, index, text, va="center", ha="left", fontweight="bold")
+        else:
+            ax.text(value - 3, index, text, va="center", ha="right", fontweight="bold")
+
+    for ax in axes:
+        ax.axvspan(-125, 0, color="#FFF7ED", zorder=0)
+        ax.axvspan(0, 105, color="#EFF6FF", zorder=0)
+        ax.axvline(0, color=NEUTRAL, linewidth=1.4)
+        ax.set_xlim(-125, 105)
+        ax.set_xticks([-100, -50, 0, 50, 100], ["100%", "50%", "same", "50%", "100%"])
+        ax.grid(axis="x", color=GRID, linewidth=0.7, alpha=0.7)
+        ax.set_axisbelow(True)
+        ax.text(
+            -62.5,
+            1.035,
+            "GO BETTER",
+            transform=ax.get_xaxis_transform(),
+            ha="center",
+            color=REGRESSION,
+            fontsize=9,
+            fontweight="bold",
+        )
+        ax.text(
+            52.5,
+            1.035,
+            "RUST BETTER",
+            transform=ax.get_xaxis_transform(),
+            ha="center",
+            color=FAVORABLE,
+            fontsize=9,
+            fontweight="bold",
+        )
+
+    axes[0].barh(y, throughput_advantage, color=colors(throughput_advantage))
     axes[0].set_yticks(y, labels)
     axes[0].invert_yaxis()
-    axes[0].set_xlim(0, 2.2)
-    axes[0].set_xlabel("Rust throughput / Go throughput")
-    axes[0].set_title("Rust is faster in every final scenario")
-    axes[0].grid(axis="x", color=GRID, linewidth=0.7, alpha=0.7)
-    for index, value in enumerate(throughput):
-        axes[0].text(value + 0.03, index, f"{value:.2f}x", va="center")
+    axes[0].set_title("Throughput", pad=22)
+    axes[0].set_xlabel("Difference in operations per second")
+    for index, value in enumerate(throughput_advantage):
+        label(axes[0], index, value, f"{value:.0f}% faster")
 
-    memory_colors = [RUST if value <= 1 else STRONG for value in memory]
-    axes[1].barh(y, memory, color=memory_colors)
-    axes[1].axvline(1, color=NEUTRAL, linewidth=1.2)
-    axes[1].set_yticks(y, [""] * len(labels))
-    axes[1].invert_yaxis()
-    axes[1].set_xlim(0, 2.35)
-    axes[1].set_xlabel("Rust RSS / Go RSS")
-    axes[1].set_title("Memory gains depend on result shape")
-    axes[1].grid(axis="x", color=GRID, linewidth=0.7, alpha=0.7)
-    for index, value in enumerate(memory):
-        axes[1].text(value + 0.03, index, f"{value:.2f}x", va="center")
+    axes[1].barh(y, memory_advantage, color=colors(memory_advantage))
+    axes[1].set_title("Peak memory", pad=22)
+    axes[1].set_xlabel("Difference in peak sampled RSS")
+    for index, value in enumerate(memory_advantage):
+        if abs(value) < 0.5:
+            text = "about equal"
+        elif value > 0:
+            text = f"{value:.0f}% less"
+        else:
+            text = f"{-value:.0f}% more"
+        label(axes[1], index, value, text)
 
-    fig.suptitle("Final workload ratios (lower memory is better)", fontsize=16, fontweight="bold")
-    fig.subplots_adjust(wspace=0.08, top=0.84)
+    fig.suptitle(
+        "Rust is faster throughout; memory improves except for broad single-process scans",
+        fontsize=16,
+        fontweight="bold",
+    )
+    fig.text(
+        0.5,
+        0.02,
+        "Blue bars are improvements; orange bars are regressions. Standard durability profile on the same benchmark corpus.",
+        ha="center",
+        fontsize=10,
+        color=NEUTRAL,
+    )
+    fig.subplots_adjust(wspace=0.08, top=0.82, bottom=0.14)
     save(fig, "workload-ratios.svg")
 
 
