@@ -209,9 +209,9 @@ fn append_backup_entry(
     } else if metadata.file_type().is_symlink()
         && is_legacy_trash_alias(archive_path, &fs::read_link(source)?)
     {
-        // Go backups included this Obsidian-facing convenience alias, while Go
-        // restore ignored it. The managed trash contents are already archived
-        // under trash/traces, so omit the alias without accepting general links.
+        // Legacy Noema backups included this Obsidian-facing convenience alias.
+        // The managed trash contents are already archived under trash/traces,
+        // so omit the alias without accepting general links.
     } else {
         bail!("refusing to back up non-regular entry {}", source.display())
     }
@@ -1006,9 +1006,9 @@ fn extract_archive(tarball: &Path, destination: &Path) -> Result<PathBuf> {
                 .as_deref()
                 .is_none_or(|link| link.as_os_str().is_empty() || link == Path::new("trash/traces"))
         {
-            // Go wrote the legacy Obsidian-facing .trash alias into archives
-            // and ignored it on restore. Preserve that behavior without
-            // creating a link or accepting any other archive link type.
+            // Legacy Noema archives may contain the Obsidian-facing .trash
+            // alias. Preserve compatibility without creating a link or
+            // accepting any other archive link type.
         } else {
             bail!(
                 "tar entry {} has unsupported type {:?}",

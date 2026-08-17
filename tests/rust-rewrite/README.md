@@ -145,7 +145,8 @@ and Rust benchmark trees after verifying both. Every mixed run finishes with
 
 Rust defaults to the `standard` direct-write and single-transaction profile,
 which matches Go's mutation posture. Set `NOEMA_DURABILITY=strong` to measure
-the enhanced per-mutation recovery protocol:
+the enhanced per-mutation recovery protocol. On the signed baseline tag, the
+convenience target was:
 
 ```sh
 NOEMA_DURABILITY=strong make benchmark-scale-rust
@@ -208,6 +209,8 @@ PYTHONPATH=tests/rust-rewrite \
   python3 -m unittest -v qualitative_distillation_test
 ```
 
+The experiment branch also exposed these convenience targets:
+
 ```sh
 make compare-rust
 make benchmark-rust
@@ -216,6 +219,6 @@ make benchmark-scale-rust
 make soak-rust
 ```
 
-The Go implementation remains the release baseline. Benchmark results are
-evidence for the rewrite decision, not a replacement for the compatibility
-gate.
+When these comparisons were run, the Go implementation was the release
+baseline. The retained results document the rewrite decision and the
+compatibility gate used for the completed cutover.
