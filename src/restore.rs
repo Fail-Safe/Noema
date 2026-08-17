@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeSet,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
@@ -206,10 +206,30 @@ fn append_backup_entry(
         header.set_mode(metadata_mode(&metadata, 0o640));
         let mut file = File::open(source)?;
         builder.append_data(&mut header, archive_path, &mut file)?;
+    } else if metadata.file_type().is_symlink()
+        && is_legacy_trash_alias(archive_path, &fs::read_link(source)?)
+    {
+        // Go backups included this Obsidian-facing convenience alias, while Go
+        // restore ignored it. The managed trash contents are already archived
+        // under trash/traces, so omit the alias without accepting general links.
     } else {
         bail!("refusing to back up non-regular entry {}", source.display())
     }
     Ok(())
+}
+
+fn is_legacy_trash_alias(path: &Path, target: &Path) -> bool {
+    is_legacy_trash_alias_path(path) && target == Path::new("trash/traces")
+}
+
+fn is_legacy_trash_alias_path(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(components.next(), Some(Component::Normal(_)))
+        && matches!(
+            components.next(),
+            Some(Component::Normal(value)) if value == OsStr::new(".trash")
+        )
+        && components.next().is_none()
 }
 
 struct ScratchDirectory {
@@ -978,6 +998,17 @@ fn extract_archive(tarball: &Path, destination: &Path) -> Result<PathBuf> {
                 .with_context(|| format!("extracting archive file {}", relative.display()))?;
             output.sync_all()?;
             set_file_permissions(&target, mode)?;
+        } else if entry_type.is_symlink()
+            && is_legacy_trash_alias_path(&relative)
+            && entry
+                .link_name()
+                .context("reading tar link target")?
+                .as_deref()
+                .is_none_or(|link| link.as_os_str().is_empty() || link == Path::new("trash/traces"))
+        {
+            // Go wrote the legacy Obsidian-facing .trash alias into archives
+            // and ignored it on restore. Preserve that behavior without
+            // creating a link or accepting any other archive link type.
         } else {
             bail!(
                 "tar entry {} has unsupported type {:?}",
@@ -1282,6 +1313,65 @@ mod tests {
         let staging = temp.path().join("multi-staging");
         fs::create_dir(&staging).unwrap();
         assert!(extract_archive(&multi_archive, &staging).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_omits_only_the_legacy_trash_alias() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        Cortex::create("original", temp.path()).unwrap();
+        let source = temp.path().join("original");
+        symlink("trash/traces/", source.join(".trash")).unwrap();
+        let archive = temp.path().join("backup.tar.gz");
+        archive_directory(&source, &archive).unwrap();
+
+        let file = File::open(&archive).unwrap();
+        let decoder = GzDecoder::new(file);
+        let mut archive = tar::Archive::new(decoder);
+        let paths = archive
+            .entries()
+            .unwrap()
+            .map(|entry| entry.unwrap().path().unwrap().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!paths.iter().any(|path| path.ends_with(".trash")));
+        assert!(paths.iter().any(|path| path.ends_with("trash/traces")));
+
+        symlink("trash/traces/", source.join("other-link")).unwrap();
+        assert!(archive_directory(&source, &temp.path().join("rejected.tar.gz")).is_err());
+    }
+
+    #[test]
+    fn restore_ignores_exact_legacy_trash_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("legacy.tar.gz");
+        let file = File::create(&archive).unwrap();
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = Builder::new(encoder);
+        for path in ["root", "root/trash", "root/trash/traces"] {
+            let mut header = Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o750);
+            header.set_entry_type(EntryType::Directory);
+            header.set_cksum();
+            builder.append_data(&mut header, path, io::empty()).unwrap();
+        }
+        let mut header = Header::new_gnu();
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_entry_type(EntryType::Symlink);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "root/.trash", io::empty())
+            .unwrap();
+        finish_archive(builder).unwrap();
+
+        let staging = temp.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+        let restored = extract_archive(&archive, &staging).unwrap();
+        assert!(restored.join("trash/traces").is_dir());
+        assert!(!restored.join(".trash").exists());
     }
 
     #[test]

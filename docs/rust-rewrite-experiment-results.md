@@ -542,18 +542,21 @@ from being placed inside the cortex it is archiving. Forced archive replacement
 keeps the previous output until the new archive is complete and synced.
 
 Restore extracts into a private staging directory and accepts only safe,
-relative directories and regular files beneath exactly one root. Traversal,
-links, duplicate paths, multiple roots, unsafe names, and invalid identities
-fail before placement. Registered names, IDs, and destination paths are also
-checked before `--force` can displace an existing directory. A returned
-configuration-save failure restores both the in-memory configuration and the
-previous destination.
+relative directories and regular files beneath exactly one root. The exact
+legacy Obsidian-facing `.trash -> trash/traces/` alias written by Go backup is
+ignored because the managed trash contents are already archived at its target.
+This includes Go's targetless tar representation of that exact top-level entry;
+Rust backup omits the same alias. Traversal, every other link, duplicate paths,
+multiple roots, unsafe names, and invalid identities fail before placement. Registered
+names, IDs, and destination paths are also checked before `--force` can
+displace an existing directory. A returned configuration-save failure restores
+both the in-memory configuration and the previous destination.
 
 The differential fixture passed Go archive to Rust restore and Rust archive to
 Go restore while preserving trace IDs and bodies. It also passed duplicate-ID
 refusal, non-destructive refusal, forced replacement without leftover staging
-artifacts, traversal refusal, and symlink refusal. This establishes archive
-interoperability and returned-error behavior; real power loss remains
+artifacts, traversal refusal, and arbitrary-link refusal. This establishes
+archive interoperability and returned-error behavior; real power loss remains
 unqualified.
 
 A separate read-only recovery-status path classifies a configured cortex as

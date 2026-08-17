@@ -76,6 +76,9 @@ def cross_restore(
 
     run(producer, source_env, "init", "--name", "source", "--path", str(source_parent))
     trace_id = add_trace(producer, source_env, body)
+    (source_parent / "source" / ".trash").symlink_to(
+        "trash/traces/", target_is_directory=True
+    )
     run(
         producer,
         source_env,
@@ -97,6 +100,9 @@ def cross_restore(
     restored = run(consumer, restore_env, "--cortex", "source", "get", trace_id)
     if body not in restored.stdout:
         raise AssertionError(f"{label}: restored trace body did not match")
+    restored_alias = restore_parent / "source" / ".trash"
+    if restored_alias.exists() or restored_alias.is_symlink():
+        raise AssertionError(f"{label}: restored the Obsidian alias as a link")
 
     collision = run(
         consumer,
