@@ -1,33 +1,3 @@
-# Release workflow for Noema.
-#
-# Triggered only by a pushed `v*` tag — regular commits to `main` or
-# `next` do nothing here. GoReleaser reads `.goreleaser.yaml`, cross-
-# compiles every OS/arch target, produces tar.gz/zip archives + a
-# checksums.txt file, and publishes a GitHub Release with auto-
-# generated notes.
-#
-# How to cut a release:
-#
-#   # From a clean `main` checkout pointing at the commit you want to ship:
-#   git tag v0.3.0
-#   git push origin v0.3.0
-#
-# (v0.1.x and v0.2.x tags exist in git history from early development
-# but were never published as downloadable releases — v0.3.0 is the
-# first tag with pre-built binaries attached.)
-#
-# This workflow takes it from there. A failed build fails cleanly before
-# any artifacts are published, so a broken tag never leaves a half-
-# published release on the repo.
-#
-# Local dry-run (no publish, no tag required):
-#
-#   goreleaser release --snapshot --clean --skip=publish
-#
-# Security note: this workflow intentionally avoids interpolating any
-# `github.event.*` values into shell commands. The only dynamic input is
-# `secrets.GITHUB_TOKEN`, passed through `env:` — no `run:` steps ever
-# see untrusted data, so there's no surface for workflow injection.
 name: release
 
 on:
@@ -35,53 +5,163 @@ on:
     tags:
       - "v*"
 
-# Default token permissions are read-only on modern GitHub; GoReleaser
-# needs write access to create the release and upload assets.
 permissions:
   contents: write
 
 jobs:
-  goreleaser:
-    name: goreleaser
-    runs-on: ubuntu-latest
+  build:
+    name: ${{ matrix.os }} ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            os: linux
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            os: linux
+            arch: arm64
+          - runner: macos-15-intel
+            os: darwin
+            arch: amd64
+          - runner: macos-15
+            os: darwin
+            arch: arm64
+          - runner: windows-2025
+            os: windows
+            arch: amd64
+          - runner: windows-11-arm
+            os: windows
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Select Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+
+      - name: Validate tag and package version
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          package_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test "$tag_version" = "$package_version"
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Smoke-test version output
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = windows ]; then
+            target/release/noema.exe version
+          else
+            target/release/noema version
+          fi
+
+      - name: Package Unix archive
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive="noema_${version}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz"
+          tar -czf "$archive" -C target/release noema -C ../../ LICENSE README.md
+
+      - name: Package Windows archive
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $archive = "noema_${version}_${{ matrix.os }}_${{ matrix.arch }}.zip"
+          New-Item -ItemType Directory -Path release-package
+          Copy-Item target/release/noema.exe, LICENSE, README.md release-package/
+          Compress-Archive -Path release-package/* -DestinationPath $archive
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: noema-${{ matrix.os }}-${{ matrix.arch }}
+          path: noema_*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          # GoReleaser needs the full history to generate the changelog
-          # (and to see the previous tag for the `use: github` diff).
           fetch-depth: 0
 
-      - name: Set up Go
-        uses: actions/setup-go@v6
+      - name: Download platform archives
+        uses: actions/download-artifact@v4
         with:
-          # Track go.mod so the CI Go version never drifts from the
-          # version the project actually builds against locally.
-          go-version-file: go.mod
-          cache: true
+          pattern: noema-*
+          path: dist
+          merge-multiple: true
 
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          # Node is needed for the GoReleaser pre-hook that builds
-          # the Obsidian plugin (esbuild via npm). Pinning to 20 keeps
-          # the build reproducible across runner-image updates;
-          # ubuntu-latest already ships Node 20+ but explicit is
-          # better than implicit for release tooling.
           node-version: "20"
-          cache: "npm"
+          cache: npm
           cache-dependency-path: plugins/obsidian/package-lock.json
 
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v7
-        with:
-          distribution: goreleaser
-          version: "~> v2"
-          args: release --clean
+      - name: Build plugin archives
+        shell: bash
+        run: |
+          tar -czf dist/noema-hermes-plugin.tar.gz \
+            -C plugins/hermes __init__.py transport.py plugin.yaml README.md
+          npm --prefix plugins/obsidian ci --silent
+          npm --prefix plugins/obsidian run build
+          git diff --exit-code -- plugins/obsidian/main.js
+          mkdir -p .release-obsidian/noema
+          cp plugins/obsidian/manifest.json plugins/obsidian/main.js \
+            plugins/obsidian/styles.css plugins/obsidian/README.md \
+            .release-obsidian/noema/
+          tar -czf dist/noema-obsidian-plugin.tar.gz -C .release-obsidian noema
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum noema_* > checksums.txt
+
+      - name: Publish GitHub release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Homebrew tap push target: Fail-Safe/homebrew-noema. Both the
-          # brews: (Formula) and homebrew_casks: (Cask) blocks in
-          # .goreleaser.yaml share this token — it's a fine-grained PAT
-          # scoped to the single tap repo with Contents write permission.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          release_flags=()
+          case "$GITHUB_REF_NAME" in
+            *-*) release_flags+=(--prerelease) ;;
+          esac
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "Noema $GITHUB_REF_NAME" --generate-notes "${release_flags[@]}"
+          fi
+
+      - name: Update Homebrew tap
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          gh repo clone Fail-Safe/homebrew-tap .release-homebrew
+          python3 scripts/render-homebrew.py \
+            --version "$version" --dist dist --tap .release-homebrew
+          git -C .release-homebrew config user.name noema-release-bot
+          git -C .release-homebrew config user.email bot@users.noreply.github.com
+          git -C .release-homebrew add Formula Casks
+          if git -C .release-homebrew diff --cached --quiet; then
+            exit 0
+          fi
+          git -C .release-homebrew commit -m "noema: update to $GITHUB_REF_NAME"
+          git -C .release-homebrew push origin HEAD:main

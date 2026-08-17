@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/Fail-Safe/Noema/actions/workflows/ci.yml"><img src="https://github.com/Fail-Safe/Noema/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="https://github.com/Fail-Safe/Noema/releases/latest"><img src="https://img.shields.io/github/v/release/Fail-Safe/Noema" alt="Latest Release"></a>
-  <a href="https://github.com/Fail-Safe/Noema/blob/main/go.mod"><img src="https://img.shields.io/github/go-mod/go-version/Fail-Safe/Noema" alt="Go Version"></a>
+  <a href="https://github.com/Fail-Safe/Noema/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/Rust-1.88%2B-000000?logo=rust" alt="Rust 1.88 or newer"></a>
   <a href="https://github.com/Fail-Safe/Noema/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Fail-Safe/Noema" alt="License"></a>
 </p>
 
@@ -38,7 +38,7 @@ Contributor and architecture notes:
 - [Repository Guidelines](AGENTS.md)
 - [Architecture](docs/architecture.md)
 - [Development Guide](docs/development.md)
-- [Why switch Noema to Rust?](docs/why-rust.md) — living rewrite assessment
+- [Why Noema switched to Rust](docs/why-rust.md) — benchmarked cutover rationale
 
 A Trace has a **type** that describes its intent:
 
@@ -130,33 +130,26 @@ sudo mv noema /usr/local/bin/
 noema version
 ```
 
-Release archives are fully static (pure-Go SQLite, `CGO_ENABLED=0`) so
-there's nothing to install alongside the binary. Supported targets:
+Release archives bundle SQLite, so there is no separate database library to
+install. Supported targets:
 `darwin/amd64`, `darwin/arm64`, `linux/amd64`, `linux/arm64`,
 `windows/amd64`, `windows/arm64`.
 
-### With the Go toolchain
-
-If you already have Go 1.25+ installed:
-
-```bash
-go install github.com/Fail-Safe/Noema/cmd/noema@latest
-```
-
 ### Build from source
+
+Building requires Rust 1.88 or newer:
 
 ```bash
 git clone https://github.com/Fail-Safe/Noema.git
 cd Noema
 make build                # dev build with debug info  -> ./noema
 make release              # stripped build for this host -> dist/noema-<os>-<arch>
-make release-linux        # stripped build for linux/amd64 -> dist/noema-linux-amd64
+make test                 # format, lint, and full Rust suite
 ```
 
-Dev builds keep the symbol table and DWARF info for debugging (~19 MB).
-Release builds strip both and run with `-trimpath` for a ~13 MB static
-binary with the git version embedded via `-ldflags`. `make help` lists
-all targets.
+Dev builds retain line tables for useful diagnostics without the former debug
+directory explosion. Release builds enable thin LTO, use one codegen unit, and
+strip symbols. `make help` lists all targets.
 
 > **Pre-1.0 notice.** Noema is currently on the `v0.x` line. Expect
 > breaking changes between minor releases until v1.0. Cortex data on
@@ -176,7 +169,7 @@ noema init --name my-cortex
 noema add
 
 # Add a Trace with flags
-noema add --title "We chose Go" --type decision --tag go --body "Pure-Go SQLite, fast iteration."
+noema add --title "We chose local SQLite" --type decision --tag storage --body "Markdown remains the source of truth."
 
 # List Traces
 noema list
@@ -554,7 +547,7 @@ The watcher runs under both transports because stdio sessions are not always the
 
 ## Semantic search (optional)
 
-Lexical FTS5 search is always on. An **opt-in semantic layer** adds embedding-based ranking — useful when a query matches by *concept* rather than shared words (e.g. "how do we authenticate agents" surfacing a trace titled "bearer-key posture for the MCP endpoint"). It stays true to Noema's lightweight, local-first posture: embeddings are stored as a SQLite `BLOB` and cosine similarity is computed in pure Go — no CGo, no vector extension, no external vector database. Embeddings are a **local index** (never federated), like the FTS5 index.
+Lexical FTS5 search is always on. An **opt-in semantic layer** adds embedding-based ranking — useful when a query matches by *concept* rather than shared words (e.g. "how do we authenticate agents" surfacing a trace titled "bearer-key posture for the MCP endpoint"). It stays true to Noema's lightweight, local-first posture: embeddings are stored as a SQLite `BLOB` and cosine similarity is computed in-process — no vector extension or external vector database. Embeddings are a **local index** (never federated), like the FTS5 index.
 
 Enable it with a `search:` block in `cortex.md`:
 
@@ -775,7 +768,7 @@ Either form updates the original trace, federates the resolution, and trashes th
 Every create / update / archive / unarchive / trash / recover / purge is recorded as an event with a ULID, timestamp, origin, and JSON snapshot. Inspect from the CLI:
 
 ```bash
-noema events 20260329-why-we-chose-go     # full history for one trace
+noema events 20260329-why-we-chose-local-storage  # full history for one trace
 noema events --limit 50                   # recent events across all traces
 noema events --since 01JQXYZ...           # cursor-based pagination
 ```
@@ -790,19 +783,19 @@ Traces are plain markdown files with YAML frontmatter. The markdown file is the 
 
 ```markdown
 ---
-id: 20260329-why-we-chose-go
-title: Why we chose Go
+id: 20260329-why-we-chose-local-storage
+title: Why we chose local storage
 type: decision
 author: research-agent-1
-tags: [go, architecture]
+tags: [storage, architecture]
 derived_from: [20260328-language-candidates]
 origin: research-cortex
 created: 2026-03-29T14:23:00Z
 updated: 2026-03-29T14:23:00Z
 ---
 
-Go gives us pure-Go SQLite (no CGo), best-in-class TUI tooling, and fast
-iteration. We can revisit Rust if the MCP server demands higher concurrency.
+Plain markdown remains the source of truth, while local SQLite provides fast
+indexing and search without putting memory data in a cloud service.
 ```
 
 `derived_from` records which traces informed this one (used by `trace_lineage` to build a knowledge graph). `origin` is the name of the Cortex that created the trace — set automatically and used by federation to attribute remote traces. Both fields are optional; existing traces without them parse unchanged.

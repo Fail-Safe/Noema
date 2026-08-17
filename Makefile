@@ -1,189 +1,60 @@
-# Noema build targets.
-#
-# Dev builds live at the repo root as ./noema (matching the convention in
-# AGENTS.md and .gitignore). Release builds land in ./dist/ with an
-# explicit <os>-<arch> suffix so cross-compiled artifacts are self-
-# identifying when scp'd onto a peer host.
-#
-# The version string is injected into internal/cli.Version at link time
-# from `git describe --tags --always --dirty`. A build from a clean tag
-# emits e.g. "v0.3.0"; a build with uncommitted changes emits
-# "v0.3.0-5-gabcdef-dirty" so --version output makes it obvious when a
-# deployed binary doesn't match any commit in the repo.
+# Noema build and qualification targets.
 
-PKG         := ./cmd/noema
-BIN         := noema
-DIST_DIR    := dist
-VERSION_PKG := github.com/Fail-Safe/Noema/internal/cli
+BIN := noema
+DIST_DIR := dist
 REPORT_PYTHON ?= python3
 
-VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+HOST_OS := $(shell uname -s | tr '[:upper:]' '[:lower:]' | sed 's/mingw.*/windows/; s/msys.*/windows/')
+HOST_ARCH := $(shell uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+HOST_ARTIFACT := $(DIST_DIR)/$(BIN)-$(HOST_OS)-$(HOST_ARCH)
 
-# Dev builds keep the symbol table and DWARF info so stack traces,
-# delve, and pprof all work out of the box. Release builds strip both
-# (-s -w) for ~25% size reduction and run with -trimpath to drop
-# absolute source paths from panics and the binary's metadata.
-LDFLAGS_DEV     := -X $(VERSION_PKG).Version=$(VERSION)
-LDFLAGS_RELEASE := -s -w -X $(VERSION_PKG).Version=$(VERSION)
-
-HOST_OS   := $(shell go env GOOS)
-HOST_ARCH := $(shell go env GOARCH)
-
-.PHONY: help build release release-linux test vet obsidian-publish clean \
-	rust-build rust-release rust-test comparison-release compare-rust benchmark-rust \
-	benchmark-mcp-rust benchmark-scale-rust soak-rust rust-report \
-	storage-fault-rust
+.PHONY: help build check test release release-check clean obsidian-publish \
+	tui-pty storage-fault historical-report
 
 help:
 	@echo "Noema build targets:"
 	@echo ""
-	@echo "  make build           Dev build with debug info      -> ./$(BIN)"
-	@echo "  make release         Stripped build for this host   -> $(DIST_DIR)/$(BIN)-$(HOST_OS)-$(HOST_ARCH)"
-	@echo "  make release-linux   Stripped build for linux/amd64 -> $(DIST_DIR)/$(BIN)-linux-amd64"
-	@echo "  make test            go test ./..."
-	@echo "  make vet             go vet ./..."
-	@echo "  make rust-build      Build the Rust comparison binary"
-	@echo "  make rust-test       Run Rust formatting, lint, and tests"
-	@echo "  make compare-rust    Run Go/Rust differential compatibility tests"
-	@echo "  make benchmark-rust  Benchmark both release binaries"
-	@echo "  make benchmark-mcp-rust"
-	@echo "                       Benchmark steady-state MCP request handling"
-	@echo "  make benchmark-scale-rust"
-	@echo "                       Benchmark isolated MCP workloads at 10k traces"
-	@echo "  make rust-report     Regenerate Why Rust benchmark charts"
-	@echo "  make storage-fault-rust"
-	@echo "                       Run disposable macOS APFS detach/recovery tests"
-	@echo "  make obsidian-publish"
-	@echo "                       Build and copy Obsidian plugin into the active cortex vault"
-	@echo "  make clean           Remove ./$(BIN) and ./$(DIST_DIR)/"
-	@echo ""
-	@echo "Version string for the next build: $(VERSION)"
+	@echo "  make build             Build the debug binary -> ./$(BIN)"
+	@echo "  make check             Run formatting and strict Clippy checks"
+	@echo "  make test              Run check plus the full Rust test suite"
+	@echo "  make release           Build the optimized host binary -> $(HOST_ARTIFACT)"
+	@echo "  make release-check     Build and smoke-test the host release binary"
+	@echo "  make tui-pty           Run the TUI pseudo-terminal qualification"
+	@echo "  make storage-fault     Run disposable macOS APFS recovery tests"
+	@echo "  make historical-report Regenerate the Go-to-Rust cutover charts"
+	@echo "  make obsidian-publish  Build and publish the Obsidian plugin"
+	@echo "  make clean             Remove local binaries and Cargo output"
 
 build:
-	go build -ldflags "$(LDFLAGS_DEV)" -o $(BIN) $(PKG)
+	cargo build --locked
+	cp target/debug/$(BIN) ./$(BIN)
 
-# CGO_ENABLED=0 is set on both release targets even for the host build.
-# Noema's only native-code dependency is modernc.org/sqlite (pure-Go
-# translation of C SQLite), so disabling CGo produces a fully static
-# binary with no surprise libc linkage on any host.
+check:
+	cargo fmt --check
+	cargo clippy --all-targets -- -D warnings
+
+test: check
+	cargo test --all-targets --locked
+
 release: | $(DIST_DIR)
-	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS_RELEASE)" \
-		-o $(DIST_DIR)/$(BIN)-$(HOST_OS)-$(HOST_ARCH) $(PKG)
-	@ls -lh $(DIST_DIR)/$(BIN)-$(HOST_OS)-$(HOST_ARCH)
+	cargo build --release --locked
+	cp target/release/$(BIN) $(HOST_ARTIFACT)
+	@ls -lh $(HOST_ARTIFACT)
 
-release-linux: | $(DIST_DIR)
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
-		-ldflags "$(LDFLAGS_RELEASE)" \
-		-o $(DIST_DIR)/$(BIN)-linux-amd64 $(PKG)
-	@ls -lh $(DIST_DIR)/$(BIN)-linux-amd64
+release-check: release
+	$(HOST_ARTIFACT) version
 
 $(DIST_DIR):
-	@mkdir -p $(DIST_DIR)
+	mkdir -p $(DIST_DIR)
 
-test:
-	go test ./...
+tui-pty: build
+	python3 ./tests/rust-rewrite/tui_pty.py --rust "$(CURDIR)/target/debug/$(BIN)"
 
-vet:
-	go vet ./...
+storage-fault: build
+	python3 -u ./tests/rust-rewrite/storage_fault_macos.py --rust "$(CURDIR)/target/debug/$(BIN)"
 
-rust-build:
-	cargo build --manifest-path rust/Cargo.toml
-
-rust-release:
-	cargo build --release --manifest-path rust/Cargo.toml
-
-rust-test:
-	cargo fmt --manifest-path rust/Cargo.toml --check
-	cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings
-	cargo test --manifest-path rust/Cargo.toml
-
-comparison-release: release rust-release
-
-compare-rust: build rust-build
-	NOEMA_GO_BIN="$(CURDIR)/noema" \
-	NOEMA_RUST_BIN="$(CURDIR)/rust/target/debug/noema-rs" \
-	./tests/rust-rewrite/compare.sh
-	python3 ./tests/rust-rewrite/restore_parity.py \
-		--go "$(CURDIR)/noema" \
-		--rust "$(CURDIR)/rust/target/debug/noema-rs"
-	NOEMA_GO_BIN="$(CURDIR)/noema" \
-	NOEMA_RUST_BIN="$(CURDIR)/rust/target/debug/noema-rs" \
-	./tests/rust-rewrite/http_smoke.sh
-	python3 ./tests/rust-rewrite/federation_network.py \
-		--go "$(CURDIR)/noema" \
-		--rust "$(CURDIR)/rust/target/debug/noema-rs"
-	python3 ./tests/rust-rewrite/federation_ring.py \
-		--go "$(CURDIR)/noema" \
-		--rust "$(CURDIR)/rust/target/debug/noema-rs"
-	python3 ./tests/rust-rewrite/federation_dynamic.py \
-		--go "$(CURDIR)/noema" \
-		--rust "$(CURDIR)/rust/target/debug/noema-rs"
-	python3 ./tests/rust-rewrite/background_lock_contention.py \
-		--go "$(CURDIR)/noema" \
-		--rust "$(CURDIR)/rust/target/debug/noema-rs"
-	python3 ./tests/rust-rewrite/io_failure_safety.py \
-		--go "$(CURDIR)/noema" \
-		--rust "$(CURDIR)/rust/target/debug/noema-rs"
-	python3 ./tests/rust-rewrite/federation_tls.py \
-		--go "$(CURDIR)/noema" \
-		--rust "$(CURDIR)/rust/target/debug/noema-rs"
-	python3 ./tests/rust-rewrite/tls_certificate_lifecycle.py \
-		--go "$(CURDIR)/noema" \
-		--rust "$(CURDIR)/rust/target/debug/noema-rs"
-	python3 ./tests/rust-rewrite/consolidation_election.py \
-		--go "$(CURDIR)/noema" \
-		--rust "$(CURDIR)/rust/target/debug/noema-rs"
-	python3 ./tests/rust-rewrite/heuristic_promotion.py \
-		--go "$(CURDIR)/noema" \
-		--rust "$(CURDIR)/rust/target/debug/noema-rs"
-	python3 ./tests/rust-rewrite/tier_maintenance.py \
-		--go "$(CURDIR)/noema" \
-		--rust "$(CURDIR)/rust/target/debug/noema-rs"
-	python3 ./tests/rust-rewrite/llm_distillation.py \
-		--go "$(CURDIR)/noema" \
-		--rust "$(CURDIR)/rust/target/debug/noema-rs"
-	python3 ./tests/rust-rewrite/watcher_parity.py \
-		--go "$(CURDIR)/noema" \
-		--rust "$(CURDIR)/rust/target/debug/noema-rs"
-	python3 ./tests/rust-rewrite/semantic_search.py \
-		--go "$(CURDIR)/noema" \
-		--rust "$(CURDIR)/rust/target/debug/noema-rs"
-	python3 ./tests/rust-rewrite/mcp_contract.py \
-		--go "$(CURDIR)/noema" \
-		--rust "$(CURDIR)/rust/target/debug/noema-rs"
-	python3 ./tests/rust-rewrite/plugin_lifecycle.py \
-		--go "$(CURDIR)/noema" \
-		--rust "$(CURDIR)/rust/target/debug/noema-rs"
-	python3 ./tests/rust-rewrite/tui_pty.py \
-		--rust "$(CURDIR)/rust/target/debug/noema-rs"
-
-benchmark-rust: comparison-release
-	./tests/rust-rewrite/benchmark.sh
-
-benchmark-mcp-rust: comparison-release
-	python3 ./tests/rust-rewrite/mcp_benchmark.py \
-		--go "$(CURDIR)/dist/noema-$(HOST_OS)-$(HOST_ARCH)" \
-		--rust "$(CURDIR)/rust/target/release/noema-rs"
-
-benchmark-scale-rust: comparison-release
-	python3 ./tests/rust-rewrite/mcp_scale_benchmark.py \
-		--go "$(CURDIR)/dist/noema-$(HOST_OS)-$(HOST_ARCH)" \
-		--rust "$(CURDIR)/rust/target/release/noema-rs" \
-		--traces "$${NOEMA_SCALE_TRACES:-10000}" \
-		--runs "$${NOEMA_SCALE_RUNS:-5}" \
-		--clients "$${NOEMA_SCALE_CLIENTS:-4}"
-
-rust-report:
+historical-report:
 	$(REPORT_PYTHON) ./tests/rust-rewrite/render_report_charts.py
-
-storage-fault-rust: rust-build
-	python3 -u ./tests/rust-rewrite/storage_fault_macos.py \
-		--rust "$(CURDIR)/rust/target/debug/noema-rs"
-
-soak-rust: comparison-release
-	python3 ./tests/rust-rewrite/federation_soak.py \
-		--go "$(CURDIR)/dist/noema-$(HOST_OS)-$(HOST_ARCH)" \
-		--rust "$(CURDIR)/rust/target/release/noema-rs"
 
 obsidian-publish:
 	npm --prefix plugins/obsidian run build
@@ -204,5 +75,6 @@ obsidian-publish:
 	echo "Obsidian plugin published to $$dest"
 
 clean:
+	cargo clean
 	rm -f $(BIN)
 	rm -rf $(DIST_DIR)

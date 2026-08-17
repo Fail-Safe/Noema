@@ -6,11 +6,10 @@
     "builds": "release optimized",
     "scale_runs": 5,
     "scale_clients": 4,
-    "standard_profile_source_label": "compatible",
     "notes": [
       "Local measurements are comparative evidence, not portable performance guarantees.",
       "The 100k campaign used independent byte-identical clones of one verified 100,150-trace corpus.",
-      "The original scale artifacts called the standard profile compatible; compatible remains a legacy alias.",
+      "Early experiment artifacts used the temporary label compatible; the final report canonicalizes it to standard.",
       "The Go repeat recorded during the Rust-strong campaign is a stability control, not a Go strong profile."
     ]
   },

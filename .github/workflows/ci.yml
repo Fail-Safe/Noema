@@ -1,18 +1,3 @@
-# CI workflow for Noema.
-#
-# Runs on every push to main/next and on every PR targeting main/next.
-# This is the "fast check" workflow — it guarantees a broken build
-# never lands on a release-track branch, and gives PR authors a red X
-# before a reviewer has to spot the problem.
-#
-# Release builds are handled separately in release.yml, which only
-# runs on v* tag pushes. Keeping the two workflows split means a
-# regular commit never accidentally triggers a release.
-#
-# Security note: no `run:` step interpolates any `github.event.*`
-# value, so there is no workflow-injection surface. `github.ref` is
-# used only in the concurrency group key, which is a YAML identifier
-# and never reaches a shell.
 name: ci
 
 on:
@@ -25,8 +10,6 @@ on:
       - main
       - next
 
-# Cancel any in-flight CI runs for the same branch/PR when a new push
-# arrives — avoids burning minutes on stale commits.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -35,57 +18,70 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: build + vet + test
-    runs-on: ubuntu-latest
+  rust:
+    name: Rust build + lint + test
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Set up Go
-        uses: actions/setup-go@v6
+      - name: Select Rust toolchain
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt
+          rustup default 1.88.0
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
         with:
-          # Track go.mod so CI never drifts from the version the
-          # project actually builds against locally.
-          go-version-file: go.mod
-          cache: true
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-
 
-      - name: Verify module graph is tidy
-        # Fails if go.mod or go.sum would change under `go mod tidy`.
-        # Catches forgotten `go get` bookkeeping before it lands.
+      - name: Verify formatting
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Smoke-test version output
+        run: target/release/noema version
+
+  plugins-and-scripts:
+    name: Plugins + repository scripts
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Select Rust toolchain
         run: |
-          go mod tidy
-          git diff --exit-code -- go.mod go.sum
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
 
-      - name: Build all packages
-        run: go build ./...
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Staticcheck
-        # honnef.co/go/tools picks up bugs, stylistic issues, and
-        # performance problems that go vet doesn't cover. Pinned to a
-        # dated release tag so CI output is reproducible — bump the
-        # version below when you want the newer checks. Installed via
-        # go install so the only third-party surface is the upstream
-        # module itself; no GitHub Action in the middle.
-        run: |
-          go install honnef.co/go/tools/cmd/staticcheck@2026.1
-          "$(go env GOPATH)/bin/staticcheck" ./...
-
-      - name: Test with race detector
-        # -race catches data races that pure unit tests miss. Noema
-        # has a federation syncer, a background SQLite connection, and
-        # MCP request concurrency — exactly the kind of surface where
-        # races hide until production.
-        run: go test -race ./...
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: plugin-rust-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: plugin-rust-${{ runner.os }}-
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.9"
-          cache: "pip"
+          cache: pip
           cache-dependency-path: plugins/hermes/requirements-dev.txt
 
       - name: Test Hermes plugin
@@ -93,29 +89,20 @@ jobs:
           python -m pip install --requirement plugins/hermes/requirements-dev.txt
           python -m pytest -q plugins/hermes
 
+      - name: Test release metadata generator
+        run: python -m unittest tests/render_homebrew_test.py
+
       - name: Test repository scripts
         run: bash tests/sync-brand-assets_test.sh
 
       - name: Set up Node
-        # Required by the Obsidian plugin build below. ubuntu-latest
-        # ships Node 20+ already; pinning explicitly keeps CI immune
-        # to runner-image drift and matches the version pinned in
-        # release.yml so plugin behaviour is reproducible across both
-        # workflows.
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: "npm"
+          cache: npm
           cache-dependency-path: plugins/obsidian/package-lock.json
 
       - name: Build Obsidian plugin
-        # Catches TypeScript regressions, broken imports, and esbuild
-        # config drift before they hit a release. Runs even on PRs
-        # that don't touch plugins/obsidian/ — cost is ~15s per CI
-        # run, well worth it given the bug we shipped to v0.10.0-beta.5
-        # would have been caught here. We install with npm ci (strict,
-        # respects package-lock) and run the production build to
-        # exercise the same path goreleaser uses on tag pushes.
         working-directory: plugins/obsidian
         run: |
           npm ci --silent

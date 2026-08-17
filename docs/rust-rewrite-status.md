@@ -1,16 +1,18 @@
-# Rust rewrite status
+# Rust rewrite status (historical)
 
 Updated: 2026-08-17
 
 ## Current state
 
 - Branch: `experiment/rust-rewrite`
-- Go remains the behavioral oracle.
-- The Rust implementation is feature-complete against the current public Go
-  CLI, storage, MCP, federation, consolidation, plugin, watcher, and TUI
-  surfaces exercised by this repository.
-- The branch is a replacement candidate, not yet the release implementation.
-  The remaining work is qualification and rollout policy, listed below.
+- The Rust implementation is the production implementation on this branch.
+- The repository root, active build, CI, release automation, and plugin
+  integration tests are Rust-first; the Go source and module graph were
+  removed after the comparison baseline was signed.
+- The final side-by-side state remains available at the signed
+  `rust-cutover-baseline` tag.
+- The detailed parity and benchmark notes below are retained as historical
+  evidence for the cutover decision.
 - Port-completion baseline:
   `8cd9719 feat(rust): complete migration and operational parity`.
   Verify the current signed commits with `git log --show-signature -3`.
@@ -161,8 +163,7 @@ not treat that warning as a failed build.
 - The default `standard` durability profile now matches Go's direct-file and
   single-SQLite-transaction mutation posture. `NOEMA_DURABILITY=strong` opts
   into the enhanced recovery protocol, unknown values fail closed, and MCP
-  usage reports the selected profile. `compatible` remains accepted as a legacy
-  alias and is normalized to `standard`.
+  usage reports the selected profile.
 - The profile experiment exposed an unrelated create-path FTS scan. Rust used
   update-style delete-and-insert helpers even for new traces; insert-only tag,
   lineage, and FTS helpers now match Go's create semantics and retain upserts
@@ -195,7 +196,7 @@ not treat that warning as a failed build.
 
 See `docs/rust-rewrite-experiment-results.md` for tables and caveats.
 
-## Remaining qualification and rollout decisions
+## Post-cutover qualification follow-ups
 
 These are not missing command or protocol ports:
 
@@ -206,8 +207,8 @@ These are not missing command or protocol ports:
    about `fsync` completion.
 2. Decide whether to implement corrupt-database salvage. Rust currently fails
    closed and preserves corrupt bytes; it does not attempt repair.
-3. Define takeover policy for older Go binaries. Only the Go build on this
-   branch understands the pending-Rust-mutation interlock.
+3. Do not downgrade a cortex while a `strong` pending-mutation record exists;
+   complete recovery with the current binary first.
 4. Perform multi-emulator human validation for any terminal-specific cell-width
    or color differences. The final identical-size capture in the original
    terminal visually matches Go after the one-cell pane-geometry correction.
@@ -218,23 +219,23 @@ These are not missing command or protocol ports:
    performance regression and intentionally shares Go's weaker mid-operation
    window; strong preserves the tested pending-record/fsync recovery protocol
    at a substantial write cost.
-7. Before release replacement, choose packaging, binary naming, migration,
-   rollback, and staged deployment policy, then repeat the mutation benchmark
-   after the durability decision.
+7. Validate the native six-platform archive workflow, checksums, plugin bundles,
+   and Homebrew metadata on the first release-candidate tag, then repeat the
+   mutation benchmark against that exact commit.
 
 Automatic restore reconciliation remains deliberately absent: ambiguous or
 tampered restore state requires an explicit operator `resume` or `rollback`.
 
-## Resume commands
+## Current validation commands
 
 ```sh
 git switch experiment/rust-rewrite
 git status --short --branch
 git log --show-signature -3
-make rust-test
-make compare-rust
-make storage-fault-rust  # macOS; requires DiskImages access
+make test
+make release-check
+make storage-fault  # macOS; requires DiskImages access
 ```
 
-Use `docs/rust-rewrite-test-plan.md` for acceptance gates and keep Go as the
-oracle until the rollout decisions above are closed.
+Use `docs/rust-rewrite-test-plan.md` for the original acceptance gates. To
+reproduce Go/Rust comparisons, check out the signed `rust-cutover-baseline` tag.

@@ -645,8 +645,9 @@ atomic temporary-file replacement, or file/directory fsync. The selected
 profile is exposed in `cortex_usage.runtime.durability_profile`; unknown values
 fail closed. `NOEMA_DURABILITY=strong` opts into the recovery protocol
 described above. The original benchmark artifacts recorded this profile as
-`compatible`; that value remains accepted as a legacy alias and is normalized
-to `standard`.
+`compatible`; the final implementation and report canonicalized it to
+`standard`. The temporary label was never released and is not accepted by the
+production parser.
 
 The final standard-profile read and mixed results were:
 

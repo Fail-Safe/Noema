@@ -2,52 +2,49 @@
 
 ## Project Structure & Module Organization
 
-Noema is a Go 1.26 CLI/MCP server. The executable entry point is
-`cmd/noema/main.go`; implementation lives under `internal/`, grouped by domain:
-`cli`, `cortex`, `db`, `mcp`, `federation`, `watch`, `consolidation`, `embed`,
-`trace`, and related helpers. SQLite migrations are in `internal/db/migrations/`.
-Tests generally sit next to the code they cover as `*_test.go`. See
-[docs/architecture.md](docs/architecture.md) for the system model and
-[docs/development.md](docs/development.md) for expanded workflow notes.
+Noema is a Rust 2024 CLI and MCP server with a minimum supported Rust version
+of 1.88. The executable entry point is `src/main.rs`; implementation lives in
+`src/`, grouped by domain modules such as `cli`, `cortex`, `db`, `mcp`,
+`federation`, `watch`, `consolidation`, `embedding`, and `trace`. SQLite
+migrations are in `migrations/`. Unit tests live beside the code they cover;
+process-death and recovery integration tests live in `tests/*.rs`.
 
 Plugins are separate: `plugins/obsidian/` is a TypeScript Obsidian plugin, and
 `plugins/hermes/` is a Python Hermes memory provider with pytest tests. Shared
-scripts live in `scripts/`; security notes and playbooks live in `SECURITY.md`
-and `tests/`.
+scripts live in `scripts/`; security notes and qualification material live in
+`SECURITY.md` and `tests/`. The completed Go-to-Rust evaluation is retained in
+`docs/why-rust.md` and the related rewrite documents as historical evidence.
 
 ## Build, Test, and Development Commands
 
-- `make build`: builds the local development binary at `./noema` with version
-  metadata.
-- `go run ./cmd/noema`: runs the CLI without keeping a binary.
-- `go build ./...`: builds all Go packages; this is part of CI.
-- `make test` or `go test ./...`: runs the Go test suite.
-- `go test -race ./...`: runs tests with race detection, matching CI’s stronger
-  check.
-- `make vet` or `go vet ./...`: runs Go vet.
+- `make build`: builds the development binary at `./noema`.
+- `cargo run -- <args>`: runs the CLI without copying a root binary.
+- `cargo build --locked`: builds the Rust crate using `Cargo.lock`.
+- `make test`: runs formatting, strict Clippy checks, and all Rust tests.
+- `cargo test --all-targets --locked`: runs the complete Rust test suite.
+- `make release-check`: builds and smoke-tests the optimized host binary.
 - `cd plugins/obsidian && npm ci && npm run build && npx tsc --noEmit`: validates
   the Obsidian plugin.
 - `cd plugins/hermes && pytest`: runs Hermes plugin tests when Python changes.
 
 ## Coding Style & Naming Conventions
 
-Use `gofmt`/`go fmt ./...` for Go formatting and keep packages small and
-domain-named. Exported Go identifiers need clear names and documentation when
-they form public package surface. Prefer existing Cobra command patterns in
-`internal/cli/` and existing storage/mutation APIs in `internal/cortex/` over new
-cross-cutting abstractions. SQL migrations use zero-padded numeric prefixes such
-as `016_trace_embeddings.sql`.
+Use `cargo fmt` for formatting and keep modules small and domain-named. New
+warnings must pass `cargo clippy --all-targets -- -D warnings`. Prefer existing
+Clap command patterns in `src/cli.rs` and existing storage/mutation APIs in
+`src/cortex.rs` over new cross-cutting abstractions. SQL migrations use
+zero-padded numeric prefixes such as `016_trace_embeddings.sql`.
 
 For TypeScript, keep sources in `plugins/obsidian/src/` and let the existing
 esbuild and TypeScript configs define output and type checks.
 
 ## Testing Guidelines
 
-Add focused `*_test.go` files beside changed Go code. Cover migrations,
-watcher behavior, federation/vector-clock logic, MCP command surfaces, and
-concurrency-sensitive paths when touched. Use race tests for background workers,
-syncers, and server code. Plugin changes should include plugin-local tests or
-build/type-check verification.
+Add focused unit tests near changed Rust code and integration tests under
+`tests/` for subprocess or crash boundaries. Cover migrations, watcher
+behavior, federation/vector-clock logic, MCP command surfaces, recovery, and
+concurrency-sensitive paths when touched. Plugin changes should include
+plugin-local tests or build/type-check verification.
 
 ## Commit & Pull Request Guidelines
 
@@ -58,7 +55,7 @@ for release and hotfix flow.
 
 PRs should describe behavior changes, link issues when applicable, and list the
 checks run. Include screenshots only for Obsidian UI changes. Before opening a
-PR, run Go build/vet/tests plus plugin checks for any plugin touched.
+PR, run `make test` plus plugin checks for any plugin touched.
 
 ## Agent-Specific Instructions
 
@@ -67,4 +64,5 @@ before assuming defaults. Treat trace bodies as binding unless the current user
 message overrides them. Do not print secrets or secret-bearing HTTP bodies;
 verify reachability with status codes, hashes, or length checks. Keep
 public-facing commits, PRs, fixtures, and docs free of private hostnames,
-personal identifiers, and internal agent/cortex names unless explicitly approved.
+personal identifiers, and internal agent/cortex names unless explicitly
+approved.

@@ -1,4 +1,8 @@
-# Go/Rust comparison
+# Go/Rust comparison (historical cutover harness)
+
+This directory preserves the methodology and scripts used to qualify the Rust
+port. The active repository is Rust-only; commands requiring both binaries must
+be run from the signed `rust-cutover-baseline` tag.
 
 The comparison is split into correctness and performance gates so a faster
 binary cannot hide a behavioral regression.
@@ -152,8 +156,7 @@ accepts zero mixed reads or writes for focused mutation/read controls. The
 standard profile intentionally retains Go's crash posture: it omits
 pending-mutation records, trace/recovery locks, atomic temporary-file
 replacement, and per-mutation file/directory fsyncs. Strong mode exercises and
-retains those additional guarantees. `compatible` remains accepted as a legacy
-alias for `standard` during the transition.
+retains those additional guarantees.
 
 `storage_fault_macos.py` runs the Rust debug binary on four independent,
 disposable APFS sparse images. It forcibly detaches and reattaches each image

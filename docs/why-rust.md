@@ -1,17 +1,18 @@
-# Why switch Noema to Rust?
+# Why Noema switched to Rust
 
-Status: living rewrite assessment, last updated 2026-08-17.
+Status: accepted cutover decision, last updated 2026-08-17.
 
-Noema's Rust implementation is now a credible replacement candidate for the Go
-implementation. The case is not that Rust is universally faster, nor that a
-language rewrite automatically improves a system. The case is that this
-specific implementation now matches Noema's tested behavior, improves the
-workloads most representative of a long-lived memory service, and makes an
-enhanced recovery protocol available without imposing its cost on every user.
+Noema's production implementation is now Rust. The case was not that Rust is
+universally faster, nor that a language rewrite automatically improves a
+system. The case was that this specific implementation matched Noema's tested
+behavior, improved the workloads most representative of a long-lived memory
+service, and made an enhanced recovery protocol available without imposing its
+cost on every user.
 
-The current recommendation is to finish the remaining release qualification
-and stage a controlled migration to Rust. Go should remain the behavioral
-oracle and rollback path until that rollout is complete.
+The final side-by-side state is preserved by the signed
+`rust-cutover-baseline` tag. The repository root, build, CI, and release paths
+now use the Rust implementation; the measurements below remain the evidence
+for that decision.
 
 > **★ Insight**
 >
@@ -34,7 +35,7 @@ oracle and rollback path until that rollout is complete.
 | Default durability | `standard` matches Go's mutation and crash posture | Migration does not impose an immediate performance regression |
 | Enhanced durability | `strong` passes process-death and APFS detach/remount recovery, with a large write cost | Useful opt-in; hard power-cut/device-cache qualification remains |
 | Release artifact | Rust is 27.8% larger in the current local release build | Favors Go, but operational impact is small |
-| Release readiness | Packaging, rollback, real-power-loss behavior, older-Go takeover, and broader human/model validation remain | Candidate, not unconditional replacement |
+| Release readiness | Rust-only source, CI, six-platform release packaging, checksums, plugins, and Homebrew metadata are configured | Cutover accepted; remote workflow and first-release validation remain operational gates |
 
 ## Performance at scale
 
@@ -141,9 +142,6 @@ The canonical profiles are:
 - `strong` — opt-in recovery records, stable mutation locks, atomic temporary
   files, rename, file and directory fsync, and recovery reconciliation.
 
-`compatible` remains accepted as a legacy alias for `standard`, but runtime
-introspection reports the canonical name.
-
 ![Three bar charts compare current Go, Rust standard, and Rust strong at 10k traces. Rust standard is the like-for-like comparison; Rust strong shows the cost of recovery guarantees unavailable in Go.](assets/rust-rewrite/durability-tradeoff.svg)
 
 | Runtime and profile | Seed time | Mixed throughput | Median write latency | Durability posture |
@@ -212,10 +210,10 @@ Only the corrected final campaigns are used in the headline scale charts.
 Earlier results remain valuable as an optimization history, not as final
 Go-versus-Rust evidence.
 
-## What remains before replacement
+## Operational follow-ups after cutover
 
-The port should not become the unconditional release binary until the remaining
-qualification and rollout decisions are closed:
+These items refine Noema's guarantees and rollout evidence; they are no longer
+missing command or protocol ports:
 
 1. Repeat the passing macOS APFS forced-detach qualification on a hard-powered
    VM or disposable hardware target. The local gate covers restore placement,
@@ -224,15 +222,17 @@ qualification and rollout decisions are closed:
    cache writes.
 2. Decide whether corrupt-database salvage belongs in Noema; Rust currently
    fails closed and preserves the bytes.
-3. Define takeover behavior for older Go binaries that do not understand Rust
-   pending-mutation records.
+3. Do not downgrade a cortex while a `strong` pending-mutation record exists.
+   Complete recovery with the current Noema binary first; older releases do not
+   understand that journal.
 4. Complete human TUI checks across the supported terminal emulators.
 5. Extend qualitative evaluation to a redacted representative corpus,
    additional models, and multiple reviewers.
-6. Define packaging, binary naming, staged migration, telemetry, rollback, and
-   the period during which the Go binary remains available.
+6. Exercise the six-platform release workflow on the first candidate tag and
+   validate the generated archives, checksums, plugin bundles, and Homebrew
+   metadata before promotion.
 7. Repeat the release qualification and key performance campaign against the
-   exact candidate commit.
+   exact release candidate commit.
 
 ## Reproduction and maintenance
 
@@ -241,12 +241,13 @@ The curated chart data lives in
 Regenerate every SVG after updating it:
 
 ```sh
-make rust-report
+make historical-report
 ```
 
 The selected `REPORT_PYTHON` interpreter needs Matplotlib. It remains a report
 tooling dependency, not a Noema runtime dependency. Override the interpreter
-when necessary, for example `make rust-report REPORT_PYTHON=/path/to/python`.
+when necessary, for example
+`make historical-report REPORT_PYTHON=/path/to/python`.
 Set `NOEMA_REPORT_PREVIEW_DIR=/tmp/noema-report-preview` to render uncommitted
 PNG copies for visual review alongside the canonical SVGs.
 
@@ -260,8 +261,9 @@ When adding a new result:
    date and adjacent accessible tables.
 5. Mark superseded measurements as historical rather than silently combining
    incompatible campaigns.
-6. Run `make rust-test`, `make compare-rust`, and `git diff --check` before
-   treating the report as release evidence.
+6. Run `make test`, `make release-check`, and `git diff --check` before treating
+   a new result as release evidence. Historical Go/Rust reproduction requires
+   checking out the signed `rust-cutover-baseline` tag.
 
 Detailed methodology and historical results remain in the
 [`Rust rewrite experiment results`](rust-rewrite-experiment-results.md), the
