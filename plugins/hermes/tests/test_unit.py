@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -11,6 +12,7 @@ from plugins.hermes.transport import (
     _jsonrpc_request,
     _parse_jsonrpc_response,
     _extract_text,
+    _well_known_binary_paths,
     find_binary,
     reset_binary_cache,
     StdioTransport,
@@ -140,6 +142,16 @@ class TestFindBinary:
             with patch("plugins.hermes.transport.shutil.which", return_value=str(binary)):
                 result = find_binary()
                 assert result == str(binary)
+
+    def test_well_known_locations_cover_rust_install_paths(self):
+        home = Path("/home/example-user")
+        assert _well_known_binary_paths(home) == [
+            Path("/opt/homebrew/bin/noema"),
+            Path("/home/linuxbrew/.linuxbrew/bin/noema"),
+            Path("/usr/local/bin/noema"),
+            home / ".cargo" / "bin" / "noema",
+            home / ".local" / "bin" / "noema",
+        ]
 
     def test_cache_persists(self, tmp_path):
         binary = tmp_path / "noema"
