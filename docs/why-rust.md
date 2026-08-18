@@ -1,13 +1,11 @@
 # Why Noema switched to Rust
 
-Status: accepted cutover decision, last updated 2026-08-17.
-
-Noema's production implementation is now Rust. The case was not that Rust is
-universally faster, nor that a language rewrite automatically improves a
-system. The case was that this specific implementation matched Noema's tested
-behavior, improved the workloads most representative of a long-lived memory
-service, and made an enhanced recovery protocol available without imposing its
-cost on every user.
+Noema's production implementation switched to Rust in v0.20.0. The case was
+not that Rust is universally faster, nor that a language rewrite automatically
+improves a system. The case was that this specific implementation matched
+Noema's tested behavior, improved the workloads most representative of a
+long-lived memory service, and made an enhanced recovery protocol available
+without imposing its cost on every user.
 
 The final side-by-side state is preserved by the signed
 `rust-cutover-baseline` tag. The repository root, build, CI, and release paths
@@ -36,7 +34,7 @@ for that decision.
 | Enhanced durability | `strong` passes process-death and APFS detach/remount recovery, with a large write cost | Useful opt-in; hard power-cut/device-cache qualification remains |
 | Release artifact | Rust is 27.8% larger in the current local release build | Favors Go, but operational impact is small |
 | Production source | Rust uses 10.7% fewer code-only lines and 30.3% fewer physical lines | Smaller implementation; not proof of correctness or a language-wide result |
-| Release readiness | Rust-only source, CI, six-platform release packaging, checksums, plugins, and Homebrew metadata are configured | Cutover accepted; remote workflow and first-release validation remain operational gates |
+| Release delivery | v0.20.0 shipped Rust-only source, CI, six-platform archives, checksums, plugins, and Homebrew packages | Production cutover complete |
 
 ## Performance at scale
 
@@ -78,10 +76,10 @@ mixed workloads favored Rust, four-client broad output was nearly tied at
 | 100k four-client selective | 52% faster | 39% less |
 | 100k mixed read/write | 41% faster | 41% less |
 
-The 100k serial-broad result is the clearest remaining performance target. It
+The 100k serial-broad result is the clearest performance caveat. It
 does not erase the gains elsewhere, but it prevents a claim that Rust always
-uses less memory. Full-corpus MCP responses should eventually become bounded or
-streamed regardless of implementation.
+uses less memory. Users relying on repeated full-corpus MCP responses should
+budget memory accordingly; selective retrieval and mixed traffic use less.
 
 ## Long-lived federation uses fewer resources
 
@@ -182,9 +180,9 @@ the default behavior.
 
 The Rust artifact is currently 27.8% larger. Both remain single local binaries,
 so the practical distribution cost is modest, but this is a real Go advantage.
-Rust also changes the build and cross-compilation toolchain; bundled SQLite and
-platform packaging need release-matrix validation rather than assumptions from
-the Go pipeline.
+Rust also changes the build and cross-compilation toolchain. The v0.20.0
+release validated bundled SQLite and the macOS, Linux, and Windows packaging
+matrix on x86-64 and ARM64.
 
 Rust's language-level contribution is compile-time memory and thread safety for
 a server that combines SQLite access, background federation, watchers,
@@ -241,63 +239,15 @@ Only the corrected final campaigns are used in the headline scale charts.
 Earlier results remain valuable as an optimization history, not as final
 Go-versus-Rust evidence.
 
-## Operational follow-ups after cutover
+## Evidence and methodology
 
-These items refine Noema's guarantees and rollout evidence; they are no longer
-missing command or protocol ports:
+The charts and accessible tables above are generated from the curated
+[`report-data.json`](../tests/rust-rewrite/report-data.json) dataset. The signed
+`rust-cutover-baseline` tag preserves the final Go and Rust comparison state.
+Detailed methodology, campaign definitions, and historical results remain in
+the [`Rust rewrite experiment results`](rust-rewrite-experiment-results.md).
 
-1. Repeat the passing macOS APFS forced-detach qualification on a hard-powered
-   VM or disposable hardware target. The local gate covers restore placement,
-   configuration rename, journal cleanup, SQLite recovery, and acknowledged
-   standard-mode state, but cannot force a device to lose already-acknowledged
-   cache writes.
-2. Decide whether corrupt-database salvage belongs in Noema; Rust currently
-   fails closed and preserves the bytes.
-3. Do not downgrade a cortex while a `strong` pending-mutation record exists.
-   Complete recovery with the current Noema binary first; older releases do not
-   understand that journal.
-4. Complete human TUI checks across the supported terminal emulators.
-5. Extend qualitative evaluation to a redacted representative corpus,
-   additional models, and multiple reviewers.
-6. Exercise the six-platform release workflow on the first candidate tag and
-   validate the generated archives, checksums, plugin bundles, and Homebrew
-   metadata before promotion.
-7. Repeat the release qualification and key performance campaign against the
-   exact release candidate commit.
-
-## Reproduction and maintenance
-
-The curated chart data lives in
-[`tests/rust-rewrite/report-data.json`](../tests/rust-rewrite/report-data.json).
-Regenerate every SVG after updating it:
-
-```sh
-make historical-report
-```
-
-The selected `REPORT_PYTHON` interpreter needs Matplotlib. It remains a report
-tooling dependency, not a Noema runtime dependency. Override the interpreter
-when necessary, for example
-`make historical-report REPORT_PYTHON=/path/to/python`.
-Set `NOEMA_REPORT_PREVIEW_DIR=/tmp/noema-report-preview` to render uncommitted
-PNG copies for visual review alongside the canonical SVGs.
-
-When adding a new result:
-
-1. Require its correctness gate to pass first.
-2. Use release-optimized binaries and record the candidate commit and host.
-3. Preserve alternating order, independent corpora, fresh processes, run count,
-   and exact post-write verification.
-4. Update the curated JSON, regenerate the charts, and update this document's
-   date and adjacent accessible tables.
-5. Mark superseded measurements as historical rather than silently combining
-   incompatible campaigns.
-6. Run `make test`, `make release-check`, and `git diff --check` before treating
-   a new result as release evidence. Historical Go/Rust reproduction requires
-   checking out the signed `rust-cutover-baseline` tag.
-
-Detailed methodology and historical results remain in the
-[`Rust rewrite experiment results`](rust-rewrite-experiment-results.md), the
-current qualification state in [`Rust rewrite status`](rust-rewrite-status.md),
-and acceptance criteria in the
-[`Rust rewrite test plan`](rust-rewrite-test-plan.md).
+Contributor procedures, evidence-update rules, and open qualification work are
+kept separately in the
+[`Rust cutover evidence maintenance guide`](rust-rewrite-maintenance.md), so
+this page can remain a stable explanation of the public decision.
