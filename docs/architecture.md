@@ -27,11 +27,11 @@ frontmatter followed by free-form body content:
 
 ```markdown
 ---
-id: 20260329-why-we-chose-go
-title: Why we chose Go
+id: 20260329-why-we-chose-local-storage
+title: Why we chose local storage
 type: decision
 author: research-agent-1
-tags: [go, architecture]
+tags: [storage, architecture]
 derived_from: [20260328-language-candidates]
 origin: research-cortex
 created: 2026-03-29T14:23:00Z
@@ -47,8 +47,8 @@ Valid trace types are `fact`, `decision`, `preference`, `context`, `skill`,
 ## Database And Migrations
 
 SQLite stores indexes, tags, lineage, event history, federation state, usage
-signals, and optional embeddings. Migrations live in
-`internal/db/migrations/`, are embedded into the binary, and run in version
+signals, and optional embeddings. Migrations live in `migrations/`, are
+embedded into the binary, and run in version
 order. Schema changes must be transparent and non-destructive: add columns,
 tables, or indexes; do not drop or reshape stored data inside automatic
 migrations. Destructive or structural migrations need an explicit CLI command

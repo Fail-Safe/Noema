@@ -5,43 +5,41 @@ system model, see [Architecture](architecture.md).
 
 ## Toolchain
 
-Noema is a Go 1.26 module. The main binary is built from `./cmd/noema`; most
-implementation code is under `internal/`. The project intentionally uses a
-small dependency set:
+Noema is a Rust 2024 crate with a minimum supported Rust version of 1.88. The
+binary starts in `src/main.rs`, and domain code lives in sibling modules under
+`src/`. Its main building blocks are:
 
-- SQLite through `modernc.org/sqlite`, so normal release builds can be static
-  with `CGO_ENABLED=0`.
-- Cobra for CLI commands in `internal/cli/`.
-- Bubble Tea and related Charm libraries for TUI code.
-- SQLite FTS5 for default lexical search.
+- Rusqlite with bundled SQLite and FTS5 for local indexing and search.
+- Clap for the CLI.
+- Tokio, Axum, and rustls-backed clients/servers for MCP and federation.
+- Ratatui and Crossterm for the terminal UI.
 
 The Obsidian plugin in `plugins/obsidian/` uses Node 20, TypeScript, and
-esbuild. The Hermes plugin in `plugins/hermes/` is Python and talks to Noema
-through MCP; it does not import Go code.
+esbuild. The Hermes plugin in `plugins/hermes/` is Python and communicates with
+Noema through MCP; it does not import Rust code.
 
 ## Common Commands
 
 ```sh
 make build
-go run ./cmd/noema
-go build ./...
-go test ./...
-go test -race ./...
-go vet ./...
+cargo run -- version
+cargo build --locked
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets --locked
 ```
 
-`make build` writes a development binary to `./noema` and injects
-`internal/cli.Version` from `git describe --tags --always --dirty`.
+`make build` writes a development binary to `./noema`. Cargo derives the
+reported version from `Cargo.toml`.
 
-Release-style local builds:
+Release-style local build and smoke test:
 
 ```sh
-make release
-make release-linux
+make release-check
 ```
 
-Release targets use `CGO_ENABLED=0`, `-trimpath`, and stripped linker flags,
-then write artifacts to `dist/` with OS/architecture suffixes.
+The release profile enables thin LTO, uses one codegen unit, strips symbols,
+and writes the host artifact to `dist/noema-<os>-<arch>`.
 
 ## Plugin Checks
 
@@ -57,7 +55,7 @@ git diff --exit-code -- main.js
 
 `main.js` is generated and committed because the Noema binary embeds it. The
 final check ensures the tracked runtime bundle matches the TypeScript source
-while keeping ordinary Go builds independent of Node.
+while keeping ordinary Rust builds independent of Node.
 
 Validate the Hermes plugin when changing `plugins/hermes/`:
 
@@ -68,14 +66,14 @@ pytest
 
 ## Testing Expectations
 
-Add focused `*_test.go` files beside changed Go code. Migration, watcher,
-federation, MCP, and CLI behavior should be covered at the package level. Use
-`go test -race ./...` for changes involving background workers, HTTP serving,
-federation sync, SQLite concurrency, or filesystem watching.
+Add focused Rust unit tests beside changed modules. Use integration tests under
+`tests/` when behavior crosses process, filesystem, SQLite, or crash-recovery
+boundaries. Migration, watcher, federation, MCP, CLI, durability, and recovery
+behavior should be covered when touched.
 
-CI runs `go mod tidy` and fails if `go.mod` or `go.sum` would change, then
-runs `go build ./...`, `go vet ./...`, Staticcheck, `go test -race ./...`, and
-the Obsidian plugin build/typecheck.
+CI runs formatting, strict Clippy, the full Rust suite, an optimized build and
+version smoke test, plus Hermes, Obsidian, release-metadata, and repository
+script checks.
 
 ## Branches, Commits, And PRs
 
@@ -83,21 +81,26 @@ the Obsidian plugin build/typecheck.
 target `next`; release PRs move `next` to `main`.
 
 Commit subjects are concise and often use conventional prefixes, for example
-`feat(tls): refuse serve on expired certs`, `release: v0.14.0 ...`, or
+`feat(tls): refuse serve on expired certs`, `release: v0.20.0 ...`, or
 `chore: normalize fixture names`. Keep subjects and PR text public-safe.
 
 PRs should describe behavior changes, link issues when relevant, and list the
 checks run. Include screenshots only for UI changes, especially Obsidian plugin
 work.
 
-## Release Notes
+## Releases
 
-Release automation runs from `v*` tags through GoReleaser. For a local dry run:
+Release automation runs from `v*` tags. The tag version must exactly match the
+package version in `Cargo.toml`; a mismatch fails before publication.
+
+The workflow builds natively for macOS, Linux, and Windows on x64 and arm64,
+smoke-tests every binary, creates archives and checksums, bundles both plugins,
+publishes the GitHub release, and updates stable or prerelease Homebrew metadata.
+Regular pushes to `main` or `next` do not publish release artifacts.
+
+To qualify the host artifact locally without publishing:
 
 ```sh
-goreleaser release --snapshot --clean --skip=publish
+make test
+make release-check
 ```
-
-The release workflow builds cross-platform archives, checksums, and Homebrew
-formula/cask updates. Regular pushes to `main` or `next` do not publish
-release artifacts.

@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="470" viewBox="0 0 1100 470" role="img" aria-labelledby="title desc">
+  <title id="title">Noema federation resource comparison</title>
+  <desc id="desc">In a bounded three-node federation soak, Rust used 37.4 percent less peak memory and 18.8 percent less mean sampled CPU than Go while reaching exact convergence.</desc>
+  <style>
+    text { fill: #1f2937; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .title { font-size: 24px; font-weight: 700; text-anchor: middle; }
+    .subtitle { fill: #4b5563; font-size: 14px; text-anchor: middle; }
+    .category { font-size: 15px; font-weight: 700; text-anchor: end; }
+    .bar-label { font-size: 12px; font-weight: 700; }
+    .inverse { fill: #ffffff; }
+    .tick { fill: #6b7280; font-size: 11px; text-anchor: middle; }
+    .axis-label, .note { fill: #4b5563; font-size: 12px; text-anchor: middle; }
+    .grid { stroke: #d1d5db; stroke-width: 1; }
+    .baseline { fill: #94a3b8; }
+    .favorable { fill: #4477aa; }
+  </style>
+  <rect width="1100" height="470" fill="#ffffff"/>
+  <text class="title" x="550" y="36">Rust cut federation memory 37% and mean CPU 19%</text>
+  <text class="subtitle" x="550" y="61">Three nodes, 80 mutations, one restart, and exact event convergence</text>
+
+  <g aria-hidden="true">
+    <line class="grid" x1="240" y1="100" x2="240" y2="350"/>
+    <line class="grid" x1="405" y1="100" x2="405" y2="350"/>
+    <line class="grid" x1="570" y1="100" x2="570" y2="350"/>
+    <line class="grid" x1="735" y1="100" x2="735" y2="350"/>
+    <line class="grid" x1="900" y1="100" x2="900" y2="350"/>
+  </g>
+
+  <text class="category" x="215" y="170">Peak RSS</text>
+  <rect class="baseline" x="240" y="125" width="660" height="34" rx="3"/>
+  <text class="bar-label inverse" x="255" y="148">Go 90.3 MiB · 100%</text>
+  <rect class="favorable" x="240" y="169" width="413" height="34" rx="3"/>
+  <text class="bar-label inverse" x="255" y="192">Rust 56.5 MiB · 62.6% of Go</text>
+  <text class="bar-label" x="667" y="192" fill="#4477aa">37.4% less</text>
+
+  <text class="category" x="215" y="290">Mean CPU</text>
+  <rect class="baseline" x="240" y="245" width="660" height="34" rx="3"/>
+  <text class="bar-label inverse" x="255" y="268">Go 7.91% · 100%</text>
+  <rect class="favorable" x="240" y="289" width="536" height="34" rx="3"/>
+  <text class="bar-label inverse" x="255" y="312">Rust 6.43% · 81.2% of Go</text>
+  <text class="bar-label" x="790" y="312" fill="#4477aa">18.8% less</text>
+
+  <text class="tick" x="240" y="372">0%</text>
+  <text class="tick" x="405" y="372">25%</text>
+  <text class="tick" x="570" y="372">50%</text>
+  <text class="tick" x="735" y="372">75%</text>
+  <text class="tick" x="900" y="372">100%</text>
+  <text class="axis-label" x="570" y="400">Resource use relative to Go</text>
+  <text class="note" x="550" y="443">Bounded soak evidence, not a long-duration stability claim.</text>
+</svg>

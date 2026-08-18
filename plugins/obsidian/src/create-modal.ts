@@ -37,7 +37,7 @@ export class CreateTraceModal extends Modal {
 
 		this.titleInput = this.row("Title", "input", {
 			type: "text",
-			placeholder: "Why we chose Go",
+			placeholder: "Why we chose local storage",
 		}) as HTMLInputElement;
 
 		this.typeSelect = this.row("Type", "select") as HTMLSelectElement;
@@ -53,7 +53,7 @@ export class CreateTraceModal extends Modal {
 
 		this.tagsInput = this.row("Tags", "input", {
 			type: "text",
-			placeholder: "go, language, architecture",
+			placeholder: "storage, local-first, architecture",
 		}) as HTMLInputElement;
 		this.descriptor("Comma- or semicolon-separated. Optional.");
 		// Tag-validation hints for Obsidian-incompatible tag formats.
