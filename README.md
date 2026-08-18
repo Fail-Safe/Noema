@@ -20,6 +20,7 @@ Noema gives AI agents — and the humans working alongside them — a persistent
 
 - **Local-first agent memory** exposed as an [MCP](https://modelcontextprotocol.io/) server (stdio + Streamable HTTP). Works out of the box with Claude Code, GitHub Copilot, Zed, Cursor, Aider, and anything else that speaks MCP.
 - **Plain markdown on disk** as the source of truth; a local SQLite database with FTS5 as the index. No cloud, no API keys, no telemetry.
+- **One cross-platform Rust binary** with SQLite and the Hermes and Obsidian plugin installers built in. Release archives cover macOS, Linux, and Windows on x86-64 and ARM64.
 - **Peer-to-peer federation** across Cortexes with vector clocks, event-log audit trail, and `divergence` traces on concurrent edits.
 - **Your editor is a first-class client.** A filesystem watcher turns Obsidian / VS Code / Finder / iCloud edits into real mutation events — same events as MCP-initiated writes, propagated through federation.
 - **Standards-friendly.** Ships an auto-generated [`AGENTS.md`](https://agents.md/) per Cortex, a native [Hermes](https://hermes-agent.nousresearch.com/) memory-provider plugin, and SHA-256 content hashing with optional source-locking for publishers.
@@ -108,7 +109,7 @@ brew install Fail-Safe/tap/noema-beta   # (or noema)
 ```
 
 `brew upgrade` on `noema-beta` pulls the newest prerelease; stable tags
-(`v0.10.0` vs `v0.10.0-beta.1`) stay on their respective channels.
+(`v0.20.0` vs `v0.20.0-rc.1`) stay on their respective channels.
 
 ### Download a pre-built binary
 
@@ -117,15 +118,15 @@ Grab the archive for your OS/arch from the
 against `checksums.txt`, and put `noema` somewhere on your `$PATH`:
 
 ```bash
-# macOS (Apple Silicon) — adjust VERSION and Arch as needed.
-# Pre-built binaries start at v0.3.0; earlier tags (v0.1.x, v0.2.x)
-# exist in git history but were never published as downloadable
-# releases.
-VERSION=0.3.0
-curl -LO https://github.com/Fail-Safe/Noema/releases/download/v${VERSION}/noema_${VERSION}_darwin_arm64.tar.gz
+# macOS (Apple Silicon) — adjust VERSION, OS, and ARCH as needed.
+VERSION=0.20.0
+OS=darwin
+ARCH=arm64
+ARCHIVE=noema_${VERSION}_${OS}_${ARCH}.tar.gz
+curl -LO https://github.com/Fail-Safe/Noema/releases/download/v${VERSION}/${ARCHIVE}
 curl -LO https://github.com/Fail-Safe/Noema/releases/download/v${VERSION}/checksums.txt
 shasum -a 256 -c checksums.txt --ignore-missing
-tar -xzf noema_${VERSION}_darwin_arm64.tar.gz
+tar -xzf "${ARCHIVE}"
 sudo mv noema /usr/local/bin/
 noema version
 ```
@@ -147,9 +148,9 @@ make release              # stripped build for this host -> dist/noema-<os>-<arc
 make test                 # format, lint, and full Rust suite
 ```
 
-Dev builds retain line tables for useful diagnostics without the former debug
-directory explosion. Release builds enable thin LTO, use one codegen unit, and
-strip symbols. `make help` lists all targets.
+Development builds retain line tables while omitting dependency debug symbols
+to keep Cargo artifacts manageable. Release builds enable thin LTO, use one
+codegen unit, and strip symbols. `make help` lists all targets.
 
 > **Pre-1.0 notice.** Noema is currently on the `v0.x` line. Expect
 > breaking changes between minor releases until v1.0. Cortex data on
@@ -178,7 +179,7 @@ noema list
 noema search "sqlite"
 
 # View a Trace
-noema get 20260329-we-chose-go
+noema get 20260329-we-chose-local-sqlite
 ```
 
 > `noema init` also writes an `AGENTS.md` at the cortex root — the
@@ -201,6 +202,10 @@ noema cortex backup <name> [-o <path>] [--force]
                                           Write a gzipped tarball of a Cortex
 noema cortex restore <tarball> [--name <n>] [--path <dir>] [--force]
                                           Restore a Cortex from a backup tarball
+noema cortex recovery-status <name>       Inspect interrupted mutation recovery without changing the Cortex
+noema cortex restore-status               List durable restore transactions without exposing sensitive paths
+noema cortex restore-recover <transaction-id> --action <resume|rollback>
+                                          Resume or roll back an interrupted Cortex restore
 
 noema add [flags]                         Add a Trace (interactive if flags omitted)
 noema list [flags]                        List Traces
@@ -250,6 +255,8 @@ noema memory promote <id> [--to mid|long] Advance a trace one tier (short→mid 
 noema memory demote <id>                  Step a mid trace back to short
 noema memory purge <id> --tier <t> --reason "..." --confirm [--hard]
                                           Ceremoniously destroy a trace with audit trail (GDPR path)
+noema consolidate [flags]                 Run an LLM-backed consolidation pass
+noema migrate cortex-id [--reset] [--yes] Assign or deliberately replace a Cortex federation identity
 
 noema federation status                   Show federation config, MCP access posture, peer sync state, and vector clock
 noema federation peers                    List configured federation peers
@@ -305,6 +312,29 @@ noema version                             Print version, commit, and build date
 1. `--cortex` flag
 2. `NOEMA_CORTEX` environment variable
 3. Default set via `noema use <name>`
+
+### Durability profiles
+
+Noema defaults to the `standard` durability profile. It matches the mutation
+and crash posture of the former Go implementation while retaining Rust's
+performance and memory improvements. No environment variable is required.
+
+Set `NOEMA_DURABILITY=strong` for processes that need Noema's opt-in recovery
+journal, stable mutation locks, atomic temporary-file replacement, and explicit
+flushes:
+
+```bash
+NOEMA_DURABILITY=strong noema serve --transport stdio
+```
+
+`strong` materially reduces write throughput in exchange for recovery guarantees
+that were not available in the Go implementation. It has passed Noema's
+process-death and macOS APFS detach/remount recovery tests; hard power-cut and
+device-cache-loss qualification remains outside that claim. Unknown profile
+names fail closed, and MCP runtime introspection reports the active profile as
+`cortex_usage.runtime.durability_profile`. See
+[Why Noema switched to Rust](docs/why-rust.md#durability-is-an-explicit-product-choice)
+for measurements and the full trade-off.
 
 ---
 
@@ -439,7 +469,7 @@ CLI flags still win when both are present. With paths configured, `noema serve` 
 ---
 name: my-cortex
 purpose: Primary memory
-owner: mark
+owner: example-user
 created: 2026-03-29
 version: 2
 access:
@@ -587,7 +617,7 @@ A Cortex can sync with peer Cortexes over Streamable HTTP: every mutation is rec
 ---
 name: alpha
 purpose: Primary research cortex
-owner: mark
+owner: example-user
 created: 2026-03-29
 version: 2
 federation:
