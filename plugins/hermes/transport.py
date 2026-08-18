@@ -31,6 +31,16 @@ _binary_cache: Optional[str] = None
 _binary_lock = threading.Lock()
 
 
+def _well_known_binary_paths(home: Path) -> list[Path]:
+    return [
+        Path("/opt/homebrew/bin/noema"),
+        Path("/home/linuxbrew/.linuxbrew/bin/noema"),
+        Path("/usr/local/bin/noema"),
+        home / ".cargo" / "bin" / "noema",
+        home / ".local" / "bin" / "noema",
+    ]
+
+
 def find_binary(override: Optional[str] = None) -> Optional[str]:
     """Locate the noema binary. Resolution order:
     1. Explicit override (config or NOEMA_BINARY env)
@@ -63,12 +73,7 @@ def find_binary(override: Optional[str] = None) -> Optional[str]:
 
     # Well-known locations.
     home = Path.home()
-    candidates = [
-        home / "go" / "bin" / "noema",
-        Path("/usr/local/bin/noema"),
-        home / ".local" / "bin" / "noema",
-    ]
-    for c in candidates:
+    for c in _well_known_binary_paths(home):
         if c.is_file() and os.access(str(c), os.X_OK):
             with _binary_lock:
                 _binary_cache = str(c)

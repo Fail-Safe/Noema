@@ -1,75 +1,60 @@
-# Noema build targets.
-#
-# Dev builds live at the repo root as ./noema (matching the convention in
-# AGENTS.md and .gitignore). Release builds land in ./dist/ with an
-# explicit <os>-<arch> suffix so cross-compiled artifacts are self-
-# identifying when scp'd onto a peer host.
-#
-# The version string is injected into internal/cli.Version at link time
-# from `git describe --tags --always --dirty`. A build from a clean tag
-# emits e.g. "v0.3.0"; a build with uncommitted changes emits
-# "v0.3.0-5-gabcdef-dirty" so --version output makes it obvious when a
-# deployed binary doesn't match any commit in the repo.
+# Noema build and qualification targets.
 
-PKG         := ./cmd/noema
-BIN         := noema
-DIST_DIR    := dist
-VERSION_PKG := github.com/Fail-Safe/Noema/internal/cli
+BIN := noema
+DIST_DIR := dist
+REPORT_PYTHON ?= python3
 
-VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+HOST_OS := $(shell uname -s | tr '[:upper:]' '[:lower:]' | sed 's/mingw.*/windows/; s/msys.*/windows/')
+HOST_ARCH := $(shell uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+HOST_ARTIFACT := $(DIST_DIR)/$(BIN)-$(HOST_OS)-$(HOST_ARCH)
 
-# Dev builds keep the symbol table and DWARF info so stack traces,
-# delve, and pprof all work out of the box. Release builds strip both
-# (-s -w) for ~25% size reduction and run with -trimpath to drop
-# absolute source paths from panics and the binary's metadata.
-LDFLAGS_DEV     := -X $(VERSION_PKG).Version=$(VERSION)
-LDFLAGS_RELEASE := -s -w -X $(VERSION_PKG).Version=$(VERSION)
-
-HOST_OS   := $(shell go env GOOS)
-HOST_ARCH := $(shell go env GOARCH)
-
-.PHONY: help build release release-linux test vet obsidian-publish clean
+.PHONY: help build check test release release-check clean obsidian-publish \
+	tui-pty storage-fault historical-report
 
 help:
 	@echo "Noema build targets:"
 	@echo ""
-	@echo "  make build           Dev build with debug info      -> ./$(BIN)"
-	@echo "  make release         Stripped build for this host   -> $(DIST_DIR)/$(BIN)-$(HOST_OS)-$(HOST_ARCH)"
-	@echo "  make release-linux   Stripped build for linux/amd64 -> $(DIST_DIR)/$(BIN)-linux-amd64"
-	@echo "  make test            go test ./..."
-	@echo "  make vet             go vet ./..."
-	@echo "  make obsidian-publish"
-	@echo "                       Build and copy Obsidian plugin into the active cortex vault"
-	@echo "  make clean           Remove ./$(BIN) and ./$(DIST_DIR)/"
-	@echo ""
-	@echo "Version string for the next build: $(VERSION)"
+	@echo "  make build             Build the debug binary -> ./$(BIN)"
+	@echo "  make check             Run formatting and strict Clippy checks"
+	@echo "  make test              Run check plus the full Rust test suite"
+	@echo "  make release           Build the optimized host binary -> $(HOST_ARTIFACT)"
+	@echo "  make release-check     Build and smoke-test the host release binary"
+	@echo "  make tui-pty           Run the TUI pseudo-terminal qualification"
+	@echo "  make storage-fault     Run disposable macOS APFS recovery tests"
+	@echo "  make historical-report Regenerate the Go-to-Rust cutover charts"
+	@echo "  make obsidian-publish  Build and publish the Obsidian plugin"
+	@echo "  make clean             Remove local binaries and Cargo output"
 
 build:
-	go build -ldflags "$(LDFLAGS_DEV)" -o $(BIN) $(PKG)
+	cargo build --locked
+	cp target/debug/$(BIN) ./$(BIN)
 
-# CGO_ENABLED=0 is set on both release targets even for the host build.
-# Noema's only native-code dependency is modernc.org/sqlite (pure-Go
-# translation of C SQLite), so disabling CGo produces a fully static
-# binary with no surprise libc linkage on any host.
+check:
+	cargo fmt --check
+	cargo clippy --all-targets -- -D warnings
+
+test: check
+	cargo test --all-targets --locked
+
 release: | $(DIST_DIR)
-	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS_RELEASE)" \
-		-o $(DIST_DIR)/$(BIN)-$(HOST_OS)-$(HOST_ARCH) $(PKG)
-	@ls -lh $(DIST_DIR)/$(BIN)-$(HOST_OS)-$(HOST_ARCH)
+	cargo build --release --locked
+	cp target/release/$(BIN) $(HOST_ARTIFACT)
+	@ls -lh $(HOST_ARTIFACT)
 
-release-linux: | $(DIST_DIR)
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
-		-ldflags "$(LDFLAGS_RELEASE)" \
-		-o $(DIST_DIR)/$(BIN)-linux-amd64 $(PKG)
-	@ls -lh $(DIST_DIR)/$(BIN)-linux-amd64
+release-check: release
+	$(HOST_ARTIFACT) version
 
 $(DIST_DIR):
-	@mkdir -p $(DIST_DIR)
+	mkdir -p $(DIST_DIR)
 
-test:
-	go test ./...
+tui-pty: build
+	python3 ./tests/rust-rewrite/tui_pty.py --rust "$(CURDIR)/target/debug/$(BIN)"
 
-vet:
-	go vet ./...
+storage-fault: build
+	python3 -u ./tests/rust-rewrite/storage_fault_macos.py --rust "$(CURDIR)/target/debug/$(BIN)"
+
+historical-report:
+	$(REPORT_PYTHON) ./tests/rust-rewrite/render_report_charts.py
 
 obsidian-publish:
 	npm --prefix plugins/obsidian run build
@@ -90,5 +75,6 @@ obsidian-publish:
 	echo "Obsidian plugin published to $$dest"
 
 clean:
+	cargo clean
 	rm -f $(BIN)
 	rm -rf $(DIST_DIR)

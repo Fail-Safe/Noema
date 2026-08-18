@@ -25,18 +25,15 @@ pytestmark = pytest.mark.integration
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="session")
-def noema_binary(tmp_path_factory):
+def noema_binary():
     """Build the current checkout so integration tests never use an installed binary."""
     repo_root = Path(__file__).resolve().parents[3]
-    binary = tmp_path_factory.mktemp("noema-bin") / "noema"
-    build_env = os.environ.copy()
-    build_env["GOCACHE"] = str(tmp_path_factory.mktemp("go-cache"))
+    binary = repo_root / "target" / "debug" / "noema"
     result = subprocess.run(
-        ["go", "build", "-o", str(binary), "./cmd/noema"],
+        ["cargo", "build", "--locked", "--bin", "noema"],
         cwd=repo_root,
         capture_output=True,
         text=True,
-        env=build_env,
         check=False,
     )
     assert result.returncode == 0, f"noema build failed: {result.stderr}"
@@ -246,7 +243,7 @@ class TestProviderLifecycle:
         provider.on_turn_start(2, "Why did we choose it?")
         provider.sync_turn(
             "Why did we choose it?",
-            "We chose Go for pure-Go SQLite and fast iteration.",
+            "We chose local SQLite for fast indexing and offline operation.",
         )
         if provider._sync_thread:
             provider._sync_thread.join(timeout=5)
@@ -286,7 +283,7 @@ class TestProviderLifecycle:
             {"role": "user", "content": "What do you know about Go?"},
             {"role": "assistant", "content": "Go is a statically typed language."},
             {"role": "user", "content": "Why did we choose it?"},
-            {"role": "assistant", "content": "We chose Go for pure-Go SQLite."},
+            {"role": "assistant", "content": "We chose local SQLite for offline operation."},
         ]
         provider.on_session_end(messages)
         if provider._end_thread:

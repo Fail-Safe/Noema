@@ -311,6 +311,7 @@ export class McpClient {
 		if (!resp.ok) {
 			throw new Error(`initialize: HTTP ${resp.status}: ${resp.statusText}`);
 		}
+		await readJsonRpcResponse(resp, initBody.id);
 		const sid = resp.headers.get("Mcp-Session-Id");
 		if (!sid) {
 			throw new Error("initialize: server did not return Mcp-Session-Id header");
@@ -363,10 +364,7 @@ export class McpClient {
 		if (!resp.ok) {
 			throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
 		}
-		const json = (await resp.json()) as {
-			result?: unknown;
-			error?: { code: number; message: string; data?: unknown };
-		};
+		const json = await readJsonRpcResponse(resp, id);
 		if (json.error) {
 			throw new JsonRpcError(json.error.code, json.error.message, json.error.data);
 		}
@@ -379,7 +377,7 @@ export class McpClient {
 	private buildHeaders(): Record<string, string> {
 		const h: Record<string, string> = {
 			"Content-Type": "application/json",
-			Accept: "application/json",
+			Accept: "application/json, text/event-stream",
 		};
 		if (this.bearerKey) {
 			h["Authorization"] = `Bearer ${this.bearerKey}`;
@@ -390,6 +388,48 @@ export class McpClient {
 	private mcpUrl(): string {
 		return this.endpoint.replace(/\/+$/, "") + "/mcp";
 	}
+}
+
+type JsonRpcResponse = {
+	id?: string | number | null;
+	result?: unknown;
+	error?: { code: number; message: string; data?: unknown };
+};
+
+// Streamable HTTP permits a JSON-RPC response as either plain JSON or a
+// finite server-sent-event stream. noema's Rust transport uses the latter
+// for the session-based 2025-03-26 protocol, even for one-shot tool calls.
+// Extract the response matching our request id while ignoring any comments,
+// retry hints, or unrelated messages that precede it.
+export async function readJsonRpcResponse(
+	response: Response,
+	expectedId: string | number
+): Promise<JsonRpcResponse> {
+	const contentType = response.headers.get("Content-Type") ?? "";
+	if (!contentType.toLowerCase().includes("text/event-stream")) {
+		return (await response.json()) as JsonRpcResponse;
+	}
+
+	const messages: JsonRpcResponse[] = [];
+	for (const event of (await response.text()).split(/\r?\n\r?\n/)) {
+		const data = event
+			.split(/\r?\n/)
+			.filter((line) => line.startsWith("data:"))
+			.map((line) => line.slice(5).replace(/^ /, ""))
+			.join("\n");
+		if (!data) continue;
+		try {
+			messages.push(JSON.parse(data) as JsonRpcResponse);
+		} catch {
+			// A malformed or non-JSON event cannot be our JSON-RPC response.
+		}
+	}
+
+	const match = messages.find((message) => message.id === expectedId);
+	if (!match) {
+		throw new Error(`SSE response missing JSON-RPC id ${expectedId}`);
+	}
+	return match;
 }
 
 // InvalidSessionError signals "the server didn't recognize our session

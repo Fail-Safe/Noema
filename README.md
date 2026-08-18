@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/Fail-Safe/Noema/actions/workflows/ci.yml"><img src="https://github.com/Fail-Safe/Noema/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="https://github.com/Fail-Safe/Noema/releases/latest"><img src="https://img.shields.io/github/v/release/Fail-Safe/Noema" alt="Latest Release"></a>
-  <a href="https://github.com/Fail-Safe/Noema/blob/main/go.mod"><img src="https://img.shields.io/github/go-mod/go-version/Fail-Safe/Noema" alt="Go Version"></a>
+  <a href="https://github.com/Fail-Safe/Noema/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/Rust-1.88%2B-000000?logo=rust" alt="Rust 1.88 or newer"></a>
   <a href="https://github.com/Fail-Safe/Noema/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Fail-Safe/Noema" alt="License"></a>
 </p>
 
@@ -20,6 +20,7 @@ Noema gives AI agents — and the humans working alongside them — a persistent
 
 - **Local-first agent memory** exposed as an [MCP](https://modelcontextprotocol.io/) server (stdio + Streamable HTTP). Works out of the box with Claude Code, GitHub Copilot, Zed, Cursor, Aider, and anything else that speaks MCP.
 - **Plain markdown on disk** as the source of truth; a local SQLite database with FTS5 as the index. No cloud, no API keys, no telemetry.
+- **One cross-platform Rust binary** with SQLite and the Hermes and Obsidian plugin installers built in. Release archives cover macOS, Linux, and Windows on x86-64 and ARM64.
 - **Peer-to-peer federation** across Cortexes with vector clocks, event-log audit trail, and `divergence` traces on concurrent edits.
 - **Your editor is a first-class client.** A filesystem watcher turns Obsidian / VS Code / Finder / iCloud edits into real mutation events — same events as MCP-initiated writes, propagated through federation.
 - **Standards-friendly.** Ships an auto-generated [`AGENTS.md`](https://agents.md/) per Cortex, a native [Hermes](https://hermes-agent.nousresearch.com/) memory-provider plugin, and SHA-256 content hashing with optional source-locking for publishers.
@@ -38,6 +39,7 @@ Contributor and architecture notes:
 - [Repository Guidelines](AGENTS.md)
 - [Architecture](docs/architecture.md)
 - [Development Guide](docs/development.md)
+- [Why Noema switched to Rust](docs/why-rust.md) — benchmarked cutover rationale
 
 A Trace has a **type** that describes its intent:
 
@@ -107,7 +109,7 @@ brew install Fail-Safe/tap/noema-beta   # (or noema)
 ```
 
 `brew upgrade` on `noema-beta` pulls the newest prerelease; stable tags
-(`v0.10.0` vs `v0.10.0-beta.1`) stay on their respective channels.
+(`v0.20.0` vs `v0.20.0-rc.1`) stay on their respective channels.
 
 ### Download a pre-built binary
 
@@ -116,46 +118,39 @@ Grab the archive for your OS/arch from the
 against `checksums.txt`, and put `noema` somewhere on your `$PATH`:
 
 ```bash
-# macOS (Apple Silicon) — adjust VERSION and Arch as needed.
-# Pre-built binaries start at v0.3.0; earlier tags (v0.1.x, v0.2.x)
-# exist in git history but were never published as downloadable
-# releases.
-VERSION=0.3.0
-curl -LO https://github.com/Fail-Safe/Noema/releases/download/v${VERSION}/noema_${VERSION}_darwin_arm64.tar.gz
+# macOS (Apple Silicon) — adjust VERSION, OS, and ARCH as needed.
+VERSION=0.20.0
+OS=darwin
+ARCH=arm64
+ARCHIVE=noema_${VERSION}_${OS}_${ARCH}.tar.gz
+curl -LO https://github.com/Fail-Safe/Noema/releases/download/v${VERSION}/${ARCHIVE}
 curl -LO https://github.com/Fail-Safe/Noema/releases/download/v${VERSION}/checksums.txt
 shasum -a 256 -c checksums.txt --ignore-missing
-tar -xzf noema_${VERSION}_darwin_arm64.tar.gz
+tar -xzf "${ARCHIVE}"
 sudo mv noema /usr/local/bin/
 noema version
 ```
 
-Release archives are fully static (pure-Go SQLite, `CGO_ENABLED=0`) so
-there's nothing to install alongside the binary. Supported targets:
+Release archives bundle SQLite, so there is no separate database library to
+install. Supported targets:
 `darwin/amd64`, `darwin/arm64`, `linux/amd64`, `linux/arm64`,
 `windows/amd64`, `windows/arm64`.
 
-### With the Go toolchain
-
-If you already have Go 1.25+ installed:
-
-```bash
-go install github.com/Fail-Safe/Noema/cmd/noema@latest
-```
-
 ### Build from source
+
+Building requires Rust 1.88 or newer:
 
 ```bash
 git clone https://github.com/Fail-Safe/Noema.git
 cd Noema
 make build                # dev build with debug info  -> ./noema
 make release              # stripped build for this host -> dist/noema-<os>-<arch>
-make release-linux        # stripped build for linux/amd64 -> dist/noema-linux-amd64
+make test                 # format, lint, and full Rust suite
 ```
 
-Dev builds keep the symbol table and DWARF info for debugging (~19 MB).
-Release builds strip both and run with `-trimpath` for a ~13 MB static
-binary with the git version embedded via `-ldflags`. `make help` lists
-all targets.
+Development builds retain line tables while omitting dependency debug symbols
+to keep Cargo artifacts manageable. Release builds enable thin LTO, use one
+codegen unit, and strip symbols. `make help` lists all targets.
 
 > **Pre-1.0 notice.** Noema is currently on the `v0.x` line. Expect
 > breaking changes between minor releases until v1.0. Cortex data on
@@ -175,7 +170,7 @@ noema init --name my-cortex
 noema add
 
 # Add a Trace with flags
-noema add --title "We chose Go" --type decision --tag go --body "Pure-Go SQLite, fast iteration."
+noema add --title "We chose local SQLite" --type decision --tag storage --body "Markdown remains the source of truth."
 
 # List Traces
 noema list
@@ -184,7 +179,7 @@ noema list
 noema search "sqlite"
 
 # View a Trace
-noema get 20260329-we-chose-go
+noema get 20260329-we-chose-local-sqlite
 ```
 
 > `noema init` also writes an `AGENTS.md` at the cortex root — the
@@ -207,6 +202,10 @@ noema cortex backup <name> [-o <path>] [--force]
                                           Write a gzipped tarball of a Cortex
 noema cortex restore <tarball> [--name <n>] [--path <dir>] [--force]
                                           Restore a Cortex from a backup tarball
+noema cortex recovery-status <name>       Inspect interrupted mutation recovery without changing the Cortex
+noema cortex restore-status               List durable restore transactions without exposing sensitive paths
+noema cortex restore-recover <transaction-id> --action <resume|rollback>
+                                          Resume or roll back an interrupted Cortex restore
 
 noema add [flags]                         Add a Trace (interactive if flags omitted)
 noema list [flags]                        List Traces
@@ -256,6 +255,8 @@ noema memory promote <id> [--to mid|long] Advance a trace one tier (short→mid 
 noema memory demote <id>                  Step a mid trace back to short
 noema memory purge <id> --tier <t> --reason "..." --confirm [--hard]
                                           Ceremoniously destroy a trace with audit trail (GDPR path)
+noema consolidate [flags]                 Run an LLM-backed consolidation pass
+noema migrate cortex-id [--reset] [--yes] Assign or deliberately replace a Cortex federation identity
 
 noema federation status                   Show federation config, MCP access posture, peer sync state, and vector clock
 noema federation peers                    List configured federation peers
@@ -274,7 +275,7 @@ noema federation key fingerprint          Print the SHA-256 fingerprint of the a
 noema keygen [--force]                    Generate this cortex's Ed25519 federation signing key so it can sign
                                           the events it emits (--force rotates it; peers must re-pin)
 
-noema serve [--transport stdio|http] [--host <addr>] [--host-dynamic <addr>] [--tls-cert <file> --tls-key <file>]
+noema serve [--transport stdio|http] [--host <addr>] [--host-dynamic <addr>] [--allowed-host <name>] [--tls-cert <file> --tls-key <file>]
                                           Start the MCP server (http requires --host; endpoint is /mcp)
 noema serve --print-config                Print a ready-to-use .mcp.json snippet and exit
 noema serve ... --print-systemd-unit      Print a systemd service unit for the current serve flags
@@ -311,6 +312,29 @@ noema version                             Print version, commit, and build date
 1. `--cortex` flag
 2. `NOEMA_CORTEX` environment variable
 3. Default set via `noema use <name>`
+
+### Durability profiles
+
+Noema defaults to the `standard` durability profile. It matches the mutation
+and crash posture of the former Go implementation while retaining Rust's
+performance and memory improvements. No environment variable is required.
+
+Set `NOEMA_DURABILITY=strong` for processes that need Noema's opt-in recovery
+journal, stable mutation locks, atomic temporary-file replacement, and explicit
+flushes:
+
+```bash
+NOEMA_DURABILITY=strong noema serve --transport stdio
+```
+
+`strong` materially reduces write throughput in exchange for recovery guarantees
+that were not available in the Go implementation. It has passed Noema's
+process-death and macOS APFS detach/remount recovery tests; hard power-cut and
+device-cache-loss qualification remains outside that claim. Unknown profile
+names fail closed, and MCP runtime introspection reports the active profile as
+`cortex_usage.runtime.durability_profile`. See
+[Why Noema switched to Rust](docs/why-rust.md#durability-is-an-explicit-product-choice)
+for measurements and the full trade-off.
 
 ---
 
@@ -388,7 +412,7 @@ noema serve --cortex my-cortex --transport http --host 10.0.0.5 --port 3000 \
             --tls-cert /path/server.crt --tls-key /path/server.key
 ```
 
-`--host` is **required** in HTTP mode and must be an explicit address — `0.0.0.0`/`::` are rejected to avoid accidentally exposing a Cortex on every interface. `--host-dynamic` accepts an IP address or hostname and rechecks it every five seconds: it adds the listener when an address it resolves to belongs to the machine and removes it when it no longer does, while required `--host` listeners remain available. Pair `--tls-cert` with `--tls-key` to serve over HTTPS. The endpoint is `/mcp` (not configurable).
+`--host` is **required** in HTTP mode and must be an explicit address — `0.0.0.0`/`::` are rejected to avoid accidentally exposing a Cortex on every interface. `--host-dynamic` accepts an IP address or hostname and rechecks it every five seconds: it adds the listener when an address it resolves to belongs to the machine and removes it when it no longer does, while required `--host` listeners remain available. Listener addresses, dynamic listener names, and loopback names are also accepted in HTTP `Host` headers. Add repeatable `--allowed-host <hostname-or-authority>` values when clients use another DNS name for an existing listener; this expands Host-header validation without binding another socket. Pair `--tls-cert` with `--tls-key` to serve over HTTPS. The endpoint is `/mcp` (not configurable).
 
 When `--print-config` is used with HTTP transport, the generated client URL uses the first `--host-dynamic` value when one is present; otherwise it uses the first `--host` value. This keeps a loopback listener available to local clients while producing a configuration that remote clients can dial on the conditional network.
 
@@ -445,7 +469,7 @@ CLI flags still win when both are present. With paths configured, `noema serve` 
 ---
 name: my-cortex
 purpose: Primary memory
-owner: mark
+owner: example-user
 created: 2026-03-29
 version: 2
 access:
@@ -553,7 +577,7 @@ The watcher runs under both transports because stdio sessions are not always the
 
 ## Semantic search (optional)
 
-Lexical FTS5 search is always on. An **opt-in semantic layer** adds embedding-based ranking — useful when a query matches by *concept* rather than shared words (e.g. "how do we authenticate agents" surfacing a trace titled "bearer-key posture for the MCP endpoint"). It stays true to Noema's lightweight, local-first posture: embeddings are stored as a SQLite `BLOB` and cosine similarity is computed in pure Go — no CGo, no vector extension, no external vector database. Embeddings are a **local index** (never federated), like the FTS5 index.
+Lexical FTS5 search is always on. An **opt-in semantic layer** adds embedding-based ranking — useful when a query matches by *concept* rather than shared words (e.g. "how do we authenticate agents" surfacing a trace titled "bearer-key posture for the MCP endpoint"). It stays true to Noema's lightweight, local-first posture: embeddings are stored as a SQLite `BLOB` and cosine similarity is computed in-process — no vector extension or external vector database. Embeddings are a **local index** (never federated), like the FTS5 index.
 
 Enable it with a `search:` block in `cortex.md`:
 
@@ -593,7 +617,7 @@ A Cortex can sync with peer Cortexes over Streamable HTTP: every mutation is rec
 ---
 name: alpha
 purpose: Primary research cortex
-owner: mark
+owner: example-user
 created: 2026-03-29
 version: 2
 federation:
@@ -774,7 +798,7 @@ Either form updates the original trace, federates the resolution, and trashes th
 Every create / update / archive / unarchive / trash / recover / purge is recorded as an event with a ULID, timestamp, origin, and JSON snapshot. Inspect from the CLI:
 
 ```bash
-noema events 20260329-why-we-chose-go     # full history for one trace
+noema events 20260329-why-we-chose-local-storage  # full history for one trace
 noema events --limit 50                   # recent events across all traces
 noema events --since 01JQXYZ...           # cursor-based pagination
 ```
@@ -789,19 +813,19 @@ Traces are plain markdown files with YAML frontmatter. The markdown file is the 
 
 ```markdown
 ---
-id: 20260329-why-we-chose-go
-title: Why we chose Go
+id: 20260329-why-we-chose-local-storage
+title: Why we chose local storage
 type: decision
 author: research-agent-1
-tags: [go, architecture]
+tags: [storage, architecture]
 derived_from: [20260328-language-candidates]
 origin: research-cortex
 created: 2026-03-29T14:23:00Z
 updated: 2026-03-29T14:23:00Z
 ---
 
-Go gives us pure-Go SQLite (no CGo), best-in-class TUI tooling, and fast
-iteration. We can revisit Rust if the MCP server demands higher concurrency.
+Plain markdown remains the source of truth, while local SQLite provides fast
+indexing and search without putting memory data in a cloud service.
 ```
 
 `derived_from` records which traces informed this one (used by `trace_lineage` to build a knowledge graph). `origin` is the name of the Cortex that created the trace — set automatically and used by federation to attribute remote traces. Both fields are optional; existing traces without them parse unchanged.

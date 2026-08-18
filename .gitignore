@@ -1,6 +1,8 @@
 # Build output
 /noema
 /dist/
+/target/
+/rust/target/
 /noema-*-plugin.tar.gz
 
 # SQLite databases

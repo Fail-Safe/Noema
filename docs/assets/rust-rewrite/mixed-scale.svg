@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="540" viewBox="0 0 1200 540" role="img" aria-labelledby="title desc">
+  <title id="title">Noema mixed-workload scaling comparison</title>
+  <desc id="desc">At 10,000 traces Rust was 26 percent faster and used 22 percent less peak memory than Go. At 100,000 traces Rust was 41 percent faster and used 41 percent less peak memory.</desc>
+  <style>
+    text { fill: #1f2937; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .title { font-size: 24px; font-weight: 700; text-anchor: middle; }
+    .subtitle { fill: #4b5563; font-size: 14px; text-anchor: middle; }
+    .panel-title { font-size: 18px; font-weight: 700; text-anchor: middle; }
+    .callout { fill: #4477aa; font-size: 12px; font-weight: 700; text-anchor: middle; }
+    .value { font-size: 12px; font-weight: 700; text-anchor: middle; }
+    .category { font-size: 12px; text-anchor: middle; }
+    .tick { fill: #6b7280; font-size: 10px; text-anchor: end; }
+    .axis-label, .note { fill: #4b5563; font-size: 11px; text-anchor: middle; }
+    .legend { font-size: 12px; }
+    .grid { stroke: #d1d5db; stroke-width: 1; }
+    .axis { stroke: #4b5563; stroke-width: 1.3; }
+    .baseline { fill: #94a3b8; }
+    .favorable { fill: #4477aa; }
+  </style>
+  <rect width="1200" height="540" fill="#ffffff"/>
+  <text class="title" x="600" y="34">Rust's mixed-workload lead grows with the corpus</text>
+  <text class="subtitle" x="600" y="59">Standard durability profile on identical verified corpora</text>
+
+  <text class="panel-title" x="315" y="96">Throughput</text>
+  <text class="panel-title" x="885" y="96">Peak memory</text>
+
+  <g aria-hidden="true">
+    <line class="grid" x1="90" y1="390" x2="540" y2="390"/><line class="grid" x1="90" y1="330" x2="540" y2="330"/><line class="grid" x1="90" y1="270" x2="540" y2="270"/><line class="grid" x1="90" y1="210" x2="540" y2="210"/><line class="grid" x1="90" y1="150" x2="540" y2="150"/><line class="grid" x1="90" y1="120" x2="540" y2="120"/>
+    <line class="axis" x1="90" y1="120" x2="90" y2="390"/><line class="axis" x1="90" y1="390" x2="540" y2="390"/>
+    <line class="grid" x1="660" y1="390" x2="1110" y2="390"/><line class="grid" x1="660" y1="322.5" x2="1110" y2="322.5"/><line class="grid" x1="660" y1="255" x2="1110" y2="255"/><line class="grid" x1="660" y1="187.5" x2="1110" y2="187.5"/><line class="grid" x1="660" y1="120" x2="1110" y2="120"/>
+    <line class="axis" x1="660" y1="120" x2="660" y2="390"/><line class="axis" x1="660" y1="390" x2="1110" y2="390"/>
+  </g>
+
+  <text class="tick" x="80" y="394">0</text><text class="tick" x="80" y="334">1,000</text><text class="tick" x="80" y="274">2,000</text><text class="tick" x="80" y="214">3,000</text><text class="tick" x="80" y="154">4,000</text><text class="tick" x="80" y="124">4,500</text>
+  <text class="tick" x="650" y="394">0</text><text class="tick" x="650" y="326">50</text><text class="tick" x="650" y="259">100</text><text class="tick" x="650" y="191">150</text><text class="tick" x="650" y="124">200</text>
+
+  <text class="callout" x="210" y="114">Rust 26% faster</text>
+  <rect class="baseline" x="155" y="185" width="48" height="205" rx="2"/><rect class="favorable" x="217" y="131" width="48" height="259" rx="2"/>
+  <text class="value" x="179" y="178">3,412</text><text class="value" x="241" y="124">4,311</text>
+  <text class="category" x="210" y="414">10k traces</text>
+
+  <text class="callout" x="425" y="114">Rust 41% faster</text>
+  <rect class="baseline" x="370" y="211" width="48" height="179" rx="2"/><rect class="favorable" x="432" y="138" width="48" height="252" rx="2"/>
+  <text class="value" x="394" y="204">2,977</text><text class="value" x="456" y="131">4,204</text>
+  <text class="category" x="425" y="414">100k traces</text>
+
+  <text class="callout" x="780" y="114">Rust 22% less</text>
+  <rect class="baseline" x="725" y="242" width="48" height="148" rx="2"/><rect class="favorable" x="787" y="274" width="48" height="116" rx="2"/>
+  <text class="value" x="749" y="235">110</text><text class="value" x="811" y="267">86</text>
+  <text class="category" x="780" y="414">10k traces</text>
+
+  <text class="callout" x="995" y="114">Rust 41% less</text>
+  <rect class="baseline" x="940" y="152" width="48" height="238" rx="2"/><rect class="favorable" x="1002" y="250" width="48" height="140" rx="2"/>
+  <text class="value" x="964" y="145">176</text><text class="value" x="1026" y="243">104</text>
+  <text class="category" x="995" y="414">100k traces</text>
+
+  <text class="axis-label" x="315" y="446">Operations per second</text>
+  <text class="axis-label" x="885" y="446">Peak sampled RSS (MiB)</text>
+  <rect class="baseline" x="445" y="475" width="16" height="16" rx="2"/><text class="legend" x="469" y="488">Go baseline</text>
+  <rect class="favorable" x="590" y="475" width="16" height="16" rx="2"/><text class="legend" x="614" y="488">Rust</text>
+  <text class="note" x="600" y="521">These are measured points, not a fitted scaling curve.</text>
+</svg>
