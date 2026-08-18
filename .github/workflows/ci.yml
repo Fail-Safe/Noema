@@ -106,6 +106,7 @@ jobs:
         working-directory: plugins/obsidian
         run: |
           npm ci --silent
+          npm test
           npm run build
           npx tsc --noEmit
           git diff --exit-code -- main.js

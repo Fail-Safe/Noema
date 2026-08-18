@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode, header},
+    http::{HeaderValue, Method, Request, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -1259,11 +1259,10 @@ pub async fn serve_http(
             listener.local_addr()?
         );
     }
-    let mut router = axum::Router::new().nest_service("/mcp", service);
-    if access_key.keyed() {
-        let expected = BearerDigest::new(&access_key.value);
-        router = router.layer(axum::middleware::from_fn_with_state(expected, bearer_auth));
-    }
+    let router = apply_http_middleware(
+        axum::Router::new().nest_service("/mcp", service),
+        &access_key,
+    );
     let server_handles = listeners
         .iter()
         .map(|_| axum_server::Handle::new())
@@ -1440,6 +1439,53 @@ pub async fn serve_http(
     shutdown_task.abort();
     servers.abort_all();
     Ok(())
+}
+
+fn apply_http_middleware(mut router: axum::Router, access_key: &AccessKey) -> axum::Router {
+    if access_key.keyed() {
+        let expected = BearerDigest::new(&access_key.value);
+        router = router.layer(axum::middleware::from_fn_with_state(expected, bearer_auth));
+    }
+    router.layer(axum::middleware::from_fn(cors))
+}
+
+async fn cors(request: Request<Body>, next: Next) -> Response {
+    let origin = request.headers().get(header::ORIGIN).cloned();
+    let allowed_origin = origin.as_ref().filter(|value| {
+        value
+            .to_str()
+            .is_ok_and(|value| matches!(value, "app://obsidian.md" | "capacitor://localhost"))
+    });
+    if origin.is_some() && allowed_origin.is_none() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let response = if request.method() == Method::OPTIONS {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        next.run(request).await
+    };
+    with_cors_headers(response, allowed_origin)
+}
+
+fn with_cors_headers(mut response: Response, origin: Option<&HeaderValue>) -> Response {
+    let headers = response.headers_mut();
+    if let Some(origin) = origin {
+        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+        headers.insert(header::VARY, HeaderValue::from_static("Origin"));
+    }
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("POST, GET, DELETE, OPTIONS"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("Authorization, Content-Type, Mcp-Session-Id"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static("Mcp-Session-Id"),
+    );
+    response
 }
 
 #[derive(Clone)]
@@ -1984,6 +2030,81 @@ mod tests {
         assert!(!digest.matches(b"bearer test-secret"));
         assert!(!digest.matches(b"Bearer wrong"));
         assert!(!digest.matches(b""));
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_bypasses_auth_and_post_remains_keyed() {
+        let access_key = AccessKey {
+            value: "test-secret".into(),
+            ..Default::default()
+        };
+        let router = apply_http_middleware(
+            axum::Router::new().route("/mcp", axum::routing::post(|| async { StatusCode::OK })),
+            &access_key,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let endpoint = format!("http://{address}/mcp");
+
+        let preflight = client
+            .request(reqwest::Method::OPTIONS, &endpoint)
+            .header(header::ORIGIN, "app://obsidian.md")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(
+                header::ACCESS_CONTROL_REQUEST_HEADERS,
+                "authorization, content-type, mcp-session-id",
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            preflight.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "app://obsidian.md"
+        );
+        assert_eq!(
+            preflight.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS],
+            "Authorization, Content-Type, Mcp-Session-Id"
+        );
+
+        let unauthorized = client.post(&endpoint).send().await.unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            !unauthorized
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        );
+
+        let rejected_origin = client
+            .request(reqwest::Method::OPTIONS, &endpoint)
+            .header(header::ORIGIN, "https://untrusted.example")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected_origin.status(), StatusCode::FORBIDDEN);
+
+        let authorized = client
+            .post(&endpoint)
+            .header(header::AUTHORIZATION, "Bearer test-secret")
+            .header(header::ORIGIN, "capacitor://localhost")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
+        assert_eq!(
+            authorized.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "capacitor://localhost"
+        );
+        assert_eq!(
+            authorized.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS],
+            "Mcp-Session-Id"
+        );
+        server.abort();
     }
 
     #[test]
