@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -133,9 +133,14 @@ fn serve(
             .min(Duration::from_millis(50));
         match receiver.recv_timeout(timeout) {
             Ok(Ok(event)) => {
-                let due = Instant::now() + settings.debounce;
-                for path in event.paths.into_iter().filter(|path| is_trace_file(path)) {
-                    pending.insert(path, due);
+                if event.need_rescan() {
+                    next_scan = Instant::now();
+                }
+                if event_needs_reconcile(&event) {
+                    let due = Instant::now() + settings.debounce;
+                    for path in event.paths.into_iter().filter(|path| is_trace_file(path)) {
+                        pending.insert(path, due);
+                    }
                 }
             }
             Ok(Err(error)) => eprintln!("[watch] notify error: {error}"),
@@ -562,6 +567,13 @@ fn is_trace_file(path: &Path) -> bool {
     !name.starts_with('.') && path.extension().and_then(|value| value.to_str()) == Some("md")
 }
 
+fn event_needs_reconcile(event: &Event) -> bool {
+    matches!(
+        event.kind,
+        EventKind::Any | EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    )
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FileStamp {
     modified: Option<SystemTime>,
@@ -609,12 +621,16 @@ fn changed_paths(
 #[cfg(test)]
 mod tests {
     use super::{
-        Reconciler, Settings, changed_paths, clean_filename_stem, extract_h1, is_trace_file,
-        partial_trace, scan_snapshot,
+        Reconciler, Settings, changed_paths, clean_filename_stem, event_needs_reconcile,
+        extract_h1, is_trace_file, partial_trace, scan_snapshot,
     };
     use crate::{
         cortex::{Cortex, ListOptions},
         trace::{self, Trace},
+    };
+    use notify::{
+        Event, EventKind,
+        event::{AccessKind, AccessMode, CreateKind, DataChange, ModifyKind, RemoveKind},
     };
     use std::{fs, path::Path, time::Duration};
     use tempfile::TempDir;
@@ -625,6 +641,30 @@ mod tests {
         assert!(is_trace_file(Path::new("20260815-note.md")));
         assert!(!is_trace_file(Path::new(".swap.md")));
         assert!(!is_trace_file(Path::new("note.txt")));
+    }
+
+    #[test]
+    fn filters_non_mutating_watcher_events() {
+        for kind in [
+            AccessKind::Read,
+            AccessKind::Open(AccessMode::Any),
+            AccessKind::Close(AccessMode::Read),
+            AccessKind::Close(AccessMode::Write),
+        ] {
+            let event = Event::new(EventKind::Access(kind));
+            assert!(!event_needs_reconcile(&event));
+        }
+        assert!(!event_needs_reconcile(&Event::new(EventKind::Other)));
+        assert!(event_needs_reconcile(&Event::new(EventKind::Any)));
+        assert!(event_needs_reconcile(&Event::new(EventKind::Create(
+            CreateKind::File,
+        ))));
+        assert!(event_needs_reconcile(&Event::new(EventKind::Modify(
+            ModifyKind::Data(DataChange::Content),
+        ))));
+        assert!(event_needs_reconcile(&Event::new(EventKind::Remove(
+            RemoveKind::File,
+        ))));
     }
 
     #[test]
