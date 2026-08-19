@@ -246,6 +246,48 @@ struct TagsParam {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct TagStatsParams {
+    /// Maximum tag rows to return (default 50, maximum 1000; 0 returns all)
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RenameTagParams {
+    /// Exact source tag spelling
+    old_tag: String,
+    /// Destination tag spelling
+    new_tag: String,
+    /// Match ASCII case variants of old_tag
+    #[serde(default)]
+    ignore_case: bool,
+    /// Apply the plan. Defaults to false and returns a read-only preview.
+    #[serde(default)]
+    apply: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct DeleteTagParams {
+    /// Exact tag spelling to remove
+    tag: String,
+    /// Match ASCII case variants of tag
+    #[serde(default)]
+    ignore_case: bool,
+    /// Apply the plan. Defaults to false and returns a read-only preview.
+    #[serde(default)]
+    apply: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct TagDoctorParams {
+    /// Build a deterministic repair plan. Ambiguous findings remain report-only.
+    #[serde(default)]
+    fix: bool,
+    /// Apply the deterministic repair plan. Requires fix=true.
+    #[serde(default)]
+    apply: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct VoteParam {
     /// Trace ID to vote on
     id: String,
@@ -637,6 +679,127 @@ impl NoemaServer {
             action: TagMutationAction::Append,
             tags,
         }))
+    }
+    #[tool(
+        description = "Tag taxonomy statistics across active and archived traces, including assignment, tier, visibility, and engagement counts."
+    )]
+    async fn tag_stats(
+        &self,
+        Parameters(p): Parameters<TagStatsParams>,
+    ) -> Result<String, ErrorData> {
+        let requested = p.limit.unwrap_or(50);
+        let limit = if requested == 0 {
+            0
+        } else {
+            requested.min(1000)
+        };
+        let report = self.open().await?.tag_stats(limit).map_err(mcp_error)?;
+        Ok(json_text(json!({"schema_version":1,"report":report})))
+    }
+    #[tool(
+        description = "Diagnose noncanonical or Obsidian-problematic tags. Read-only by default. Set fix=true to include a deterministic repair plan, then apply=true to execute it; numeric-only and other ambiguous findings are never auto-fixed."
+    )]
+    async fn tag_doctor(
+        &self,
+        Parameters(p): Parameters<TagDoctorParams>,
+    ) -> Result<String, ErrorData> {
+        if p.apply && !p.fix {
+            return Err(ErrorData::invalid_params(
+                "apply=true requires fix=true",
+                None,
+            ));
+        }
+        if p.apply {
+            self.ensure_writable()?;
+        }
+        let cx = self.open().await?;
+        let rows = cx.tag_rows().map_err(mcp_error)?;
+        let report = crate::tag::doctor(&rows);
+        let plan = p
+            .fix
+            .then(|| crate::tag::doctor_fix_plan(&rows, &cx.name, &report));
+        let applied = if p.apply {
+            apply_mcp_tag_plan(&cx, plan.as_ref().unwrap()).map_err(mcp_error)?
+        } else {
+            0
+        };
+        Ok(json_text(json!({
+            "schema_version":1,
+            "report":report,
+            "plan":plan.as_ref().map(tag_plan_value),
+            "applied":p.apply,
+            "changed_traces":applied,
+        })))
+    }
+    #[tool(
+        description = "Preview or apply a cortex-wide exact tag rename across active and archived traces. ASCII case-insensitive matching is opt-in. apply defaults to false."
+    )]
+    async fn rename_tag(
+        &self,
+        Parameters(p): Parameters<RenameTagParams>,
+    ) -> Result<String, ErrorData> {
+        if p.old_tag.is_empty() || p.new_tag.is_empty() {
+            return Err(ErrorData::invalid_params(
+                "tag names must not be empty",
+                None,
+            ));
+        }
+        if p.old_tag == p.new_tag {
+            return Err(ErrorData::invalid_params(
+                "source and destination tags are identical",
+                None,
+            ));
+        }
+        if p.apply {
+            self.ensure_writable()?;
+        }
+        let cx = self.open().await?;
+        let rows = cx.tag_rows().map_err(mcp_error)?;
+        let plan = crate::tag::rename_plan(&rows, &cx.name, &p.old_tag, &p.new_tag, p.ignore_case);
+        let applied = if p.apply {
+            apply_mcp_tag_plan(&cx, &plan).map_err(mcp_error)?
+        } else {
+            0
+        };
+        Ok(json_text(json!({
+            "schema_version":1,
+            "action":"rename",
+            "plan":tag_plan_value(&plan),
+            "applied":p.apply,
+            "changed_traces":applied,
+        })))
+    }
+    #[tool(
+        description = "Preview or apply cortex-wide removal of an exact tag from active and archived traces. ASCII case-insensitive matching is opt-in. apply defaults to false."
+    )]
+    async fn delete_tag(
+        &self,
+        Parameters(p): Parameters<DeleteTagParams>,
+    ) -> Result<String, ErrorData> {
+        if p.tag.is_empty() {
+            return Err(ErrorData::invalid_params(
+                "tag name must not be empty",
+                None,
+            ));
+        }
+        if p.apply {
+            self.ensure_writable()?;
+        }
+        let cx = self.open().await?;
+        let rows = cx.tag_rows().map_err(mcp_error)?;
+        let plan = crate::tag::delete_plan(&rows, &cx.name, &p.tag, p.ignore_case);
+        let applied = if p.apply {
+            apply_mcp_tag_plan(&cx, &plan).map_err(mcp_error)?
+        } else {
+            0
+        };
+        Ok(json_text(json!({
+            "schema_version":1,
+            "action":"delete",
+            "plan":tag_plan_value(&plan),
+            "applied":p.apply,
+            "changed_traces":applied,
+        })))
     }
     #[tool(
         description = "Cast a tier-preference vote on a trace. Use sparingly: only when the user has clearly indicated preference. Votes accumulate across calls and are preferences, not overrides."
@@ -1619,8 +1782,10 @@ derived_from when synthesizing conclusions from existing traces.
 append_trace is useful for running logs and fire-and-forget writes because it
 appends content without reading the full trace first.
 
-Use set_trace_tags or append_trace_tags for retrieval metadata hygiene. Do not
-use vote_trace to compensate for missing or excessive tags; voting is only a
+Use set_trace_tags or append_trace_tags for per-trace retrieval metadata
+hygiene. Use tag_stats and tag_doctor to inspect the cortex-wide taxonomy.
+rename_tag and delete_tag return a read-only plan unless apply=true. Do not use
+vote_trace to compensate for missing or excessive tags; voting is only a
 tier-preference signal.
 
 ## Guardrails
@@ -1753,6 +1918,7 @@ fn build_cortex_usage(cortex: &Cortex) -> Result<CortexUsageOutput> {
                 "append_trace appends content without reading the full trace first.",
                 "set_trace_tags replaces retrieval tags without touching title, body, type, or lineage.",
                 "append_trace_tags adds retrieval tags idempotently without touching title, body, type, or lineage.",
+                "rename_tag and delete_tag preview cortex-wide changes by default and require apply=true to mutate.",
                 "archive_trace hides without deleting; delete_trace moves to trash; recover_trace restores from trash."
             ],
             "audit_federation":[
@@ -1768,13 +1934,15 @@ fn build_cortex_usage(cortex: &Cortex) -> Result<CortexUsageOutput> {
             "durability_profile":cortex.durability_profile(),
             "filesystem_watch_enabled":watch_enabled,
             "long_tier_content_mutable":false,
+            "long_tier_tags_mutable":true,
             "trash_visible_through_mcp":false,
             "source_locking_description":"Source-locked foreign traces refuse update, delete, and remove outside their origin; archive and unarchive remain local visibility choices."
         })),
         authoring_tips: vec![
             "Prefer specific types over note.".into(),
             "Use tags for cross-cutting retrieval.".into(),
-            "Use set_trace_tags or append_trace_tags for tag cleanup; vote_trace is only a tier-preference signal.".into(),
+            "Use tag_stats and tag_doctor before cortex-wide tag cleanup; bulk tag tools preview unless apply=true.".into(),
+            "Use set_trace_tags or append_trace_tags for per-trace tag cleanup; vote_trace is only a tier-preference signal.".into(),
             "Set author to the human or agent responsible for the memory.".into(),
             "Keep public-facing content free of private hostnames, personal identifiers, cortex names, and secret-bearing output unless explicitly approved.".into(),
         ],
@@ -1831,6 +1999,37 @@ fn resolve_search_mode(
         return Ok((mode, None, String::new(), weight));
     };
     Ok((mode, Some(embedder), search.embedding_model.clone(), weight))
+}
+
+fn tag_plan_value(plan: &crate::tag::TagMutationPlan) -> serde_json::Value {
+    json!({
+        "matched_spellings":&plan.matched_spellings,
+        "matched_assignments":plan.matched_assignments(),
+        "affected_traces":plan.changes.len(),
+        "changes":&plan.changes,
+        "blocked_source_locked":&plan.blocked_source_locked,
+    })
+}
+
+fn apply_mcp_tag_plan(cx: &Cortex, plan: &crate::tag::TagMutationPlan) -> Result<usize> {
+    if !plan.blocked_source_locked.is_empty() {
+        bail!(
+            "{} source-locked trace(s) block this operation: {}",
+            plan.blocked_source_locked.len(),
+            plan.blocked_source_locked.join(", ")
+        );
+    }
+    let mut changed = 0;
+    for change in &plan.changes {
+        cx.set_tags(&change.id, change.after.clone(), true)
+            .with_context(|| {
+                format!(
+                    "bulk tag mutation stopped after {changed} successful trace mutation(s); rerun is safe"
+                )
+            })?;
+        changed += 1;
+    }
+    Ok(changed)
 }
 
 fn csv(value: &str) -> Vec<String> {
@@ -2003,6 +2202,73 @@ fn mcp_error(error: impl std::fmt::Display) -> ErrorData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bulk_tag_tools_preview_before_applying() {
+        let temp = tempfile::tempdir().unwrap();
+        Cortex::create("test", temp.path()).unwrap();
+        let root = temp.path().join("test");
+        let cx = Cortex::open("test", &root).unwrap();
+        let mut upper = Trace::new("Upper", "note", "", vec!["AI".into()], "alpha");
+        let upper_id = upper.frontmatter.id.clone();
+        cx.add(&mut upper).unwrap();
+        let mut lower = Trace::new("Lower", "note", "", vec!["ai".into()], "beta");
+        let lower_id = lower.frontmatter.id.clone();
+        cx.add(&mut lower).unwrap();
+        drop(cx);
+
+        let server = NoemaServer::new("test", &root, false).unwrap();
+        let preview = server
+            .rename_tag(Parameters(RenameTagParams {
+                old_tag: "AI".into(),
+                new_tag: "artificial-intelligence".into(),
+                ignore_case: true,
+                apply: false,
+            }))
+            .await
+            .unwrap();
+        let preview: serde_json::Value = serde_json::from_str(&preview).unwrap();
+        assert_eq!(preview["applied"], false);
+        assert_eq!(preview["plan"]["affected_traces"], 2);
+        let changes = preview["plan"]["changes"].as_array().unwrap();
+        assert!(
+            changes
+                .iter()
+                .any(|change| change["before"] == json!(["AI"]))
+        );
+        assert!(
+            changes
+                .iter()
+                .all(|change| { change["after"] == json!(["artificial-intelligence"]) })
+        );
+        {
+            let cx = server.open().await.unwrap();
+            assert_eq!(cx.get(&upper_id).unwrap().tags, vec!["AI"]);
+            assert_eq!(cx.get(&lower_id).unwrap().tags, vec!["ai"]);
+        }
+
+        let applied = server
+            .rename_tag(Parameters(RenameTagParams {
+                old_tag: "AI".into(),
+                new_tag: "artificial-intelligence".into(),
+                ignore_case: true,
+                apply: true,
+            }))
+            .await
+            .unwrap();
+        let applied: serde_json::Value = serde_json::from_str(&applied).unwrap();
+        assert_eq!(applied["applied"], true);
+        assert_eq!(applied["changed_traces"], 2);
+        let cx = server.open().await.unwrap();
+        assert_eq!(
+            cx.get(&upper_id).unwrap().tags,
+            vec!["artificial-intelligence"]
+        );
+        assert_eq!(
+            cx.get(&lower_id).unwrap().tags,
+            vec!["artificial-intelligence"]
+        );
+    }
 
     #[test]
     fn formats_compact_public_rows() {

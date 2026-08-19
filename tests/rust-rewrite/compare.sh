@@ -208,14 +208,16 @@ test "$(sqlite3 "$cortex_parent/shared/db/noema.db" "SELECT count(*) FROM traces
 printf 'ok - Rust ceremonial soft and hard purge stays readable by Go\n'
 
 force_id=$(go_noema add \
-    --title "Rust force remove trace" \
+    --title "Rust forced trash trace" \
     --type note \
     --author go \
     --tag remove \
-    --body "force remove interoperability" | sed -n 's/^Trace added: //p')
+    --body "forced trash interoperability" | sed -n 's/^Trace added: //p')
 rust_noema remove --force "$force_id" >/dev/null
-test "$(sqlite3 "$cortex_parent/shared/db/noema.db" "SELECT count(*) FROM traces WHERE id='$force_id';")" -eq 0
-printf 'ok - Rust remove --force performs Go-compatible hard deletion\n'
+test "$(sqlite3 "$cortex_parent/shared/db/noema.db" "SELECT count(*) FROM traces WHERE id='$force_id' AND trashed_at IS NOT NULL;")" -eq 1
+rust_noema recover --force "$force_id" >/dev/null
+test "$(sqlite3 "$cortex_parent/shared/db/noema.db" "SELECT count(*) FROM traces WHERE id='$force_id' AND trashed_at IS NULL;")" -eq 1
+printf 'ok - Rust remove --force remains recoverable\n'
 
 collision_id=$(rust_noema add \
     --title "Rust collision trace" \

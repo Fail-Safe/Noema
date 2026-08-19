@@ -154,6 +154,7 @@ jobs:
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
+          gh auth setup-git --hostname github.com
           gh repo clone Fail-Safe/homebrew-tap .release-homebrew
           python3 scripts/render-homebrew.py \
             --version "$version" --dist dist --tap .release-homebrew
