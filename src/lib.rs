@@ -12,6 +12,7 @@ pub mod mcp;
 pub mod migration;
 pub mod plugin;
 pub mod restore;
+pub mod tag;
 pub mod tlsutil;
 pub mod trace;
 pub mod tui;

@@ -556,6 +556,25 @@ pub struct TagSummary {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
+pub struct TagStatsEntry {
+    pub tag: String,
+    pub trace_count: i64,
+    pub active_count: i64,
+    pub archived_count: i64,
+    pub long_count: i64,
+    pub search_hits: i64,
+    pub read_count: i64,
+    pub modify_count: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TagStatsReport {
+    pub distinct_tags: usize,
+    pub assignments: i64,
+    pub tags: Vec<TagStatsEntry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct TierStats {
     pub short: i64,
@@ -1855,6 +1874,61 @@ impl Cortex {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn tag_stats(&self, limit: usize) -> Result<TagStatsReport> {
+        let mut statement = self.connection.prepare(
+            "SELECT tt.tag,
+                    COUNT(DISTINCT t.id) AS trace_count,
+                    COUNT(DISTINCT CASE WHEN t.archived_at IS NULL THEN t.id END) AS active_count,
+                    COUNT(DISTINCT CASE WHEN t.archived_at IS NOT NULL THEN t.id END) AS archived_count,
+                    COUNT(DISTINCT CASE WHEN t.tier='long' THEN t.id END) AS long_count,
+                    COALESCE(SUM(u.search_hit_count),0) AS hits,
+                    COALESCE(SUM(u.read_count),0) AS reads,
+                    COALESCE(SUM(u.modify_count),0) AS mods
+             FROM trace_tags tt
+             JOIN traces t ON t.id=tt.trace_id
+             LEFT JOIN trace_usage u ON u.trace_id=t.id
+             WHERE t.trashed_at IS NULL AND t.purged_at IS NULL
+             GROUP BY tt.tag
+             ORDER BY trace_count DESC,tt.tag ASC",
+        )?;
+        let mut tags = statement
+            .query_map([], |row| {
+                Ok(TagStatsEntry {
+                    tag: row.get(0)?,
+                    trace_count: row.get(1)?,
+                    active_count: row.get(2)?,
+                    archived_count: row.get(3)?,
+                    long_count: row.get(4)?,
+                    search_hits: row.get(5)?,
+                    read_count: row.get(6)?,
+                    modify_count: row.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let distinct_tags = tags.len();
+        let assignments = tags.iter().map(|tag| tag.trace_count).sum();
+        if limit > 0 {
+            tags.truncate(limit);
+        }
+        Ok(TagStatsReport {
+            distinct_tags,
+            assignments,
+            tags,
+        })
+    }
+
+    pub fn tag_rows(&self) -> Result<Vec<Row>> {
+        let mut rows = self.list(&ListOptions {
+            all: true,
+            ..Default::default()
+        })?;
+        for row in &mut rows {
+            let trace = Trace::parse_file(&self.file_path(row))?;
+            row.tags = trace.frontmatter.tags;
+        }
+        Ok(rows)
+    }
+
     pub fn tier_stats(&self) -> Result<TierStats> {
         let mut stats = TierStats::default();
         let mut statement = self.connection.prepare(
@@ -2800,9 +2874,7 @@ impl Cortex {
     }
 
     pub fn set_tags(&self, id: &str, tags: Vec<String>, actor_agent: bool) -> Result<()> {
-        let (_, mut trace) = self.get_trace(id)?;
-        trace.frontmatter.tags = dedupe(tags);
-        self.update_trace(id, &mut trace, actor_agent)
+        self.replace_trace_tags(id, dedupe(tags), actor_agent)
     }
 
     pub fn append_tags(
@@ -2815,8 +2887,40 @@ impl Cortex {
         trace.frontmatter.tags.extend(tags);
         trace.frontmatter.tags = dedupe(trace.frontmatter.tags);
         let result = trace.frontmatter.tags.clone();
-        self.update_trace(id, &mut trace, actor_agent)?;
+        self.replace_trace_tags(id, result.clone(), actor_agent)?;
         Ok(result)
+    }
+
+    fn replace_trace_tags(&self, id: &str, tags: Vec<String>, actor_agent: bool) -> Result<()> {
+        let row = self.get(id)?;
+        self.check_source_lock(&row)?;
+        let (_, mut trace) = self.get_trace(id)?;
+        if trace.frontmatter.tags == tags {
+            return Ok(());
+        }
+        trace.frontmatter.tags = tags;
+        trace.frontmatter.updated = row.updated_at.clone();
+        trace.validate()?;
+        let path = self.file_path(&row);
+        self.replace_trace_transactionally(&path, &trace, |pending_key| {
+            let tx = self.connection.unchecked_transaction()?;
+            replace_tags(&tx, id, &trace.frontmatter.tags)?;
+            upsert_fts(&tx, id, &row.title, &trace.body, &trace.frontmatter.tags)?;
+            self.emit_event(
+                &tx,
+                "tag_update",
+                id,
+                &trace::now_rfc3339(),
+                json!({"tags":&trace.frontmatter.tags}),
+            )?;
+            Self::clear_pending_in_transaction(&tx, pending_key)?;
+            tx.commit()?;
+            Ok(())
+        })?;
+        if actor_agent {
+            self.bump_usage(id, false, true)?;
+        }
+        Ok(())
     }
 
     pub fn archive(&self, id: &str) -> Result<()> {
@@ -5708,6 +5812,79 @@ mod tests {
         assert_eq!(after.content_hash, before.content_hash);
         assert_eq!(after.updated_at, before.updated_at);
         assert_eq!(Trace::parse_file(&path).unwrap().body, "out-of-band edit");
+    }
+
+    #[test]
+    fn tag_only_mutation_preserves_long_term_content_immutability() {
+        let (_temp, cx) = cortex();
+        let mut trace = Trace::new(
+            "Retaggable immutable memory",
+            "fact",
+            "",
+            vec!["Old.Tag".into(), "stable".into()],
+            "committed body",
+        );
+        cx.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        cx.promote(&id, "mid").unwrap();
+        cx.promote(&id, "long").unwrap();
+        let before = cx.get(&id).unwrap();
+
+        cx.set_tags(&id, vec!["new-tag".into(), "stable".into()], false)
+            .unwrap();
+
+        let after = cx.get(&id).unwrap();
+        let (_, stored) = cx.get_trace(&id).unwrap();
+        assert_eq!(after.tier, "long");
+        assert_eq!(after.tags, vec!["new-tag", "stable"]);
+        assert_eq!(stored.frontmatter.tags, vec!["new-tag", "stable"]);
+        assert_eq!(stored.body, "committed body");
+        assert_eq!(after.content_hash, before.content_hash);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert!(cx.update_trace(&id, &mut trace, false).is_err());
+        assert_eq!(
+            cx.history(&id).unwrap().last().unwrap().action,
+            "tag_update"
+        );
+        assert_eq!(
+            cx.search(
+                "new-tag",
+                &ListOptions {
+                    all: true,
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn tag_stats_include_active_archived_and_long_counts() {
+        let (_temp, cx) = cortex();
+        let mut active = Trace::new("Active tags", "note", "", vec!["shared".into()], "body");
+        cx.add(&mut active).unwrap();
+        let mut archived = Trace::new(
+            "Archived tags",
+            "note",
+            "",
+            vec!["shared".into(), "archive-only".into()],
+            "body",
+        );
+        cx.add(&mut archived).unwrap();
+        cx.promote(&archived.frontmatter.id, "mid").unwrap();
+        cx.promote(&archived.frontmatter.id, "long").unwrap();
+        cx.archive(&archived.frontmatter.id).unwrap();
+
+        let report = cx.tag_stats(0).unwrap();
+        assert_eq!(report.distinct_tags, 2);
+        assert_eq!(report.assignments, 3);
+        let shared = report.tags.iter().find(|tag| tag.tag == "shared").unwrap();
+        assert_eq!(shared.trace_count, 2);
+        assert_eq!(shared.active_count, 1);
+        assert_eq!(shared.archived_count, 1);
+        assert_eq!(shared.long_count, 1);
     }
 
     #[test]
