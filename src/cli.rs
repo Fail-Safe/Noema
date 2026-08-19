@@ -3380,13 +3380,13 @@ fn setup_serve_logging(
         if unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) } < 0 {
             return Err(std::io::Error::last_os_error()).context("redirecting stderr");
         }
+        Ok(())
     }
     #[cfg(not(unix))]
     {
         let _ = file;
         bail!("serve log redirection is not implemented on this platform");
     }
-    Ok(())
 }
 
 async fn serve(selected: Option<&str>, args: ServeArgs) -> Result<()> {
