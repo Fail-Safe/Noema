@@ -88,7 +88,7 @@ impl NoemaServer {
     }
 }
 
-#[tool_handler(router = self.tool_router, name = "noema", version = "0.20.0")]
+#[tool_handler(router = self.tool_router, name = "noema", version = "0.21.0")]
 impl ServerHandler for NoemaServer {}
 
 #[derive(Debug, Deserialize, JsonSchema)]

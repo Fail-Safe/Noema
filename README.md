@@ -109,7 +109,7 @@ brew install Fail-Safe/tap/noema-beta   # (or noema)
 ```
 
 `brew upgrade` on `noema-beta` pulls the newest prerelease; stable tags
-(`v0.20.0` vs `v0.20.0-rc.1`) stay on their respective channels.
+(`v0.21.0` vs `v0.21.0-rc.1`) stay on their respective channels.
 
 ### Download a pre-built binary
 
@@ -119,7 +119,7 @@ against `checksums.txt`, and put `noema` somewhere on your `$PATH`:
 
 ```bash
 # macOS (Apple Silicon) — adjust VERSION, OS, and ARCH as needed.
-VERSION=0.20.0
+VERSION=0.21.0
 OS=darwin
 ARCH=arm64
 ARCHIVE=noema_${VERSION}_${OS}_${ARCH}.tar.gz
