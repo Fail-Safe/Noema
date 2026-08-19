@@ -109,7 +109,7 @@ brew install Fail-Safe/tap/noema-beta   # (or noema)
 ```
 
 `brew upgrade` on `noema-beta` pulls the newest prerelease; stable tags
-(`v0.20.0` vs `v0.20.0-rc.1`) stay on their respective channels.
+(`v0.21.0` vs `v0.21.0-rc.1`) stay on their respective channels.
 
 ### Download a pre-built binary
 
@@ -119,7 +119,7 @@ against `checksums.txt`, and put `noema` somewhere on your `$PATH`:
 
 ```bash
 # macOS (Apple Silicon) — adjust VERSION, OS, and ARCH as needed.
-VERSION=0.20.0
+VERSION=0.21.0
 OS=darwin
 ARCH=arm64
 ARCHIVE=noema_${VERSION}_${OS}_${ARCH}.tar.gz
@@ -212,8 +212,10 @@ noema list [flags]                        List Traces
 noema get <id>                            Show a Trace
 noema edit <id>                           Edit a Trace in $EDITOR
 noema append <id> [--content <text>]      Append to a Trace body (pipe-friendly: `echo X | noema append <id>`)
-noema remove <id>                         Move a Trace to trash (--force to hard-delete)
-noema recover <id>                        Restore a Trace from trash
+noema remove <id> [--force]               Move a Trace to recoverable trash
+                                          (--force only overrides source-lock protection)
+noema recover <id> [--force]              Restore a Trace from trash
+                                          (--force overrides source-lock protection)
 noema purge [--days N]                    Permanently delete all trashed Traces older than N days
 noema search <query> [flags]              Full-text search (FTS5). --semantic / --hybrid
                                           rank by embedding similarity (needs a search: block + backfill)
@@ -257,6 +259,15 @@ noema memory purge <id> --tier <t> --reason "..." --confirm [--hard]
                                           Ceremoniously destroy a trace with audit trail (GDPR path)
 noema consolidate [flags]                 Run an LLM-backed consolidation pass
 noema migrate cortex-id [--reset] [--yes] Assign or deliberately replace a Cortex federation identity
+
+noema tags stats [--limit 50] [--output text|json]
+                                          Show cortex-wide tag, visibility, tier, and engagement counts
+noema tags rename <old> <new> [-i] [--dry-run] [-y]
+                                          Rename a tag across active and archived traces
+noema tags delete <tag> [-i] [--dry-run] [-y]
+                                          Remove a tag across active and archived traces
+noema tags doctor [--fix] [-y] [--output text|json]
+                                          Diagnose tag hygiene and optionally apply deterministic fixes
 
 noema federation status                   Show federation config, MCP access posture, peer sync state, and vector clock
 noema federation peers                    List configured federation peers
@@ -355,6 +366,10 @@ Noema can run as an [MCP](https://modelcontextprotocol.io) server, giving any MC
 | `append_trace` | Append content to an existing trace without reading it first (fire-and-forget logging) |
 | `set_trace_tags` | Replace a trace's retrieval tags without touching title, body, type, or lineage |
 | `append_trace_tags` | Add retrieval tags idempotently without touching title, body, type, or lineage |
+| `tag_stats` | Cortex-wide tag assignment, visibility, tier, and engagement statistics |
+| `tag_doctor` | Diagnose tag hygiene; optionally preview or apply deterministic repairs |
+| `rename_tag` | Preview or apply a cortex-wide exact tag rename; supports opt-in ASCII case-insensitive matching |
+| `delete_tag` | Preview or apply cortex-wide tag removal; supports opt-in ASCII case-insensitive matching |
 | `search_traces` | Search traces. `mode`: `lexical` (FTS5, default), `semantic` (embedding similarity), or `hybrid` (RRF fusion); semantic/hybrid need a configured `search:` block and fall back to lexical otherwise |
 | `find_similar_traces` | Surface traces related to one you hold. Default ranks by BM25 vocabulary overlap; `mode=semantic`/`hybrid` ranks by embedding similarity to the source trace's vector |
 | `archive_trace` / `unarchive_trace` | Archive a trace or restore it |
@@ -695,7 +710,7 @@ consolidation:
     require_unmodified: true
 ```
 
-Explicit curation is always available: `noema memory promote <id>` advances a trace one tier (short→mid or mid→long), and `noema memory demote <id>` steps mid→short. Long-term demotion goes through `noema memory purge` because undoing a base truth deserves the same ceremony as destroying it.
+Explicit curation is always available: `noema memory promote <id>` advances a trace one tier (short→mid or mid→long), and `noema memory demote <id>` steps mid→short. Long-term demotion goes through `noema memory purge` because undoing a base truth deserves the same ceremony as destroying it. Tags remain mutable retrieval metadata on every tier; retagging a long-term trace does not change its body, identity fields, content hash, or `updated` timestamp.
 
 ### Automatic LLM distillation
 
@@ -837,8 +852,17 @@ indexing and search without putting memory data in a cloud service.
 - **Tags must contain at least one letter.** A pure-numeric tag like `2026` or `42` is stored, indexed, and searchable via `search_traces` / FTS5, but Obsidian silently drops it from the tag panel. Use `y2026`, `2026q1`, or `event-2026-04-02` instead.
 - **Avoid dots inside a tag.** Obsidian interprets `release.candidate` as a nested tag tree (`release` / `candidate`), which is rarely the intent for a flat tag. Use hyphens: `release-candidate`.
 - **No spaces.** Use hyphens or underscores: `network-troubleshooting`, not `network troubleshooting`.
+- **Prefer lowercase.** Lowercase kebab-case keeps exact matching and cross-tool display predictable: `mcp-server`, not `MCP-Server`.
 
 The Obsidian plugin's "New trace" command surfaces these as inline warnings as you type — non-blocking hints, not validation errors. The cortex still accepts the tag.
+
+Use `noema tags doctor` to audit these conventions. `doctor --fix` only applies
+deterministic repairs such as lowercasing and replacing spaces or periods with
+hyphens; numeric-only tags remain report-only because Noema cannot infer the
+intended replacement. Bulk rename and delete commands show a preflight plan and
+prompt with `y/N` by default. Pass `--dry-run` to stop after the plan or
+`--yes`/`-y` for non-interactive execution. `--ignore-case`/`-i` uses ASCII
+case-insensitive matching and reports every spelling that will converge.
 
 **Cortex layout on disk:**
 

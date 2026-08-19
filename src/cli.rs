@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     fs::{self, OpenOptions},
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
@@ -15,7 +16,8 @@ use crate::{
     config::Config,
     consolidation::{DistillationConfig, HeuristicConfig, run_distillation_pass},
     cortex::{
-        Cortex, EmbedBackfillOptions, ListOptions, SemanticOptions, TraceIdExists, write_manifest,
+        Cortex, EmbedBackfillOptions, ListOptions, SemanticOptions, TagStatsReport, TraceIdExists,
+        write_manifest,
     },
     embedding::HttpEmbedder,
     eventsig,
@@ -58,6 +60,7 @@ enum Command {
     #[command(alias = "rm", alias = "delete")]
     Remove {
         id: String,
+        /// Bypass source-lock protection; the trace still moves to recoverable trash
         #[arg(short = 'f', long)]
         force: bool,
     },
@@ -66,7 +69,12 @@ enum Command {
     /// Restore an archived Trace
     Unarchive { id: String },
     /// Restore a trashed Trace
-    Recover { id: String },
+    Recover {
+        id: String,
+        /// Bypass source-lock protection
+        #[arg(short = 'f', long)]
+        force: bool,
+    },
     /// Permanently delete expired trashed Traces
     Purge {
         #[arg(long, default_value_t = 30)]
@@ -123,6 +131,12 @@ enum Command {
     Memory {
         #[command(subcommand)]
         command: MemoryCommand,
+    },
+    /// Inspect and maintain trace tags
+    #[command(alias = "tag")]
+    Tags {
+        #[command(subcommand)]
+        command: TagCommand,
     },
     /// Run a consolidation pass
     Consolidate(ConsolidateArgs),
@@ -319,6 +333,60 @@ enum MemoryCommand {
         confirm: bool,
         #[arg(long)]
         hard: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TagCommand {
+    /// Show tag counts, visibility, tier, and engagement statistics
+    Stats {
+        /// Maximum tag rows to show (0 means all)
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        output: String,
+    },
+    /// Rename a tag across active and archived traces
+    Rename {
+        old: String,
+        new: String,
+        /// Match ASCII case variants of the source tag
+        #[arg(short = 'i', long)]
+        ignore_case: bool,
+        /// Print the complete plan without changing traces
+        #[arg(long)]
+        dry_run: bool,
+        /// Apply without an interactive confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        output: String,
+    },
+    /// Delete a tag from active and archived traces
+    Delete {
+        tag: String,
+        /// Match ASCII case variants of the tag
+        #[arg(short = 'i', long)]
+        ignore_case: bool,
+        /// Print the complete plan without changing traces
+        #[arg(long)]
+        dry_run: bool,
+        /// Apply without an interactive confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        output: String,
+    },
+    /// Diagnose tags that are noncanonical or problematic in Obsidian
+    Doctor {
+        /// Apply deterministic fixes; ambiguous findings remain unchanged
+        #[arg(long)]
+        fix: bool,
+        /// Apply fixes without an interactive confirmation prompt
+        #[arg(short = 'y', long, requires = "fix")]
+        yes: bool,
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        output: String,
     },
 }
 
@@ -604,13 +672,8 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
         }
         Command::Remove { id, force } => {
             cx.set_force_source_lock(force);
-            if force {
-                cx.remove_hard(&id)?;
-                println!("Trace {id} permanently deleted.");
-            } else {
-                cx.trash(&id)?;
-                println!("Trace moved to trash: {id}");
-            }
+            cx.trash(&id)?;
+            println!("Trace moved to trash: {id}");
         }
         Command::Archive { id } => {
             cx.archive(&id)?;
@@ -620,11 +683,13 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
             cx.unarchive(&id)?;
             println!("Trace unarchived: {id}");
         }
-        Command::Recover { id } => {
+        Command::Recover { id, force } => {
+            cx.set_force_source_lock(force);
             cx.recover(&id)?;
             println!("Trace recovered: {id}");
         }
         Command::Purge { days } => println!("Purged {} trace(s).", cx.purge_expired(days)?),
+        Command::Tags { command } => tag_command(cx, command)?,
         Command::Search {
             query,
             semantic,
@@ -723,14 +788,20 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
                 if recover {
                     println!("      The local event log had no usable snapshot for these IDs.");
                     println!(
-                        "      Use `noema list` + `noema remove --force <id>` to clean them up."
+                        "      Use `noema list` to inspect the tier, then explicitly purge each orphan:"
+                    );
+                    println!(
+                        "      `noema memory purge <id> --tier <tier> --reason \"orphan cleanup\" --confirm --hard`."
                     );
                 } else {
                     println!(
                         "      Try `noema sync --recover` to rebuild them from the local event log,"
                     );
                     println!(
-                        "      or use `noema list` + `noema remove --force <id>` to clean them up."
+                        "      or use `noema list` to inspect the tier and explicitly purge each orphan:"
+                    );
+                    println!(
+                        "      `noema memory purge <id> --tier <tier> --reason \"orphan cleanup\" --confirm --hard`."
                     );
                 }
             }
@@ -1375,6 +1446,329 @@ fn remove_cortex(name: &str, purge: bool, force: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn tag_command(cx: &Cortex, command: TagCommand) -> Result<()> {
+    match command {
+        TagCommand::Stats { limit, output } => {
+            let report = cx.tag_stats(limit)?;
+            if output == "json" {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"schema_version":1,"report":report})
+                    )?
+                );
+                return Ok(());
+            }
+            print!("{}", format_tag_stats_report(&report));
+        }
+        TagCommand::Rename {
+            old,
+            new,
+            ignore_case,
+            dry_run,
+            yes,
+            output,
+        } => {
+            if old.is_empty() || new.is_empty() {
+                bail!("tag names must not be empty");
+            }
+            if old == new {
+                bail!("source and destination tags are identical");
+            }
+            let rows = tag_rows(cx)?;
+            let plan = crate::tag::rename_plan(&rows, &cx.name, &old, &new, ignore_case);
+            execute_tag_plan(cx, "rename", &plan, dry_run, yes, &output, None)?;
+        }
+        TagCommand::Delete {
+            tag,
+            ignore_case,
+            dry_run,
+            yes,
+            output,
+        } => {
+            if tag.is_empty() {
+                bail!("tag name must not be empty");
+            }
+            let rows = tag_rows(cx)?;
+            let plan = crate::tag::delete_plan(&rows, &cx.name, &tag, ignore_case);
+            execute_tag_plan(cx, "delete", &plan, dry_run, yes, &output, None)?;
+        }
+        TagCommand::Doctor { fix, yes, output } => {
+            let rows = tag_rows(cx)?;
+            let report = crate::tag::doctor(&rows);
+            if output == "json" && !fix {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"schema_version":1,"report":report})
+                    )?
+                );
+                return Ok(());
+            }
+            if output == "text" {
+                print!("{}", format_tag_doctor_report(&report));
+            }
+            if !fix {
+                return Ok(());
+            }
+            let plan = crate::tag::doctor_fix_plan(&rows, &cx.name, &report);
+            execute_tag_plan(cx, "doctor_fix", &plan, false, yes, &output, Some(&report))?;
+        }
+    }
+    Ok(())
+}
+
+fn format_tag_stats_report(report: &TagStatsReport) -> String {
+    let mut output = format!(
+        "Distinct tags: {}\nAssignments:   {}\n",
+        report.distinct_tags, report.assignments
+    );
+    if report.tags.is_empty() {
+        output.push_str("\n(no tags)\n");
+        return output;
+    }
+
+    let tag_width = report
+        .tags
+        .iter()
+        .map(|entry| entry.tag.chars().count())
+        .max()
+        .unwrap_or_default()
+        .max("Tag".len());
+    let traces_width =
+        numeric_column_width("Traces", report.tags.iter().map(|entry| entry.trace_count));
+    let active_width =
+        numeric_column_width("Active", report.tags.iter().map(|entry| entry.active_count));
+    let archived_width = numeric_column_width(
+        "Archived",
+        report.tags.iter().map(|entry| entry.archived_count),
+    );
+    let long_width = numeric_column_width("Long", report.tags.iter().map(|entry| entry.long_count));
+    let hits_width =
+        numeric_column_width("Hits", report.tags.iter().map(|entry| entry.search_hits));
+    let reads_width =
+        numeric_column_width("Reads", report.tags.iter().map(|entry| entry.read_count));
+    let modifies_width = numeric_column_width(
+        "Modifies",
+        report.tags.iter().map(|entry| entry.modify_count),
+    );
+
+    let _ = writeln!(
+        output,
+        "\n{:<tag_width$}  {:>traces_width$}  {:>active_width$}  {:>archived_width$}  {:>long_width$}  {:>hits_width$}  {:>reads_width$}  {:>modifies_width$}",
+        "Tag", "Traces", "Active", "Archived", "Long", "Hits", "Reads", "Modifies"
+    );
+    for entry in &report.tags {
+        let _ = writeln!(
+            output,
+            "{:<tag_width$}  {:>traces_width$}  {:>active_width$}  {:>archived_width$}  {:>long_width$}  {:>hits_width$}  {:>reads_width$}  {:>modifies_width$}",
+            entry.tag,
+            entry.trace_count,
+            entry.active_count,
+            entry.archived_count,
+            entry.long_count,
+            entry.search_hits,
+            entry.read_count,
+            entry.modify_count
+        );
+    }
+    output
+}
+
+fn numeric_column_width(header: &str, values: impl Iterator<Item = i64>) -> usize {
+    values
+        .map(|value| value.to_string().len())
+        .max()
+        .unwrap_or_default()
+        .max(header.len())
+}
+
+fn tag_rows(cx: &Cortex) -> Result<Vec<crate::cortex::Row>> {
+    cx.tag_rows()
+}
+
+fn execute_tag_plan(
+    cx: &Cortex,
+    action: &str,
+    plan: &crate::tag::TagMutationPlan,
+    dry_run: bool,
+    assume_yes: bool,
+    output: &str,
+    report: Option<&crate::tag::TagDoctorReport>,
+) -> Result<()> {
+    if output == "text" {
+        println!("Tag {action} plan");
+        if plan.matched_spellings.is_empty() {
+            println!("  matched spellings: (none)");
+        } else {
+            println!("  matched spellings:");
+            for (spelling, count) in &plan.matched_spellings {
+                println!("    {spelling}: {count} assignment(s)");
+            }
+        }
+        println!("  affected traces:  {}", plan.changes.len());
+        if !plan.blocked_source_locked.is_empty() {
+            println!(
+                "  source-locked:    {}",
+                plan.blocked_source_locked.join(", ")
+            );
+        }
+    }
+
+    if !plan.blocked_source_locked.is_empty() {
+        if output == "json" {
+            print_tag_plan_json(action, plan, dry_run, false, 0, report)?;
+        }
+        bail!(
+            "{} source-locked trace(s) block this operation",
+            plan.blocked_source_locked.len()
+        );
+    }
+    if plan.changes.is_empty() {
+        if output == "json" {
+            print_tag_plan_json(action, plan, dry_run, false, 0, report)?;
+        } else {
+            println!("No changes required.");
+        }
+        return Ok(());
+    }
+    if dry_run {
+        if output == "json" {
+            print_tag_plan_json(action, plan, true, false, 0, report)?;
+        } else {
+            println!("Dry run only; no traces changed.");
+        }
+        return Ok(());
+    }
+    if !assume_yes {
+        if output == "json" || !io::stdin().is_terminal() {
+            bail!("--yes is required for non-interactive tag mutations");
+        }
+        print!("Proceed? [y/N]: ");
+        io::stdout().flush()?;
+        if !tag_mutation_confirmed(&read_line()?) {
+            println!("Aborted; no traces changed.");
+            return Ok(());
+        }
+    }
+
+    let mut changed = 0;
+    for change in &plan.changes {
+        cx.set_tags(&change.id, change.after.clone(), false)
+            .with_context(|| {
+                format!(
+                    "tag {action} stopped after {changed} successful trace mutation(s); rerun is safe"
+                )
+            })?;
+        changed += 1;
+    }
+    if output == "json" {
+        print_tag_plan_json(action, plan, false, true, changed, report)?;
+    } else {
+        println!("Changed {changed} trace(s).");
+    }
+    Ok(())
+}
+
+fn tag_mutation_confirmed(answer: &str) -> bool {
+    answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
+}
+
+fn print_tag_plan_json(
+    action: &str,
+    plan: &crate::tag::TagMutationPlan,
+    dry_run: bool,
+    applied: bool,
+    changed: usize,
+    report: Option<&crate::tag::TagDoctorReport>,
+) -> Result<()> {
+    let mut output = serde_json::json!({
+        "schema_version": 1,
+        "action": action,
+        "dry_run": dry_run,
+        "matched_spellings": &plan.matched_spellings,
+        "matched_assignments": plan.matched_assignments(),
+        "affected_traces": plan.changes.len(),
+        "changes": &plan.changes,
+        "blocked_source_locked": &plan.blocked_source_locked,
+        "applied": applied,
+        "changed_traces": changed,
+    });
+    if let Some(report) = report {
+        output["report"] = serde_json::to_value(report)?;
+    }
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+fn format_tag_doctor_report(report: &crate::tag::TagDoctorReport) -> String {
+    let mut output = format!("Checked {} distinct tag(s).\n", report.checked_tags);
+    if report.findings.is_empty() {
+        output.push_str("No tag hygiene findings.\n");
+        return output;
+    }
+
+    let rows = report
+        .findings
+        .iter()
+        .map(|finding| {
+            let issues = finding
+                .issues
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            (
+                finding.tag.as_str(),
+                finding.trace_count,
+                issues,
+                finding.suggestion.as_deref().unwrap_or("manual review"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let tag_width = rows
+        .iter()
+        .map(|row| row.0.chars().count())
+        .max()
+        .unwrap_or_default()
+        .max("Tag".len());
+    let traces_width = rows
+        .iter()
+        .map(|row| row.1.to_string().len())
+        .max()
+        .unwrap_or_default()
+        .max("Traces".len());
+    let issues_width = rows
+        .iter()
+        .map(|row| row.2.chars().count())
+        .max()
+        .unwrap_or_default()
+        .max("Issues".len());
+    let _ = writeln!(
+        output,
+        "\n{:<tag_width$}  {:>traces_width$}  {:<issues_width$}  Suggested fix",
+        "Tag", "Traces", "Issues"
+    );
+    for (tag, traces, issues, suggestion) in rows {
+        let _ = writeln!(
+            output,
+            "{tag:<tag_width$}  {traces:>traces_width$}  {issues:<issues_width$}  {suggestion}"
+        );
+    }
+    if !report.collisions.is_empty() {
+        output.push_str("\nNormalization collisions:\n");
+        for collision in &report.collisions {
+            let _ = writeln!(
+                output,
+                "  {} <- {}",
+                collision.destination,
+                collision.sources.join(", ")
+            );
+        }
+    }
+    output
 }
 
 fn memory_command(cx: &Cortex, command: MemoryCommand) -> Result<()> {
@@ -3714,6 +4108,120 @@ mod tests {
             Command::Serve(ServeArgs { ref allowed_host, .. })
                 if allowed_host == &["memory.example.com", "memory.example.com:3000"]
         ));
+    }
+
+    #[test]
+    fn tag_commands_parse_aliases_and_automation_flags() {
+        let cli = Cli::try_parse_from(["noema", "tags", "rename", "AI", "ai", "-i", "-y"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Tags {
+                command: TagCommand::Rename {
+                    ignore_case: true,
+                    yes: true,
+                    ..
+                }
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["noema", "tag", "delete", "legacy", "--dry-run"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Tags {
+                command: TagCommand::Delete { dry_run: true, .. }
+            }
+        ));
+
+        assert!(Cli::try_parse_from(["noema", "tags", "doctor", "--yes"]).is_err());
+        assert!(tag_mutation_confirmed("y"));
+        assert!(tag_mutation_confirmed("YES"));
+        assert!(!tag_mutation_confirmed("n"));
+        assert!(!tag_mutation_confirmed(""));
+    }
+
+    #[test]
+    fn tag_stats_text_aligns_variable_width_columns_without_tabs() {
+        let report = TagStatsReport {
+            distinct_tags: 1,
+            assignments: 1111,
+            tags: vec![crate::cortex::TagStatsEntry {
+                tag: "a-variable-width-tag".into(),
+                trace_count: 1111,
+                active_count: 222,
+                archived_count: 33,
+                long_count: 44,
+                search_hits: 5555,
+                read_count: 666,
+                modify_count: 77,
+            }],
+        };
+        let output = format_tag_stats_report(&report);
+        assert!(!output.contains('\t'));
+        let mut lines = output.lines();
+        assert_eq!(lines.next(), Some("Distinct tags: 1"));
+        assert_eq!(lines.next(), Some("Assignments:   1111"));
+        assert_eq!(lines.next(), Some(""));
+        let header = lines.next().unwrap();
+        let row = lines.next().unwrap();
+        for (heading, value) in [
+            ("Traces", "1111"),
+            ("Active", "222"),
+            ("Archived", "33"),
+            ("Long", "44"),
+            ("Hits", "5555"),
+            ("Reads", "666"),
+            ("Modifies", "77"),
+        ] {
+            assert_eq!(
+                header.find(heading).unwrap() + heading.len(),
+                row.find(value).unwrap() + value.len()
+            );
+        }
+    }
+
+    #[test]
+    fn tag_doctor_text_aligns_variable_width_columns_without_tabs() {
+        let report = crate::tag::TagDoctorReport {
+            checked_tags: 2,
+            findings: vec![
+                crate::tag::TagDiagnostic {
+                    tag: "a-variable-width-tag".into(),
+                    trace_count: 65,
+                    issues: vec![
+                        crate::tag::TagIssue::Period,
+                        crate::tag::TagIssue::Uppercase,
+                    ],
+                    suggestion: Some("normalized-tag".into()),
+                },
+                crate::tag::TagDiagnostic {
+                    tag: "2026-08-18".into(),
+                    trace_count: 1,
+                    issues: vec![crate::tag::TagIssue::NumericOnly],
+                    suggestion: None,
+                },
+            ],
+            collisions: vec![crate::tag::TagCollision {
+                destination: "normalized-tag".into(),
+                sources: vec!["Normalized.Tag".into(), "normalized-tag".into()],
+            }],
+        };
+        let output = format_tag_doctor_report(&report);
+        assert!(!output.contains('\t'));
+        let mut lines = output.lines();
+        assert_eq!(lines.next(), Some("Checked 2 distinct tag(s)."));
+        assert_eq!(lines.next(), Some(""));
+        let header = lines.next().unwrap();
+        let first = lines.next().unwrap();
+        let second = lines.next().unwrap();
+        assert_eq!(header.find("Issues"), first.find("period,uppercase"));
+        assert_eq!(header.find("Issues"), second.find("numeric_only"));
+        assert_eq!(header.find("Suggested fix"), first.find("normalized-tag"));
+        assert_eq!(header.find("Suggested fix"), second.find("manual review"));
+        assert_eq!(
+            header.find("Traces").unwrap() + "Traces".len(),
+            first.find("65").unwrap() + "65".len()
+        );
+        assert!(output.contains("  normalized-tag <- Normalized.Tag, normalized-tag"));
     }
 
     #[test]
