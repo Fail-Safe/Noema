@@ -381,8 +381,16 @@ enum TagMutationAction {
     Append,
 }
 
+fn schema_version_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "integer",
+        "minimum": 0
+    })
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 struct CortexUsageOutput {
+    #[schemars(schema_with = "schema_version_schema")]
     schema_version: u32,
     cortex: BTreeMap<String, serde_json::Value>,
     contract: CortexContractOutput,
@@ -2202,6 +2210,16 @@ fn mcp_error(error: impl std::fmt::Display) -> ErrorData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cortex_usage_schema_uses_portable_schema_version() {
+        let schema = serde_json::to_value(schemars::schema_for!(CortexUsageOutput)).unwrap();
+
+        assert_eq!(
+            schema["properties"]["schema_version"],
+            json!({"type": "integer", "minimum": 0})
+        );
+    }
 
     #[tokio::test]
     async fn bulk_tag_tools_preview_before_applying() {
