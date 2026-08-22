@@ -3637,7 +3637,7 @@ impl Cortex {
             && !local.vclock.is_empty()
             && !event.vclock.is_empty()
         {
-            match federation::compare(&local.vclock, &event.vclock) {
+            match federation::compare_for_replay(&local.vclock, &event.vclock) {
                 Relation::Concurrent => return self.create_divergence(&row, event),
                 Relation::After | Relation::Equal => return self.store_remote_event(event),
                 Relation::Before => {}
@@ -5937,6 +5937,49 @@ mod tests {
             .unwrap();
         assert_eq!(event.pubkey, public);
         eventsig::verify(&event.pubkey, &event, &event.signature).unwrap();
+    }
+
+    #[test]
+    fn replay_materializes_causal_update_after_legacy_clock_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        Cortex::create("legacy-alpha", temp.path()).unwrap();
+        Cortex::create("legacy-beta", temp.path()).unwrap();
+        let alpha = Cortex::open("legacy-alpha", temp.path().join("legacy-alpha")).unwrap();
+        let beta = Cortex::open("legacy-beta", temp.path().join("legacy-beta")).unwrap();
+
+        let mut trace = Trace::new("Legacy replay", "fact", "", vec![], "historical body");
+        alpha.add(&mut trace).unwrap();
+        let trace_id = trace.frontmatter.id.clone();
+        let mut historical = event_for(&alpha, &trace_id, "create", &alpha.id);
+        historical.vclock.insert("legacy-alpha".into(), 19);
+        beta.replay_event(&historical).unwrap();
+
+        trace.body = "current body".into();
+        alpha.update_trace(&trace_id, &mut trace, false).unwrap();
+        let current = event_for(&alpha, &trace_id, "update", &alpha.id);
+        assert_eq!(
+            federation::compare(&historical.vclock, &current.vclock),
+            Relation::Concurrent
+        );
+
+        beta.replay_event(&current).unwrap();
+
+        assert_eq!(beta.get_trace(&trace_id).unwrap().1.body, "current body");
+        assert!(
+            beta.list(&ListOptions {
+                trace_type: "divergence".into(),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty()
+        );
+        let stored_historical = beta
+            .history(&trace_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.id == historical.id)
+            .unwrap();
+        assert_eq!(stored_historical.vclock, historical.vclock);
     }
 
     #[test]
