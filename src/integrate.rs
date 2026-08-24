@@ -696,7 +696,7 @@ fn bootstrap_command() -> String {
             "additionalContext": BOOTSTRAP
         }
     });
-    format!("printf '%s\\n' '{}' # {CLAUDE_HOOK_MARKER}", payload)
+    format!("printf '%s\\n' '{payload}' # {CLAUDE_HOOK_MARKER}")
 }
 
 fn opencode_plugin_source() -> String {
