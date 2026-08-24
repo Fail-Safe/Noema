@@ -119,7 +119,7 @@ against `checksums.txt`, and put `noema` somewhere on your `$PATH`:
 
 ```bash
 # macOS (Apple Silicon) — adjust VERSION, OS, and ARCH as needed.
-VERSION=0.21.0
+VERSION=0.21.3
 OS=darwin
 ARCH=arm64
 ARCHIVE=noema_${VERSION}_${OS}_${ARCH}.tar.gz
