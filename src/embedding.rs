@@ -237,8 +237,10 @@ pub fn decode(blob: &[u8]) -> Result<Vec<f32>> {
         bail!("invalid embedding blob");
     }
     Ok(blob[1..]
-        .chunks_exact(4)
-        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
         .collect())
 }
 

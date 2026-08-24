@@ -1,6 +1,6 @@
 [package]
 name = "noema"
-version = "0.21.2"
+version = "0.21.3"
 edition = "2024"
 rust-version = "1.88"
 description = "The intentional memory layer for your AI agents"

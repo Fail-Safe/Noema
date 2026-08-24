@@ -119,7 +119,7 @@ against `checksums.txt`, and put `noema` somewhere on your `$PATH`:
 
 ```bash
 # macOS (Apple Silicon) — adjust VERSION, OS, and ARCH as needed.
-VERSION=0.21.0
+VERSION=0.21.3
 OS=darwin
 ARCH=arm64
 ARCHIVE=noema_${VERSION}_${OS}_${ARCH}.tar.gz
@@ -233,6 +233,19 @@ noema plugin hermes install [--check] [--force] [--hermes-home PATH]
 noema plugin obsidian status [--check] --vault PATH
 noema plugin obsidian install [--check] [--force] --vault PATH
                                           Inspect or install the embedded Obsidian runtime files
+
+noema integrate list                      List supported agent-client adapters
+noema integrate status [CLIENT] [--scope user|project] [--check]
+                                          Inspect installed MCP and startup-bootstrap state
+noema integrate CLIENT install --scope user|project [--check] [--force]
+                                          Install a local stdio integration
+noema integrate CLIENT install --scope user|project --transport http --url URL
+                                [--bearer-token-env ENV] [--check] [--force]
+                                          Install an HTTP integration using an environment reference
+noema integrate CLIENT remove --scope user|project [--check] [--force]
+                                          Remove only recognized Noema integration components
+noema integrate CLIENT print --scope user|project [connection flags]
+                                          Print generated fragments without changing files
 
 noema archive <id>                        Archive a Trace
 noema unarchive <id>                      Restore an archived Trace
@@ -349,6 +362,53 @@ for measurements and the full trade-off.
 
 ---
 
+## Agent Integrations
+
+`noema integrate` connects a Cortex to supported coding agents and installs the
+small startup bootstrap that tells each agent to call `get_instructions`. An MCP
+entry without that bootstrap is callable but not reliably memory-aware after a
+fresh session or compaction.
+
+Supported clients are `codex`, `claude-code`, and `opencode` (OpenCode v1).
+Pi is listed as planned because it needs a first-class MCP extension rather than
+configuration alone.
+
+```bash
+# Preview a user-level Codex installation; exits non-zero while work is pending
+noema integrate codex install --scope user --check
+
+# Install local stdio MCP plus the SessionStart bootstrap
+noema integrate codex install --scope user
+
+# Install a remote OpenCode integration without writing a token value
+noema integrate opencode install --scope user \
+  --transport http \
+  --url https://memory.example.com/mcp \
+  --bearer-token-env NOEMA_MCP_KEY
+
+# Inspect all installed user-level adapters, or remove one recognized integration
+noema integrate status --scope user --check
+noema integrate claude-code remove --scope user
+```
+
+Mutation commands require an explicit `--scope`. User scope targets each
+client's private configuration; project scope targets the current Git root.
+`--check` never writes and exits non-zero when installation or removal work is
+pending. Existing unrelated configuration, JSONC comments, and hook entries are
+preserved. A named `noema` entry that is not recognizably a Noema MCP endpoint is
+reported as a conflict. Drifted managed components require `--force`.
+
+`integrate status` is observational: it detects each installed adapter's actual
+transport and checks that its MCP entry and startup bootstrap are complete and
+recognized. It does not assume a desired connection. Use `integrate CLIENT
+install --check` with connection flags to compare the installed files against a
+specific desired configuration without writing them.
+
+The default transport is local stdio and pins the selected Cortex in the client
+configuration. HTTP mode requires an absolute URL whose path is `/mcp`.
+`--bearer-token-env` accepts an environment-variable name, never a credential;
+the generated client syntax resolves that variable at runtime.
+
 ## MCP Server
 
 Noema can run as an [MCP](https://modelcontextprotocol.io) server, giving any MCP-compatible AI tool direct access to your Cortex.
@@ -427,7 +487,7 @@ noema serve --cortex my-cortex --transport http --host 10.0.0.5 --port 3000 \
             --tls-cert /path/server.crt --tls-key /path/server.key
 ```
 
-`--host` is **required** in HTTP mode and must be an explicit address — `0.0.0.0`/`::` are rejected to avoid accidentally exposing a Cortex on every interface. `--host-dynamic` accepts an IP address or hostname and rechecks it every five seconds: it adds the listener when an address it resolves to belongs to the machine and removes it when it no longer does, while required `--host` listeners remain available. Listener addresses, dynamic listener names, and loopback names are also accepted in HTTP `Host` headers. Add repeatable `--allowed-host <hostname-or-authority>` values when clients use another DNS name for an existing listener; this expands Host-header validation without binding another socket. Pair `--tls-cert` with `--tls-key` to serve over HTTPS. The endpoint is `/mcp` (not configurable).
+`--host` is **required** in HTTP mode and accepts an explicit IP address or hostname — `0.0.0.0`/`::` are rejected to avoid accidentally exposing a Cortex on every interface. A static hostname is resolved once at startup and every unique resolved address is bound, so `--host localhost` covers both IPv4 and IPv6 when the host resolver supplies both. `--host-dynamic` accepts an IP address or hostname and rechecks it every five seconds: it adds the listener when an address it resolves to belongs to the machine and removes it when it no longer does, while required `--host` listeners remain available. Listener addresses, dynamic listener names, and loopback names are also accepted in HTTP `Host` headers. Add repeatable `--allowed-host <hostname-or-authority>` values when clients use another DNS name for an existing listener; this expands Host-header validation without binding another socket. Pair `--tls-cert` with `--tls-key` to serve over HTTPS. The endpoint is `/mcp` (not configurable).
 
 When `--print-config` is used with HTTP transport, the generated client URL uses the first `--host-dynamic` value when one is present; otherwise it uses the first `--host` value. This keeps a loopback listener available to local clients while producing a configuration that remote clients can dial on the conditional network.
 
@@ -561,6 +621,8 @@ noema serve --cortex mycortex --transport http --host 127.0.0.1 \
   --print-launchd-plist > ~/Library/LaunchAgents/com.fail-safe.noema.mycortex.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fail-safe.noema.mycortex.plist
 ```
+
+For launchd output, `--host localhost` is normalized to explicit `--host 127.0.0.1 --host ::1` arguments. This keeps the supervised listener set deterministic even if resolver ordering changes between launches.
 
 Both flags require `--transport http` (stdio has no endpoint to supervise) and an explicit `--cortex` (the unit/plist pins exactly one cortex — NOEMA_CORTEX and the config default aren't carried into the service environment). `--host-dynamic` never replaces `--host`: at least one required listener is still needed, and the optional listener disappears if its address is no longer local. All the usual HTTP flag invariants (`--host` not `0.0.0.0`, TLS pair symmetry) are validated at preview time, so you catch misconfigurations before installing.
 

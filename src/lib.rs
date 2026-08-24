@@ -7,6 +7,7 @@ pub mod embedding;
 pub mod event;
 pub mod eventsig;
 pub mod federation;
+pub mod integrate;
 pub mod lock;
 pub mod mcp;
 pub mod migration;

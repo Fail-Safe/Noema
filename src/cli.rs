@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fmt::Write as _,
     fs::{self, OpenOptions},
     io::{self, IsTerminal, Read, Write},
@@ -197,6 +198,11 @@ enum Command {
     Plugin {
         #[command(subcommand)]
         command: PluginCommand,
+    },
+    /// Connect Noema to supported agent clients
+    Integrate {
+        #[command(subcommand)]
+        command: IntegrateCommand,
     },
     /// Generate or install shell completions
     Completion {
@@ -542,6 +548,131 @@ enum PluginCommand {
         command: ObsidianPluginAction,
     },
 }
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum IntegrationClient {
+    Codex,
+    ClaudeCode,
+    Opencode,
+}
+
+impl From<IntegrationClient> for crate::integrate::Client {
+    fn from(value: IntegrationClient) -> Self {
+        match value {
+            IntegrationClient::Codex => Self::Codex,
+            IntegrationClient::ClaudeCode => Self::ClaudeCode,
+            IntegrationClient::Opencode => Self::OpenCode,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum IntegrationScope {
+    User,
+    Project,
+}
+
+impl From<IntegrationScope> for crate::integrate::Scope {
+    fn from(value: IntegrationScope) -> Self {
+        match value {
+            IntegrationScope::User => Self::User,
+            IntegrationScope::Project => Self::Project,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum IntegrationTransport {
+    Stdio,
+    Http,
+}
+
+impl From<IntegrationTransport> for crate::integrate::Transport {
+    fn from(value: IntegrationTransport) -> Self {
+        match value {
+            IntegrationTransport::Stdio => Self::Stdio,
+            IntegrationTransport::Http => Self::Http,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum IntegrateCommand {
+    /// List supported agent clients
+    List,
+    /// Inspect one or all supported integrations
+    Status {
+        #[arg(value_enum)]
+        client: Option<IntegrationClient>,
+        #[command(flatten)]
+        args: IntegrationStatusArgs,
+    },
+    /// Manage the Codex integration
+    Codex {
+        #[command(subcommand)]
+        command: IntegrationAction,
+    },
+    /// Manage the Claude Code integration
+    ClaudeCode {
+        #[command(subcommand)]
+        command: IntegrationAction,
+    },
+    /// Manage the OpenCode integration
+    Opencode {
+        #[command(subcommand)]
+        command: IntegrationAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IntegrationAction {
+    /// Inspect the integration without changing it
+    Status(IntegrationStatusArgs),
+    /// Install or update the integration
+    Install(IntegrationInstallArgs),
+    /// Remove Noema-owned integration components
+    Remove {
+        #[arg(long, value_enum)]
+        scope: IntegrationScope,
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print the generated integration fragments
+    Print(IntegrationConnectionArgs),
+}
+
+#[derive(Debug, Args)]
+struct IntegrationInstallArgs {
+    #[command(flatten)]
+    connection: IntegrationConnectionArgs,
+    #[arg(long)]
+    check: bool,
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
+struct IntegrationStatusArgs {
+    #[arg(long, value_enum, default_value = "user")]
+    scope: IntegrationScope,
+    #[arg(long)]
+    check: bool,
+}
+
+#[derive(Debug, Args)]
+struct IntegrationConnectionArgs {
+    #[arg(long, value_enum)]
+    scope: IntegrationScope,
+    #[arg(long, value_enum, default_value = "stdio")]
+    transport: IntegrationTransport,
+    #[arg(long)]
+    url: Option<String>,
+    /// Environment variable containing the HTTP bearer token; never the token value
+    #[arg(long)]
+    bearer_token_env: Option<String>,
+}
 #[derive(Debug, Subcommand)]
 enum HermesPluginAction {
     Status {
@@ -627,6 +758,7 @@ pub async fn run() -> Result<()> {
         Command::Completion { command } => completion_command(command)?,
         Command::Config { command } => config_command(command)?,
         Command::Plugin { command } => plugin_command(command)?,
+        Command::Integrate { command } => integrate_command(selected, command)?,
         Command::Serve(args) => serve(selected, args).await?,
         Command::Consolidate(args) => consolidate(selected, args).await?,
         Command::Migrate { command } => migrate_command(selected, command)?,
@@ -943,7 +1075,8 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
         | Command::Completion { .. }
         | Command::Version
         | Command::Config { .. }
-        | Command::Plugin { .. } => unreachable!(),
+        | Command::Plugin { .. }
+        | Command::Integrate { .. } => unreachable!(),
     }
     Ok(())
 }
@@ -3095,6 +3228,171 @@ fn render_plugin_install(
     Ok(())
 }
 
+fn integrate_command(selected: Option<&str>, command: IntegrateCommand) -> Result<()> {
+    match command {
+        IntegrateCommand::List => {
+            for client in crate::integrate::Client::ALL {
+                println!("{:<12}  {}", client.name(), client.description());
+            }
+            println!(
+                "{:<12}  planned; requires a first-class MCP extension",
+                "pi"
+            );
+        }
+        IntegrateCommand::Status { client, args } => {
+            let clients = client
+                .map(|client| vec![client.into()])
+                .unwrap_or_else(|| crate::integrate::Client::ALL.to_vec());
+            let mut failed = false;
+            for (index, client) in clients.into_iter().enumerate() {
+                if index > 0 {
+                    println!();
+                }
+                let target = integration_target(client, args.scope.into())?;
+                let report = crate::integrate::status(&target)?;
+                failed |= !report.healthy();
+                render_integration_report(&report);
+            }
+            if args.check && failed {
+                bail!("integration check failed");
+            }
+        }
+        IntegrateCommand::Codex { command } => {
+            integrate_client_command(selected, crate::integrate::Client::Codex, command)?;
+        }
+        IntegrateCommand::ClaudeCode { command } => {
+            integrate_client_command(selected, crate::integrate::Client::ClaudeCode, command)?;
+        }
+        IntegrateCommand::Opencode { command } => {
+            integrate_client_command(selected, crate::integrate::Client::OpenCode, command)?;
+        }
+    }
+    Ok(())
+}
+
+fn integrate_client_command(
+    selected: Option<&str>,
+    client: crate::integrate::Client,
+    command: IntegrationAction,
+) -> Result<()> {
+    match command {
+        IntegrationAction::Status(args) => {
+            let target = integration_target(client, args.scope.into())?;
+            let report = crate::integrate::status(&target)?;
+            render_integration_report(&report);
+            if args.check && !report.healthy() {
+                bail!("integration check failed");
+            }
+        }
+        IntegrationAction::Install(args) => {
+            let request = integration_request_from_args(selected, client, args.connection)?;
+            let report = crate::integrate::install(&request, args.check, args.force)?;
+            render_integration_report(&report);
+            if report
+                .components
+                .iter()
+                .any(|component| component.state == crate::integrate::State::Conflict)
+            {
+                bail!(
+                    "integration install refused because an existing named component is not recognized as Noema-managed"
+                );
+            }
+            if report
+                .components
+                .iter()
+                .any(|component| component.state == crate::integrate::State::Drift)
+            {
+                bail!(
+                    "integration install refused because managed components have drifted; rerun with --force to replace them"
+                );
+            }
+            if args.check && report.pending() {
+                bail!("integration install check failed");
+            }
+        }
+        IntegrationAction::Remove {
+            scope,
+            check,
+            force,
+        } => {
+            let target = integration_target(client, scope.into())?;
+            let report = crate::integrate::remove(&target, check, force)?;
+            render_integration_report(&report);
+            if report.refused() {
+                bail!(
+                    "integration removal refused because a target is modified or not recognized as Noema-managed; rerun with --force only if it should be removed"
+                );
+            }
+            if check && report.pending() {
+                bail!("integration removal check failed");
+            }
+        }
+        IntegrationAction::Print(args) => {
+            let request = integration_request_from_args(selected, client, args)?;
+            print!("{}", crate::integrate::print(&request)?);
+        }
+    }
+    Ok(())
+}
+
+fn integration_request_from_args(
+    selected: Option<&str>,
+    client: crate::integrate::Client,
+    args: IntegrationConnectionArgs,
+) -> Result<crate::integrate::Request> {
+    integration_request(
+        selected,
+        client,
+        args.scope.into(),
+        args.transport.into(),
+        args.url,
+        args.bearer_token_env,
+    )
+}
+
+fn integration_request(
+    selected: Option<&str>,
+    client: crate::integrate::Client,
+    scope: crate::integrate::Scope,
+    transport: crate::integrate::Transport,
+    url: Option<String>,
+    bearer_token_env: Option<String>,
+) -> Result<crate::integrate::Request> {
+    let cortex = Cortex::resolve(selected)?;
+    crate::integrate::Request::from_environment(
+        client,
+        scope,
+        cortex.name,
+        transport,
+        url,
+        bearer_token_env,
+    )
+}
+
+fn integration_target(
+    client: crate::integrate::Client,
+    scope: crate::integrate::Scope,
+) -> Result<crate::integrate::Target> {
+    crate::integrate::Target::from_environment(client, scope)
+}
+
+fn render_integration_report(report: &crate::integrate::Report) {
+    println!("{} ({})", report.client, report.scope);
+    for component in &report.components {
+        let transport = component
+            .transport
+            .map(|transport| format!(" ({})", transport.name()))
+            .unwrap_or_default();
+        println!(
+            "  {:<13} {}{}",
+            component.state.label(),
+            component.component,
+            transport
+        );
+        println!("    {}", component.path.display());
+    }
+}
+
 fn resolve_hermes_target(flag: Option<PathBuf>) -> Result<PathBuf> {
     let home = flag
         .or_else(|| std::env::var_os("HERMES_HOME").map(PathBuf::from))
@@ -3314,12 +3612,47 @@ fn systemd_escape(argument: String) -> String {
     )
 }
 
+fn launchd_serve_arguments(
+    selected: Option<&str>,
+    args: &ServeArgs,
+    port: u16,
+) -> Result<Vec<String>> {
+    let arguments = serve_arguments(selected, args, port)?;
+    Ok(normalize_launchd_arguments(arguments))
+}
+
+fn normalize_launchd_arguments(arguments: Vec<String>) -> Vec<String> {
+    let mut output = Vec::with_capacity(arguments.len() + 2);
+    let mut seen_hosts = HashSet::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        if arguments[index] == "--host" {
+            let host = &arguments[index + 1];
+            let expanded = if host == "localhost" {
+                vec!["127.0.0.1", "::1"]
+            } else {
+                vec![host.as_str()]
+            };
+            for host in expanded {
+                if seen_hosts.insert(host.to_owned()) {
+                    output.extend(["--host".to_owned(), host.to_owned()]);
+                }
+            }
+            index += 2;
+            continue;
+        }
+        output.push(arguments[index].clone());
+        index += 1;
+    }
+    output
+}
+
 fn print_launchd_plist(selected: Option<&str>, args: &ServeArgs, port: u16) -> Result<()> {
     let cortex = selected
         .filter(|name| !name.is_empty())
         .context("--print-launchd-plist requires an explicit --cortex flag")?;
     let executable = std::env::current_exe()?;
-    let arguments = serve_arguments(selected, args, port)?;
+    let arguments = launchd_serve_arguments(selected, args, port)?;
     let mut array = format!(
         "    <string>{}</string>\n",
         xml_escape(&executable.display().to_string())
@@ -4111,6 +4444,43 @@ mod tests {
     }
 
     #[test]
+    fn launchd_expands_localhost_into_explicit_loopbacks() {
+        let arguments = normalize_launchd_arguments(
+            [
+                "serve",
+                "--cortex",
+                "sample",
+                "--transport",
+                "http",
+                "--host",
+                "localhost",
+                "--host",
+                "127.0.0.1",
+                "--host-dynamic",
+                "192.0.2.10",
+                "--allowed-host",
+                "memory.example.com",
+                "--port",
+                "3000",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+        );
+        let hosts = arguments
+            .windows(2)
+            .filter(|pair| pair[0] == "--host")
+            .map(|pair| pair[1].as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(hosts, ["127.0.0.1", "::1"]);
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--host-dynamic", "192.0.2.10"])
+        );
+    }
+
+    #[test]
     fn tag_commands_parse_aliases_and_automation_flags() {
         let cli = Cli::try_parse_from(["noema", "tags", "rename", "AI", "ai", "-i", "-y"]).unwrap();
         assert!(matches!(
@@ -4137,6 +4507,57 @@ mod tests {
         assert!(tag_mutation_confirmed("YES"));
         assert!(!tag_mutation_confirmed("n"));
         assert!(!tag_mutation_confirmed(""));
+    }
+
+    #[test]
+    fn integration_commands_require_scope_for_mutations_and_parse_http_options() {
+        let cli = Cli::try_parse_from([
+            "noema",
+            "integrate",
+            "codex",
+            "install",
+            "--scope",
+            "user",
+            "--transport",
+            "http",
+            "--url",
+            "https://memory.example.com/mcp",
+            "--bearer-token-env",
+            "NOEMA_MCP_KEY",
+            "--check",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Integrate {
+                command: IntegrateCommand::Codex {
+                    command: IntegrationAction::Install(IntegrationInstallArgs {
+                        connection: IntegrationConnectionArgs {
+                            scope: IntegrationScope::User,
+                            transport: IntegrationTransport::Http,
+                            ..
+                        },
+                        check: true,
+                        ..
+                    })
+                }
+            }
+        ));
+
+        assert!(Cli::try_parse_from(["noema", "integrate", "claude-code", "install"]).is_err());
+        assert!(Cli::try_parse_from(["noema", "integrate", "opencode", "remove"]).is_err());
+        assert!(Cli::try_parse_from(["noema", "integrate", "status"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "noema",
+                "integrate",
+                "opencode",
+                "status",
+                "--transport",
+                "http"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

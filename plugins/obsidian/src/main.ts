@@ -1,7 +1,7 @@
 import { Notice, Plugin, TFile, WorkspaceLeaf } from "obsidian";
 import { DEFAULT_SETTINGS, NoemaSettings, NoemaSettingTab } from "./settings";
 import { LineageView, LINEAGE_VIEW_TYPE } from "./lineage-view";
-import { McpClient, UnauthorizedError } from "./mcp-client";
+import { describeConnectionError, McpClient, UnauthorizedError } from "./mcp-client";
 import { readTraceMetadata, tierGlyph, tierLabel } from "./tier-status";
 import { CreateTraceModal } from "./create-modal";
 import { ImmutableWarning } from "./immutable-warning";
@@ -15,6 +15,7 @@ const STATUS_PING_INTERVAL_MS = 30_000;
 // "disconnected" because the remedy is different and we want to nudge
 // the user toward it (see setConnState's one-shot Notice).
 type ConnState = "connected" | "disconnected" | "unauthorized";
+type ProbeResult = { state: ConnState; error?: unknown };
 
 // NoemaPlugin is the Obsidian-side entry point. It wires up:
 //
@@ -198,27 +199,31 @@ export default class NoemaPlugin extends Plugin {
 	// result. Both the background ping and the settings "Test
 	// connection" button build on it so they classify failures
 	// identically.
-	private async probe(): Promise<ConnState> {
+	private async probe(): Promise<ProbeResult> {
 		if (!this.client) {
 			this.cortexName = "";
-			return "disconnected";
+			return { state: "disconnected" };
 		}
 		try {
 			const id = await this.client.cortexIdentity();
 			this.cortexName = id.name;
-			return "connected";
+			return { state: "connected" };
 		} catch (err) {
 			this.cortexName = "";
 			// A bearer-key rejection is distinct from "server's not
 			// there" — the AuthMiddleware 401 surfaces as
 			// UnauthorizedError, everything else (DNS, TLS, refused
 			// connection, 5xx) is a plain disconnect.
-			return err instanceof UnauthorizedError ? "unauthorized" : "disconnected";
+			return {
+				state: err instanceof UnauthorizedError ? "unauthorized" : "disconnected",
+				error: err,
+			};
 		}
 	}
 
 	private async pingConnection(): Promise<void> {
-		this.setConnState(await this.probe());
+		const result = await this.probe();
+		this.setConnState(result.state);
 		this.renderStatus();
 	}
 
@@ -240,10 +245,10 @@ export default class NoemaPlugin extends Plugin {
 		if (!this.client) {
 			this.client = new McpClient(this.settings.endpoint, this.settings.bearerKey);
 		}
-		const state = await this.probe();
-		this.connState = state;
+		const result = await this.probe();
+		this.connState = result.state;
 		this.renderStatus();
-		switch (state) {
+		switch (result.state) {
 			case "connected":
 				new Notice(`Noema: connected to ${this.cortexName || this.settings.endpoint}.`);
 				break;
@@ -256,7 +261,10 @@ export default class NoemaPlugin extends Plugin {
 				);
 				break;
 			case "disconnected":
-				new Notice(`Noema: couldn't reach ${this.settings.endpoint}.`);
+				new Notice(
+					`Noema: couldn't connect to ${this.settings.endpoint}: ${describeConnectionError(result.error)}.`,
+					8000
+				);
 				break;
 		}
 	}
