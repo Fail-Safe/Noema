@@ -234,6 +234,19 @@ noema plugin obsidian status [--check] --vault PATH
 noema plugin obsidian install [--check] [--force] --vault PATH
                                           Inspect or install the embedded Obsidian runtime files
 
+noema integrate list                      List supported agent-client adapters
+noema integrate status [CLIENT] [--scope user|project] [--check]
+                                          Inspect installed MCP and startup-bootstrap state
+noema integrate CLIENT install --scope user|project [--check] [--force]
+                                          Install a local stdio integration
+noema integrate CLIENT install --scope user|project --transport http --url URL
+                                [--bearer-token-env ENV] [--check] [--force]
+                                          Install an HTTP integration using an environment reference
+noema integrate CLIENT remove --scope user|project [--check] [--force]
+                                          Remove only recognized Noema integration components
+noema integrate CLIENT print --scope user|project [connection flags]
+                                          Print generated fragments without changing files
+
 noema archive <id>                        Archive a Trace
 noema unarchive <id>                      Restore an archived Trace
 noema sync [--recover]                    Re-index trace files; --recover rebuilds missing files from the event log
@@ -348,6 +361,53 @@ names fail closed, and MCP runtime introspection reports the active profile as
 for measurements and the full trade-off.
 
 ---
+
+## Agent Integrations
+
+`noema integrate` connects a Cortex to supported coding agents and installs the
+small startup bootstrap that tells each agent to call `get_instructions`. An MCP
+entry without that bootstrap is callable but not reliably memory-aware after a
+fresh session or compaction.
+
+Supported clients are `codex`, `claude-code`, and `opencode` (OpenCode v1).
+Pi is listed as planned because it needs a first-class MCP extension rather than
+configuration alone.
+
+```bash
+# Preview a user-level Codex installation; exits non-zero while work is pending
+noema integrate codex install --scope user --check
+
+# Install local stdio MCP plus the SessionStart bootstrap
+noema integrate codex install --scope user
+
+# Install a remote OpenCode integration without writing a token value
+noema integrate opencode install --scope user \
+  --transport http \
+  --url https://memory.example.com/mcp \
+  --bearer-token-env NOEMA_MCP_KEY
+
+# Inspect all installed user-level adapters, or remove one recognized integration
+noema integrate status --scope user --check
+noema integrate claude-code remove --scope user
+```
+
+Mutation commands require an explicit `--scope`. User scope targets each
+client's private configuration; project scope targets the current Git root.
+`--check` never writes and exits non-zero when installation or removal work is
+pending. Existing unrelated configuration, JSONC comments, and hook entries are
+preserved. A named `noema` entry that is not recognizably a Noema MCP endpoint is
+reported as a conflict. Drifted managed components require `--force`.
+
+`integrate status` is observational: it detects each installed adapter's actual
+transport and checks that its MCP entry and startup bootstrap are complete and
+recognized. It does not assume a desired connection. Use `integrate CLIENT
+install --check` with connection flags to compare the installed files against a
+specific desired configuration without writing them.
+
+The default transport is local stdio and pins the selected Cortex in the client
+configuration. HTTP mode requires an absolute URL whose path is `/mcp`.
+`--bearer-token-env` accepts an environment-variable name, never a credential;
+the generated client syntax resolves that variable at runtime.
 
 ## MCP Server
 
