@@ -813,29 +813,32 @@ fn install_codex_block(path: &Path, request: &Request, check: bool, force: bool)
             (State::WouldReplace, next)
         }
         Some(_) => return Ok(State::Drift),
-        None if source.contains(CLAUDE_HOOK_MARKER) => return Ok(State::Conflict),
-        None if let Some((begin, finish)) = toml_table_span(&source, "[mcp_servers.noema]")? => {
-            if !codex_unmanaged_mcp_compatible(&source, begin, finish, request)? {
+        None => {
+            if source.contains(CLAUDE_HOOK_MARKER) {
                 return Ok(State::Conflict);
             }
-            let mut block = adopted_codex_block(&source[begin..finish])?;
-            if finish < source.len() {
-                block.push('\n');
+            if let Some((begin, finish)) = toml_table_span(&source, "[mcp_servers.noema]")? {
+                if !codex_unmanaged_mcp_compatible(&source, begin, finish, request)? {
+                    return Ok(State::Conflict);
+                }
+                let mut block = adopted_codex_block(&source[begin..finish])?;
+                if finish < source.len() {
+                    block.push('\n');
+                }
+                let mut next = source.clone();
+                next.replace_range(begin..finish, &block);
+                (State::WouldReplace, next)
+            } else {
+                let mut next = source.clone();
+                if !next.is_empty() && !next.ends_with('\n') {
+                    next.push('\n');
+                }
+                if !next.is_empty() {
+                    next.push('\n');
+                }
+                next.push_str(&expected);
+                (State::WouldInstall, next)
             }
-            let mut next = source.clone();
-            next.replace_range(begin..finish, &block);
-            (State::WouldReplace, next)
-        }
-        None => {
-            let mut next = source.clone();
-            if !next.is_empty() && !next.ends_with('\n') {
-                next.push('\n');
-            }
-            if !next.is_empty() {
-                next.push('\n');
-            }
-            next.push_str(&expected);
-            (State::WouldInstall, next)
         }
     };
     if check {
