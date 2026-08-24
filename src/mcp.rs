@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Write as _,
+    net::ToSocketAddrs,
     path::PathBuf,
     sync::Arc,
 };
@@ -1276,6 +1277,35 @@ struct DynamicListener {
     task: tokio::task::JoinHandle<Result<()>>,
 }
 
+fn bind_static_listeners(hosts: &[String], port: u16) -> Result<Vec<std::net::TcpListener>> {
+    let mut addresses = Vec::new();
+    let mut seen = HashSet::new();
+    for host in hosts {
+        let resolved = (host.as_str(), port)
+            .to_socket_addrs()
+            .with_context(|| format!("resolving static address {host}"))?;
+        let mut resolved_any = false;
+        for address in resolved {
+            resolved_any = true;
+            if seen.insert(address) {
+                addresses.push((host, address));
+            }
+        }
+        if !resolved_any {
+            bail!("static address {host} did not resolve to any socket addresses");
+        }
+    }
+
+    let mut listeners = Vec::with_capacity(addresses.len());
+    for (host, address) in addresses {
+        let listener = std::net::TcpListener::bind(address)
+            .with_context(|| format!("binding static address {host} ({address})"))?;
+        listener.set_nonblocking(true)?;
+        listeners.push(listener);
+    }
+    Ok(listeners)
+}
+
 #[cfg(unix)]
 fn local_interface_addresses() -> Result<HashSet<std::net::IpAddr>> {
     let mut interfaces = std::ptr::null_mut();
@@ -1352,12 +1382,7 @@ pub async fn serve_http(
         ),
         None => None,
     };
-    let mut listeners = Vec::with_capacity(hosts.len());
-    for host in &hosts {
-        let listener = std::net::TcpListener::bind((host.as_str(), port))?;
-        listener.set_nonblocking(true)?;
-        listeners.push(listener);
-    }
+    let listeners = bind_static_listeners(&hosts, port)?;
     let cancellation = CancellationToken::new();
     let registry = Arc::new(crate::consolidation::InFlightRegistry::default());
     let (scheduler, eligibility, cadence, watchdog, watcher, embedder) =
@@ -2411,6 +2436,35 @@ mod tests {
                 "127.0.0.1",
                 "::1",
             ]
+        );
+    }
+
+    #[test]
+    fn static_listener_binding_covers_every_resolved_address() {
+        let expected = ("localhost", 0)
+            .to_socket_addrs()
+            .unwrap()
+            .map(|address| address.ip())
+            .collect::<HashSet<_>>();
+        let listeners = bind_static_listeners(&["localhost".to_owned()], 0).unwrap();
+        let actual = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap().ip())
+            .collect::<HashSet<_>>();
+
+        assert!(!expected.is_empty());
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn static_listener_binding_deduplicates_repeated_addresses() {
+        let listeners =
+            bind_static_listeners(&["127.0.0.1".to_owned(), "127.0.0.1".to_owned()], 0).unwrap();
+
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(
+            listeners[0].local_addr().unwrap().ip(),
+            std::net::Ipv4Addr::LOCALHOST
         );
     }
 

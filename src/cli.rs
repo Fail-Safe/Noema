@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fmt::Write as _,
     fs::{self, OpenOptions},
     io::{self, IsTerminal, Read, Write},
@@ -3611,12 +3612,47 @@ fn systemd_escape(argument: String) -> String {
     )
 }
 
+fn launchd_serve_arguments(
+    selected: Option<&str>,
+    args: &ServeArgs,
+    port: u16,
+) -> Result<Vec<String>> {
+    let arguments = serve_arguments(selected, args, port)?;
+    Ok(normalize_launchd_arguments(arguments))
+}
+
+fn normalize_launchd_arguments(arguments: Vec<String>) -> Vec<String> {
+    let mut output = Vec::with_capacity(arguments.len() + 2);
+    let mut seen_hosts = HashSet::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        if arguments[index] == "--host" {
+            let host = &arguments[index + 1];
+            let expanded = if host == "localhost" {
+                vec!["127.0.0.1", "::1"]
+            } else {
+                vec![host.as_str()]
+            };
+            for host in expanded {
+                if seen_hosts.insert(host.to_owned()) {
+                    output.extend(["--host".to_owned(), host.to_owned()]);
+                }
+            }
+            index += 2;
+            continue;
+        }
+        output.push(arguments[index].clone());
+        index += 1;
+    }
+    output
+}
+
 fn print_launchd_plist(selected: Option<&str>, args: &ServeArgs, port: u16) -> Result<()> {
     let cortex = selected
         .filter(|name| !name.is_empty())
         .context("--print-launchd-plist requires an explicit --cortex flag")?;
     let executable = std::env::current_exe()?;
-    let arguments = serve_arguments(selected, args, port)?;
+    let arguments = launchd_serve_arguments(selected, args, port)?;
     let mut array = format!(
         "    <string>{}</string>\n",
         xml_escape(&executable.display().to_string())
@@ -4405,6 +4441,43 @@ mod tests {
             Command::Serve(ServeArgs { ref allowed_host, .. })
                 if allowed_host == &["memory.example.com", "memory.example.com:3000"]
         ));
+    }
+
+    #[test]
+    fn launchd_expands_localhost_into_explicit_loopbacks() {
+        let arguments = normalize_launchd_arguments(
+            [
+                "serve",
+                "--cortex",
+                "sample",
+                "--transport",
+                "http",
+                "--host",
+                "localhost",
+                "--host",
+                "127.0.0.1",
+                "--host-dynamic",
+                "192.0.2.10",
+                "--allowed-host",
+                "memory.example.com",
+                "--port",
+                "3000",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+        );
+        let hosts = arguments
+            .windows(2)
+            .filter(|pair| pair[0] == "--host")
+            .map(|pair| pair[1].as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(hosts, ["127.0.0.1", "::1"]);
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--host-dynamic", "192.0.2.10"])
+        );
     }
 
     #[test]

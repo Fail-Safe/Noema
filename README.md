@@ -487,7 +487,7 @@ noema serve --cortex my-cortex --transport http --host 10.0.0.5 --port 3000 \
             --tls-cert /path/server.crt --tls-key /path/server.key
 ```
 
-`--host` is **required** in HTTP mode and must be an explicit address — `0.0.0.0`/`::` are rejected to avoid accidentally exposing a Cortex on every interface. `--host-dynamic` accepts an IP address or hostname and rechecks it every five seconds: it adds the listener when an address it resolves to belongs to the machine and removes it when it no longer does, while required `--host` listeners remain available. Listener addresses, dynamic listener names, and loopback names are also accepted in HTTP `Host` headers. Add repeatable `--allowed-host <hostname-or-authority>` values when clients use another DNS name for an existing listener; this expands Host-header validation without binding another socket. Pair `--tls-cert` with `--tls-key` to serve over HTTPS. The endpoint is `/mcp` (not configurable).
+`--host` is **required** in HTTP mode and accepts an explicit IP address or hostname — `0.0.0.0`/`::` are rejected to avoid accidentally exposing a Cortex on every interface. A static hostname is resolved once at startup and every unique resolved address is bound, so `--host localhost` covers both IPv4 and IPv6 when the host resolver supplies both. `--host-dynamic` accepts an IP address or hostname and rechecks it every five seconds: it adds the listener when an address it resolves to belongs to the machine and removes it when it no longer does, while required `--host` listeners remain available. Listener addresses, dynamic listener names, and loopback names are also accepted in HTTP `Host` headers. Add repeatable `--allowed-host <hostname-or-authority>` values when clients use another DNS name for an existing listener; this expands Host-header validation without binding another socket. Pair `--tls-cert` with `--tls-key` to serve over HTTPS. The endpoint is `/mcp` (not configurable).
 
 When `--print-config` is used with HTTP transport, the generated client URL uses the first `--host-dynamic` value when one is present; otherwise it uses the first `--host` value. This keeps a loopback listener available to local clients while producing a configuration that remote clients can dial on the conditional network.
 
@@ -621,6 +621,8 @@ noema serve --cortex mycortex --transport http --host 127.0.0.1 \
   --print-launchd-plist > ~/Library/LaunchAgents/com.fail-safe.noema.mycortex.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fail-safe.noema.mycortex.plist
 ```
+
+For launchd output, `--host localhost` is normalized to explicit `--host 127.0.0.1 --host ::1` arguments. This keeps the supervised listener set deterministic even if resolver ordering changes between launches.
 
 Both flags require `--transport http` (stdio has no endpoint to supervise) and an explicit `--cortex` (the unit/plist pins exactly one cortex — NOEMA_CORTEX and the config default aren't carried into the service environment). `--host-dynamic` never replaces `--host`: at least one required listener is still needed, and the optional listener disappears if its address is no longer local. All the usual HTTP flag invariants (`--host` not `0.0.0.0`, TLS pair symmetry) are validated at preview time, so you catch misconfigurations before installing.
 

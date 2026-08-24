@@ -67,3 +67,33 @@ test("MCP client accepts and decodes Streamable HTTP SSE responses", async () =>
 		globalThis.fetch = originalFetch;
 	}
 });
+
+test("MCP client reports the failed transport phase and network category", async () => {
+	const { McpClient } = await loadClient();
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => {
+		const error = new TypeError("fetch failed");
+		error.cause = { code: "ECONNREFUSED" };
+		throw error;
+	};
+
+	try {
+		const client = new McpClient("https://memory.example.com:3000", "test-key");
+		await assert.rejects(
+			client.cortexIdentity(),
+			/initialize request: connection refused \(ECONNREFUSED\)/
+		);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("connection errors retain useful HTTP and protocol messages", async () => {
+	const { describeConnectionError } = await loadClient();
+
+	assert.equal(
+		describeConnectionError(new Error("initialize: HTTP 403: Forbidden")),
+		"initialize: HTTP 403: Forbidden"
+	);
+	assert.equal(describeConnectionError(undefined), "unknown connection error");
+});
