@@ -774,6 +774,21 @@ consolidation:
 
 Explicit curation is always available: `noema memory promote <id>` advances a trace one tier (short→mid or mid→long), and `noema memory demote <id>` steps mid→short. Long-term demotion goes through `noema memory purge` because undoing a base truth deserves the same ceremony as destroying it. Tags remain mutable retrieval metadata on every tier; retagging a long-term trace does not change its body, identity fields, content hash, or `updated` timestamp.
 
+If `noema sync` reports that a long-tier file has drifted from its immutable
+database/event history, preview the exact differences before repairing it:
+
+```bash
+noema memory reconcile <id>
+noema memory reconcile <id> --apply       # prompts for confirmation
+noema memory reconcile <id> --apply --yes # non-interactive
+```
+
+Reconciliation restores the canonical content-bearing event snapshot without
+changing the long-tier row. Before replacement, Noema retains the exact drifted
+bytes under the private `db/reconciliations/` directory and records an audited
+long-term divergence resolution. Substantive revisions should remain separate
+traces linked through `derived_from`; reconciliation is not an edit bypass.
+
 ### Automatic LLM distillation
 
 By default, `consolidation.llm_enabled: true` wires up the `noema consolidate` CLI but leaves the in-process agent on cheap heuristic-only work — you'd run the CLI from a separate system cron to get clusters distilled. Set `auto_distillation_enabled: true` to fold the LLM pipeline into every scheduled trigger instead, so each cron/idle/threshold fire runs **distillation → heuristic → graduation** in sequence on the elected peer.

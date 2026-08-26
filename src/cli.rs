@@ -329,6 +329,16 @@ enum MemoryCommand {
     Demote {
         trace_id: String,
     },
+    /// Preview or repair an on-disk file that drifted from immutable long-term history
+    Reconcile {
+        trace_id: String,
+        /// Restore the canonical event-backed file
+        #[arg(long)]
+        apply: bool,
+        /// Apply without an interactive confirmation prompt
+        #[arg(short = 'y', long, requires = "apply")]
+        yes: bool,
+    },
     Purge {
         trace_id: String,
         #[arg(long)]
@@ -879,17 +889,18 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
         }
         Command::Sync { recover } => {
             let result = cx.sync_with_recovery(recover)?;
-            if recover {
-                println!(
-                    "Added: {}  Updated: {}  Drifted: {}  Recovered: {}  Orphaned: {}",
-                    result.added, result.updated, result.drifted, result.recovered, result.orphaned
-                );
-            } else {
-                println!(
-                    "Added: {}  Updated: {}  Drifted: {}  Orphaned: {}",
-                    result.added, result.updated, result.drifted, result.orphaned
-                );
+            for invalid in &result.invalid_files {
+                println!("INVALID {}", invalid.path);
+                println!("        {}", invalid.error);
             }
+            println!(
+                "Scanned: {}  Added: {}  Changed: {}  Unchanged: {}",
+                result.scanned, result.added, result.changed, result.unchanged
+            );
+            println!(
+                "Drifted: {}  Invalid: {}  Recovered: {}  Orphaned: {}",
+                result.drifted, result.invalid, result.recovered, result.orphaned
+            );
             if result.recovered > 0 {
                 println!(
                     "Note: recovered entries had missing files that were rebuilt from the local event log."
@@ -903,7 +914,7 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
                     "      The DB row is left untouched (long-tier is immutable). Visibility was still reconciled."
                 );
                 println!(
-                    "      Use `noema get <id>` to inspect each trace's current file body. Drifted IDs:"
+                    "      Use `noema memory reconcile <id>` to preview a safe repair. Drifted IDs:"
                 );
                 for id in &result.drifted_ids {
                     println!("        {id}");
@@ -917,6 +928,10 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
             }
             if result.orphaned > 0 {
                 println!("Note: orphaned entries are in the database but have no file on disk.");
+                println!("      Orphaned IDs:");
+                for id in &result.orphaned_ids {
+                    println!("        {id}");
+                }
                 if recover {
                     println!("      The local event log had no usable snapshot for these IDs.");
                     println!(
@@ -936,6 +951,12 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
                         "      `noema memory purge <id> --tier <tier> --reason \"orphan cleanup\" --confirm --hard`."
                     );
                 }
+            }
+            if result.invalid > 0 {
+                bail!(
+                    "sync completed with {} invalid trace file(s); invalid files were not changed",
+                    result.invalid
+                );
             }
         }
         Command::Events {
@@ -2045,6 +2066,57 @@ fn memory_command(cx: &Cortex, command: MemoryCommand) -> Result<()> {
         MemoryCommand::Demote { trace_id } => {
             cx.demote(&trace_id)?;
             println!("Demoted {trace_id} to short");
+        }
+        MemoryCommand::Reconcile {
+            trace_id,
+            apply,
+            yes,
+        } => {
+            let plan = cx.long_term_reconciliation_plan(&trace_id)?;
+            println!("Long-tier reconciliation — {}", plan.id);
+            println!("  File: {}", plan.path);
+            println!("  Classification: {}", plan.classification);
+            if plan.drift_fields.is_empty() {
+                println!("  Drifted fields: none");
+                println!("  No repair is needed.");
+                return Ok(());
+            }
+            println!("  Drifted fields: {}", plan.drift_fields.join(", "));
+            println!("  Canonical event: {}", plan.canonical_event_id);
+            println!("  Canonical content: {}", plan.canonical_content_hash);
+            println!("  On-disk content: {}", plan.file_content_hash);
+            if plan.successors.is_empty() {
+                println!("  Derived successors: none");
+                println!(
+                    "  Warning: the drifted bytes will be retained in a private recovery artifact."
+                );
+            } else {
+                println!("  Derived successors:");
+                for successor in &plan.successors {
+                    println!("    {successor}");
+                }
+            }
+            println!("  Proposed action: restore the canonical event-backed long-tier file.");
+            if !apply {
+                println!(
+                    "  Preview only. Apply with `noema memory reconcile {} --apply`.",
+                    plan.id
+                );
+                return Ok(());
+            }
+            if !yes {
+                print!("Proceed? [y/N]: ");
+                io::stdout().flush()?;
+                if !matches!(read_line()?.as_str(), "y" | "Y" | "yes") {
+                    bail!("aborted by user");
+                }
+            }
+            let result = cx.reconcile_long_term(&trace_id)?;
+            println!(
+                "Reconciled {} from immutable event history.",
+                result.plan.id
+            );
+            println!("Recovery artifact: {}", result.recovery_artifact);
         }
         MemoryCommand::Purge {
             trace_id,

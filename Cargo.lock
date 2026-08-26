@@ -1843,7 +1843,7 @@ dependencies = [
 
 [[package]]
 name = "noema"
-version = "0.21.3"
+version = "0.21.4"
 dependencies = [
  "anyhow",
  "assert_cmd",
