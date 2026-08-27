@@ -656,12 +656,41 @@ pub struct OneSourceMidCount {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SyncResult {
+    pub scanned: usize,
     pub added: usize,
-    pub updated: usize,
+    pub changed: usize,
+    pub unchanged: usize,
     pub recovered: usize,
     pub orphaned: usize,
+    pub orphaned_ids: Vec<String>,
     pub drifted: usize,
     pub drifted_ids: Vec<String>,
+    pub invalid: usize,
+    pub invalid_files: Vec<SyncInvalidFile>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncInvalidFile {
+    pub path: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LongTermReconciliationPlan {
+    pub id: String,
+    pub path: String,
+    pub classification: String,
+    pub drift_fields: Vec<String>,
+    pub successors: Vec<String>,
+    pub canonical_event_id: String,
+    pub canonical_content_hash: String,
+    pub file_content_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LongTermReconciliationResult {
+    pub plan: LongTermReconciliationPlan,
+    pub recovery_artifact: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1086,12 +1115,24 @@ impl Cortex {
             .read(true)
             .write(true)
             .open(&path_lock_path)?;
-        path_lock_file.try_lock_exclusive().with_context(|| {
-            format!(
-                "trace mutation is already in progress ({})",
-                path_lock_path.display()
-            )
-        })?;
+        let mut retries = 0;
+        loop {
+            match path_lock_file.try_lock_exclusive() {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && retries < 5 => {
+                    retries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "trace mutation is already in progress ({})",
+                            path_lock_path.display()
+                        )
+                    });
+                }
+            }
+        }
         Ok(path_lock_file)
     }
 
@@ -3028,7 +3069,7 @@ impl Cortex {
                 frontmatter: crate::trace::Frontmatter {
                     id: id.to_owned(),
                     title: data.title,
-                    trace_type: data.trace_type,
+                    trace_type: normalize_legacy_trace_type(&data.trace_type).into(),
                     tier: row.tier,
                     author: data.author,
                     tags: data.tags,
@@ -3039,6 +3080,7 @@ impl Cortex {
                     content_hash: data.content_hash,
                     source_hash: data.source_hash,
                     source_locked: data.source_locked,
+                    extra: Default::default(),
                 },
                 body: data.body,
             };
@@ -3236,7 +3278,12 @@ impl Cortex {
         let cutoff = (Utc::now() - Duration::days(days.into())).to_rfc3339();
         let ids: Vec<String> = {
             let mut statement = self.connection.prepare(
-                "SELECT id FROM traces WHERE trashed_at IS NOT NULL AND trashed_at < ?1",
+                "SELECT id FROM traces
+                 WHERE trashed_at IS NOT NULL
+                   AND trashed_at < ?1
+                   AND tier != 'long'
+                   AND purged_at IS NULL
+                 ORDER BY id",
             )?;
             statement
                 .query_map([cutoff], |row| row.get(0))?
@@ -3975,7 +4022,7 @@ impl Cortex {
             frontmatter: trace::Frontmatter {
                 id: event.trace_id.clone(),
                 title: data.title,
-                trace_type: data.trace_type,
+                trace_type: normalize_legacy_trace_type(&data.trace_type).into(),
                 tier,
                 author: data.author,
                 tags: dedupe(data.tags),
@@ -3990,6 +4037,7 @@ impl Cortex {
                 content_hash,
                 source_hash: data.source_hash,
                 source_locked: data.source_locked && event.cortex_id != self.id,
+                extra: Default::default(),
             },
             body: data.body,
         };
@@ -4135,6 +4183,178 @@ impl Cortex {
         Ok((parents, children))
     }
 
+    pub fn long_term_reconciliation_plan(&self, id: &str) -> Result<LongTermReconciliationPlan> {
+        let row = self.get(id)?;
+        if row.tier != "long" {
+            bail!(
+                "trace {id:?} is tier {:?}; reconciliation is only for long-tier drift",
+                row.tier
+            );
+        }
+        let path = self.file_path(&row);
+        let file_trace =
+            Trace::parse_file(&path).with_context(|| format!("reading drifted trace {id:?}"))?;
+        file_trace.validate()?;
+        let file_content_hash = trace::content_hash(&file_trace.body);
+        let (canonical_event_id, canonical) = self.canonical_long_term_trace(&row)?;
+        let mut drift_fields = Vec::new();
+        let file = &file_trace.frontmatter;
+        let expected = &canonical.frontmatter;
+        for (field, differs) in [
+            ("id", file.id != expected.id),
+            ("title", file.title != expected.title),
+            ("type", file.trace_type != expected.trace_type),
+            ("tier", file_trace.effective_tier() != expected.tier),
+            ("author", file.author != expected.author),
+            ("origin", file.origin != expected.origin),
+            ("created", file.created != expected.created),
+            ("updated", file.updated != expected.updated),
+            ("body", file_content_hash != expected.content_hash),
+            (
+                "content_hash",
+                file.content_hash != file_content_hash
+                    || file.content_hash != expected.content_hash,
+            ),
+            (
+                "source_locked",
+                file.source_locked != expected.source_locked,
+            ),
+            ("source_hash", file.source_hash != expected.source_hash),
+        ] {
+            if differs {
+                drift_fields.push(field.to_owned());
+            }
+        }
+        let (_, successors) = self.lineage(id)?;
+        Ok(LongTermReconciliationPlan {
+            id: id.to_owned(),
+            path: self.relative_trace_path(&path)?,
+            classification: if drift_fields.is_empty() {
+                "clean".into()
+            } else {
+                "restore-canonical".into()
+            },
+            drift_fields,
+            successors,
+            canonical_event_id,
+            canonical_content_hash: canonical.frontmatter.content_hash,
+            file_content_hash,
+        })
+    }
+
+    pub fn reconcile_long_term(&self, id: &str) -> Result<LongTermReconciliationResult> {
+        let plan = self.long_term_reconciliation_plan(id)?;
+        if plan.drift_fields.is_empty() {
+            bail!("trace {id:?} has no long-tier drift");
+        }
+        let row = self.get(id)?;
+        let path = self.file_path(&row);
+        let original_bytes = fs::read(&path)
+            .with_context(|| format!("reading drifted trace {id:?} for recovery artifact"))?;
+        let artifact_directory = self.dir.join("db/reconciliations");
+        fs::create_dir_all(&artifact_directory)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&artifact_directory, fs::Permissions::from_mode(0o700))?;
+        }
+        let artifact_name = format!("{id}-{}.md", ulid::Ulid::new());
+        let artifact_path = artifact_directory.join(&artifact_name);
+        trace::write_bytes_atomic_with_mode(&artifact_path, &original_bytes, 0o600)?;
+        let recovery_artifact = format!("db/reconciliations/{artifact_name}");
+        let (_, mut canonical) = self.canonical_long_term_trace(&row)?;
+        canonical.frontmatter.extra = Trace::parse(&original_bytes)?.frontmatter.extra;
+        let now = trace::now_rfc3339();
+        let event_data = json!({
+            "kind": "local_file_reconciliation",
+            "resolution": "restore_canonical",
+            "canonical_event_id": plan.canonical_event_id,
+            "canonical_content_hash": plan.canonical_content_hash,
+            "drifted_content_hash": plan.file_content_hash,
+            "drift_fields": plan.drift_fields,
+            "recovery_artifact": recovery_artifact,
+        });
+        self.replace_trace_transactionally(&path, &canonical, |pending_key| {
+            let tx = self.connection.unchecked_transaction()?;
+            self.emit_event(&tx, "divergence_long_term", id, &now, event_data)?;
+            Self::clear_pending_in_transaction(&tx, pending_key)?;
+            tx.commit()?;
+            Ok(())
+        })?;
+        Ok(LongTermReconciliationResult {
+            plan,
+            recovery_artifact,
+        })
+    }
+
+    fn canonical_long_term_trace(&self, row: &Row) -> Result<(String, Trace)> {
+        let event = self
+            .history(&row.id)?
+            .into_iter()
+            .rev()
+            .find(|event| matches!(event.action.as_str(), "create" | "update"))
+            .ok_or_else(|| anyhow::anyhow!("trace {:?} has no content-bearing event", row.id))?;
+        let data: TraceEventData = serde_json::from_value(event.data.clone())?;
+        let content_hash = trace::content_hash(&data.body);
+        if !data.content_hash.is_empty() && data.content_hash != content_hash {
+            bail!(
+                "trace {:?} event {} has an invalid content hash",
+                row.id,
+                event.id
+            );
+        }
+        let event_type = normalize_legacy_trace_type(&data.trace_type);
+        let event_origin = if data.origin.is_empty() {
+            row.origin.as_str()
+        } else {
+            data.origin.as_str()
+        };
+        let mut mismatches = Vec::new();
+        for (field, differs) in [
+            ("title", data.title != row.title),
+            ("type", event_type != row.trace_type),
+            ("author", data.author != row.author),
+            ("origin", event_origin != row.origin),
+            ("updated", event.timestamp != row.updated_at),
+            ("content_hash", content_hash != row.content_hash),
+            ("source_locked", data.source_locked != row.source_locked),
+            ("source_hash", data.source_hash != row.source_hash),
+        ] {
+            if differs {
+                mismatches.push(field);
+            }
+        }
+        if !mismatches.is_empty() {
+            bail!(
+                "trace {:?} DB row does not match latest content event {} in: {}",
+                row.id,
+                event.id,
+                mismatches.join(", ")
+            );
+        }
+        let trace = Trace {
+            frontmatter: trace::Frontmatter {
+                id: row.id.clone(),
+                title: row.title.clone(),
+                trace_type: row.trace_type.clone(),
+                tier: row.tier.clone(),
+                author: row.author.clone(),
+                tags: row.tags.clone(),
+                derived_from: row.derived_from.clone(),
+                origin: row.origin.clone(),
+                created: row.created_at.clone(),
+                updated: row.updated_at.clone(),
+                content_hash,
+                source_hash: row.source_hash.clone(),
+                source_locked: row.source_locked,
+                extra: Default::default(),
+            },
+            body: data.body,
+        };
+        trace.validate()?;
+        Ok((event.id, trace))
+    }
+
     pub fn sync(&self) -> Result<SyncResult> {
         self.sync_with_recovery(false)
     }
@@ -4158,22 +4378,58 @@ impl Cortex {
                 if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
                     continue;
                 }
+                let relative_path = path
+                    .strip_prefix(&self.dir)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                if let Some(id) = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .filter(|id| trace::is_valid_id(id))
+                {
+                    found.insert(id.to_owned());
+                }
                 let mut trace = match Trace::parse_file(&path) {
                     Ok(trace) => trace,
-                    Err(_) => continue,
+                    Err(error) => {
+                        result.invalid += 1;
+                        result.invalid_files.push(SyncInvalidFile {
+                            path: relative_path,
+                            error: error.to_string(),
+                        });
+                        continue;
+                    }
                 };
                 let id = trace.frontmatter.id.clone();
-                found.insert(id.clone());
-                let existing = self.get(&id).ok();
+                if trace::is_valid_id(&id) {
+                    found.insert(id.clone());
+                }
+                let existing = trace::is_valid_id(&id)
+                    .then(|| self.get(&id).ok())
+                    .flatten();
+                let repair_tier = existing
+                    .as_ref()
+                    .is_some_and(|row| trace.effective_tier() != row.tier);
                 if let Some(row) = &existing
-                    && trace.effective_tier() != row.tier
+                    && repair_tier
                 {
                     trace.frontmatter.tier = row.tier.clone();
+                }
+                if let Err(error) = trace.validate() {
+                    result.invalid += 1;
+                    result.invalid_files.push(SyncInvalidFile {
+                        path: relative_path,
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+                result.scanned += 1;
+                if repair_tier {
                     trace
                         .write_preserving_updated(&path)
                         .with_context(|| format!("repairing tier for {id}"))?;
                 }
-                trace.validate()?;
 
                 let archived_at = if archived {
                     Some(
@@ -4216,6 +4472,9 @@ impl Cortex {
                 let content_hash = trace::content_hash(&trace.body);
 
                 if let Some(row) = existing {
+                    let visibility_changed = row.archived_at
+                        != archived_at.as_deref().unwrap_or_default()
+                        || row.trashed_at != trashed_at.as_deref().unwrap_or_default();
                     if row.tier == "long" {
                         let drifted = row.title != trace.frontmatter.title
                             || row.trace_type != trace.frontmatter.trace_type
@@ -4236,8 +4495,10 @@ impl Cortex {
                             if result.drifted_ids.len() < 10 {
                                 result.drifted_ids.push(id);
                             }
+                        } else if visibility_changed {
+                            result.changed += 1;
                         } else {
-                            result.updated += 1;
+                            result.unchanged += 1;
                         }
                         continue;
                     }
@@ -4247,6 +4508,20 @@ impl Cortex {
                         trace.frontmatter.content_hash = content_hash.clone();
                         trace.frontmatter.updated = trace::now_rfc3339();
                     }
+                    let changed = repair_tier
+                        || needs_file_repair
+                        || row.title != trace.frontmatter.title
+                        || row.trace_type != trace.frontmatter.trace_type
+                        || row.author != trace.frontmatter.author
+                        || row.origin != trace.frontmatter.origin
+                        || row.cortex_id != cortex_id
+                        || row.updated_at != trace.frontmatter.updated
+                        || visibility_changed
+                        || row.content_hash != content_hash
+                        || row.source_locked != trace.frontmatter.source_locked
+                        || row.source_hash != trace.frontmatter.source_hash
+                        || !same_string_members(&row.tags, &trace.frontmatter.tags)
+                        || !same_string_members(&row.derived_from, &trace.frontmatter.derived_from);
                     let update_db = |pending_key: Option<&str>| -> Result<()> {
                         let tx = self.connection.unchecked_transaction()?;
                         let f = &trace.frontmatter;
@@ -4270,7 +4545,11 @@ impl Cortex {
                     } else {
                         update_db(None)?;
                     }
-                    result.updated += 1;
+                    if changed {
+                        result.changed += 1;
+                    } else {
+                        result.unchanged += 1;
+                    }
                 } else {
                     let needs_file_repair = trace.frontmatter.content_hash != content_hash;
                     if needs_file_repair {
@@ -4305,7 +4584,12 @@ impl Cortex {
             }
         }
         let db_ids: Vec<String> = {
-            let mut statement = self.connection.prepare("SELECT id FROM traces")?;
+            let query = if recover {
+                "SELECT id FROM traces WHERE purged_at IS NULL ORDER BY id"
+            } else {
+                "SELECT id FROM traces WHERE purged_at IS NULL AND trashed_at IS NULL ORDER BY id"
+            };
+            let mut statement = self.connection.prepare(query)?;
             statement
                 .query_map([], |row| row.get(0))?
                 .collect::<rusqlite::Result<_>>()?
@@ -4313,6 +4597,7 @@ impl Cortex {
         for id in db_ids.into_iter().filter(|id| !found.contains(id)) {
             if !recover {
                 result.orphaned += 1;
+                result.orphaned_ids.push(id);
                 continue;
             }
             if self
@@ -4322,6 +4607,7 @@ impl Cortex {
                 result.recovered += 1;
             } else {
                 result.orphaned += 1;
+                result.orphaned_ids.push(id);
             }
         }
         Ok(result)
@@ -4353,7 +4639,7 @@ impl Cortex {
             frontmatter: trace::Frontmatter {
                 id: id.to_owned(),
                 title: data.title,
-                trace_type: data.trace_type,
+                trace_type: normalize_legacy_trace_type(&data.trace_type).into(),
                 tier: row.tier,
                 author: data.author,
                 tags: data.tags,
@@ -4364,6 +4650,7 @@ impl Cortex {
                 content_hash: data.content_hash,
                 source_hash: data.source_hash,
                 source_locked: data.source_locked,
+                extra: Default::default(),
             },
             body: data.body,
         };
@@ -4760,6 +5047,13 @@ struct TraceEventData {
     source_hash: String,
     #[serde(default)]
     source_locked: bool,
+}
+
+fn normalize_legacy_trace_type(value: &str) -> &str {
+    match value {
+        "reference" => "note",
+        _ => value,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -5333,6 +5627,16 @@ fn dedupe(values: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+fn same_string_members(left: &[String], right: &[String]) -> bool {
+    left.iter()
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>()
+        == right
+            .iter()
+            .filter(|value| !value.is_empty())
+            .collect::<BTreeSet<_>>()
+}
+
 pub fn sanitize_fts5_query(query: &str) -> String {
     let mut out = Vec::new();
     for token in query.split_whitespace() {
@@ -5778,8 +6082,10 @@ mod tests {
 
         let ordinary = cx.sync().unwrap();
         assert_eq!((ordinary.recovered, ordinary.orphaned), (0, 1));
+        assert_eq!(ordinary.orphaned_ids, vec![id.clone()]);
         let recovered = cx.sync_with_recovery(true).unwrap();
         assert_eq!((recovered.recovered, recovered.orphaned), (1, 0));
+        assert!(recovered.orphaned_ids.is_empty());
 
         let rebuilt = Trace::parse_file(&path).unwrap();
         let row = cx.get(&id).unwrap();
@@ -5812,6 +6118,138 @@ mod tests {
         assert_eq!(after.content_hash, before.content_hash);
         assert_eq!(after.updated_at, before.updated_at);
         assert_eq!(Trace::parse_file(&path).unwrap().body, "out-of-band edit");
+    }
+
+    #[test]
+    fn long_term_reconciliation_restores_event_snapshot_and_keeps_recovery_artifact() {
+        let (_temp, cx) = cortex();
+        let mut original = Trace::new(
+            "Immutable policy",
+            "preference",
+            "tester",
+            vec!["policy".into()],
+            "canonical body",
+        );
+        cx.add(&mut original).unwrap();
+        let id = original.frontmatter.id.clone();
+        cx.promote(&id, "mid").unwrap();
+        cx.promote(&id, "long").unwrap();
+        let before = cx.get(&id).unwrap();
+
+        let mut successor = Trace::new(
+            "Revised policy",
+            "preference",
+            "tester",
+            vec!["policy".into()],
+            "replacement policy",
+        );
+        successor.frontmatter.derived_from = vec![id.clone()];
+        let successor_id = successor.frontmatter.id.clone();
+        cx.add(&mut successor).unwrap();
+
+        let path = cx.file_path(&before);
+        let mut drifted = Trace::parse_file(&path).unwrap();
+        drifted.frontmatter.title = "Out-of-band title".into();
+        drifted.body = "out-of-band body".into();
+        drifted.frontmatter.content_hash = trace::content_hash(&drifted.body);
+        drifted
+            .frontmatter
+            .extra
+            .insert("access".into(), serde_yaml::Value::Null);
+        drifted.write_preserving_updated(&path).unwrap();
+        let drifted_bytes = fs::read(&path).unwrap();
+
+        let preview = cx.long_term_reconciliation_plan(&id).unwrap();
+        assert_eq!(preview.classification, "restore-canonical");
+        assert!(preview.drift_fields.contains(&"title".into()));
+        assert!(preview.drift_fields.contains(&"body".into()));
+        assert_eq!(preview.successors, vec![successor_id]);
+        assert_eq!(fs::read(&path).unwrap(), drifted_bytes);
+
+        let result = cx.reconcile_long_term(&id).unwrap();
+        let artifact = cx.dir.join(&result.recovery_artifact);
+        assert_eq!(fs::read(artifact).unwrap(), drifted_bytes);
+        let restored = Trace::parse_file(&path).unwrap();
+        assert_eq!(restored.frontmatter.title, before.title);
+        assert_eq!(restored.frontmatter.updated, before.updated_at);
+        assert_eq!(restored.frontmatter.content_hash, before.content_hash);
+        assert_eq!(
+            restored.frontmatter.extra.get("access"),
+            Some(&serde_yaml::Value::Null)
+        );
+        assert_eq!(restored.body, "canonical body");
+        assert_eq!(cx.get(&id).unwrap().content_hash, before.content_hash);
+        assert_eq!(cx.sync().unwrap().drifted, 0);
+        let audit = cx.history(&id).unwrap().pop().unwrap();
+        assert_eq!(audit.action, "divergence_long_term");
+        assert_eq!(audit.data["resolution"].as_str(), Some("restore_canonical"));
+    }
+
+    #[test]
+    fn reconciliation_rejects_non_long_trace_without_writing_artifact() {
+        let (_temp, cx) = cortex();
+        let mut trace = Trace::new("Mutable note", "note", "", vec![], "body");
+        cx.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+
+        let error = cx.long_term_reconciliation_plan(&id).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("reconciliation is only for long-tier drift")
+        );
+        assert!(!cx.dir.join("db/reconciliations").exists());
+    }
+
+    #[test]
+    fn reconciliation_rejects_tampered_canonical_event_without_writing_artifact() {
+        let (_temp, cx) = cortex();
+        let mut trace = Trace::new("Immutable note", "note", "", vec![], "canonical body");
+        cx.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        cx.promote(&id, "mid").unwrap();
+        cx.promote(&id, "long").unwrap();
+        let path = cx.trace_file(&id, false);
+        let original_bytes = fs::read(&path).unwrap();
+        cx.connection
+            .execute(
+                "UPDATE events SET data=json_set(data,'$.body','tampered event body') WHERE trace_id=?1 AND action='create'",
+                [&id],
+            )
+            .unwrap();
+
+        let error = cx.long_term_reconciliation_plan(&id).unwrap_err();
+
+        assert!(error.to_string().contains("invalid content hash"));
+        assert_eq!(fs::read(path).unwrap(), original_bytes);
+        assert!(!cx.dir.join("db/reconciliations").exists());
+    }
+
+    #[test]
+    fn recovery_normalizes_legacy_reference_event_to_current_note_type() {
+        let (_temp, cx) = cortex();
+        let mut trace = Trace::new("Legacy reference", "note", "", vec![], "body");
+        cx.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        cx.promote(&id, "mid").unwrap();
+        cx.promote(&id, "long").unwrap();
+        cx.connection
+            .execute(
+                "UPDATE events SET data=json_set(data,'$.type','reference') WHERE trace_id=?1 AND action='create'",
+                [&id],
+            )
+            .unwrap();
+        let path = cx.trace_file(&id, false);
+        fs::remove_file(&path).unwrap();
+
+        let result = cx.sync_with_recovery(true).unwrap();
+
+        assert_eq!((result.recovered, result.orphaned), (1, 0));
+        assert_eq!(
+            Trace::parse_file(&path).unwrap().frontmatter.trace_type,
+            "note"
+        );
     }
 
     #[test]
@@ -5899,10 +6337,116 @@ mod tests {
 
         let result = cx.sync().unwrap();
         assert_eq!(result.added, 1);
+        assert_eq!(
+            (result.scanned, result.changed, result.unchanged),
+            (1, 0, 0)
+        );
         let repaired = Trace::parse_file(&path).unwrap();
         let expected = trace::content_hash("on disk");
         assert_eq!(repaired.frontmatter.content_hash, expected);
         assert_eq!(cx.get(&id).unwrap().content_hash, expected);
+    }
+
+    #[test]
+    fn sync_reports_invalid_files_and_continues_with_valid_files() {
+        let (_temp, cx) = cortex();
+        let mut valid = Trace::new("Valid drop-in", "note", "", vec![], "valid body");
+        valid.frontmatter.origin = cx.name.clone();
+        let valid_id = valid.frontmatter.id.clone();
+        valid
+            .write_preserving_updated(&cx.trace_file(&valid_id, false))
+            .unwrap();
+
+        let mut invalid = Trace::new("Legacy incident", "incident", "", vec![], "invalid body");
+        invalid.frontmatter.origin = cx.name.clone();
+        let invalid_id = invalid.frontmatter.id.clone();
+        let invalid_path = cx.trace_file(&invalid_id, false);
+        invalid.write_preserving_updated(&invalid_path).unwrap();
+        let invalid_bytes = fs::read(&invalid_path).unwrap();
+
+        let result = cx.sync().unwrap();
+
+        assert_eq!((result.added, result.invalid, result.orphaned), (1, 1, 0));
+        assert_eq!(
+            (result.scanned, result.changed, result.unchanged),
+            (1, 0, 0)
+        );
+        assert_eq!(result.invalid_files.len(), 1);
+        assert_eq!(
+            result.invalid_files[0].path,
+            format!("traces/{invalid_id}.md")
+        );
+        assert!(result.invalid_files[0].error.contains("incident"));
+        assert!(result.invalid_files[0].error.contains("expected one of"));
+        assert!(cx.get(&valid_id).is_ok());
+        assert!(cx.get(&invalid_id).is_err());
+        assert_eq!(fs::read(invalid_path).unwrap(), invalid_bytes);
+    }
+
+    #[test]
+    fn sync_recovery_does_not_overwrite_a_present_malformed_trace() {
+        let (_temp, cx) = cortex();
+        let mut trace = Trace::new("Malformed but present", "fact", "", vec![], "original");
+        cx.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        let path = cx.trace_file(&id, false);
+        let malformed = b"frontmatter is temporarily malformed\n";
+        fs::write(&path, malformed).unwrap();
+
+        let result = cx.sync_with_recovery(true).unwrap();
+
+        assert_eq!(
+            (result.invalid, result.recovered, result.orphaned),
+            (1, 0, 0)
+        );
+        assert_eq!(result.invalid_files[0].path, format!("traces/{id}.md"));
+        assert_eq!(fs::read(path).unwrap(), malformed);
+        assert!(cx.get(&id).is_ok());
+    }
+
+    #[test]
+    fn sync_distinguishes_changed_and_unchanged_existing_traces() {
+        let (_temp, cx) = cortex();
+        let mut trace = Trace::new("Accurate sync counts", "fact", "", vec![], "original");
+        cx.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        let path = cx.trace_file(&id, false);
+
+        let unchanged = cx.sync().unwrap();
+        assert_eq!(
+            (
+                unchanged.scanned,
+                unchanged.added,
+                unchanged.changed,
+                unchanged.unchanged,
+            ),
+            (1, 0, 0, 1)
+        );
+
+        let mut edited = Trace::parse_file(&path).unwrap();
+        edited.body = "edited on disk".into();
+        edited.write_preserving_updated(&path).unwrap();
+        let changed = cx.sync().unwrap();
+        assert_eq!(
+            (
+                changed.scanned,
+                changed.added,
+                changed.changed,
+                changed.unchanged,
+            ),
+            (1, 0, 1, 0)
+        );
+
+        let stable = cx.sync().unwrap();
+        assert_eq!(
+            (
+                stable.scanned,
+                stable.added,
+                stable.changed,
+                stable.unchanged,
+            ),
+            (1, 0, 0, 1)
+        );
     }
 
     #[test]
@@ -6261,6 +6805,76 @@ mod tests {
         assert!(cx.get(&id).is_err());
         assert_eq!(cx.history(&id).unwrap().last().unwrap().action, "purge");
         assert!(!cx.trash_dir().join(format!("{id}.md")).exists());
+    }
+
+    #[test]
+    fn expired_long_term_recovery_survives_reopen_and_repeated_sync() {
+        let (_temp, mut cx) = cortex();
+        let mut trace = Trace::new("Expired long trash", "preference", "", vec![], "body");
+        trace.frontmatter.tier = "long".into();
+        cx.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        cx.trash(&id).unwrap();
+        cx.connection
+            .execute(
+                "UPDATE traces SET trashed_at='2000-01-01T00:00:00Z' WHERE id=?1",
+                [&id],
+            )
+            .unwrap();
+        let path = cx.trash_dir().join(format!("{id}.md"));
+
+        assert_eq!(cx.purge_expired(30).unwrap(), 0);
+        assert!(path.exists());
+        assert_eq!(cx.history(&id).unwrap().last().unwrap().action, "trash");
+
+        fs::remove_file(&path).unwrap();
+        let root = cx.dir.clone();
+        drop(cx);
+
+        let recovered = Cortex::open("test", &root).unwrap();
+        let result = recovered.sync_with_recovery(true).unwrap();
+        assert_eq!((result.recovered, result.orphaned), (1, 0));
+        assert!(path.exists());
+        drop(recovered);
+
+        let stable = Cortex::open("test", &root).unwrap();
+        let result = stable.sync().unwrap();
+        assert_eq!((result.recovered, result.orphaned), (0, 0));
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn sync_does_not_recover_intentionally_fileless_long_term_tombstones() {
+        let (_temp, cx) = cortex();
+        let mut trace = Trace::new("Purged tombstone", "fact", "", vec![], "body");
+        trace.frontmatter.tier = "long".into();
+        cx.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        let path = cx.trace_file(&id, false);
+
+        cx.admin_purge(&id, "retention request", "long", false)
+            .unwrap();
+        assert!(!path.exists());
+
+        let result = cx.sync_with_recovery(true).unwrap();
+        assert_eq!((result.recovered, result.orphaned), (0, 0));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn ordinary_sync_does_not_report_trashed_trace_as_orphaned() {
+        let (_temp, cx) = cortex();
+        let mut trace = Trace::new("Trashed trace", "preference", "", vec![], "body");
+        trace.frontmatter.tier = "long".into();
+        cx.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+
+        cx.trash(&id).unwrap();
+        assert!(cx.trash_dir().join(format!("{id}.md")).exists());
+
+        let result = cx.sync().unwrap();
+        assert_eq!((result.recovered, result.orphaned), (0, 0));
+        assert!(result.orphaned_ids.is_empty());
     }
 
     #[test]

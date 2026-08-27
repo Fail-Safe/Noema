@@ -103,7 +103,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 19);
+        assert_eq!(version, 20);
         let fts: String = connection
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE name='traces_fts'",
@@ -112,5 +112,40 @@ mod tests {
             )
             .unwrap();
         assert!(fts.contains("fts5"));
+    }
+
+    #[test]
+    fn normalizes_legacy_reference_rows_without_weakening_long_term_trigger() {
+        let temp = tempfile::tempdir().unwrap();
+        let connection = open(temp.path()).unwrap();
+        connection
+            .execute("DELETE FROM schema_migrations WHERE version=20", [])
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO traces(id,title,type,tier,author,origin,cortex_id,created_at,updated_at,content_hash,source_locked)
+                 VALUES ('20260101-legacy-reference','Legacy reference','reference','long','','local','cortex','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','sha256:test',0)",
+                [],
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        let trace_type: String = connection
+            .query_row(
+                "SELECT type FROM traces WHERE id='20260101-legacy-reference'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trace_type, "note");
+        assert!(
+            connection
+                .execute(
+                    "UPDATE traces SET title='Changed' WHERE id='20260101-legacy-reference'",
+                    [],
+                )
+                .is_err()
+        );
     }
 }

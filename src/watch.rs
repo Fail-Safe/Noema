@@ -476,6 +476,7 @@ impl Reconciler {
                 content_hash: trace::content_hash(&body),
                 source_hash: row.source_hash.clone(),
                 source_locked: row.source_locked,
+                extra: Default::default(),
             },
             body,
         };
