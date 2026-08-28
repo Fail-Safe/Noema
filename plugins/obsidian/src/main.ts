@@ -7,6 +7,7 @@ import { CreateTraceModal } from "./create-modal";
 import { ImmutableWarning } from "./immutable-warning";
 import { openAppendModalFromActive } from "./append-modal";
 import { SearchModal } from "./search-modal";
+import { FileExplorerTierBadges } from "./file-explorer-tiers";
 
 const STATUS_PING_INTERVAL_MS = 30_000;
 
@@ -44,6 +45,7 @@ export default class NoemaPlugin extends Plugin {
 	// unreachable server (actionable: check the endpoint/network).
 	private connState: ConnState = "disconnected";
 	private immutableWarning: ImmutableWarning | null = null;
+	private fileExplorerTierBadges: FileExplorerTierBadges | null = null;
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -119,6 +121,13 @@ export default class NoemaPlugin extends Plugin {
 		});
 
 		this.immutableWarning = new ImmutableWarning(this.app, this);
+		this.fileExplorerTierBadges = new FileExplorerTierBadges(
+			this.app,
+			this,
+			() => this.settings.tracesFolder,
+			() => this.settings.showFileExplorerTierBadges
+		);
+		this.fileExplorerTierBadges.start();
 
 		// Re-render the status bar AND immutable-warning banner when
 		// the active file changes (tier glyph follows the user) or
@@ -159,6 +168,7 @@ export default class NoemaPlugin extends Plugin {
 		// Clean up any lingering banner DOM so a plugin reload during
 		// active development doesn't leave orphan elements behind.
 		this.immutableWarning?.removeAll();
+		this.fileExplorerTierBadges?.stop();
 	}
 
 	async loadSettings(): Promise<void> {
@@ -168,6 +178,10 @@ export default class NoemaPlugin extends Plugin {
 
 	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
+	}
+
+	refreshFileExplorerTierBadges(): void {
+		this.fileExplorerTierBadges?.refresh();
 	}
 
 	// refreshClient is called from the settings tab when the

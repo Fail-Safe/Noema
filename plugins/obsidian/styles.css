@@ -15,6 +15,33 @@
 	margin-right: 4px;
 }
 
+/* ---- File explorer tier badges ---- */
+
+.noema-file-tier-badge {
+	display: inline-block;
+	flex: 0 0 auto;
+	min-width: 2.25em;
+	margin-inline-end: 4px;
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
+	font-weight: 600;
+	line-height: var(--line-height-tight, 1.2);
+	text-align: center;
+	color: var(--text-faint);
+}
+
+.noema-file-tier-mid {
+	color: var(--text-muted);
+}
+
+.noema-file-tier-long {
+	color: var(--text-warning, var(--text-accent));
+}
+
+.noema-file-tier-unknown {
+	color: var(--text-error, var(--text-muted));
+}
+
 .noema-status-ok {
 	color: var(--text-success, var(--text-normal));
 }

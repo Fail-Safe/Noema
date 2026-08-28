@@ -343,7 +343,7 @@ export class McpClient {
 			params: {
 				protocolVersion: MCP_PROTOCOL_VERSION,
 				capabilities: {},
-				clientInfo: { name: "noema-obsidian", version: "0.3.0" },
+				clientInfo: { name: "noema-obsidian", version: "0.4.0" },
 			},
 		};
 		const resp = await mcpFetch(
