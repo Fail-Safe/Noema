@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use serde::Deserialize;
+use serde_yaml::Value;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
@@ -445,6 +445,7 @@ impl Reconciler {
             partial.tags,
             body,
         );
+        trace.frontmatter.extra = partial.extra;
         let target = self.cortex.trace_file(&trace.frontmatter.id, false);
         if target != path && target.exists() {
             bail!("target path already exists: {}", target.display());
@@ -485,16 +486,13 @@ impl Reconciler {
     }
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default)]
 struct PartialFrontmatter {
-    #[serde(default)]
     title: Option<String>,
-    #[serde(default, rename = "type")]
     trace_type: Option<String>,
-    #[serde(default)]
     author: Option<String>,
-    #[serde(default)]
     tags: Vec<String>,
+    extra: BTreeMap<String, Value>,
 }
 
 fn partial_trace(source: &str) -> (PartialFrontmatter, &str) {
@@ -504,11 +502,69 @@ fn partial_trace(source: &str) -> (PartialFrontmatter, &str) {
     let Some(end) = rest.find("\n---\n") else {
         return (PartialFrontmatter::default(), source);
     };
-    let partial = serde_yaml::from_str(&rest[..end]).unwrap_or_default();
+    let partial = serde_yaml::from_str(&rest[..end])
+        .ok()
+        .and_then(partial_frontmatter)
+        .unwrap_or_default();
     let body = rest[end + 5..]
         .strip_prefix('\n')
         .unwrap_or(&rest[end + 5..]);
     (partial, body)
+}
+
+fn partial_frontmatter(value: Value) -> Option<PartialFrontmatter> {
+    let Value::Mapping(mapping) = value else {
+        return None;
+    };
+    let mut partial = PartialFrontmatter::default();
+    for (key, value) in mapping {
+        let Some(key) = key.as_str() else {
+            continue;
+        };
+        match key {
+            "title" => partial.title = yaml_string(&value),
+            "type" => partial.trace_type = yaml_string(&value),
+            "author" => {
+                let authors = yaml_strings(&value);
+                partial.author = (!authors.is_empty()).then(|| authors.join(", "));
+            }
+            "tags" => partial.tags = yaml_tags(&value),
+            "id" | "tier" | "derived_from" | "origin" | "created" | "updated" | "content_hash"
+            | "source_hash" | "source_locked" => {}
+            _ => {
+                partial.extra.insert(key.to_owned(), value);
+            }
+        }
+    }
+    Some(partial)
+}
+
+fn yaml_string(value: &Value) -> Option<String> {
+    value.as_str().map(str::to_owned)
+}
+
+fn yaml_strings(value: &Value) -> Vec<String> {
+    match value {
+        Value::String(value) if !value.is_empty() => vec![value.clone()],
+        Value::Sequence(values) => values
+            .iter()
+            .filter_map(yaml_string)
+            .filter(|value| !value.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn yaml_tags(value: &Value) -> Vec<String> {
+    match value {
+        Value::String(value) => value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        _ => yaml_strings(value),
+    }
 }
 
 fn extract_h1(body: &str) -> Option<String> {
@@ -682,6 +738,57 @@ mod tests {
     }
 
     #[test]
+    fn derives_web_clipper_fields_independently() {
+        let source = r#"---
+title: Clipped page
+source: https://example.com/article
+author:
+  - "[[Author One]]"
+  - "[[Author Two]]"
+published: 2026-08-27
+description: Useful reference
+tags:
+  - clippings
+  - research
+---
+
+Body
+"#;
+        let (partial, body) = partial_trace(source);
+
+        assert_eq!(partial.title.as_deref(), Some("Clipped page"));
+        assert_eq!(
+            partial.author.as_deref(),
+            Some("[[Author One]], [[Author Two]]")
+        );
+        assert_eq!(partial.tags, ["clippings", "research"]);
+        assert_eq!(
+            partial.extra.get("source").and_then(|value| value.as_str()),
+            Some("https://example.com/article")
+        );
+        assert_eq!(
+            partial
+                .extra
+                .get("description")
+                .and_then(|value| value.as_str()),
+            Some("Useful reference")
+        );
+        assert!(partial.extra.contains_key("published"));
+        assert_eq!(body, "Body\n");
+    }
+
+    #[test]
+    fn unsupported_author_does_not_erase_valid_neighboring_fields() {
+        let source = "---\ntitle: Clipped page\nauthor: {name: Writer}\ntags: [docs]\nsource: https://example.com\n---\n\nBody\n";
+        let (partial, _) = partial_trace(source);
+
+        assert_eq!(partial.title.as_deref(), Some("Clipped page"));
+        assert_eq!(partial.author, None);
+        assert_eq!(partial.tags, ["docs"]);
+        assert!(partial.extra.contains_key("source"));
+    }
+
+    #[test]
     fn fallback_scan_reports_same_second_changes() {
         let temp = tempfile::tempdir().unwrap();
         for relative in ["traces", "archive/traces", "trash/traces"] {
@@ -807,5 +914,65 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn onboards_web_clipper_frontmatter_without_losing_properties() {
+        let (_temp, mut reconciler, _) = setup();
+        let dropped = reconciler.cortex.traces_dir().join("Clipped page.md");
+        fs::write(
+            &dropped,
+            r#"---
+title: Clipped page
+source: https://example.com/article
+author:
+  - "[[Author One]]"
+  - "[[Author Two]]"
+published: 2026-08-27
+created: 2026-08-27
+description: Useful reference
+tags:
+  - clippings
+  - research
+---
+
+Clipped body
+"#,
+        )
+        .unwrap();
+
+        reconciler
+            .reconcile(&dropped, &CancellationToken::new())
+            .unwrap();
+
+        let row = reconciler
+            .cortex
+            .list(&ListOptions::default())
+            .unwrap()
+            .into_iter()
+            .find(|row| row.title == "Clipped page")
+            .unwrap();
+        assert_eq!(row.author, "[[Author One]], [[Author Two]]");
+        assert_eq!(row.tags, ["clippings", "research"]);
+        let stored = Trace::parse_file(&reconciler.cortex.trace_file(&row.id, false)).unwrap();
+        assert_eq!(
+            stored
+                .frontmatter
+                .extra
+                .get("source")
+                .and_then(|value| value.as_str()),
+            Some("https://example.com/article")
+        );
+        assert_eq!(
+            stored
+                .frontmatter
+                .extra
+                .get("description")
+                .and_then(|value| value.as_str()),
+            Some("Useful reference")
+        );
+        assert!(stored.frontmatter.extra.contains_key("published"));
+        assert!(stored.body.contains("Clipped body"));
+        assert!(!dropped.exists());
     }
 }
