@@ -25,6 +25,7 @@ use crate::{
     event::Event,
     eventsig,
     federation::{self, Relation},
+    markdown_normalization::{MarkdownNormalizationPlan, MarkdownTracePlan, validate_trace_plan},
     trace::{self, Trace},
 };
 
@@ -691,6 +692,30 @@ pub struct LongTermReconciliationPlan {
 pub struct LongTermReconciliationResult {
     pub plan: LongTermReconciliationPlan,
     pub recovery_artifact: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MarkdownNormalizationPreview {
+    pub trace_id: String,
+    pub path: String,
+    pub tier: String,
+    pub before_content_hash: String,
+    pub after_content_hash: String,
+    pub operation_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MarkdownNormalizationResult {
+    pub preview: MarkdownNormalizationPreview,
+    pub recovery_artifact: String,
+}
+
+struct PreparedMarkdownNormalization {
+    plan: MarkdownTracePlan,
+    row: Row,
+    trace: Trace,
+    normalized_body: String,
+    path: PathBuf,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -3062,7 +3087,7 @@ impl Cortex {
             .history(id)?
             .into_iter()
             .rev()
-            .find(|event| matches!(event.action.as_str(), "create" | "update"))
+            .find(is_trace_snapshot_event)
         {
             let data: TraceEventData = serde_json::from_value(event.data)?;
             let trace = Trace {
@@ -3680,7 +3705,7 @@ impl Cortex {
             .history(&event.trace_id)?
             .into_iter()
             .rev()
-            .find(|candidate| matches!(candidate.action.as_str(), "create" | "update"))
+            .find(is_trace_snapshot_event)
             && !local.vclock.is_empty()
             && !event.vclock.is_empty()
         {
@@ -4094,7 +4119,7 @@ impl Cortex {
             .history(&local.id)?
             .into_iter()
             .rev()
-            .find(|event| matches!(event.action.as_str(), "create" | "update"))
+            .find(is_trace_snapshot_event)
             .ok_or_else(|| anyhow::anyhow!("local trace has no mutation event"))?;
         let mut versions = vec![
             (
@@ -4287,12 +4312,203 @@ impl Cortex {
         })
     }
 
+    pub fn markdown_normalization_preview(
+        &self,
+        plan: &MarkdownNormalizationPlan,
+    ) -> Result<Vec<MarkdownNormalizationPreview>> {
+        Ok(self
+            .prepare_markdown_normalizations(plan)?
+            .iter()
+            .map(Self::markdown_normalization_preview_for)
+            .collect())
+    }
+
+    pub fn normalize_markdown(
+        &self,
+        plan: &MarkdownNormalizationPlan,
+    ) -> Result<Vec<MarkdownNormalizationResult>> {
+        let prepared = self.prepare_markdown_normalizations(plan)?;
+        let mut results = Vec::with_capacity(prepared.len());
+        for item in prepared {
+            let current = self.prepare_markdown_normalization(&item.plan)?;
+            let preview = Self::markdown_normalization_preview_for(&current);
+            let original_bytes = fs::read(&current.path).with_context(|| {
+                format!(
+                    "reading trace {:?} for markdown-normalization recovery artifact",
+                    current.row.id
+                )
+            })?;
+            let artifact_directory = self.dir.join("db/markdown-normalizations");
+            fs::create_dir_all(&artifact_directory)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&artifact_directory, fs::Permissions::from_mode(0o700))?;
+            }
+            let artifact_name = format!("{}-{}.md", current.row.id, ulid::Ulid::new());
+            let artifact_path = artifact_directory.join(&artifact_name);
+            trace::write_bytes_atomic_with_mode(&artifact_path, &original_bytes, 0o600)?;
+            let recovery_artifact = format!("db/markdown-normalizations/{artifact_name}");
+
+            let mut normalized = current.trace.clone();
+            normalized.body = current.normalized_body;
+            normalized.frontmatter.updated = trace::now_rfc3339();
+            normalized.frontmatter.content_hash = preview.after_content_hash.clone();
+            normalized.validate()?;
+            let mut event_data = trace_snapshot(&normalized);
+            event_data["normalization"] = json!({
+                "schema_version": 1,
+                "kind": "obsidian_body_tag_normalization",
+                "before_content_hash": &preview.before_content_hash,
+                "after_content_hash": &preview.after_content_hash,
+                "operations": &current.plan.operations,
+                "recovery_artifact": &recovery_artifact,
+            });
+            let id = current.row.id.clone();
+            let tier = current.row.tier.clone();
+            let timestamp = normalized.frontmatter.updated.clone();
+            self.replace_trace_transactionally(&current.path, &normalized, |pending_key| {
+                let tx = self.connection.unchecked_transaction()?;
+                let trigger = if tier == "long" {
+                    tx.query_row(
+                        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_long_term_immutable'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                } else {
+                    None
+                };
+                if tier == "long" {
+                    tx.execute("DROP TRIGGER IF EXISTS trg_long_term_immutable", [])?;
+                }
+                tx.execute(
+                    "UPDATE traces SET updated_at=?1,content_hash=?2 WHERE id=?3",
+                    params![timestamp, normalized.frontmatter.content_hash, id],
+                )?;
+                upsert_fts(
+                    &tx,
+                    &id,
+                    &current.row.title,
+                    &normalized.body,
+                    &current.row.tags,
+                )?;
+                if let Some(trigger) = trigger {
+                    tx.execute_batch(&trigger)?;
+                }
+                let event_action = if tier == "long" {
+                    "divergence_long_term"
+                } else {
+                    "update"
+                };
+                self.emit_event(&tx, event_action, &id, &timestamp, event_data)?;
+                Self::clear_pending_in_transaction(&tx, pending_key)?;
+                tx.commit()?;
+                Ok(())
+            })?;
+            results.push(MarkdownNormalizationResult {
+                preview,
+                recovery_artifact,
+            });
+        }
+        Ok(results)
+    }
+
+    fn prepare_markdown_normalizations(
+        &self,
+        plan: &MarkdownNormalizationPlan,
+    ) -> Result<Vec<PreparedMarkdownNormalization>> {
+        if plan.schema_version != 1 {
+            bail!(
+                "unsupported markdown normalization schema version {}",
+                plan.schema_version
+            );
+        }
+        if plan.cortex_id != self.id {
+            bail!(
+                "markdown normalization plan targets cortex {}, but the open cortex is {}",
+                plan.cortex_id,
+                self.id
+            );
+        }
+        if plan.traces.is_empty() {
+            bail!("markdown normalization plan has no traces");
+        }
+        let mut seen = BTreeSet::new();
+        let mut prepared = Vec::with_capacity(plan.traces.len());
+        for trace_plan in &plan.traces {
+            if !seen.insert(trace_plan.trace_id.as_str()) {
+                bail!(
+                    "markdown normalization plan repeats trace {:?}",
+                    trace_plan.trace_id
+                );
+            }
+            prepared.push(self.prepare_markdown_normalization(trace_plan)?);
+        }
+        Ok(prepared)
+    }
+
+    fn prepare_markdown_normalization(
+        &self,
+        plan: &MarkdownTracePlan,
+    ) -> Result<PreparedMarkdownNormalization> {
+        let row = self.get(&plan.trace_id)?;
+        self.check_source_lock(&row)?;
+        if row.tier != plan.tier {
+            bail!(
+                "trace {:?} tier changed after planning: expected {:?}, found {:?}",
+                plan.trace_id,
+                plan.tier,
+                row.tier
+            );
+        }
+        let path = self.file_path(&row);
+        let relative_path = self.relative_trace_path(&path)?;
+        if relative_path != plan.relative_path {
+            bail!(
+                "trace {:?} path changed after planning: expected {:?}, found {:?}",
+                plan.trace_id,
+                plan.relative_path,
+                relative_path
+            );
+        }
+        let trace = Trace::parse_file(&path)?;
+        let body_hash = trace::content_hash(&trace.body);
+        if row.content_hash != body_hash || trace.frontmatter.content_hash != body_hash {
+            bail!(
+                "trace {:?} file, frontmatter, and database content hashes do not agree",
+                plan.trace_id
+            );
+        }
+        let normalized_body = validate_trace_plan(plan, &trace.body)?;
+        Ok(PreparedMarkdownNormalization {
+            plan: plan.clone(),
+            row,
+            trace,
+            normalized_body,
+            path,
+        })
+    }
+
+    fn markdown_normalization_preview_for(
+        prepared: &PreparedMarkdownNormalization,
+    ) -> MarkdownNormalizationPreview {
+        MarkdownNormalizationPreview {
+            trace_id: prepared.row.id.clone(),
+            path: prepared.plan.relative_path.clone(),
+            tier: prepared.row.tier.clone(),
+            before_content_hash: prepared.plan.expected_content_hash.clone(),
+            after_content_hash: prepared.plan.expected_result_hash.clone(),
+            operation_count: prepared.plan.operations.len(),
+        }
+    }
+
     fn canonical_long_term_trace(&self, row: &Row) -> Result<(String, Trace)> {
         let event = self
             .history(&row.id)?
             .into_iter()
             .rev()
-            .find(|event| matches!(event.action.as_str(), "create" | "update"))
+            .find(is_trace_snapshot_event)
             .ok_or_else(|| anyhow::anyhow!("trace {:?} has no content-bearing event", row.id))?;
         let data: TraceEventData = serde_json::from_value(event.data.clone())?;
         let content_hash = trace::content_hash(&data.body);
@@ -4628,7 +4844,7 @@ impl Cortex {
             .history(id)?
             .into_iter()
             .rev()
-            .find(|event| matches!(event.action.as_str(), "create" | "update"))
+            .find(is_trace_snapshot_event)
         else {
             return Ok(false);
         };
@@ -5047,6 +5263,17 @@ struct TraceEventData {
     source_hash: String,
     #[serde(default)]
     source_locked: bool,
+}
+
+fn is_trace_snapshot_event(event: &Event) -> bool {
+    matches!(event.action.as_str(), "create" | "update")
+        || event.action == "divergence_long_term"
+            && event
+                .data
+                .get("normalization")
+                .and_then(|value| value.get("kind"))
+                .and_then(|value| value.as_str())
+                == Some("obsidian_body_tag_normalization")
 }
 
 fn normalize_legacy_trace_type(value: &str) -> &str {

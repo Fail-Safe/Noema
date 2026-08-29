@@ -9,6 +9,7 @@ pub mod eventsig;
 pub mod federation;
 pub mod integrate;
 pub mod lock;
+pub mod markdown_normalization;
 pub mod mcp;
 pub mod migration;
 pub mod plugin;
