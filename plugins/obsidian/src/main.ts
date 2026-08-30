@@ -8,6 +8,8 @@ import { ImmutableWarning } from "./immutable-warning";
 import { openAppendModalFromActive } from "./append-modal";
 import { SearchModal } from "./search-modal";
 import { FileExplorerTierBadges } from "./file-explorer-tiers";
+import { EditTraceTitleModal } from "./edit-title-modal";
+import { titleFromFilenameRename } from "./rename-title";
 
 const STATUS_PING_INTERVAL_MS = 30_000;
 
@@ -95,6 +97,21 @@ export default class NoemaPlugin extends Plugin {
 			},
 		});
 
+		this.addCommand({
+			id: "edit-trace-title",
+			name: "Edit trace title",
+			checkCallback: (checking: boolean) => {
+				const file = this.app.workspace.getActiveFile();
+				if (!(file instanceof TFile)) return false;
+				const meta = readTraceMetadata(this.app, file);
+				if (!meta?.id) return false;
+				if (!checking) {
+					new EditTraceTitleModal(this.app, this, meta.id, meta.title ?? "").open();
+				}
+				return true;
+			},
+		});
+
 		// Append-to-trace uses checkCallback so the command is greyed
 		// out in the palette unless the active editor is a trace.
 		// That's the right UX hint: "no trace open" reads as an
@@ -145,8 +162,23 @@ export default class NoemaPlugin extends Plugin {
 				this.immutableWarning?.refresh();
 			})
 		);
-		// Initial render in case a trace file is already open at
-		// plugin start.
+		this.registerEvent(
+			this.app.vault.on("rename", (file, oldPath) => {
+				if (!(file instanceof TFile) || file.extension !== "md") return;
+				const folder = this.settings.tracesFolder.replace(/^\/+|\/+$/g, "");
+				const oldParent = oldPath.slice(0, Math.max(0, oldPath.lastIndexOf("/")));
+				if (file.parent?.path !== folder || oldParent !== folder) return;
+				const meta = readTraceMetadata(this.app, file);
+				const oldName = oldPath.slice(oldPath.lastIndexOf("/") + 1).replace(/\.md$/, "");
+				if (!meta?.id || meta.id !== oldName || file.basename === meta.id) return;
+				const proposedTitle = titleFromFilenameRename(meta.id, file.basename);
+				new EditTraceTitleModal(this.app, this, meta.id, proposedTitle).open();
+				new Notice(
+					"Noema is restoring the stable ID filename. Confirm the trace title in the dialog.",
+					8000
+				);
+			})
+		);
 		this.immutableWarning.refresh();
 
 		// Initial connection probe + periodic ping. We don't block

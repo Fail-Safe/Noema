@@ -9,8 +9,9 @@ Lineage view and tier visibility for [Noema](https://github.com/Fail-Safe/Noema)
 - **Tier badges in the file explorer.** Shows the same tier shorthand beside every trace in the configured traces folder, including while disconnected from the MCP endpoint. Enabled by default and independently toggleable in the plugin settings.
 - **Connection status.** The same status bar item shows whether the plugin is connected to a `noema serve --transport http` endpoint. A keyed-mode server that rejects (or requires) the bearer key shows `noema: unauthorized` instead of `noema: disconnected`, and pops a one-time notice pointing you at the bearer-key setting — so a wrong key reads as a credential problem, not an unreachable server.
 - **Noema-backed trace search.** `Noema: Search traces` calls the connected cortex's `search_traces` MCP tool and opens the selected trace in Obsidian. The plugin setting chooses `hybrid`, `semantic`, or `lexical`; the modal can show 5 or 10 results. Server-side `cortex.md` still owns embedding configuration and `hybrid_weight`.
+- **Semantic title editing.** Run `Noema: Edit trace title`, edit the `title` property, or rename the inline filename. Inline filename edits open the semantic-title dialog while Noema restores the stable ID filename.
 
-That's intentionally the whole feature set for v0.4. Saved search views and federation status panels are reasonable next-version additions but aren't here yet.
+Saved search views and federation status panels remain reasonable future additions, but aren't part of the current plugin.
 
 ## Setup
 
