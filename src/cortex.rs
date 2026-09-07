@@ -655,6 +655,62 @@ pub struct OneSourceMidCount {
     pub promoted_last_7d: i64,
 }
 
+/// Default retention for the local `op_metrics` table (not federated).
+pub const OP_METRICS_DEFAULT_RETENTION_DAYS: i64 = 30;
+
+#[derive(Debug, Clone, Default)]
+pub struct OpMetricInput<'a> {
+    pub op: &'a str,
+    pub source: &'a str,
+    pub duration_ms: i64,
+    pub ok: bool,
+    pub result_count: Option<i64>,
+    pub mode: Option<&'a str>,
+    pub usage_recorded: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OpMetricsOpRow {
+    pub op: String,
+    pub count: usize,
+    pub errors: usize,
+    pub p50: String,
+    pub p95: String,
+    pub modes: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OpMetricsDay {
+    pub date: String,
+    pub ops: i64,
+    pub errors: i64,
+    pub get_trace: i64,
+    pub usage_opens: i64,
+    pub search_traces: i64,
+    pub create_trace: i64,
+    pub find_similar: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OpMetricsReport {
+    pub since: String,
+    pub since_start: String,
+    pub retention_days: i64,
+    pub total_ops: usize,
+    pub total_errors: usize,
+    pub by_op: Vec<OpMetricsOpRow>,
+    pub by_source: BTreeMap<String, usize>,
+    pub daily: Vec<OpMetricsDay>,
+    pub usage_open_rate: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OpMetricAccumulator {
+    durations: Vec<Duration>,
+    errors: usize,
+    modes: BTreeMap<String, usize>,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SyncResult {
     pub scanned: usize,
@@ -2253,6 +2309,154 @@ impl Cortex {
             current,
             promoted_last_7d,
         })
+    }
+
+    /// Append one local op-metric sample. Failures are local-only and never federated.
+    pub fn record_op_metric(&self, input: &OpMetricInput<'_>) -> Result<()> {
+        let recorded_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let duration_ms = input.duration_ms.max(0);
+        let mode = input
+            .mode
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let usage_recorded = input.usage_recorded.map(i64::from);
+        self.connection.execute(
+            "INSERT INTO op_metrics(recorded_at,op,source,duration_ms,ok,result_count,mode,usage_recorded)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                recorded_at,
+                input.op,
+                input.source,
+                duration_ms,
+                i64::from(input.ok),
+                input.result_count,
+                mode,
+                usage_recorded,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Best-effort record used by MCP/CLI wrappers so metrics never fail the primary op.
+    pub fn record_op_metric_lossy(&self, input: &OpMetricInput<'_>) {
+        let _ = self.record_op_metric(input);
+    }
+
+    pub fn prune_op_metrics(&self, retain: Duration) -> Result<usize> {
+        let retain = if retain <= Duration::zero() {
+            Duration::days(OP_METRICS_DEFAULT_RETENTION_DAYS)
+        } else {
+            retain
+        };
+        let cutoff = (Utc::now() - retain).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        Ok(self
+            .connection
+            .execute("DELETE FROM op_metrics WHERE recorded_at < ?1", [cutoff])?)
+    }
+
+    pub fn op_metrics_report(&self, since: Duration) -> Result<OpMetricsReport> {
+        let _ = self.prune_op_metrics(Duration::days(OP_METRICS_DEFAULT_RETENTION_DAYS));
+        let since_start = if since > Duration::zero() {
+            (Utc::now() - since).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        } else {
+            "0001-01-01T00:00:00Z".into()
+        };
+        let mut report = OpMetricsReport {
+            since: format_duration_label(since),
+            since_start: since_start.clone(),
+            retention_days: OP_METRICS_DEFAULT_RETENTION_DAYS,
+            ..Default::default()
+        };
+
+        let mut statement = self.connection.prepare(
+            "SELECT op,source,duration_ms,ok,mode,usage_recorded,substr(recorded_at,1,10)
+             FROM op_metrics WHERE recorded_at >= ?1 ORDER BY recorded_at",
+        )?;
+        let mut rows = statement.query(params![since_start])?;
+
+        let mut by_op: BTreeMap<String, OpMetricAccumulator> = BTreeMap::new();
+        let mut by_source: BTreeMap<String, usize> = BTreeMap::new();
+        let mut daily: BTreeMap<String, OpMetricsDay> = BTreeMap::new();
+        let mut get_trace_total = 0usize;
+        let mut usage_opens = 0usize;
+
+        while let Some(row) = rows.next()? {
+            let op: String = row.get(0)?;
+            let source: String = row.get(1)?;
+            let duration_ms: i64 = row.get(2)?;
+            let failed = row.get::<_, i64>(3)? == 0;
+            let mode: Option<String> = row.get(4)?;
+            let usage_recorded: Option<i64> = row.get(5)?;
+            let date: String = row.get(6)?;
+
+            report.total_ops += 1;
+            if failed {
+                report.total_errors += 1;
+            }
+            *by_source.entry(source).or_default() += 1;
+
+            let entry = by_op.entry(op.clone()).or_default();
+            entry
+                .durations
+                .push(Duration::milliseconds(duration_ms.max(0)));
+            if failed {
+                entry.errors += 1;
+            }
+            if let Some(mode) = mode
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                *entry.modes.entry(mode.to_owned()).or_default() += 1;
+            }
+
+            let day = daily.entry(date.clone()).or_insert_with(|| OpMetricsDay {
+                date,
+                ..Default::default()
+            });
+            day.ops += 1;
+            if failed {
+                day.errors += 1;
+            }
+            match op.as_str() {
+                "get_trace" => {
+                    day.get_trace += 1;
+                    get_trace_total += 1;
+                    if usage_recorded == Some(1) {
+                        day.usage_opens += 1;
+                        usage_opens += 1;
+                    }
+                }
+                "search_traces" => day.search_traces += 1,
+                "create_trace" => day.create_trace += 1,
+                "find_similar" => day.find_similar += 1,
+                _ => {}
+            }
+        }
+
+        report.by_source = by_source;
+        report.daily = daily.into_values().collect();
+        report.usage_open_rate = if get_trace_total == 0 {
+            0.0
+        } else {
+            usage_opens as f64 / get_trace_total as f64
+        };
+        report.by_op = by_op
+            .into_iter()
+            .map(|(op, mut entry)| {
+                let stats = summarize_op_durations(&mut entry.durations);
+                OpMetricsOpRow {
+                    op,
+                    count: stats.count,
+                    errors: entry.errors,
+                    p50: stats.p50,
+                    p95: stats.p95,
+                    modes: entry.modes,
+                }
+            })
+            .collect();
+        Ok(report)
     }
 
     pub fn embedding_status(&self, model: &str) -> Result<EmbeddingStatus> {
@@ -5764,6 +5968,17 @@ fn format_duration_label(duration: Duration) -> String {
     output
 }
 fn summarize_durations(values: &mut [Duration]) -> PromotionStats {
+    summarize_percentile_durations(values, format_duration_label)
+}
+
+fn summarize_op_durations(values: &mut [Duration]) -> PromotionStats {
+    summarize_percentile_durations(values, format_op_latency)
+}
+
+fn summarize_percentile_durations(
+    values: &mut [Duration],
+    format: fn(Duration) -> String,
+) -> PromotionStats {
     if values.is_empty() {
         return PromotionStats::default();
     }
@@ -5774,9 +5989,17 @@ fn summarize_durations(values: &mut [Duration]) -> PromotionStats {
     };
     PromotionStats {
         count: values.len(),
-        p50: format_duration_label(pick(50)),
-        p95: format_duration_label(pick(95)),
+        p50: format(pick(50)),
+        p95: format(pick(95)),
     }
+}
+
+fn format_op_latency(duration: Duration) -> String {
+    let millis = duration.num_milliseconds();
+    if millis.abs() < 1000 {
+        return format!("{millis}ms");
+    }
+    format_duration_label(duration)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -6016,6 +6239,81 @@ mod tests {
             .effective_window(),
             std::time::Duration::from_secs(72 * 60 * 60)
         );
+    }
+
+    #[test]
+    fn local_op_metrics_record_report_and_prune() {
+        let (_temp, cx) = cortex();
+        cx.record_op_metric(&OpMetricInput {
+            op: "search_traces",
+            source: "mcp",
+            duration_ms: 4,
+            ok: true,
+            result_count: Some(3),
+            mode: Some("hybrid"),
+            usage_recorded: None,
+        })
+        .unwrap();
+        cx.record_op_metric(&OpMetricInput {
+            op: "get_trace",
+            source: "mcp",
+            duration_ms: 1,
+            ok: true,
+            result_count: Some(1),
+            mode: None,
+            usage_recorded: Some(true),
+        })
+        .unwrap();
+        cx.record_op_metric(&OpMetricInput {
+            op: "get_trace",
+            source: "cli",
+            duration_ms: 2,
+            ok: true,
+            result_count: Some(1),
+            mode: None,
+            usage_recorded: Some(false),
+        })
+        .unwrap();
+        cx.record_op_metric(&OpMetricInput {
+            op: "create_trace",
+            source: "mcp",
+            duration_ms: 12,
+            ok: false,
+            result_count: None,
+            mode: None,
+            usage_recorded: None,
+        })
+        .unwrap();
+
+        let report = cx.op_metrics_report(Duration::hours(24)).unwrap();
+        assert_eq!(report.total_ops, 4);
+        assert_eq!(report.total_errors, 1);
+        assert!((report.usage_open_rate - 0.5).abs() < f64::EPSILON);
+        assert_eq!(report.by_source.get("mcp"), Some(&3));
+        assert_eq!(report.by_source.get("cli"), Some(&1));
+        let search = report
+            .by_op
+            .iter()
+            .find(|row| row.op == "search_traces")
+            .unwrap();
+        assert_eq!(search.count, 1);
+        assert_eq!(search.modes.get("hybrid"), Some(&1));
+        assert!(!report.daily.is_empty());
+        assert_eq!(report.daily.iter().map(|day| day.ops).sum::<i64>(), 4);
+
+        cx.connection
+            .execute(
+                "UPDATE op_metrics SET recorded_at='2000-01-01T00:00:00.000Z'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            cx.prune_op_metrics(Duration::days(OP_METRICS_DEFAULT_RETENTION_DAYS))
+                .unwrap(),
+            4
+        );
+        let empty = cx.op_metrics_report(Duration::hours(24)).unwrap();
+        assert_eq!(empty.total_ops, 0);
     }
 
     #[test]

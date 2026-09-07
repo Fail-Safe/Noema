@@ -1,17 +1,31 @@
 use std::{
+    ffi::{OsStr, OsString},
     fmt,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-const BOOTSTRAP: &str = "[mem-bootstrap-v1]: call the Noema get_instructions tool first, then follow its startup policy. Surface tool failures explicitly.";
+const BOOTSTRAP: &str = "[mem-bootstrap-v2]: call Noema recall_context once with task-relevant queries; it returns active preferences and bounded full traces. If recall_context is unavailable, call get_instructions and follow its startup policy. Surface tool failures explicitly.";
 const CODEX_START: &str = "# >>> noema integrate codex v1";
 const CODEX_END: &str = "# <<< noema integrate codex v1";
+const CODEX_CONTINUITY_PROFILE_MARKER: &str = "noema-managed-codex-continuity-v1";
+const CODEX_CONTINUITY_PROFILE_NAME: &str = "noema-continuity";
+const CODEX_PREFETCH_MARKER: &str = "noema-managed-codex-prefetch-v1";
+const CODEX_PREFERENCE_MARKER: &str = "noema-managed-codex-preferences-v1";
+const CODEX_PREFETCH_TIMEOUT_SECS: u64 = 15;
+const CODEX_PREFETCH_CONTEXT_LIMIT: u64 = 2_500;
+const CODEX_PREFERENCE_CONTEXT_LIMIT: u64 = 32_000;
+const CODEX_PREFERENCE_LIMIT: u64 = 24;
 const CLAUDE_HOOK_MARKER: &str = "noema-managed-session-bootstrap-v1";
+const CURSOR_HOOK_COMMAND: &str = "./hooks/noema-bootstrap.sh";
+const CURSOR_HOOK_MARKER: &str = "noema-managed-cursor-bootstrap-v2";
+const CURSOR_HOOK_TIMEOUT_SECS: u64 = 15;
+const CURSOR_PREFERENCE_BANNER: &str = "[noema-user-preferences-v1]";
 const LEGACY_OPENCODE_PLUGIN_V1: &str = r#"import type { Plugin } from "@opencode-ai/plugin"
 
 const bootstrap =
@@ -28,16 +42,18 @@ export const NoemaSessionBootstrap: Plugin = async () => ({
 pub enum Client {
     Codex,
     ClaudeCode,
+    Cursor,
     OpenCode,
 }
 
 impl Client {
-    pub const ALL: [Self; 3] = [Self::Codex, Self::ClaudeCode, Self::OpenCode];
+    pub const ALL: [Self; 4] = [Self::Codex, Self::ClaudeCode, Self::Cursor, Self::OpenCode];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::Codex => "codex",
             Self::ClaudeCode => "claude-code",
+            Self::Cursor => "cursor",
             Self::OpenCode => "opencode",
         }
     }
@@ -46,6 +62,7 @@ impl Client {
         match self {
             Self::Codex => "Codex MCP configuration and SessionStart hook",
             Self::ClaudeCode => "Claude Code MCP configuration and SessionStart hook",
+            Self::Cursor => "Cursor MCP configuration and local/cloud bootstrap",
             Self::OpenCode => "OpenCode MCP configuration and bootstrap plugin",
         }
     }
@@ -124,6 +141,18 @@ impl Target {
         }
     }
 
+    fn codex_hooks(&self) -> PathBuf {
+        match self.scope {
+            Scope::User => self.home.join(".codex/hooks.json"),
+            Scope::Project => self.project_root.join(".codex/hooks.json"),
+        }
+    }
+
+    fn codex_continuity_profile(&self) -> PathBuf {
+        self.codex_config()
+            .with_file_name(format!("{CODEX_CONTINUITY_PROFILE_NAME}.config.toml"))
+    }
+
     fn claude_mcp_config(&self) -> PathBuf {
         match self.scope {
             Scope::User => self.home.join(".claude.json"),
@@ -159,6 +188,29 @@ impl Target {
     fn opencode_plugin(&self) -> PathBuf {
         self.opencode_root()
             .join("plugins/noema-session-bootstrap.ts")
+    }
+
+    fn cursor_root(&self) -> PathBuf {
+        match self.scope {
+            Scope::User => self.home.join(".cursor"),
+            Scope::Project => self.project_root.join(".cursor"),
+        }
+    }
+
+    fn cursor_mcp_config(&self) -> PathBuf {
+        self.cursor_root().join("mcp.json")
+    }
+
+    fn cursor_hooks(&self) -> PathBuf {
+        self.cursor_root().join("hooks.json")
+    }
+
+    fn cursor_hook_script(&self) -> PathBuf {
+        self.cursor_root().join("hooks/noema-bootstrap.sh")
+    }
+
+    fn cursor_rule(&self) -> PathBuf {
+        self.cursor_root().join("rules/noema.mdc")
     }
 }
 
@@ -209,6 +261,21 @@ impl ConnectionSpec {
 pub struct Request {
     pub target: Target,
     pub connection: ConnectionSpec,
+    pub prefetch: PrefetchInstall,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefetchInstall {
+    Disabled,
+    WithManagedMcp,
+    Only,
+    ContinuityProfile,
+}
+
+impl PrefetchInstall {
+    fn enabled(self) -> bool {
+        self != Self::Disabled
+    }
 }
 
 impl Request {
@@ -219,6 +286,7 @@ impl Request {
         transport: Transport,
         url: Option<String>,
         bearer_token_env: Option<String>,
+        prefetch: PrefetchInstall,
     ) -> Result<Self> {
         let request = Self {
             target: Target::from_environment(client, scope)?,
@@ -229,6 +297,7 @@ impl Request {
                 url,
                 bearer_token_env,
             },
+            prefetch,
         };
         request.connection.validate()?;
         Ok(request)
@@ -296,6 +365,8 @@ pub struct ComponentReport {
     pub transport: Option<Transport>,
 }
 
+type ComponentState = (&'static str, PathBuf, State, Option<Transport>);
+
 #[derive(Debug, Clone)]
 pub struct Report {
     pub client: Client,
@@ -327,6 +398,7 @@ pub fn status(target: &Target) -> Result<Report> {
     match target.client {
         Client::Codex => codex_status(target),
         Client::ClaudeCode => claude_status(target),
+        Client::Cursor => cursor_status(target),
         Client::OpenCode => opencode_status(target),
     }
 }
@@ -335,6 +407,7 @@ pub fn install(request: &Request, check: bool, force: bool) -> Result<Report> {
     match request.target.client {
         Client::Codex => codex_install(request, check, force),
         Client::ClaudeCode => claude_install(request, check, force),
+        Client::Cursor => cursor_install(request, check, force),
         Client::OpenCode => opencode_install(request, check, force),
     }
 }
@@ -343,17 +416,14 @@ pub fn remove(target: &Target, check: bool, force: bool) -> Result<Report> {
     match target.client {
         Client::Codex => codex_remove(target, check, force),
         Client::ClaudeCode => claude_remove(target, check, force),
+        Client::Cursor => cursor_remove(target, check, force),
         Client::OpenCode => opencode_remove(target, check, force),
     }
 }
 
 pub fn print(request: &Request) -> Result<String> {
     match request.target.client {
-        Client::Codex => Ok(format!(
-            "# target: {}\n{}",
-            request.target.codex_config().display(),
-            codex_block(request)?
-        )),
+        Client::Codex => codex_print(request),
         Client::ClaudeCode => Ok(format!(
             "# MCP target: {}\n{}\n\n# hook target: {}\n{}\n",
             request.target.claude_mcp_config().display(),
@@ -365,6 +435,7 @@ pub fn print(request: &Request) -> Result<String> {
                 &json!({"hooks": {"SessionStart": [claude_hook_value()]}})
             )?
         )),
+        Client::Cursor => cursor_print(request),
         Client::OpenCode => {
             require_opencode_v1(&request.target)?;
             Ok(format!(
@@ -380,33 +451,433 @@ pub fn print(request: &Request) -> Result<String> {
     }
 }
 
+pub fn capture(
+    request: &Request,
+    client_binary: Option<&Path>,
+    client_args: &[OsString],
+) -> Result<()> {
+    let target = &request.target;
+    if !matches!(target.client, Client::Codex | Client::OpenCode) {
+        bail!("capture sessions are currently supported only for Codex and OpenCode");
+    }
+    let (base_state, base_transport) = match target.client {
+        Client::Codex => inspect_codex_block(&codex_capture_config(target))?,
+        Client::OpenCode => {
+            require_opencode_v1(target)?;
+            inspect_json_mcp(&opencode_capture_config(target), &["mcp"], "noema")?
+        }
+        Client::ClaudeCode | Client::Cursor => unreachable!(),
+    };
+    let recognized = match target.client {
+        Client::Codex => base_transport.is_some(),
+        Client::OpenCode => base_state.healthy() && base_transport.is_some(),
+        Client::ClaudeCode | Client::Cursor => unreachable!(),
+    };
+    if !recognized {
+        bail!(
+            "{} capture requires a recognized installed Noema MCP connection; run `noema integrate {} status --scope {} --check`",
+            target.client,
+            target.client,
+            target.scope
+        );
+    }
+
+    let default_program = Path::new(target.client.name());
+    let program = client_binary.unwrap_or(default_program);
+    let mut command = Command::new(program);
+    let mut client_args_forwarded = false;
+    match target.client {
+        Client::Codex => {
+            let transport = base_transport.unwrap();
+            let server = if transport == Transport::Stdio {
+                "noema"
+            } else {
+                "noema_capture"
+            };
+            let capture_command = toml_string(&request.connection.binary.to_string_lossy())?;
+            let capture_args = [
+                "--cortex",
+                &request.connection.cortex,
+                "serve",
+                "--transport",
+                "stdio",
+            ]
+            .iter()
+            .map(|value| toml_string(value))
+            .collect::<Result<Vec<_>>>()?
+            .join(", ");
+            let mut config_args = Vec::new();
+            if transport == Transport::Http {
+                config_args.extend([
+                    "--config".to_owned(),
+                    "mcp_servers.noema.enabled=false".to_owned(),
+                    "--config".to_owned(),
+                    format!("mcp_servers.noema_capture.command={capture_command}"),
+                    "--config".to_owned(),
+                    format!("mcp_servers.noema_capture.args=[{capture_args}]"),
+                ]);
+            }
+            config_args.extend([
+                "--config".to_owned(),
+                format!("mcp_servers.{server}.env.NOEMA_MCP_TOOL_PROFILE=\"continuity-capture\""),
+                "--config".to_owned(),
+                format!("mcp_servers.{server}.tools.get_instructions.approval_mode=\"approve\""),
+                "--config".to_owned(),
+                format!("mcp_servers.{server}.tools.create_traces.approval_mode=\"approve\""),
+            ]);
+            for name in ["XDG_CONFIG_HOME", "XDG_STATE_HOME"] {
+                if let Some(value) = std::env::var_os(name) {
+                    config_args.extend([
+                        "--config".to_owned(),
+                        format!(
+                            "mcp_servers.{server}.env.{name}={}",
+                            toml_string(&value.to_string_lossy())?
+                        ),
+                    ]);
+                }
+            }
+            if client_args
+                .first()
+                .is_some_and(|argument| argument == OsStr::new("exec"))
+            {
+                command
+                    .arg("exec")
+                    .args(config_args)
+                    .args(&client_args[1..]);
+                client_args_forwarded = true;
+            } else {
+                command.args(config_args);
+            }
+        }
+        Client::OpenCode => {
+            if std::env::var_os("OPENCODE_CONFIG_CONTENT").is_some() {
+                bail!(
+                    "OpenCode capture cannot safely replace an existing OPENCODE_CONFIG_CONTENT override"
+                );
+            }
+            command.env(
+                "OPENCODE_CONFIG_CONTENT",
+                opencode_capture_override(request)?,
+            );
+        }
+        Client::ClaudeCode | Client::Cursor => unreachable!(),
+    }
+    if !client_args_forwarded {
+        command.args(client_args);
+    }
+    let status = command
+        .status()
+        .with_context(|| format!("launching {} capture session", program.display()))?;
+    if !status.success() {
+        bail!("{} capture session exited with {status}", program.display());
+    }
+    Ok(())
+}
+
+fn codex_capture_config(target: &Target) -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .map(|root| root.join("config.toml"))
+        .unwrap_or_else(|| target.codex_config())
+}
+
+fn opencode_capture_config(target: &Target) -> PathBuf {
+    std::env::var_os("OPENCODE_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| target.opencode_config())
+}
+
+fn opencode_capture_override(request: &Request) -> Result<String> {
+    let source = read_optional(&opencode_capture_config(&request.target))?
+        .context("capture requires an installed OpenCode MCP connection")?;
+    let container = find_object_path(&source, &["mcp"])?
+        .context("capture requires an installed OpenCode MCP connection")?;
+    let member = find_member(&source, container, "noema")?
+        .context("capture requires an installed OpenCode MCP connection")?;
+    let base = parse_jsonc_value(&source[member.value_start..member.value_end])?;
+    let disabled = match base.get("type").and_then(Value::as_str) {
+        Some("local") => json!({
+            "type": "local",
+            "command": ["noema", "serve"],
+            "enabled": false
+        }),
+        Some("remote") => json!({
+            "type": "remote",
+            "url": "http://127.0.0.1/mcp",
+            "enabled": false
+        }),
+        _ => bail!("OpenCode capture requires a recognized v1 Noema MCP connection"),
+    };
+    let mut capture = mcp_value(request, Client::OpenCode)?;
+    capture["environment"] = json!({
+        "NOEMA_MCP_TOOL_PROFILE": "continuity-capture"
+    });
+    Ok(serde_json::to_string(&json!({
+        "mcp": {
+            "noema": disabled,
+            "noema_capture": capture
+        }
+    }))?)
+}
+
 fn codex_status(target: &Target) -> Result<Report> {
     let path = target.codex_config();
     let (state, transport) = inspect_codex_block(&path)?;
-    Ok(report(
-        target,
-        vec![("mcp + bootstrap", path, state, transport)],
-    ))
+    let profile_path = target.codex_continuity_profile();
+    let profile_source = read_optional(&profile_path)?;
+    let continuity_installed = profile_source
+        .as_deref()
+        .is_some_and(|source| source.contains(CODEX_CONTINUITY_PROFILE_MARKER));
+    let mut components = if continuity_installed && transport.is_some() {
+        vec![("base mcp preserved", path, State::Configured, transport)]
+    } else {
+        vec![("mcp + bootstrap", path, state, transport)]
+    };
+    if continuity_installed {
+        components.push((
+            "continuity profile",
+            profile_path.clone(),
+            inspect_managed_file(
+                &profile_path,
+                codex_continuity_profile_source().as_bytes(),
+                false,
+            )?,
+            None,
+        ));
+    }
+    let hook_path = target.codex_hooks();
+    let hook_source = read_optional(&hook_path)?;
+    if hook_source
+        .as_deref()
+        .is_some_and(|source| source.contains(CODEX_PREFERENCE_MARKER))
+    {
+        components.push((
+            "startup preferences",
+            hook_path.clone(),
+            inspect_codex_hook(
+                &hook_path,
+                &["hooks", "SessionStart"],
+                is_noema_codex_preference_hook,
+                codex_preference_hook_valid,
+            )?,
+            None,
+        ));
+    }
+    if hook_source
+        .as_deref()
+        .is_some_and(|source| source.contains(CODEX_PREFETCH_MARKER))
+    {
+        components.push((
+            "prompt prefetch",
+            hook_path.clone(),
+            inspect_codex_hook(
+                &hook_path,
+                &["hooks", "UserPromptSubmit"],
+                is_noema_codex_prefetch_hook,
+                codex_prefetch_hook_valid,
+            )?,
+            None,
+        ));
+    }
+    Ok(report(target, components))
 }
 
 fn codex_install(request: &Request, check: bool, force: bool) -> Result<Report> {
+    match request.prefetch {
+        PrefetchInstall::Only => return codex_prefetch_install(request, check, force),
+        PrefetchInstall::ContinuityProfile => {
+            return codex_continuity_install(request, check, force);
+        }
+        PrefetchInstall::Disabled | PrefetchInstall::WithManagedMcp => {}
+    }
+    if request.prefetch.enabled() && !check {
+        let preview = codex_install(request, true, force)?;
+        if preview.refused() {
+            return Ok(preview);
+        }
+    }
     let path = request.target.codex_config();
     let state = install_codex_block(&path, request, check, force)?;
+    let mut components = vec![(
+        "mcp + bootstrap",
+        path,
+        state,
+        Some(request.connection.transport),
+    )];
+    if request.prefetch.enabled() {
+        components.extend(install_codex_context_hooks(request, check, force)?);
+    }
+    Ok(report(&request.target, components))
+}
+
+fn codex_prefetch_install(request: &Request, check: bool, force: bool) -> Result<Report> {
+    if !check {
+        let preview = codex_prefetch_install(request, true, force)?;
+        if preview.refused() {
+            return Ok(preview);
+        }
+    }
     Ok(report(
         &request.target,
-        vec![(
-            "mcp + bootstrap",
-            path,
-            state,
-            Some(request.connection.transport),
-        )],
+        install_codex_context_hooks(request, check, force)?,
     ))
 }
 
+fn codex_continuity_install(request: &Request, check: bool, force: bool) -> Result<Report> {
+    if request.target.scope != Scope::User {
+        bail!("Codex continuity profiles are supported only at user scope");
+    }
+    let config_path = request.target.codex_config();
+    let (_, transport) = inspect_codex_block(&config_path)?;
+    let transport = transport.context(
+        "Codex continuity mode requires an existing recognizable [mcp_servers.noema] connection",
+    )?;
+    if !check {
+        let preview = codex_continuity_install(request, true, force)?;
+        if preview.refused() {
+            return Ok(preview);
+        }
+    }
+    let profile_path = request.target.codex_continuity_profile();
+    let profile = install_managed_file(
+        &profile_path,
+        codex_continuity_profile_source().as_bytes(),
+        false,
+        check,
+        force,
+    )?;
+    let mut components = vec![
+        (
+            "base mcp preserved",
+            config_path,
+            State::Configured,
+            Some(transport),
+        ),
+        ("continuity profile", profile_path, profile, None),
+    ];
+    components.extend(install_codex_context_hooks(request, check, force)?);
+    Ok(report(&request.target, components))
+}
+
+fn install_codex_context_hooks(
+    request: &Request,
+    check: bool,
+    force: bool,
+) -> Result<Vec<ComponentState>> {
+    let hook_path = request.target.codex_hooks();
+    let preferences = install_json_array_value(
+        &hook_path,
+        &["hooks", "SessionStart"],
+        &codex_preference_hook_value(request),
+        is_noema_codex_preference_hook,
+        check,
+        force,
+    )?;
+    let prompt = install_json_array_value(
+        &hook_path,
+        &["hooks", "UserPromptSubmit"],
+        &codex_prefetch_hook_value(request),
+        is_noema_codex_prefetch_hook,
+        check,
+        force,
+    )?;
+    Ok(vec![
+        ("startup preferences", hook_path.clone(), preferences, None),
+        ("prompt prefetch", hook_path, prompt, None),
+    ])
+}
+
 fn codex_remove(target: &Target, check: bool, force: bool) -> Result<Report> {
+    if !check {
+        let preview = codex_remove(target, true, force)?;
+        if preview.refused() {
+            return Ok(preview);
+        }
+    }
     let path = target.codex_config();
     let state = remove_text_block(&path, CODEX_START, CODEX_END, check, force)?;
-    Ok(report(target, vec![("mcp + bootstrap", path, state, None)]))
+    let mut components = vec![("mcp + bootstrap", path, state, None)];
+    let profile_path = target.codex_continuity_profile();
+    let profile_source = read_optional(&profile_path)?;
+    if profile_source
+        .as_deref()
+        .is_some_and(|source| source.contains(CODEX_CONTINUITY_PROFILE_MARKER))
+    {
+        let profile = remove_managed_file(
+            &profile_path,
+            codex_continuity_profile_source().as_bytes(),
+            check,
+            force,
+        )?;
+        components.push(("continuity profile", profile_path, profile, None));
+    }
+    let hook_path = target.codex_hooks();
+    let hook_source = read_optional(&hook_path)?;
+    if hook_source
+        .as_deref()
+        .is_some_and(|source| source.contains(CODEX_PREFERENCE_MARKER))
+    {
+        let hook = remove_json_array_value(
+            &hook_path,
+            &["hooks", "SessionStart"],
+            is_noema_codex_preference_hook,
+            check,
+            force,
+        )?;
+        components.push(("startup preferences", hook_path.clone(), hook, None));
+    }
+    if hook_source
+        .as_deref()
+        .is_some_and(|source| source.contains(CODEX_PREFETCH_MARKER))
+    {
+        let hook = remove_json_array_value(
+            &hook_path,
+            &["hooks", "UserPromptSubmit"],
+            is_noema_codex_prefetch_hook,
+            check,
+            force,
+        )?;
+        components.push(("prompt prefetch", hook_path, hook, None));
+    }
+    Ok(report(target, components))
+}
+
+fn codex_print(request: &Request) -> Result<String> {
+    let prefetch = format!(
+        "# prefetch hook target: {}\n{}\n",
+        request.target.codex_hooks().display(),
+        serde_json::to_string_pretty(&json!({
+            "hooks": {
+                "SessionStart": [codex_preference_hook_value(request)],
+                "UserPromptSubmit": [codex_prefetch_hook_value(request)]
+            }
+        }))?
+    );
+    match request.prefetch {
+        PrefetchInstall::Only => return Ok(prefetch),
+        PrefetchInstall::ContinuityProfile => {
+            return Ok(format!(
+                "# continuity profile target: {}\n{}\n{prefetch}",
+                request.target.codex_continuity_profile().display(),
+                codex_continuity_profile_source()
+            ));
+        }
+        PrefetchInstall::Disabled | PrefetchInstall::WithManagedMcp => {}
+    }
+    let config = format!(
+        "# target: {}\n{}",
+        request.target.codex_config().display(),
+        codex_block(request)?
+    );
+    if request.prefetch.enabled() {
+        Ok(format!("{config}\n\n{prefetch}"))
+    } else {
+        Ok(config)
+    }
+}
+
+fn codex_continuity_profile_source() -> &'static str {
+    "# noema-managed-codex-continuity-v1\n# Select with: codex --profile noema-continuity\n[mcp_servers.noema]\nenabled = false\n"
 }
 
 fn codex_block(request: &Request) -> Result<String> {
@@ -557,6 +1028,165 @@ fn claude_remove(target: &Target, check: bool, force: bool) -> Result<Report> {
     ))
 }
 
+fn cursor_print(request: &Request) -> Result<String> {
+    let mcp = serde_json::to_string_pretty(
+        &json!({"mcpServers": {"noema": mcp_value(request, Client::Cursor)?}}),
+    )?;
+    match request.target.scope {
+        Scope::User => Ok(format!(
+            "# MCP target: {}\n{mcp}\n\n# hook target: {}\n{}\n\n# script target: {}\n{}",
+            request.target.cursor_mcp_config().display(),
+            request.target.cursor_hooks().display(),
+            serde_json::to_string_pretty(
+                &json!({"version": 1, "hooks": {"sessionStart": [cursor_hook_value()]}})
+            )?,
+            request.target.cursor_hook_script().display(),
+            cursor_hook_source()
+        )),
+        Scope::Project => Ok(format!(
+            "# MCP target: {}\n{mcp}\n\n# rule target: {}\n{}",
+            request.target.cursor_mcp_config().display(),
+            request.target.cursor_rule().display(),
+            cursor_rule_source()
+        )),
+    }
+}
+
+fn cursor_status(target: &Target) -> Result<Report> {
+    let mcp_path = target.cursor_mcp_config();
+    let (mcp, transport) = inspect_json_mcp(&mcp_path, &["mcpServers"], "noema")?;
+    let mut components = vec![("mcp", mcp_path, mcp, transport)];
+    match target.scope {
+        Scope::User => {
+            let hook_path = target.cursor_hooks();
+            let hook_version = inspect_cursor_hook_version(&hook_path)?;
+            let hook = inspect_json_array_value(
+                &hook_path,
+                &["hooks", "sessionStart"],
+                &cursor_hook_value(),
+                is_noema_cursor_hook,
+            )?;
+            let script_path = target.cursor_hook_script();
+            let script = inspect_managed_file(&script_path, cursor_hook_source().as_bytes(), true)?;
+            components.extend([
+                ("hook schema", hook_path.clone(), hook_version, None),
+                ("bootstrap hook", hook_path, hook, None),
+                ("bootstrap script", script_path, script, None),
+            ]);
+        }
+        Scope::Project => {
+            let rule_path = target.cursor_rule();
+            let rule = inspect_managed_file(&rule_path, cursor_rule_source().as_bytes(), false)?;
+            components.push(("bootstrap rule", rule_path, rule, None));
+        }
+    }
+    Ok(report(target, components))
+}
+
+fn cursor_install(request: &Request, check: bool, force: bool) -> Result<Report> {
+    if !check {
+        let preview = cursor_install(request, true, force)?;
+        if preview.refused() {
+            return Ok(preview);
+        }
+    }
+    let mcp_path = request.target.cursor_mcp_config();
+    let mcp = install_json_member(
+        &mcp_path,
+        &["mcpServers"],
+        "noema",
+        &mcp_value(request, Client::Cursor)?,
+        is_noema_mcp,
+        check,
+        force,
+    )?;
+    let mut components = vec![("mcp", mcp_path, mcp, Some(request.connection.transport))];
+    match request.target.scope {
+        Scope::User => {
+            let hook_path = request.target.cursor_hooks();
+            let hook_version = install_cursor_hook_version(&hook_path, check)?;
+            let hook = install_json_array_value(
+                &hook_path,
+                &["hooks", "sessionStart"],
+                &cursor_hook_value(),
+                is_noema_cursor_hook,
+                check,
+                force,
+            )?;
+            let script_path = request.target.cursor_hook_script();
+            let script = install_managed_file(
+                &script_path,
+                cursor_hook_source().as_bytes(),
+                true,
+                check,
+                force,
+            )?;
+            components.extend([
+                ("hook schema", hook_path.clone(), hook_version, None),
+                ("bootstrap hook", hook_path, hook, None),
+                ("bootstrap script", script_path, script, None),
+            ]);
+        }
+        Scope::Project => {
+            let rule_path = request.target.cursor_rule();
+            let rule = install_managed_file(
+                &rule_path,
+                cursor_rule_source().as_bytes(),
+                false,
+                check,
+                force,
+            )?;
+            components.push(("bootstrap rule", rule_path, rule, None));
+        }
+    }
+    Ok(report(&request.target, components))
+}
+
+fn cursor_remove(target: &Target, check: bool, force: bool) -> Result<Report> {
+    if !check {
+        let preview = cursor_remove(target, true, force)?;
+        if preview.refused() {
+            return Ok(preview);
+        }
+    }
+    let mcp_path = target.cursor_mcp_config();
+    let mcp = remove_json_member(
+        &mcp_path,
+        &["mcpServers"],
+        "noema",
+        is_noema_mcp,
+        check,
+        force,
+    )?;
+    let mut components = vec![("mcp", mcp_path, mcp, None)];
+    match target.scope {
+        Scope::User => {
+            let hook_path = target.cursor_hooks();
+            let hook = remove_json_array_value(
+                &hook_path,
+                &["hooks", "sessionStart"],
+                is_noema_cursor_hook,
+                check,
+                force,
+            )?;
+            let script_path = target.cursor_hook_script();
+            let script =
+                remove_managed_file(&script_path, cursor_hook_source().as_bytes(), check, force)?;
+            components.extend([
+                ("bootstrap hook", hook_path, hook, None),
+                ("bootstrap script", script_path, script, None),
+            ]);
+        }
+        Scope::Project => {
+            let rule_path = target.cursor_rule();
+            let rule =
+                remove_managed_file(&rule_path, cursor_rule_source().as_bytes(), check, force)?;
+            components.push(("bootstrap rule", rule_path, rule, None));
+        }
+    }
+    Ok(report(target, components))
+}
+
 fn opencode_status(target: &Target) -> Result<Report> {
     require_opencode_v1(target)?;
     let config = target.opencode_config();
@@ -622,10 +1252,7 @@ fn opencode_remove(target: &Target, check: bool, force: bool) -> Result<Report> 
     ))
 }
 
-fn report(
-    target: &Target,
-    components: Vec<(&'static str, PathBuf, State, Option<Transport>)>,
-) -> Report {
+fn report(target: &Target, components: Vec<ComponentState>) -> Report {
     Report {
         client: target.client,
         scope: target.scope,
@@ -649,6 +1276,10 @@ fn mcp_value(request: &Request, client: Client) -> Result<Value> {
             "command": request.connection.binary,
             "args": ["--cortex", request.connection.cortex, "serve", "--transport", "stdio"]
         })),
+        (Transport::Stdio, Client::Cursor) => Ok(json!({
+            "command": request.connection.binary,
+            "args": ["--cortex", request.connection.cortex, "serve", "--transport", "stdio"]
+        })),
         (Transport::Stdio, Client::OpenCode) => Ok(json!({
             "type": "local",
             "command": [request.connection.binary, "--cortex", request.connection.cortex, "serve", "--transport", "stdio"],
@@ -659,6 +1290,13 @@ fn mcp_value(request: &Request, client: Client) -> Result<Value> {
                 json!({"type": "http", "url": request.connection.url.as_deref().unwrap()});
             if let Some(name) = &request.connection.bearer_token_env {
                 value["headers"] = json!({"Authorization": format!("Bearer ${{{name}}}")});
+            }
+            Ok(value)
+        }
+        (Transport::Http, Client::Cursor) => {
+            let mut value = json!({"url": request.connection.url.as_deref().unwrap()});
+            if let Some(name) = &request.connection.bearer_token_env {
+                value["headers"] = json!({"Authorization": format!("Bearer ${{env:{name}}}")});
             }
             Ok(value)
         }
@@ -689,6 +1327,32 @@ fn claude_hook_value() -> Value {
     })
 }
 
+fn cursor_hook_value() -> Value {
+    json!({
+        "command": CURSOR_HOOK_COMMAND,
+        "timeout": CURSOR_HOOK_TIMEOUT_SECS
+    })
+}
+
+fn cursor_hook_source() -> String {
+    // Materialize active user-preference traces via the Noema CLI so Cursor
+    // sessionStart injects binding preference bodies without depending on the
+    // model calling MCP (and without auto-review being able to skip the load).
+    include_str!("integrate/cursor_noema_bootstrap.sh")
+        .replace("__CURSOR_HOOK_MARKER__", CURSOR_HOOK_MARKER)
+        .replace("__CURSOR_PREFERENCE_BANNER__", CURSOR_PREFERENCE_BANNER)
+        .replace(
+            "__BOOTSTRAP_JSON__",
+            &serde_json::to_string(BOOTSTRAP).unwrap(),
+        )
+}
+
+fn cursor_rule_source() -> String {
+    format!(
+        "---\ndescription: Load Noema memory policy for every Cursor agent session\nalwaysApply: true\n---\n\n{BOOTSTRAP}\n"
+    )
+}
+
 fn bootstrap_command() -> String {
     let payload = json!({
         "hookSpecificOutput": {
@@ -697,6 +1361,77 @@ fn bootstrap_command() -> String {
         }
     });
     format!("printf '%s\\n' '{payload}' # {CLAUDE_HOOK_MARKER}")
+}
+
+fn codex_prefetch_hook_value(request: &Request) -> Value {
+    json!({
+        "matcher": "",
+        "hooks": [{
+            "type": "command",
+            "command": codex_prefetch_command(request),
+            "timeout": CODEX_PREFETCH_TIMEOUT_SECS,
+            "additionalContextLimit": CODEX_PREFETCH_CONTEXT_LIMIT
+        }]
+    })
+}
+
+fn codex_preference_hook_value(request: &Request) -> Value {
+    json!({
+        "matcher": "^(startup|resume|clear|compact)$",
+        "hooks": [{
+            "type": "command",
+            "command": codex_preference_command(request),
+            "timeout": CODEX_PREFETCH_TIMEOUT_SECS,
+            "additionalContextLimit": CODEX_PREFERENCE_CONTEXT_LIMIT
+        }]
+    })
+}
+
+fn codex_prefetch_command(request: &Request) -> String {
+    [
+        shell_word(&request.connection.binary.to_string_lossy()),
+        "--cortex".into(),
+        shell_word(&request.connection.cortex),
+        "prefetch".into(),
+        "--input".into(),
+        "codex-hook".into(),
+        "--output".into(),
+        "codex-hook".into(),
+        "--max-preferences".into(),
+        "0".into(),
+        "--exclude-startup-preferences".into(),
+        "--max-chars".into(),
+        CODEX_PREFETCH_CONTEXT_LIMIT.to_string(),
+        "--fail-open".into(),
+        format!("# {CODEX_PREFETCH_MARKER}"),
+    ]
+    .join(" ")
+}
+
+fn codex_preference_command(request: &Request) -> String {
+    [
+        shell_word(&request.connection.binary.to_string_lossy()),
+        "--cortex".into(),
+        shell_word(&request.connection.cortex),
+        "prefetch".into(),
+        "--input".into(),
+        "raw".into(),
+        "--output".into(),
+        "codex-session-start".into(),
+        "--max-results".into(),
+        "0".into(),
+        "--max-preferences".into(),
+        CODEX_PREFERENCE_LIMIT.to_string(),
+        "--max-chars".into(),
+        CODEX_PREFERENCE_CONTEXT_LIMIT.to_string(),
+        "--fail-open".into(),
+        format!("# {CODEX_PREFERENCE_MARKER}"),
+    ]
+    .join(" ")
+}
+
+fn shell_word(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn opencode_plugin_source() -> String {
@@ -741,6 +1476,94 @@ fn is_noema_hook(value: &Value) -> bool {
         .flatten()
         .filter_map(|hook| hook.get("command").and_then(Value::as_str))
         .any(|command| command.contains(CLAUDE_HOOK_MARKER))
+}
+
+fn is_noema_codex_prefetch_hook(value: &Value) -> bool {
+    value
+        .get("hooks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|hook| hook.get("command").and_then(Value::as_str))
+        .any(|command| command.contains(CODEX_PREFETCH_MARKER))
+}
+
+fn is_noema_codex_preference_hook(value: &Value) -> bool {
+    value
+        .get("hooks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|hook| hook.get("command").and_then(Value::as_str))
+        .any(|command| command.contains(CODEX_PREFERENCE_MARKER))
+}
+
+fn codex_prefetch_hook_valid(value: &Value) -> bool {
+    if value.as_object().is_none_or(|object| object.len() != 2) {
+        return false;
+    }
+    if value.get("matcher").and_then(Value::as_str) != Some("") {
+        return false;
+    }
+    let Some(hooks) = value.get("hooks").and_then(Value::as_array) else {
+        return false;
+    };
+    let [hook] = hooks.as_slice() else {
+        return false;
+    };
+    if hook.as_object().is_none_or(|object| object.len() != 4) {
+        return false;
+    }
+    let command = hook.get("command").and_then(Value::as_str);
+    hook.get("type").and_then(Value::as_str) == Some("command")
+        && hook.get("timeout").and_then(Value::as_u64) == Some(CODEX_PREFETCH_TIMEOUT_SECS)
+        && hook.get("additionalContextLimit").and_then(Value::as_u64)
+            == Some(CODEX_PREFETCH_CONTEXT_LIMIT)
+        && command.is_some_and(|command| {
+            command.contains(CODEX_PREFETCH_MARKER)
+                && command.contains(" prefetch ")
+                && command.contains("--input codex-hook")
+                && command.contains("--output codex-hook")
+                && command.contains("--max-preferences 0")
+                && command.contains("--exclude-startup-preferences")
+                && command.contains("--fail-open")
+        })
+}
+
+fn codex_preference_hook_valid(value: &Value) -> bool {
+    if value.as_object().is_none_or(|object| object.len() != 2) {
+        return false;
+    }
+    if value.get("matcher").and_then(Value::as_str) != Some("^(startup|resume|clear|compact)$") {
+        return false;
+    }
+    let Some(hooks) = value.get("hooks").and_then(Value::as_array) else {
+        return false;
+    };
+    let [hook] = hooks.as_slice() else {
+        return false;
+    };
+    if hook.as_object().is_none_or(|object| object.len() != 4) {
+        return false;
+    }
+    let command = hook.get("command").and_then(Value::as_str);
+    hook.get("type").and_then(Value::as_str) == Some("command")
+        && hook.get("timeout").and_then(Value::as_u64) == Some(CODEX_PREFETCH_TIMEOUT_SECS)
+        && hook.get("additionalContextLimit").and_then(Value::as_u64)
+            == Some(CODEX_PREFERENCE_CONTEXT_LIMIT)
+        && command.is_some_and(|command| {
+            command.contains(CODEX_PREFERENCE_MARKER)
+                && command.contains(" prefetch ")
+                && command.contains("--input raw")
+                && command.contains("--output codex-session-start")
+                && command.contains("--max-results 0")
+                && command.contains(&format!("--max-preferences {CODEX_PREFERENCE_LIMIT}"))
+                && command.contains("--fail-open")
+        })
+}
+
+fn is_noema_cursor_hook(value: &Value) -> bool {
+    value.get("command").and_then(Value::as_str) == Some(CURSOR_HOOK_COMMAND)
 }
 
 fn is_noema_mcp(value: &Value) -> bool {
@@ -1156,6 +1979,133 @@ fn remove_opencode_plugin(path: &Path, check: bool, force: bool) -> Result<State
     }
 }
 
+fn inspect_managed_file(path: &Path, expected: &[u8], executable: bool) -> Result<State> {
+    match fs::read(path) {
+        Ok(bytes) if bytes == expected && (!executable || is_user_executable(path)?) => {
+            Ok(State::UpToDate)
+        }
+        Ok(_) => Ok(State::Drift),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(State::NotInstalled),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+fn install_managed_file(
+    path: &Path,
+    expected: &[u8],
+    executable: bool,
+    check: bool,
+    force: bool,
+) -> Result<State> {
+    match fs::read(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && check => {
+            Ok(State::WouldInstall)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_atomic(path, expected)?;
+            if executable {
+                set_user_executable(path)?;
+            }
+            Ok(State::Installed)
+        }
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+        Ok(bytes) if bytes == expected && (!executable || is_user_executable(path)?) => {
+            Ok(State::Unchanged)
+        }
+        Ok(_) if !force => Ok(State::Drift),
+        Ok(_) if check => Ok(State::WouldReplace),
+        Ok(_) => {
+            write_atomic(path, expected)?;
+            if executable {
+                set_user_executable(path)?;
+            }
+            Ok(State::Replaced)
+        }
+    }
+}
+
+fn remove_managed_file(path: &Path, expected: &[u8], check: bool, force: bool) -> Result<State> {
+    match fs::read(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(State::Unchanged),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+        Ok(bytes) if bytes != expected && !force => Ok(State::Drift),
+        Ok(_) if check => Ok(State::WouldRemove),
+        Ok(_) => {
+            fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+            Ok(State::Removed)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn is_user_executable(path: &Path) -> Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+
+    Ok(fs::metadata(path)
+        .with_context(|| format!("inspecting {}", path.display()))?
+        .permissions()
+        .mode()
+        & 0o100
+        != 0)
+}
+
+#[cfg(not(unix))]
+fn is_user_executable(_path: &Path) -> Result<bool> {
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn set_user_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)
+        .with_context(|| format!("inspecting {}", path.display()))?
+        .permissions();
+    permissions.set_mode(permissions.mode() | 0o100);
+    fs::set_permissions(path, permissions)
+        .with_context(|| format!("setting executable permission on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_user_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn inspect_cursor_hook_version(path: &Path) -> Result<State> {
+    let Some(source) = read_optional(path)? else {
+        return Ok(State::NotInstalled);
+    };
+    let root = root_object(&source)?;
+    let Some(member) = find_member(&source, root, "version")? else {
+        return Ok(State::NotInstalled);
+    };
+    let value = parse_jsonc_value(&source[member.value_start..member.value_end])?;
+    if value == json!(1) {
+        Ok(State::UpToDate)
+    } else {
+        Ok(State::Conflict)
+    }
+}
+
+fn install_cursor_hook_version(path: &Path, check: bool) -> Result<State> {
+    let source = read_optional(path)?.unwrap_or_else(|| "{}\n".into());
+    let root = root_object(&source)?;
+    if let Some(member) = find_member(&source, root, "version")? {
+        let value = parse_jsonc_value(&source[member.value_start..member.value_end])?;
+        return Ok(if value == json!(1) {
+            State::Unchanged
+        } else {
+            State::Conflict
+        });
+    }
+    if check {
+        return Ok(State::WouldInstall);
+    }
+    let next = insert_json_path_member(&source, &[], "version", &json!(1))?;
+    write_atomic(path, next.as_bytes())?;
+    Ok(State::Installed)
+}
+
 fn inspect_json_mcp(
     path: &Path,
     object_path: &[&str],
@@ -1295,6 +2245,31 @@ fn inspect_json_array_value(
         }
         if managed(&value) {
             return Ok(State::Drift);
+        }
+    }
+    Ok(State::NotInstalled)
+}
+
+fn inspect_codex_hook(
+    path: &Path,
+    array_path: &[&str],
+    managed: fn(&Value) -> bool,
+    valid: fn(&Value) -> bool,
+) -> Result<State> {
+    let Some(source) = read_optional(path)? else {
+        return Ok(State::NotInstalled);
+    };
+    let Some(array) = find_array_path(&source, array_path)? else {
+        return Ok(State::NotInstalled);
+    };
+    for element in array_elements(&source, array)? {
+        let value = parse_jsonc_value(&source[element.value_start..element.value_end])?;
+        if managed(&value) {
+            return Ok(if valid(&value) {
+                State::UpToDate
+            } else {
+                State::Drift
+            });
         }
     }
     Ok(State::NotInstalled)
@@ -1888,6 +2863,7 @@ mod tests {
                 url: None,
                 bearer_token_env: None,
             },
+            prefetch: PrefetchInstall::Disabled,
         }
     }
 
@@ -1905,6 +2881,7 @@ mod tests {
         assert!(installed.starts_with("model = \"gpt-5\"\n"));
         assert!(installed.contains("[mcp_servers.noema]"));
         assert!(installed.contains("[[hooks.SessionStart]]"));
+        assert!(!request.target.codex_hooks().exists());
 
         fs::write(&path, installed.replace("timeout = 5", "timeout = 9")).unwrap();
         assert_eq!(
@@ -1923,6 +2900,209 @@ mod tests {
             install(&request, false, true).unwrap().components[0].state,
             State::Replaced
         );
+    }
+
+    #[test]
+    fn codex_prefetch_is_opt_in_fail_safe_and_preserves_unrelated_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut request = request(temp.path(), Client::Codex);
+        request.prefetch = PrefetchInstall::WithManagedMcp;
+        let hook_path = request.target.codex_hooks();
+        fs::create_dir_all(hook_path.parent().unwrap()).unwrap();
+        let original = r#"{
+  "hooks": {
+    "Stop": [{"hooks": [{"type": "command", "command": "keep-stop"}]}],
+    "UserPromptSubmit": [{"matcher": "docs", "hooks": [{"type": "command", "command": "keep-prompt"}]}]
+  },
+  "theme": "dark"
+}
+"#;
+        fs::write(&hook_path, original).unwrap();
+
+        let preview = install(&request, true, false).unwrap();
+        assert!(preview.pending());
+        assert_eq!(fs::read_to_string(&hook_path).unwrap(), original);
+        assert!(!request.target.codex_config().exists());
+
+        let installed = install(&request, false, false).unwrap();
+        assert!(installed.healthy());
+        assert_eq!(installed.components.len(), 3);
+        let source = fs::read_to_string(&hook_path).unwrap();
+        assert!(source.contains("keep-stop"));
+        assert!(source.contains("keep-prompt"));
+        assert!(source.contains(CODEX_PREFETCH_MARKER));
+        assert!(source.contains(CODEX_PREFERENCE_MARKER));
+        assert!(source.contains("--max-preferences 0"));
+        assert!(source.contains("--max-results 0"));
+        assert!(source.contains("--max-preferences 24"));
+        assert!(source.contains("--fail-open"));
+        assert!(source.contains("additionalContextLimit"));
+        let report = status(&request.target).unwrap();
+        assert_eq!(report.components.len(), 3);
+        assert_eq!(report.components[1].state, State::UpToDate);
+        assert_eq!(report.components[2].state, State::UpToDate);
+
+        fs::write(
+            &hook_path,
+            source.replace("\"timeout\": 15", "\"timeout\": 9"),
+        )
+        .unwrap();
+        let report = status(&request.target).unwrap();
+        assert_eq!(report.components[1].state, State::Drift);
+        assert_eq!(report.components[2].state, State::Drift);
+        let refused = install(&request, false, false).unwrap();
+        assert_eq!(refused.components[1].state, State::Drift);
+        assert_eq!(refused.components[2].state, State::Drift);
+        let repaired = install(&request, false, true).unwrap();
+        assert_eq!(repaired.components[1].state, State::Replaced);
+        assert_eq!(repaired.components[2].state, State::Replaced);
+
+        let removed = remove(&request.target, false, false).unwrap();
+        assert_eq!(removed.components.len(), 3);
+        assert!(
+            removed
+                .components
+                .iter()
+                .all(|component| component.state == State::Removed)
+        );
+        let source = fs::read_to_string(&hook_path).unwrap();
+        assert!(source.contains("keep-stop"));
+        assert!(source.contains("keep-prompt"));
+        assert!(source.contains("\"theme\": \"dark\""));
+        assert!(!source.contains(CODEX_PREFETCH_MARKER));
+        assert!(!source.contains(CODEX_PREFERENCE_MARKER));
+    }
+
+    #[test]
+    fn codex_prefetch_only_never_rewrites_an_unmanaged_secret_bearing_mcp() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut request = request(temp.path(), Client::Codex);
+        request.prefetch = PrefetchInstall::Only;
+        let config_path = request.target.codex_config();
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let original = r#"model = "gpt-5"
+
+[mcp_servers.noema]
+enabled = true
+url = "https://memory.example.com/mcp"
+
+[mcp_servers.noema.http_headers]
+Authorization = "Bearer secret-that-must-remain-untouched"
+"#;
+        fs::write(&config_path, original).unwrap();
+
+        let preview = install(&request, true, false).unwrap();
+        assert_eq!(preview.components.len(), 2);
+        assert_eq!(preview.components[0].state, State::WouldInstall);
+        assert_eq!(preview.components[1].state, State::WouldInstall);
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+
+        let installed = install(&request, false, false).unwrap();
+        assert_eq!(installed.components.len(), 2);
+        assert_eq!(installed.components[0].state, State::Installed);
+        assert_eq!(installed.components[1].state, State::Installed);
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+        assert!(
+            fs::read_to_string(request.target.codex_hooks())
+                .unwrap()
+                .contains(CODEX_PREFETCH_MARKER)
+        );
+        assert!(
+            fs::read_to_string(request.target.codex_hooks())
+                .unwrap()
+                .contains(CODEX_PREFERENCE_MARKER)
+        );
+    }
+
+    #[test]
+    fn codex_continuity_profile_preserves_base_mcp_and_is_reversible() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut request = request(temp.path(), Client::Codex);
+        request.prefetch = PrefetchInstall::ContinuityProfile;
+        let config_path = request.target.codex_config();
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let original = r#"model = "gpt-5"
+
+[mcp_servers.noema]
+enabled = true
+url = "https://memory.example.com/mcp"
+
+[mcp_servers.noema.http_headers]
+Authorization = "Bearer secret-that-must-remain-untouched"
+"#;
+        fs::write(&config_path, original).unwrap();
+
+        let preview = install(&request, true, false).unwrap();
+        assert_eq!(preview.components.len(), 4);
+        assert_eq!(preview.components[0].state, State::Configured);
+        assert_eq!(preview.components[1].state, State::WouldInstall);
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+
+        let installed = install(&request, false, false).unwrap();
+        assert!(installed.healthy());
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+        assert_eq!(
+            fs::read_to_string(request.target.codex_continuity_profile()).unwrap(),
+            codex_continuity_profile_source()
+        );
+        let status = status(&request.target).unwrap();
+        assert_eq!(status.components[0].component, "base mcp preserved");
+        assert_eq!(status.components[0].state, State::Configured);
+        assert!(status.components.iter().any(|component| {
+            component.component == "continuity profile" && component.state == State::UpToDate
+        }));
+
+        let removed = remove(&request.target, false, false).unwrap();
+        assert!(
+            removed
+                .components
+                .iter()
+                .all(|component| matches!(component.state, State::Removed | State::Unchanged))
+        );
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+        assert!(!request.target.codex_continuity_profile().exists());
+        let hooks = fs::read_to_string(request.target.codex_hooks()).unwrap();
+        assert!(!hooks.contains(CODEX_PREFETCH_MARKER));
+        assert!(!hooks.contains(CODEX_PREFERENCE_MARKER));
+    }
+
+    #[test]
+    fn codex_continuity_profile_requires_an_existing_recognizable_mcp() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut request = request(temp.path(), Client::Codex);
+        request.prefetch = PrefetchInstall::ContinuityProfile;
+
+        let error = install(&request, true, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires an existing recognizable [mcp_servers.noema] connection")
+        );
+        assert!(!request.target.codex_continuity_profile().exists());
+        assert!(!request.target.codex_hooks().exists());
+    }
+
+    #[test]
+    fn opencode_capture_override_disables_remote_mcp_without_copying_its_url() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut request = request(temp.path(), Client::OpenCode);
+        request.connection.transport = Transport::Http;
+        request.connection.url = Some("https://memory.example.com/mcp".into());
+        request.connection.validate().unwrap();
+        install(&request, false, false).unwrap();
+
+        request.connection.transport = Transport::Stdio;
+        request.connection.url = None;
+        let override_source = opencode_capture_override(&request).unwrap();
+        let value: Value = serde_json::from_str(&override_source).unwrap();
+        assert_eq!(value["mcp"]["noema"]["enabled"], false);
+        assert_eq!(value["mcp"]["noema"]["url"], "http://127.0.0.1/mcp");
+        assert_eq!(value["mcp"]["noema_capture"]["type"], "local");
+        assert_eq!(
+            value["mcp"]["noema_capture"]["environment"]["NOEMA_MCP_TOOL_PROFILE"],
+            "continuity-capture"
+        );
+        assert!(!override_source.contains("memory.example.com"));
     }
 
     #[test]
@@ -2102,6 +3282,192 @@ bearer_token_env_var = "NOEMA_MCP_KEY"
             fs::read_to_string(hook_path)
                 .unwrap()
                 .contains("\"timeout\":9")
+        );
+    }
+
+    #[test]
+    fn cursor_user_install_injects_context_and_preserves_unrelated_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = request(temp.path(), Client::Cursor);
+        let mcp_path = request.target.cursor_mcp_config();
+        let hook_path = request.target.cursor_hooks();
+        fs::create_dir_all(mcp_path.parent().unwrap()).unwrap();
+        fs::write(
+            &mcp_path,
+            "{\n  \"mcpServers\": {\"docs\": {\"url\": \"https://docs.example.com/mcp\"}}\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            &hook_path,
+            "{\n  \"version\": 1,\n  \"hooks\": {\"beforeSubmitPrompt\": [{\"command\": \"./hooks/audit.sh\"}]}\n}\n",
+        )
+        .unwrap();
+
+        let installed = install(&request, false, false).unwrap();
+        assert!(installed.healthy());
+        let mcp: Value = serde_json::from_str(&fs::read_to_string(&mcp_path).unwrap()).unwrap();
+        let hooks: Value = serde_json::from_str(&fs::read_to_string(&hook_path).unwrap()).unwrap();
+        assert!(mcp["mcpServers"]["docs"].is_object());
+        assert!(mcp["mcpServers"]["noema"].is_object());
+        assert_eq!(
+            hooks["hooks"]["beforeSubmitPrompt"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(hooks["hooks"]["sessionStart"][0], cursor_hook_value());
+
+        let script = request.target.cursor_hook_script();
+        assert_eq!(fs::read_to_string(&script).unwrap(), cursor_hook_source());
+        assert!(is_user_executable(&script).unwrap());
+        #[cfg(unix)]
+        {
+            let mut child = std::process::Command::new(&script)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"{\"session_id\":\"test\"}\n")
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let context = payload["additional_context"].as_str().unwrap();
+            assert!(
+                context.contains(CURSOR_PREFERENCE_BANNER),
+                "stdout={context}"
+            );
+            assert!(
+                context.contains(BOOTSTRAP) || context.contains("user-preference"),
+                "stdout={context}"
+            );
+
+            let failing_noema = temp.path().join("failing-noema");
+            fs::write(
+                &failing_noema,
+                "#!/bin/sh\nprintf '%s\\n' 'PRIVATE-DIAGNOSTIC-CANARY' >&2\nexit 7\n",
+            )
+            .unwrap();
+            let mut permissions = fs::metadata(&failing_noema).unwrap().permissions();
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o700);
+            fs::set_permissions(&failing_noema, permissions).unwrap();
+            let mut child = std::process::Command::new(&script)
+                .env("NOEMA_BIN", &failing_noema)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"{\"session_id\":\"test\"}\n")
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let context = payload["additional_context"].as_str().unwrap();
+            assert!(context.contains("exit 7"));
+            assert!(!context.contains("PRIVATE-DIAGNOSTIC-CANARY"));
+        }
+
+        let report = status(&request.target).unwrap();
+        assert!(report.healthy());
+        assert_eq!(report.components[0].transport, Some(Transport::Stdio));
+        assert_eq!(report.components.len(), 4);
+
+        let removed = remove(&request.target, false, false).unwrap();
+        assert!(
+            removed
+                .components
+                .iter()
+                .all(|component| component.state == State::Removed)
+        );
+        let hooks: Value = serde_json::from_str(&fs::read_to_string(&hook_path).unwrap()).unwrap();
+        assert!(
+            hooks["hooks"]["sessionStart"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            hooks["hooks"]["beforeSubmitPrompt"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!script.exists());
+    }
+
+    #[test]
+    fn cursor_user_install_preflights_hook_drift_before_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = request(temp.path(), Client::Cursor);
+        let hook_path = request.target.cursor_hooks();
+        fs::create_dir_all(hook_path.parent().unwrap()).unwrap();
+        fs::write(
+            &hook_path,
+            format!(
+                "{{\"version\":1,\"hooks\":{{\"sessionStart\":[{{\"command\":{command},\"timeout\":9}}]}}}}",
+                command = serde_json::to_string(CURSOR_HOOK_COMMAND).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let report = install(&request, false, false).unwrap();
+        assert!(report.refused());
+        assert!(!request.target.cursor_mcp_config().exists());
+        assert!(!request.target.cursor_hook_script().exists());
+        assert!(
+            fs::read_to_string(hook_path)
+                .unwrap()
+                .contains("\"timeout\":9")
+        );
+    }
+
+    #[test]
+    fn cursor_project_install_uses_cloud_rule_and_http_environment_reference() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut request = request(temp.path(), Client::Cursor);
+        request.target.scope = Scope::Project;
+        request.connection.transport = Transport::Http;
+        request.connection.url = Some("https://memory.example.com/mcp".into());
+        request.connection.bearer_token_env = Some("NOEMA_MCP_KEY".into());
+        request.connection.validate().unwrap();
+
+        let preview = install(&request, true, false).unwrap();
+        assert!(preview.pending());
+        assert!(!request.target.cursor_mcp_config().exists());
+        assert!(!request.target.cursor_rule().exists());
+
+        let installed = install(&request, false, false).unwrap();
+        assert!(installed.healthy());
+        assert_eq!(installed.components.len(), 2);
+        let mcp = fs::read_to_string(request.target.cursor_mcp_config()).unwrap();
+        assert!(mcp.contains("Bearer ${env:NOEMA_MCP_KEY}"));
+        let rule = fs::read_to_string(request.target.cursor_rule()).unwrap();
+        assert_eq!(rule, cursor_rule_source());
+        assert!(rule.contains("alwaysApply: true"));
+        assert!(!request.target.cursor_hooks().exists());
+        assert!(!request.target.cursor_hook_script().exists());
+
+        let report = status(&request.target).unwrap();
+        assert!(report.healthy());
+        assert_eq!(report.components[0].transport, Some(Transport::Http));
+
+        let removed = remove(&request.target, false, false).unwrap();
+        assert!(
+            removed
+                .components
+                .iter()
+                .all(|component| component.state == State::Removed)
         );
     }
 

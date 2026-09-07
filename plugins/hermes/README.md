@@ -93,7 +93,9 @@ The plugin automatically manages session state:
 - **On context compression** — appends the compressed context to the session log
   and returns a breadcrumb pointing back to the trace.
 - **On session end** — creates a summary trace (`type: observation`) derived
-  from the session log, then archives the session log.
+  from the session log, then archives the session log. Session logs and
+  summaries are identified by title/id conventions (`hermes-session: …`,
+  `session-summary: …`) rather than hub taxonomy tags.
 
 ## Prefetch
 

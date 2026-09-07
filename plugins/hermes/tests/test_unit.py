@@ -354,7 +354,7 @@ class TestSessionTrace:
         assert args["title"] == "hermes-session: hey max (abcdef123456)"
         assert args["type"] == "context"
         assert args["author"] == "hermes/tester"
-        assert args["tags"] == "hermes-session, session-abcdef123456"
+        assert "tags" not in args
         assert p._session_trace_id == "20260531-hermes-session-hey-max-abcdef123456"
 
     def test_title_omits_redundant_sid_when_no_session_title(self):
@@ -378,15 +378,18 @@ class TestSessionTrace:
         assert p._session_trace_id == "20260531-hermes-session-hey-max-abcdef123456"
         assert p._transport.call_tool.call_count == 1
 
-    def test_collision_without_id_falls_back_to_tag_search(self):
+    def test_collision_without_id_falls_back_to_title_search(self):
         p = self._provider()
         p._transport.call_tool.side_effect = [
             json.dumps({"kind": "trace_id_collision"}),
-            "[context] 20260531-hermes-session-hey-max-abcdef123456 (2026-05-31) — max [hermes-session]",
+            "[context] 20260531-hermes-session-hey-max-abcdef123456 (2026-05-31) — max",
         ]
         p._create_session_trace()
         assert p._session_trace_id == "20260531-hermes-session-hey-max-abcdef123456"
         assert p._transport.call_tool.call_count == 2
+        recover_call = p._transport.call_tool.call_args_list[1]
+        assert recover_call[0][0] == "search_traces"
+        assert recover_call[0][1]["query"] == "hermes-session: hey max (abcdef123456)"
 
     def test_unexpected_response_leaves_trace_id_unset(self):
         p = self._provider()
@@ -616,14 +619,34 @@ class TestPrefetch:
         p = NoemaMemoryProvider()
         p._transport = MagicMock()
         p._transport.call_tool.return_value = (
-            "[context] 20260412-hermes-session (2026-04-12) — hermes/agent [hermes-session]\n"
+            "[context] 20260412-hermes-session-abc (2026-04-12) — hermes/agent\n"
             "[fact] 20260412-real-trace (2026-04-12) — agent [useful]"
         )
         result = p.prefetch("test")
-        assert "hermes-session" not in result or "hermes-session-summary" in result
+        assert "20260412-hermes-session-abc" not in result
+        assert "20260412-real-trace" in result
+
+    def test_filters_legacy_session_log_tags(self):
+        p = NoemaMemoryProvider()
+        p._transport = MagicMock()
+        p._transport.call_tool.return_value = (
+            "[context] 20260412-other-id (2026-04-12) — hermes/agent [hermes-session]\n"
+            "[fact] 20260412-real-trace (2026-04-12) — agent [useful]"
+        )
+        result = p.prefetch("test")
+        assert "20260412-other-id" not in result
         assert "20260412-real-trace" in result
 
     def test_keeps_session_summaries(self):
+        p = NoemaMemoryProvider()
+        p._transport = MagicMock()
+        p._transport.call_tool.return_value = (
+            "[observation] 20260412-session-summary-abc (2026-04-12) — hermes/agent"
+        )
+        result = p.prefetch("test")
+        assert "20260412-session-summary-abc" in result
+
+    def test_keeps_legacy_session_summary_tags(self):
         p = NoemaMemoryProvider()
         p._transport = MagicMock()
         p._transport.call_tool.return_value = (
@@ -631,6 +654,7 @@ class TestPrefetch:
         )
         result = p.prefetch("test")
         assert "hermes-session-summary" in result
+        assert "20260412-session-summary" in result
 
     def test_truncates_long_query(self):
         p = NoemaMemoryProvider()

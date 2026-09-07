@@ -39,6 +39,7 @@ Contributor and architecture notes:
 - [Repository Guidelines](AGENTS.md)
 - [Architecture](docs/architecture.md)
 - [Development Guide](docs/development.md)
+- [Cross-agent continuity evaluation](docs/continuity-evaluation.md) — Codex/OpenCode benchmark evidence
 - [Why Noema switched to Rust](docs/why-rust.md) — benchmarked cutover rationale
 
 A Trace has a **type** that describes its intent:
@@ -178,6 +179,9 @@ noema list
 # Search
 noema search "sqlite"
 
+# Render bounded prompt-relevant context without a model tool call
+printf '%s' "What did we decide about storage?" | noema prefetch
+
 # View a Trace
 noema get 20260329-we-chose-local-sqlite
 ```
@@ -219,6 +223,8 @@ noema recover <id> [--force]              Restore a Trace from trash
 noema purge [--days N]                    Permanently delete all trashed Traces older than N days
 noema search <query> [flags]              Full-text search (FTS5). --semantic / --hybrid
                                           rank by embedding similarity (needs a search: block + backfill)
+noema prefetch [flags]                    Read a prompt from stdin and emit confidence-gated relevant context
+                                          (`--input codex-hook --output codex-hook` for Codex hooks)
 noema similar <id> [--limit N]            Find traces related to <id> (BM25; --semantic / --hybrid for embeddings)
 noema embeddings status                   Show semantic-search embedding coverage (embedded / stale / missing)
 noema embeddings backfill [--force] [--limit N]
@@ -270,6 +276,9 @@ noema memory promote <id> [--to mid|long] Advance a trace one tier (short→mid 
 noema memory demote <id>                  Step a mid trace back to short
 noema memory purge <id> --tier <t> --reason "..." --confirm [--hard]
                                           Ceremoniously destroy a trace with audit trail (GDPR path)
+noema metrics summary [--since 7d]        Compact local MCP/CLI op latency and volume summary
+noema metrics report [--since 24h]        Full local op metrics (p50/p95, daily volume, modes)
+noema metrics prune [--days 30] --yes     Delete local op metric rows older than the retention window
 noema consolidate [flags]                 Run an LLM-backed consolidation pass
 noema migrate cortex-id [--reset] [--yes] Assign or deliberately replace a Cortex federation identity
 
@@ -369,9 +378,30 @@ small startup bootstrap that tells each agent to call `get_instructions`. An MCP
 entry without that bootstrap is callable but not reliably memory-aware after a
 fresh session or compaction.
 
-Supported clients are `codex`, `claude-code`, and `opencode` (OpenCode v1).
-Pi is listed as planned because it needs a first-class MCP extension rather than
-configuration alone.
+Supported clients are `codex`, `claude-code`, `cursor`, and `opencode`
+(OpenCode v1). Pi is listed as planned because it needs a first-class MCP
+extension rather than configuration alone.
+
+### Choosing an integration mode
+
+Existing Noema integrations remain valid. Prefetch and capture are additive:
+they do not change the Cortex format or require a new day-to-day workflow.
+
+| Goal | Mode |
+|---|---|
+| Codex continuity plus normal Noema tools | Install Codex with `--prefetch`; relevant context arrives before the model responds, while the ordinary MCP connection remains available for reads, writes, and management. |
+| Preserve a hand-managed Codex MCP connection | Install Codex with `--prefetch-only`; Noema adds the bounded hooks without adopting or rewriting `config.toml`. |
+| Use a selectable read-only Codex session | Install Codex with `--continuity`, then launch `codex --profile noema-continuity`; the base MCP configuration remains unchanged. |
+| Deliberately record natural-language memories in Codex or OpenCode | Run `noema integrate CLIENT capture`; only the bounded capture tools are exposed to that child process, and the normal client configuration remains unchanged. |
+| Keep model-selected retrieval in any supported client | Use the ordinary installation without a prefetch flag. |
+
+The practical Codex default for proactive continuity is `--prefetch`.
+Use the capture launcher for intentional authoring sessions, not as a wrapper
+around every agent invocation. A preregistered Codex/OpenCode evaluation found
+that bounded prefetch preserved perfect Noema recall while removing the earlier
+token and latency regression; see the
+[cross-agent continuity evaluation](docs/continuity-evaluation.md) for the
+measured result and its limitations.
 
 ```bash
 # Preview a user-level Codex installation; exits non-zero while work is pending
@@ -380,11 +410,40 @@ noema integrate codex install --scope user --check
 # Install local stdio MCP plus the SessionStart bootstrap
 noema integrate codex install --scope user
 
+# Add bounded prompt-time context to a Noema-managed Codex installation
+noema integrate codex install --scope user --prefetch --check
+noema integrate codex install --scope user --prefetch
+
+# Keep an existing hand-managed MCP transport byte-for-byte unchanged
+noema integrate codex install --scope user --prefetch-only --check
+noema integrate codex install --scope user --prefetch-only
+
+# Install a selectable pure-continuity profile while preserving the base MCP
+noema integrate codex install --scope user --continuity --check
+noema integrate codex install --scope user --continuity
+codex --profile noema-continuity
+
+# Install Cursor's local user MCP plus its structured sessionStart bootstrap
+noema integrate cursor install --scope user
+
+# Install a Cloud Agent-compatible project rule and remote MCP connection
+noema integrate cursor install --scope project \
+  --transport http \
+  --url https://memory.example.com/mcp \
+  --bearer-token-env NOEMA_MCP_KEY
+
 # Install a remote OpenCode integration without writing a token value
 noema integrate opencode install --scope user \
   --transport http \
   --url https://memory.example.com/mcp \
   --bearer-token-env NOEMA_MCP_KEY
+
+# Launch an ephemeral capture-only session over an installed local connection
+noema integrate codex capture --scope user
+noema integrate opencode capture --scope user
+
+# Forward normal client arguments after `--`
+noema integrate codex capture --scope user -- exec "Remember this decision"
 
 # Inspect all installed user-level adapters, or remove one recognized integration
 noema integrate status --scope user --check
@@ -395,7 +454,43 @@ Mutation commands require an explicit `--scope`. User scope targets each
 client's private configuration; project scope targets the current Git root.
 `--check` never writes and exits non-zero when installation or removal work is
 pending. Existing unrelated configuration, JSONC comments, and hook entries are
-preserved. A named `noema` entry that is not recognizably a Noema MCP endpoint is
+preserved. Codex context injection is opt-in: it loads active
+`user-preference` traces once through `SessionStart`, then uses a separate
+2,500-character `UserPromptSubmit` hook for task-relevant traces without
+repeating the preference set on every turn. Task retrieval is confidence-gated:
+exact structured identifiers qualify directly, while natural-language matches
+must match the first meaningful query term and need corroborating terms covering
+at least 55% of the meaningful query. Weak matches emit empty context instead
+of spending the prompt budget on a distractor. Prompts stay on stdin, and both hooks fail
+open with explicit unavailable-memory context if retrieval cannot run.
+Use `--prefetch-only` when the MCP transport is hand-managed or contains client
+settings Noema must not adopt; that mode never writes the Codex `config.toml`.
+Use `--continuity` when the base configuration already contains a recognizable
+`[mcp_servers.noema]` connection and ordinary sessions should reproduce the
+pure-prefetch delivery profile: Noema writes a separate
+`~/.codex/noema-continuity.config.toml` overlay with only `enabled = false`,
+installs the same bounded hooks, and leaves the base MCP table byte-for-byte
+unchanged. Launch `codex --profile noema-continuity` for read-only continuity;
+launch Codex normally when MCP write and management tools are needed. Removing
+the Codex integration removes the Noema-owned profile and hooks but never
+removes a hand-managed MCP table.
+A capture session is a process-local mode for natural memory authoring. With a
+recognized installed integration, `integrate codex capture` or `integrate
+opencode capture` launches the client with only `get_instructions` and
+`create_traces` exposed by Noema. Client arguments may be forwarded after `--`.
+The installed configuration is not rewritten, and subsequent ordinary client
+sessions retain the full Noema tool set. For an installed Codex stdio connection,
+the launcher reuses that local server with the bounded profile. For HTTP, it disables
+the ordinary connection only inside the child client and injects a temporary
+local stdio connection named `noema_capture`. Capture refuses missing or
+unrecognized MCP entries.
+For HTTP installations this writes to the locally selected Cortex, not the
+remote endpoint; configure any required federation separately. OpenCode capture
+also uses the locally selected Cortex. Codex stdio capture reuses the installed
+server's Cortex selection. Verify that destination before authoring memories.
+Capture profiles limit the Noema server's tools; they do not disable other
+client tools or provide a workspace access-control boundary.
+A named `noema` entry that is not recognizably a Noema MCP endpoint is
 reported as a conflict. Drifted managed components require `--force`.
 
 `integrate status` is observational: it detects each installed adapter's actual
@@ -409,6 +504,19 @@ configuration. HTTP mode requires an absolute URL whose path is `/mcp`.
 `--bearer-token-env` accepts an environment-variable name, never a credential;
 the generated client syntax resolves that variable at runtime.
 
+Cursor user scope writes `~/.cursor/mcp.json` plus a `sessionStart` hook. The
+managed hook script calls the Noema CLI to load active
+`tag=user-preference` / `type=preference` traces and returns their bodies as
+structured `additional_context`, so preference startup does not depend on the
+model calling MCP. Cursor Cloud Agents cannot load user hooks or run
+`sessionStart`, so project scope instead writes `.cursor/mcp.json` and an
+always-applied `.cursor/rules/noema.mdc` rule that reminds agents to call
+`get_instructions`. Project stdio remains useful for local workspaces, but
+Cloud Agents require an HTTP endpoint reachable from their VM and the named
+bearer-token environment variable in that environment. The project integration
+does not copy a user's local Noema memory-policy file or preference traces into
+the repository.
+
 ## MCP Server
 
 Noema can run as an [MCP](https://modelcontextprotocol.io) server, giving any MCP-compatible AI tool direct access to your Cortex.
@@ -421,7 +529,8 @@ Noema can run as an [MCP](https://modelcontextprotocol.io) server, giving any MC
 | `cortex_usage` | MCP structured content for clients: Cortex identity, trace semantics, startup pattern, runtime posture, and constraints, with a JSON text fallback |
 | `list_traces` | List traces, filterable by `type`, `author`, `tag`, `origin`, `archived`, `all` |
 | `get_trace` | Fetch a trace's full body, origin, and lineage |
-| `create_trace` | Create a new trace (supports `derived_from`, `origin`) |
+| `create_trace` | Create one trace (supports `derived_from`, `origin`) |
+| `create_traces` | Create 1-16 independently transactional traces with structured receipts and explicit partial failures |
 | `update_trace` | Update any subset of fields on an existing trace |
 | `append_trace` | Append content to an existing trace without reading it first (fire-and-forget logging) |
 | `set_trace_tags` | Replace a trace's retrieval tags without touching title, body, type, or lineage |
@@ -432,6 +541,7 @@ Noema can run as an [MCP](https://modelcontextprotocol.io) server, giving any MC
 | `delete_tag` | Preview or apply cortex-wide tag removal; supports opt-in ASCII case-insensitive matching |
 | `search_traces` | Search traces. `mode`: `lexical` (FTS5, default), `semantic` (embedding similarity), or `hybrid` (RRF fusion); semantic/hybrid need a configured `search:` block and fall back to lexical otherwise |
 | `find_similar_traces` | Surface traces related to one you hold. Default ranks by BM25 vocabulary overlap; `mode=semantic`/`hybrid` ranks by embedding similarity to the source trace's vector |
+| `metrics_summary` | Local MCP/CLI op latency and volume for a lookback window (not federated telemetry) |
 | `archive_trace` / `unarchive_trace` | Archive a trace or restore it |
 | `delete_trace` / `recover_trace` | Soft-delete (move to trash) or restore from trash |
 | `trace_history` | Event log (audit trail) for a trace |
@@ -444,6 +554,11 @@ Noema can run as an [MCP](https://modelcontextprotocol.io) server, giving any MC
 `delete_trace` moves a trace to trash (soft-delete, recoverable). Use `recover_trace` to restore it.
 
 Call `get_instructions` first in any new agent session for concise Markdown guidance. Use `cortex_usage` when a client needs structured JSON context. MCP tool discovery and each tool's schema remain the authoritative callable tool reference.
+
+Set `NOEMA_MCP_TOOL_PROFILE=continuity-read` on an MCP server process to expose only
+`recall_context`, or `NOEMA_MCP_TOOL_PROFILE=continuity-capture` to expose only
+`get_instructions` and `create_traces`. These opt-in profiles reduce model-facing tool schemas for
+bounded continuity tasks; the default remains the full tool set.
 
 ### stdio (Claude Desktop, Claude Code, any MCP client)
 

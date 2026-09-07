@@ -449,12 +449,14 @@ class NoemaMemoryProvider(MemoryProvider):
             result = self._transport.call_tool("search_traces", {"query": query[:500]})
             if not result or result == "No traces found.":
                 return ""
-            # Filter out session log traces from prefetch results.
+            # Filter out session log traces from prefetch results. Match on
+            # title/id conventions (and legacy hub tags) so infrastructure
+            # logs stay out of agent context without relying on taxonomy tags.
             lines = result.split("\n")
             filtered = []
             skip_until_next = False
             for line in lines:
-                if "hermes-session" in line and "hermes-session-summary" not in line:
+                if self._is_session_log_prefetch_line(line):
                     skip_until_next = True
                     continue
                 if skip_until_next and line.startswith("["):
@@ -530,7 +532,6 @@ class NoemaMemoryProvider(MemoryProvider):
                     "title": f"session-summary: {title}",
                     "type": "observation",
                     "author": self._author,
-                    "tags": f"hermes-session-summary, session-{self._session_id[:12]}",
                     "derived_from": session_trace_id,
                     "body": body,
                 })
@@ -705,6 +706,10 @@ class NoemaMemoryProvider(MemoryProvider):
         session re-initializes on the same day the id collides
         deterministically; we detect the collision envelope and reuse the
         existing trace instead of failing.
+
+        Session logs intentionally carry no taxonomy tags: title/id already
+        identify them, and hub tags like ``hermes-session`` / ``session-*``
+        pollute tag graphs and search without adding retrieval value.
         """
         sid = self._session_id[:12]
         label = self._session_title or sid
@@ -714,7 +719,6 @@ class NoemaMemoryProvider(MemoryProvider):
             f"hermes-session: {label} ({sid})" if label != sid
             else f"hermes-session: {sid}"
         )
-        session_tag = f"session-{sid}"
         body = (
             f"Session ID: {self._session_id}\n"
             f"Agent: {self._agent_identity}\n"
@@ -726,7 +730,6 @@ class NoemaMemoryProvider(MemoryProvider):
                 "title": title,
                 "type": "context",
                 "author": self._author,
-                "tags": f"hermes-session, {session_tag}",
                 "body": body,
             })
         except Exception as e:
@@ -745,8 +748,8 @@ class NoemaMemoryProvider(MemoryProvider):
             self._session_trace_id = collision["id"]
             logger.info("Session trace already exists, reusing %s", collision["id"])
         elif collision:
-            # Malformed envelope (no id) — fall back to a tag lookup.
-            self._recover_session_trace(session_tag)
+            # Malformed envelope (no id) — fall back to a title/id search.
+            self._recover_session_trace(title, sid)
         else:
             logger.warning("Unexpected create_trace response: %s", result)
 
@@ -768,20 +771,53 @@ class NoemaMemoryProvider(MemoryProvider):
             return payload
         return None
 
-    def _recover_session_trace(self, session_tag: str) -> None:
-        """Find an existing session trace by tag and reuse it."""
+    def _recover_session_trace(self, title: str, sid: str) -> None:
+        """Find an existing session log by title/id convention and reuse it."""
+        queries = (title, f"hermes-session: {sid}", sid)
         try:
-            result = self._transport.call_tool(
-                "search_traces", {"query": session_tag}
+            for query in queries:
+                result = self._transport.call_tool(
+                    "search_traces", {"query": query}
+                )
+                trace_id = self._extract_session_log_trace_id(result or "")
+                if trace_id:
+                    self._session_trace_id = trace_id
+                    logger.info("Recovered session trace: %s", trace_id)
+                    return
+            logger.warning(
+                "Could not find existing session trace for title=%r sid=%r",
+                title,
+                sid,
             )
-            trace_id = self._extract_first_trace_id(result)
-            if trace_id:
-                self._session_trace_id = trace_id
-                logger.info("Recovered session trace: %s", trace_id)
-            else:
-                logger.warning("Could not find existing session trace for %s", session_tag)
         except Exception as e:
             logger.warning("Failed to recover session trace: %s", e)
+
+    @staticmethod
+    def _is_session_log_prefetch_line(line: str) -> bool:
+        """True for session *log* list lines that should stay out of prefetch.
+
+        Session summaries (``session-summary`` title/id, or legacy
+        ``hermes-session-summary`` tag) are kept. Session logs are identified
+        by title/id convention or the legacy ``hermes-session`` hub tag.
+        """
+        if not line.startswith("["):
+            return False
+        # Summaries win: their id/title/tag all contain "session-summary".
+        if "session-summary" in line:
+            return False
+        return "-hermes-session" in line or "hermes-session" in line
+
+    @classmethod
+    def _extract_session_log_trace_id(cls, list_output: str) -> Optional[str]:
+        """Return the first session-log trace id from search/list output."""
+        for line in list_output.split("\n"):
+            line = line.strip()
+            if not cls._is_session_log_prefetch_line(line):
+                continue
+            trace_id = cls._extract_first_trace_id(line)
+            if trace_id:
+                return trace_id
+        return None
 
     @staticmethod
     def _extract_first_trace_id(list_output: str) -> Optional[str]:
