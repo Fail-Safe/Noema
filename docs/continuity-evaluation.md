@@ -11,6 +11,10 @@ The benchmark harness and reproduction procedure are documented in
 
 ## What was tested
 
+The 192-turn deterministic campaign and final natural replication reported
+below ran on macOS, not inside an Omarchy VM. The harness directory name does
+not identify the execution platform; these results are not Linux qualification.
+
 - Codex and OpenCode handed synthetic memories to one another in both
   directions using fresh, non-resumed sessions.
 - Cases covered the same workspace, a sibling workspace beneath `~/Work`, and
@@ -36,11 +40,11 @@ Noema, balanced across conditions, scenarios, and handoff directions.
 | Measure | Native | Noema |
 |---|---:|---:|
 | Macro F1 | 72.2% | 100.0% |
-| Exact-value accuracy | 75.0% | 100.0% |
+| Exact-value F1 | 75.0% | 100.0% |
 | Rationale accuracy | 66.7% | 100.0% |
 | Provenance accuracy | 75.0% | 100.0% |
 | Stale-value rate | 0.0% | 0.0% |
-| Hallucination rate | 0.0% | 0.0% |
+| Hallucination rate (token-based) | 0.0% | 0.0% |
 | Scope-leakage rate | 0.0% | 0.0% |
 | Median total tokens | 11,823 | 10,724 |
 | p50 latency | 5.34 s | 5.55 s |
@@ -109,6 +113,21 @@ they do not establish generalization to other projects, models, or memory sets.
 Exact model identifiers and detailed run manifests are retained privately, so
 the public harness reproduces the method rather than the exact campaign.
 
+A subsequent scorer audit made recall specific to the answer field, penalized
+invented value tokens, and rejected answers contradicting abstention. Offline
+re-scoring of 636 retained case rows across 15 runs, including their smoke rows
+and capture failures, changed none of the scored metrics. This covered the
+reported deterministic campaign, all ten completed natural checkpoints, and
+the separate Linux smoke; it was not new model evidence. Original reports were
+preserved. Interrupted and mechanics-only development attempts outside those
+runs were not included in this audit.
+
+Exact-value scoring is token-set F1; rationale and provenance use expected
+markers in their respective fields. The hallucination metric detects synthetic
+token errors, unsupported tokenless answers, and invalid abstention. It is not
+a semantic review of arbitrary prose and cannot establish that every statement
+in a response is true.
+
 Scope scores measure answer behavior. Prefetch searches the selected Cortex;
 it does not enforce workspace access permissions. Use separate Cortexes where
 memory must be inaccessible across projects.
@@ -135,6 +154,20 @@ success rule also required a 20-point advantage on update and scoping cases
 where both systems were perfect, the analyzer did not emit a formal success
 candidate. The correct claim is a demonstrated boundary advantage with no
 material regression in the tested conditions.
+
+## Separate Linux mechanics check
+
+A subsequent Omarchy Linux ARM64 smoke tested the reviewed capture-isolation
+revision using Codex 0.153.2 and OpenCode 1.18.28. All four capture turns and
+four retrieval turns completed, and both conditions scored 100% macro F1,
+exact-value accuracy, and provenance accuracy on the same-workspace cases.
+There were no stale answers, hallucinations, or scope leaks in those cases.
+Managed paths restored, all guarded files remained unchanged, and pinned
+executables were removed. The installed Noema binary was unchanged.
+
+This eight-turn check used a development build and does not qualify Linux
+boundary behavior, repeated capture sessions, or comparative efficiency.
+It is separate from the macOS campaign and is not added to its sample count.
 
 ## Product use
 

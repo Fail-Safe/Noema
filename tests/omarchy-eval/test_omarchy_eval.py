@@ -215,6 +215,60 @@ class EventParserTests(unittest.TestCase):
 
 
 class ScoringTests(unittest.TestCase):
+    def test_recall_uses_answer_field_only(self) -> None:
+        case = next(c for c in build_batch_cases(1) if c.scenario == "same_workspace_exact")
+        for misplaced_field in ("rationale", "provenance"):
+            with self.subTest(field=misplaced_field):
+                answers = []
+                for question in case.questions:
+                    item = {
+                        "question_id": question.question_id, "answer": "banana",
+                        "rationale": " ".join(question.expected_rationales),
+                        "provenance": list(question.expected_provenance), "abstain": False,
+                    }
+                    if misplaced_field == "rationale":
+                        item["rationale"] += " " + " ".join(question.expected_values)
+                    else:
+                        item["provenance"] += list(question.expected_values)
+                    answers.append(item)
+                score = score_case(case, json.dumps({"answers": answers}), benchmark_cli.all_tokens_for(case))
+                self.assertEqual(score["exact_accuracy"], 0.0)
+                self.assertEqual(score["hallucination_count"], len(case.questions))
+
+    def test_invented_answer_token_reduces_recall(self) -> None:
+        case = next(c for c in build_batch_cases(1) if c.scenario == "same_workspace_exact")
+        answers = [{
+            "question_id": q.question_id,
+            "answer": " ".join(q.expected_values) + " ALPHA-GP-99-VALUE-INVENTED",
+            "rationale": " ".join(q.expected_rationales),
+            "provenance": list(q.expected_provenance), "abstain": False,
+        } for q in case.questions]
+        score = score_case(case, json.dumps({"answers": answers}), benchmark_cli.all_tokens_for(case))
+        self.assertLess(score["exact_accuracy"], 1.0)
+        self.assertEqual(score["hallucination_count"], len(case.questions))
+
+    def test_abstaining_from_known_value_does_not_score_recall(self) -> None:
+        case = next(c for c in build_batch_cases(1) if c.scenario == "same_workspace_exact")
+        answers = [{
+            "question_id": q.question_id, "answer": " ".join(q.expected_values),
+            "rationale": " ".join(q.expected_rationales),
+            "provenance": list(q.expected_provenance), "abstain": True,
+        } for q in case.questions]
+        score = score_case(case, json.dumps({"answers": answers}), benchmark_cli.all_tokens_for(case))
+        self.assertEqual(score["exact_accuracy"], 0.0)
+
+    def test_abstention_cannot_accompany_an_answer(self) -> None:
+        case = next(c for c in build_batch_cases(1) if c.scenario == "scope_distractor_abstention")
+        answers = [{
+            "question_id": q.question_id,
+            "answer": "banana" if q.should_abstain else " ".join(q.expected_values),
+            "rationale": " ".join(q.expected_rationales),
+            "provenance": list(q.expected_provenance), "abstain": q.should_abstain,
+        } for q in case.questions]
+        score = score_case(case, json.dumps({"answers": answers}), benchmark_cli.all_tokens_for(case))
+        self.assertEqual(score["dimension_scores"]["abstention"], 0.0)
+        self.assertGreater(score["hallucination_count"], 0)
+
     def setUp(self) -> None:
         self.case = next(
             case for case in build_batch_cases(1)
@@ -281,6 +335,52 @@ class ScoringTests(unittest.TestCase):
         }
         score = score_case(case, json.dumps(payload), self.tokens)
         self.assertEqual(score["leakage_count"], 1)
+
+
+class SmokeFailureTests(unittest.TestCase):
+    def run_smoke(self, track="natural", failure=None):
+        state = {"smoke": {"status": "not_run"}, "track": track, "retrieval_profile": "prefetch"}
+        run = mock.MagicMock()
+        run.run_id = "test-smoke"
+        capture = mock.Mock(return_value=({}, "capture_event_parse_error" if failure == "capture" else None))
+        retrieval = mock.Mock(side_effect=lambda *a, **k: {
+            "case_id": a[2].case_id,
+            "status": "failed" if failure == "retrieval" else "completed",
+            "error_code": "event_parse_error" if failure == "retrieval" else None,
+        })
+        restore = mock.Mock(return_value={"managed_restored": True, "guard_files_unchanged": True})
+        with mock.patch.multiple(
+            benchmark_cli,
+            resolve_run=mock.Mock(return_value=run),
+            require_preflight=mock.Mock(return_value=state),
+            prepare_context=mock.Mock(), run_capture_case=capture,
+            run_retrieval_case=retrieval, restore_managed=restore,
+            write_json=mock.Mock(),
+        ), mock.patch("builtins.print"):
+            result = benchmark_cli.cmd_smoke(mock.Mock(confirm_live=True), {})
+        restore.assert_called_once()
+        return result, state["smoke"], capture.call_count, retrieval.call_count
+
+    def test_capture_failure_stops_before_another_model_turn(self) -> None:
+        result, smoke, captures, retrievals = self.run_smoke(failure="capture")
+        self.assertEqual((result, captures, retrievals, smoke["model_turns"]), (1, 1, 0, 1))
+        self.assertEqual(len(smoke["failures"]), 1)
+
+    def test_retrieval_failure_stops_before_next_case(self) -> None:
+        result, smoke, captures, retrievals = self.run_smoke(failure="retrieval")
+        self.assertEqual((result, captures, retrievals, smoke["model_turns"]), (1, 1, 1, 2))
+
+    def test_deterministic_failure_counts_one_attempt(self) -> None:
+        result, smoke, captures, retrievals = self.run_smoke(track="deterministic", failure="retrieval")
+        self.assertEqual((result, captures, retrievals, smoke["model_turns"]), (1, 0, 1, 1))
+
+    def test_success_counts_both_tracks(self) -> None:
+        for track, expected in (("natural", 8), ("deterministic", 4)):
+            with self.subTest(track=track):
+                result, smoke, captures, retrievals = self.run_smoke(track=track)
+                self.assertEqual(result, 0)
+                self.assertEqual(smoke["model_turns"], expected)
+                self.assertEqual(captures + retrievals, expected)
 
 
 class SnapshotTests(unittest.TestCase):

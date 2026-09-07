@@ -1206,7 +1206,7 @@ def restore_managed(run: Run, state: dict[str, Any], *, archive_runtime: bool) -
 
 def cmd_smoke(args: argparse.Namespace, config: dict[str, Any]) -> int:
     if not args.confirm_live:
-        raise BenchmarkError("smoke starts four live model turns; rerun with --confirm-live")
+        raise BenchmarkError("smoke starts up to eight live model turns; rerun with --confirm-live")
     run = resolve_run(args, config)
     state = require_preflight(run)
     track = track_for(state)
@@ -1220,6 +1220,7 @@ def cmd_smoke(args: argparse.Namespace, config: dict[str, Any]) -> int:
         if case.scenario == "same_workspace_exact"
     ]
     rows: list[dict[str, Any]] = []
+    model_turns = 0
     try:
         for direction in (case.direction for case in smoke_cases if case.condition == "native"):
             for condition in ("native", "noema"):
@@ -1237,6 +1238,7 @@ def cmd_smoke(args: argparse.Namespace, config: dict[str, Any]) -> int:
             captured: dict[str, Any] = {}
             capture_error = None
             if track == "natural":
+                model_turns += 1
                 captured, capture_error = run_capture_case(
                     run,
                     state,
@@ -1258,6 +1260,7 @@ def cmd_smoke(args: argparse.Namespace, config: dict[str, Any]) -> int:
                     retrieval_profile if smoke_case.condition == "noema" else "native"
                 )
             else:
+                model_turns += 1
                 row = run_retrieval_case(
                     run,
                     state,
@@ -1267,6 +1270,8 @@ def cmd_smoke(args: argparse.Namespace, config: dict[str, Any]) -> int:
             row.update(captured)
             write_json(run.raw_dir / "results" / f"{smoke_case.case_id}.json", row)
             rows.append(row)
+            if row["status"] != "completed" or row["error_code"]:
+                break
     finally:
         restoration = restore_managed(run, state, archive_runtime=True)
         state["contexts"] = {}
@@ -1285,7 +1290,7 @@ def cmd_smoke(args: argparse.Namespace, config: dict[str, Any]) -> int:
         "status": "passed" if passed else "failed",
         "completed_at": utc_now(),
         "turns": len(rows),
-        "model_turns": len(rows) * (2 if track == "natural" else 1),
+        "model_turns": model_turns,
         "track": track,
         "retrieval_profile": retrieval_profile,
         "restoration": restoration,

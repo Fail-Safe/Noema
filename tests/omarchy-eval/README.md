@@ -154,6 +154,16 @@ without publishing configuration contents or overwriting current user state.
 
 ## Fixed controls
 
+- Smoke stops after the first capture or retrieval integration failure and still
+  restores its managed runtime. `model_turns` counts attempted capture/retrieval
+  invocations, including failed attempts, rather than assuming every case ran both.
+- Recall uses synthetic value tokens in the answer field only. Rationale and
+  provenance are scored in their own fields; stale and forbidden tokens are
+  checked across all three fields. The `exact_accuracy` metric is token-set F1,
+  not binary exact-string accuracy. Hallucination counts detect unexpected
+  synthetic tokens, nonempty answers without value tokens, and invalid abstention;
+  they do not establish the absence of arbitrary false claims in free text.
+
 - Codex model: explicitly selected in the private configuration, medium reasoning, `codex exec --ephemeral`, JSONL events, and a
   strict output schema. The generated isolated-home hook is locally vetted before Codex's automation-only
   hook-trust bypass is enabled for the Noema condition. Unrelated app/plugin catalogs are disabled;
