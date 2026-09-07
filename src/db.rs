@@ -103,7 +103,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 20);
+        assert_eq!(version, 21);
         let fts: String = connection
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE name='traces_fts'",

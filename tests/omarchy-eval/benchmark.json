@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "models": {
+    "codex": null,
+    "opencode": null,
+    "reasoning": "medium"
+  },
+  "commands": {
+    "codex": "codex",
+    "opencode": "opencode",
+    "noema": "../../noema"
+  },
+  "paths": {
+    "private_root": ".private",
+    "reports_root": "reports",
+    "work_parent": "${HOME}/Work/noema-omarchy-eval",
+    "outside_parent": "${HOME}/noema-omarchy-eval-outside"
+  },
+  "limits": {
+    "turn_timeout_seconds": 600,
+    "bootstrap_samples": 10000,
+    "max_batches": 12,
+    "natural_max_batches": 2
+  },
+  "pricing_usd_per_million_tokens": null
+}

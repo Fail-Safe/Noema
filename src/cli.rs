@@ -1,9 +1,11 @@
 use std::{
     collections::HashSet,
+    ffi::OsString,
     fmt::Write as _,
     fs::{self, OpenOptions},
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
@@ -17,11 +19,12 @@ use crate::{
     config::Config,
     consolidation::{DistillationConfig, HeuristicConfig, run_distillation_pass},
     cortex::{
-        Cortex, EmbedBackfillOptions, ListOptions, SemanticOptions, TagStatsReport, TraceIdExists,
-        write_manifest,
+        Cortex, EmbedBackfillOptions, ListOptions, OpMetricInput, SemanticOptions, TagStatsReport,
+        TraceIdExists, write_manifest,
     },
     embedding::HttpEmbedder,
     eventsig,
+    prefetch::PrefetchOptions,
     trace::Trace,
 };
 
@@ -91,6 +94,8 @@ enum Command {
         #[command(flatten)]
         list: ListArgs,
     },
+    /// Retrieve bounded prompt-relevant context without a model tool round trip
+    Prefetch(PrefetchArgs),
     /// Find related Traces
     Similar {
         trace_id: String,
@@ -132,6 +137,11 @@ enum Command {
     Memory {
         #[command(subcommand)]
         command: MemoryCommand,
+    },
+    /// Local MCP/CLI operation metrics (latency, volume; not federated)
+    Metrics {
+        #[command(subcommand)]
+        command: MetricsCommand,
     },
     /// Inspect and maintain trace tags
     #[command(alias = "tag")]
@@ -230,6 +240,45 @@ struct AddArgs {
     tags: Vec<String>,
     #[arg(long)]
     body: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PrefetchInput {
+    Raw,
+    CodexHook,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PrefetchOutput {
+    Text,
+    Json,
+    CodexHook,
+    CodexSessionStart,
+}
+
+#[derive(Debug, Args)]
+struct PrefetchArgs {
+    /// Input format read from stdin
+    #[arg(long, value_enum, default_value_t = PrefetchInput::Raw)]
+    input: PrefetchInput,
+    /// Output format written to stdout
+    #[arg(long, value_enum, default_value_t = PrefetchOutput::Text)]
+    output: PrefetchOutput,
+    /// Maximum task-relevant search matches
+    #[arg(long, default_value_t = 8)]
+    max_results: usize,
+    /// Maximum active user-preference traces
+    #[arg(long, default_value_t = 4)]
+    max_preferences: usize,
+    /// Maximum Unicode characters in the rendered context
+    #[arg(long, default_value_t = 8_000)]
+    max_chars: usize,
+    /// Exclude binding startup preferences from task-search matches
+    #[arg(long)]
+    exclude_startup_preferences: bool,
+    /// Emit safe empty-memory context instead of failing a Codex hook
+    #[arg(long)]
+    fail_open: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -362,6 +411,31 @@ enum MemoryCommand {
         confirm: bool,
         #[arg(long)]
         hard: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MetricsCommand {
+    /// Compact local op latency and volume summary
+    Summary {
+        #[arg(long, default_value = "7d")]
+        since: String,
+        #[arg(long)]
+        output: Option<String>,
+    },
+    /// Full local op metrics report (latency, daily volume, modes)
+    Report {
+        #[arg(long, default_value = "24h")]
+        since: String,
+        #[arg(long)]
+        output: Option<String>,
+    },
+    /// Delete local op metric rows older than --days (default 30)
+    Prune {
+        #[arg(long, default_value_t = 30)]
+        days: u32,
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
@@ -576,6 +650,7 @@ enum PluginCommand {
 enum IntegrationClient {
     Codex,
     ClaudeCode,
+    Cursor,
     Opencode,
 }
 
@@ -584,6 +659,7 @@ impl From<IntegrationClient> for crate::integrate::Client {
         match value {
             IntegrationClient::Codex => Self::Codex,
             IntegrationClient::ClaudeCode => Self::ClaudeCode,
+            IntegrationClient::Cursor => Self::Cursor,
             IntegrationClient::Opencode => Self::OpenCode,
         }
     }
@@ -640,6 +716,11 @@ enum IntegrateCommand {
         #[command(subcommand)]
         command: IntegrationAction,
     },
+    /// Manage the Cursor integration
+    Cursor {
+        #[command(subcommand)]
+        command: IntegrationAction,
+    },
     /// Manage the OpenCode integration
     Opencode {
         #[command(subcommand)]
@@ -664,6 +745,8 @@ enum IntegrationAction {
     },
     /// Print the generated integration fragments
     Print(IntegrationConnectionArgs),
+    /// Launch a session with only bounded Noema capture tools
+    Capture(IntegrationCaptureArgs),
 }
 
 #[derive(Debug, Args)]
@@ -685,6 +768,18 @@ struct IntegrationStatusArgs {
 }
 
 #[derive(Debug, Args)]
+struct IntegrationCaptureArgs {
+    #[arg(long, value_enum, default_value = "user")]
+    scope: IntegrationScope,
+    /// Client executable to launch instead of resolving it from PATH
+    #[arg(long)]
+    client_binary: Option<PathBuf>,
+    /// Arguments passed to the client; place them after `--`
+    #[arg(last = true, allow_hyphen_values = true)]
+    client_args: Vec<OsString>,
+}
+
+#[derive(Debug, Args)]
 struct IntegrationConnectionArgs {
     #[arg(long, value_enum)]
     scope: IntegrationScope,
@@ -695,6 +790,15 @@ struct IntegrationConnectionArgs {
     /// Environment variable containing the HTTP bearer token; never the token value
     #[arg(long)]
     bearer_token_env: Option<String>,
+    /// Install prompt-time Noema context injection (Codex only)
+    #[arg(long)]
+    prefetch: bool,
+    /// Install only prompt-time context injection without managing Codex MCP config
+    #[arg(long, conflicts_with = "prefetch")]
+    prefetch_only: bool,
+    /// Install a selectable Codex profile with prefetch enabled and Noema MCP disabled
+    #[arg(long, conflicts_with_all = ["prefetch", "prefetch_only"])]
+    continuity: bool,
 }
 #[derive(Debug, Subcommand)]
 enum HermesPluginAction {
@@ -782,6 +886,7 @@ pub async fn run() -> Result<()> {
         Command::Config { command } => config_command(command)?,
         Command::Plugin { command } => plugin_command(command)?,
         Command::Integrate { command } => integrate_command(selected, command)?,
+        Command::Prefetch(args) => prefetch_resolved_command(selected, args)?,
         Command::Serve(args) => serve(selected, args).await?,
         Command::Consolidate(args) => consolidate(selected, args).await?,
         Command::Migrate { command } => migrate_command(selected, command)?,
@@ -797,13 +902,33 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
     match command {
         Command::Add(args) => {
             let (title, trace_type, author, tags, body) = collect_add_args(args)?;
-            add_trace_interactive(cx, title, trace_type, author, tags, body)?;
+            let started = Instant::now();
+            let result = add_trace_interactive(cx, title, trace_type, author, tags, body);
+            record_cli_op(
+                cx,
+                "create_trace",
+                started,
+                result.is_ok(),
+                result.is_ok().then_some(1),
+                None,
+                None,
+            );
+            result?;
         }
         Command::List(args) => print_rows(cx.list(&args.into())?),
         Command::Get { id } => {
-            let (row, trace) = cx
-                .get_trace(&id)
-                .map_err(|_| anyhow::anyhow!("trace {id:?} not found"))?;
+            let started = Instant::now();
+            let result = cx.get_trace(&id);
+            record_cli_op(
+                cx,
+                "get_trace",
+                started,
+                result.is_ok(),
+                result.is_ok().then_some(1),
+                None,
+                Some(false),
+            );
+            let (row, trace) = result.map_err(|_| anyhow::anyhow!("trace {id:?} not found"))?;
             print_trace(&row, &trace);
         }
         Command::Append { id, content, force } => {
@@ -851,7 +976,9 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
             hybrid,
             list,
         } => {
-            if semantic || hybrid {
+            let started = Instant::now();
+            let mode = cli_search_mode(semantic, hybrid);
+            let result = if semantic || hybrid {
                 let include_archived = list.all || list.archived;
                 let (client, model, weight) = semantic_client(cx)?;
                 let options = SemanticOptions {
@@ -859,16 +986,30 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
                     include_archived,
                     ..Default::default()
                 };
-                let scored = if hybrid {
-                    cx.hybrid_search(&client, &query, &options, weight).await?
+                if hybrid {
+                    cx.hybrid_search(&client, &query, &options, weight)
+                        .await
+                        .map(|scored| scored.into_iter().map(|item| item.row).collect::<Vec<_>>())
                 } else {
-                    cx.semantic_search(&client, &query, &options).await?
-                };
-                print_rows(scored.into_iter().map(|item| item.row).collect());
+                    cx.semantic_search(&client, &query, &options)
+                        .await
+                        .map(|scored| scored.into_iter().map(|item| item.row).collect::<Vec<_>>())
+                }
             } else {
-                print_rows(cx.search(&query, &list.into())?);
-            }
+                cx.search(&query, &list.into())
+            };
+            record_cli_op(
+                cx,
+                "search_traces",
+                started,
+                result.is_ok(),
+                result.as_ref().ok().map(|rows| rows.len() as i64),
+                Some(mode),
+                None,
+            );
+            print_rows(result?);
         }
+        Command::Prefetch(_) => unreachable!("prefetch is handled before Cortex resolution"),
         Command::Similar {
             trace_id,
             limit,
@@ -876,7 +1017,9 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
             semantic,
             hybrid,
         } => {
-            if semantic || hybrid {
+            let started = Instant::now();
+            let mode = cli_search_mode(semantic, hybrid);
+            let result = if semantic || hybrid {
                 let search = cx.manifest.search.as_ref().context(
                     "semantic mode needs search.embedding_model in cortex.md (then: noema embeddings backfill)",
                 )?;
@@ -890,15 +1033,26 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
                     limit,
                     include_archived: archived,
                 };
-                let scored = if hybrid {
-                    cx.hybrid_similar(&trace_id, &options, search.effective_hybrid_weight())?
+                if hybrid {
+                    cx.hybrid_similar(&trace_id, &options, search.effective_hybrid_weight())
+                        .map(|scored| scored.into_iter().map(|item| item.row).collect::<Vec<_>>())
                 } else {
-                    cx.semantic_similar(&trace_id, &options)?
-                };
-                print_rows(scored.into_iter().map(|item| item.row).collect());
+                    cx.semantic_similar(&trace_id, &options)
+                        .map(|scored| scored.into_iter().map(|item| item.row).collect::<Vec<_>>())
+                }
             } else {
-                print_rows(cx.find_similar(&trace_id, limit, archived)?);
-            }
+                cx.find_similar(&trace_id, limit, archived)
+            };
+            record_cli_op(
+                cx,
+                "find_similar",
+                started,
+                result.is_ok(),
+                result.as_ref().ok().map(|rows| rows.len() as i64),
+                Some(mode),
+                None,
+            );
+            print_rows(result?);
         }
         Command::Sync { recover } => {
             let result = cx.sync_with_recovery(recover)?;
@@ -1018,6 +1172,7 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
         }
         Command::Drift => verify(cx, Some(VerifyCommand::Drift), false)?,
         Command::Memory { command } => memory_command(cx, command)?,
+        Command::Metrics { command } => metrics_command(cx, command)?,
         Command::Embeddings { command } => match command {
             EmbeddingCommand::Status => {
                 let model = cx
@@ -2225,6 +2380,207 @@ fn memory_command(cx: &Cortex, command: MemoryCommand) -> Result<()> {
     Ok(())
 }
 
+fn metrics_command(cx: &Cortex, command: MetricsCommand) -> Result<()> {
+    match command {
+        MetricsCommand::Summary { since, output } | MetricsCommand::Report { since, output } => {
+            let report = cx.op_metrics_report(crate::cortex::parse_since(&since)?)?;
+            let value = serde_json::json!({
+                "schema_version": 1,
+                "report": report,
+            });
+            match output.as_deref().unwrap_or("text") {
+                "json" => println!("{}", serde_json::to_string_pretty(&value)?),
+                "text" => print_op_metrics_text(&since, &value["report"]),
+                other => bail!("unsupported --output {other:?} (try: text, json)"),
+            }
+        }
+        MetricsCommand::Prune { days, yes } => {
+            if !yes {
+                bail!(
+                    "refusing to prune without --yes (would delete op_metrics older than {days}d)"
+                );
+            }
+            let deleted = cx.prune_op_metrics(chrono::Duration::days(i64::from(days)))?;
+            println!("Pruned {deleted} op metric row(s) older than {days}d");
+        }
+    }
+    Ok(())
+}
+
+fn cli_search_mode(semantic: bool, hybrid: bool) -> &'static str {
+    if hybrid {
+        "hybrid"
+    } else if semantic {
+        "semantic"
+    } else {
+        "lexical"
+    }
+}
+
+fn elapsed_ms(started: Instant) -> i64 {
+    i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
+}
+
+fn record_cli_op(
+    cx: &Cortex,
+    op: &str,
+    started: Instant,
+    ok: bool,
+    result_count: Option<i64>,
+    mode: Option<&str>,
+    usage_recorded: Option<bool>,
+) {
+    cx.record_op_metric_lossy(&OpMetricInput {
+        op,
+        source: "cli",
+        duration_ms: elapsed_ms(started),
+        ok,
+        result_count,
+        mode,
+        usage_recorded,
+    });
+}
+
+fn print_op_metrics_text(since: &str, report: &serde_json::Value) {
+    println!("Local op metrics — last {since}");
+    println!(
+        "  total ops: {}  errors: {}  usage-open rate: {:.0}%  retention: {}d",
+        report["total_ops"],
+        report["total_errors"],
+        report["usage_open_rate"].as_f64().unwrap_or(0.0) * 100.0,
+        report["retention_days"]
+    );
+    let by_op = report["by_op"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    if by_op.is_empty() {
+        println!("\n  (no recorded operations in window)");
+    } else {
+        let op_width = by_op
+            .iter()
+            .map(|row| row["op"].as_str().unwrap_or("").chars().count())
+            .max()
+            .unwrap_or(0)
+            .max("Op".len());
+        let count_width = numeric_column_width(
+            "Count",
+            by_op.iter().filter_map(|row| row["count"].as_i64()),
+        );
+        let errors_width = numeric_column_width(
+            "Errors",
+            by_op.iter().filter_map(|row| row["errors"].as_i64()),
+        );
+        let p50_width = by_op
+            .iter()
+            .map(|row| row["p50"].as_str().unwrap_or("-").chars().count())
+            .max()
+            .unwrap_or(0)
+            .max("p50".len());
+        let p95_width = by_op
+            .iter()
+            .map(|row| row["p95"].as_str().unwrap_or("-").chars().count())
+            .max()
+            .unwrap_or(0)
+            .max("p95".len());
+        println!(
+            "\n  {op:<op_width$}  {count:>count_width$}  {errors:>errors_width$}  {p50:>p50_width$}  {p95:>p95_width$}  Modes",
+            op = "Op",
+            count = "Count",
+            errors = "Errors",
+            p50 = "p50",
+            p95 = "p95",
+        );
+        for row in by_op {
+            let modes = format_metric_counts(row["modes"].as_object(), ",", "-");
+            println!(
+                "  {op:<op_width$}  {count:>count_width$}  {errors:>errors_width$}  {p50:>p50_width$}  {p95:>p95_width$}  {modes}",
+                op = row["op"].as_str().unwrap_or(""),
+                count = row["count"].as_u64().unwrap_or(0),
+                errors = row["errors"].as_u64().unwrap_or(0),
+                p50 = row["p50"].as_str().unwrap_or("-"),
+                p95 = row["p95"].as_str().unwrap_or("-"),
+            );
+        }
+    }
+    let sources = format_metric_counts(report["by_source"].as_object(), " ", "");
+    if !sources.is_empty() {
+        println!("\nBy source: {sources}");
+    }
+    let daily = report["daily"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    if !daily.is_empty() {
+        let date_width = daily
+            .iter()
+            .map(|day| day["date"].as_str().unwrap_or("").chars().count())
+            .max()
+            .unwrap_or(0)
+            .max("Date".len());
+        let ops_width =
+            numeric_column_width("Ops", daily.iter().filter_map(|day| day["ops"].as_i64()));
+        let errors_width = numeric_column_width(
+            "Errors",
+            daily.iter().filter_map(|day| day["errors"].as_i64()),
+        );
+        let gets_width = numeric_column_width(
+            "Gets",
+            daily.iter().filter_map(|day| day["get_trace"].as_i64()),
+        );
+        let usage_width = numeric_column_width(
+            "UsageOpens",
+            daily.iter().filter_map(|day| day["usage_opens"].as_i64()),
+        );
+        let search_width = numeric_column_width(
+            "Search",
+            daily.iter().filter_map(|day| day["search_traces"].as_i64()),
+        );
+        let create_width = numeric_column_width(
+            "Create",
+            daily.iter().filter_map(|day| day["create_trace"].as_i64()),
+        );
+        let similar_width = numeric_column_width(
+            "Similar",
+            daily.iter().filter_map(|day| day["find_similar"].as_i64()),
+        );
+        println!("\nDaily volume");
+        println!(
+            "  {date:<date_width$}  {ops:>ops_width$}  {errors:>errors_width$}  {gets:>gets_width$}  {usage:>usage_width$}  {search:>search_width$}  {create:>create_width$}  {similar:>similar_width$}",
+            date = "Date",
+            ops = "Ops",
+            errors = "Errors",
+            gets = "Gets",
+            usage = "UsageOpens",
+            search = "Search",
+            create = "Create",
+            similar = "Similar",
+        );
+        for day in daily {
+            println!(
+                "  {date:<date_width$}  {ops:>ops_width$}  {errors:>errors_width$}  {gets:>gets_width$}  {usage:>usage_width$}  {search:>search_width$}  {create:>create_width$}  {similar:>similar_width$}",
+                date = day["date"].as_str().unwrap_or(""),
+                ops = day["ops"].as_i64().unwrap_or(0),
+                errors = day["errors"].as_i64().unwrap_or(0),
+                gets = day["get_trace"].as_i64().unwrap_or(0),
+                usage = day["usage_opens"].as_i64().unwrap_or(0),
+                search = day["search_traces"].as_i64().unwrap_or(0),
+                create = day["create_trace"].as_i64().unwrap_or(0),
+                similar = day["find_similar"].as_i64().unwrap_or(0),
+            );
+        }
+    }
+}
+
+fn format_metric_counts(
+    object: Option<&serde_json::Map<String, serde_json::Value>>,
+    sep: &str,
+    empty: &str,
+) -> String {
+    let Some(object) = object.filter(|object| !object.is_empty()) else {
+        return empty.to_owned();
+    };
+    object
+        .iter()
+        .map(|(key, count)| format!("{key}={count}"))
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
 fn events_backfill(cx: &Cortex, dry_run: bool, assume_yes: bool) -> Result<()> {
     let preview = cx.backfill_create_events(true)?;
     if preview.backfilled_ids.is_empty() && preview.skipped_ids.is_empty() {
@@ -3425,6 +3781,9 @@ fn integrate_command(selected: Option<&str>, command: IntegrateCommand) -> Resul
         IntegrateCommand::ClaudeCode { command } => {
             integrate_client_command(selected, crate::integrate::Client::ClaudeCode, command)?;
         }
+        IntegrateCommand::Cursor { command } => {
+            integrate_client_command(selected, crate::integrate::Client::Cursor, command)?;
+        }
         IntegrateCommand::Opencode { command } => {
             integrate_client_command(selected, crate::integrate::Client::OpenCode, command)?;
         }
@@ -3493,6 +3852,18 @@ fn integrate_client_command(
             let request = integration_request_from_args(selected, client, args)?;
             print!("{}", crate::integrate::print(&request)?);
         }
+        IntegrationAction::Capture(args) => {
+            let request = integration_request(
+                selected,
+                client,
+                args.scope.into(),
+                crate::integrate::Transport::Stdio,
+                None,
+                None,
+                crate::integrate::PrefetchInstall::Disabled,
+            )?;
+            crate::integrate::capture(&request, args.client_binary.as_deref(), &args.client_args)?;
+        }
     }
     Ok(())
 }
@@ -3502,6 +3873,25 @@ fn integration_request_from_args(
     client: crate::integrate::Client,
     args: IntegrationConnectionArgs,
 ) -> Result<crate::integrate::Request> {
+    if (args.prefetch || args.prefetch_only || args.continuity)
+        && client != crate::integrate::Client::Codex
+    {
+        bail!(
+            "--prefetch, --prefetch-only, and --continuity are currently supported only for Codex"
+        );
+    }
+    if args.continuity && !matches!(args.scope, IntegrationScope::User) {
+        bail!("--continuity is supported only with --scope user");
+    }
+    let prefetch = if args.continuity {
+        crate::integrate::PrefetchInstall::ContinuityProfile
+    } else if args.prefetch_only {
+        crate::integrate::PrefetchInstall::Only
+    } else if args.prefetch {
+        crate::integrate::PrefetchInstall::WithManagedMcp
+    } else {
+        crate::integrate::PrefetchInstall::Disabled
+    };
     integration_request(
         selected,
         client,
@@ -3509,6 +3899,7 @@ fn integration_request_from_args(
         args.transport.into(),
         args.url,
         args.bearer_token_env,
+        prefetch,
     )
 }
 
@@ -3519,6 +3910,7 @@ fn integration_request(
     transport: crate::integrate::Transport,
     url: Option<String>,
     bearer_token_env: Option<String>,
+    prefetch: crate::integrate::PrefetchInstall,
 ) -> Result<crate::integrate::Request> {
     let cortex = Cortex::resolve(selected)?;
     crate::integrate::Request::from_environment(
@@ -3528,6 +3920,7 @@ fn integration_request(
         transport,
         url,
         bearer_token_env,
+        prefetch,
     )
 }
 
@@ -4117,6 +4510,114 @@ fn print_rows(rows: Vec<crate::cortex::Row>) {
         );
     }
 }
+
+fn validate_prefetch_args(args: &PrefetchArgs) -> Result<()> {
+    if args.max_results > 16 {
+        bail!("max-results must be between 0 and 16");
+    }
+    if args.max_preferences > 24 {
+        bail!("max-preferences must be between 0 and 24");
+    }
+    if !(512..=32_000).contains(&args.max_chars) {
+        bail!("max-chars must be between 512 and 32000");
+    }
+    if args.fail_open
+        && !matches!(
+            args.output,
+            PrefetchOutput::CodexHook | PrefetchOutput::CodexSessionStart
+        )
+    {
+        bail!("--fail-open requires a Codex hook output format");
+    }
+    Ok(())
+}
+
+fn prefetch_resolved_command(selected: Option<&str>, args: PrefetchArgs) -> Result<()> {
+    validate_prefetch_args(&args)?;
+    let cx = match Cortex::resolve(selected) {
+        Ok(cx) => cx,
+        Err(_error) if args.fail_open => {
+            print_prefetch_fallback(prefetch_hook_event(args.output))?;
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let started = Instant::now();
+    let result = prefetch_command(&cx, &args);
+    record_cli_op(
+        &cx,
+        "prefetch_context",
+        started,
+        result.is_ok(),
+        result.as_ref().ok().copied().map(|count| count as i64),
+        Some("lexical"),
+        Some(false),
+    );
+    match result {
+        Ok(_) => Ok(()),
+        Err(_) if args.fail_open => print_prefetch_fallback(prefetch_hook_event(args.output)),
+        Err(error) => Err(error),
+    }
+}
+
+fn prefetch_hook_event(output: PrefetchOutput) -> &'static str {
+    match output {
+        PrefetchOutput::CodexSessionStart => "SessionStart",
+        _ => "UserPromptSubmit",
+    }
+}
+
+fn print_prefetch_fallback(event: &str) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "additionalContext": "[noema-prefetch-v1]\nNoema prefetch is unavailable. Do not invent memories; continue without memory and surface the unavailable source.",
+            }
+        }))?
+    );
+    Ok(())
+}
+
+fn prefetch_command(cx: &Cortex, args: &PrefetchArgs) -> Result<usize> {
+    let input = read_stdin()?;
+    let prompt = match args.input {
+        PrefetchInput::Raw => input,
+        PrefetchInput::CodexHook => serde_json::from_str::<serde_json::Value>(&input)
+            .context("parsing Codex hook input")?
+            .get("prompt")
+            .and_then(serde_json::Value::as_str)
+            .context("Codex hook input is missing string field prompt")?
+            .to_owned(),
+    };
+    let result = crate::prefetch::retrieve(
+        cx,
+        &prompt,
+        PrefetchOptions {
+            max_results: args.max_results,
+            max_preferences: args.max_preferences,
+            max_chars: args.max_chars,
+            exclude_startup_preferences_from_search: args.exclude_startup_preferences,
+        },
+    )?;
+    let included = result.included_trace_count;
+    match args.output {
+        PrefetchOutput::Text => println!("{}", result.context),
+        PrefetchOutput::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        PrefetchOutput::CodexHook | PrefetchOutput::CodexSessionStart => println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": prefetch_hook_event(args.output),
+                    "additionalContext": result.context,
+                }
+            }))?
+        ),
+    }
+    Ok(included)
+}
+
 fn read_stdin() -> Result<String> {
     let mut body = String::new();
     io::stdin()
@@ -4707,6 +5208,17 @@ mod tests {
         ));
 
         assert!(Cli::try_parse_from(["noema", "integrate", "claude-code", "install"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "noema",
+                "integrate",
+                "cursor",
+                "install",
+                "--scope",
+                "project"
+            ])
+            .is_ok()
+        );
         assert!(Cli::try_parse_from(["noema", "integrate", "opencode", "remove"]).is_err());
         assert!(Cli::try_parse_from(["noema", "integrate", "status"]).is_ok());
         assert!(

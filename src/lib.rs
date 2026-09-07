@@ -13,6 +13,7 @@ pub mod markdown_normalization;
 pub mod mcp;
 pub mod migration;
 pub mod plugin;
+pub mod prefetch;
 pub mod restore;
 pub mod tag;
 pub mod tlsutil;

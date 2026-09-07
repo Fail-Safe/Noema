@@ -4,6 +4,7 @@ use std::{
     net::ToSocketAddrs,
     path::PathBuf,
     sync::Arc,
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
@@ -32,13 +33,21 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     VERSION,
     cortex::{
-        AccessKey, Cortex, DistilledTraceSpec, ListOptions, SemanticOptions, load_access_key,
-        parse_since,
+        AccessKey, Cortex, DistilledTraceSpec, ListOptions, OpMetricInput, SemanticOptions,
+        load_access_key, parse_since,
     },
     embedding::HttpEmbedder,
     lock::CortexLock,
     trace::Trace,
 };
+
+const MAX_RECALL_QUERIES: usize = 8;
+const DEFAULT_RECALL_MATCHES: usize = 3;
+const MAX_RECALL_MATCHES: usize = 5;
+const DEFAULT_RECALL_BODY_CHARS: usize = 4_000;
+const MAX_RECALL_BODY_CHARS: usize = 12_000;
+const MAX_RECALL_PREFERENCES: usize = 24;
+const MAX_CREATE_TRACES: usize = 16;
 
 #[derive(Clone)]
 pub struct NoemaServer {
@@ -67,11 +76,29 @@ impl NoemaServer {
         } else {
             String::new()
         };
+        let tool_profile = std::env::var("NOEMA_MCP_TOOL_PROFILE").unwrap_or_default();
         Ok(Self {
             cortex: Arc::new(Mutex::new(cortex)),
             federation_mode,
-            tool_router: Self::tool_router(),
+            tool_router: Self::tool_router_for_profile(&tool_profile)?,
         })
+    }
+
+    fn tool_router_for_profile(profile: &str) -> Result<ToolRouter<Self>> {
+        let mut router = Self::tool_router();
+        match profile {
+            "" | "full" => {}
+            "continuity-read" => {
+                router.map.retain(|name, _| name == "recall_context");
+            }
+            "continuity-capture" => {
+                router
+                    .map
+                    .retain(|name, _| name == "get_instructions" || name == "create_traces");
+            }
+            _ => bail!("unsupported NOEMA_MCP_TOOL_PROFILE {profile:?}"),
+        }
+        Ok(router)
     }
 
     async fn open(&self) -> Result<OwnedMutexGuard<Cortex>, ErrorData> {
@@ -195,6 +222,41 @@ struct CreateParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct CreateTracesParams {
+    /// Independent traces to persist (1-16). The complete request is validated before any write.
+    traces: Vec<CreateParams>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct CreateTraceReceipt {
+    #[schemars(schema_with = "nonnegative_integer_schema")]
+    index: usize,
+    id: String,
+    content_hash: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct CreateTraceFailure {
+    #[schemars(schema_with = "nonnegative_integer_schema")]
+    index: usize,
+    error_code: &'static str,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct CreateTracesOutput {
+    status: &'static str,
+    #[schemars(schema_with = "nonnegative_integer_schema")]
+    requested: usize,
+    #[schemars(schema_with = "nonnegative_integer_schema")]
+    persisted: usize,
+    #[schemars(schema_with = "nonnegative_integer_schema")]
+    failed: usize,
+    atomic: bool,
+    receipts: Vec<CreateTraceReceipt>,
+    failures: Vec<CreateTraceFailure>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct UpdateParams {
     /// Trace ID
     id: String,
@@ -224,6 +286,66 @@ struct SearchParams {
     /// Search mode: 'lexical' (FTS5, default), 'semantic' (embedding similarity), or 'hybrid'. Semantic/hybrid need a configured search block; if unavailable, falls back to lexical.
     #[serde(default)]
     mode: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RecallContextParams {
+    /// Task-specific search queries to resolve in one call (maximum 8)
+    #[serde(default)]
+    queries: Vec<String>,
+    /// Include active traces tagged user-preference (default true)
+    include_preferences: Option<bool>,
+    /// Maximum matches returned for each query (default 3, maximum 5)
+    limit_per_query: Option<usize>,
+    /// Maximum Unicode characters returned from each trace body (default 4000, maximum 12000)
+    max_body_chars: Option<usize>,
+    /// Include archived traces in task-specific search results
+    #[serde(default)]
+    all: bool,
+    /// Search mode: 'lexical' (FTS5, default), 'semantic', or 'hybrid'. Semantic/hybrid fall back to lexical when unavailable.
+    #[serde(default)]
+    mode: String,
+    /// Record returned traces as agent reads for memory-tier promotion signals (default false)
+    #[serde(default)]
+    record_usage: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct RecallTrace {
+    id: String,
+    title: String,
+    #[serde(rename = "type")]
+    trace_type: String,
+    tier: String,
+    author: String,
+    origin: String,
+    tags: Vec<String>,
+    derived_from: Vec<String>,
+    created: String,
+    updated: String,
+    content_hash: String,
+    source_hash: String,
+    source_locked: bool,
+    body: String,
+    body_truncated: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct RecallQueryResult {
+    query: String,
+    mode: String,
+    note: String,
+    matches: Vec<RecallTrace>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct RecallContextOutput {
+    schema_version: u32,
+    guidance: &'static str,
+    preferences: Vec<RecallTrace>,
+    preference_results_truncated: bool,
+    results: Vec<RecallQueryResult>,
+    usage_recorded: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -389,6 +511,13 @@ fn schema_version_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema 
     })
 }
 
+fn nonnegative_integer_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "integer",
+        "minimum": 0
+    })
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 struct CortexUsageOutput {
     #[schemars(schema_with = "schema_version_schema")]
@@ -455,10 +584,23 @@ impl NoemaServer {
     #[tool(description = "Get a trace by ID, including its full body")]
     async fn get_trace(&self, Parameters(p): Parameters<GetParams>) -> Result<String, ErrorData> {
         let cx = self.open().await?;
-        let (row, trace) = cx.get_trace(&p.id).map_err(mcp_error)?;
-        if p.record_usage {
-            cx.bump_read(&p.id).map_err(mcp_error)?;
-        }
+        let started = Instant::now();
+        let result = cx.get_trace(&p.id).and_then(|value| {
+            if p.record_usage {
+                cx.bump_read(&p.id)?;
+            }
+            Ok(value)
+        });
+        record_mcp_op(
+            &cx,
+            "get_trace",
+            started,
+            result.is_ok(),
+            result.is_ok().then_some(1),
+            None,
+            Some(p.record_usage && result.is_ok()),
+        );
+        let (row, trace) = result.map_err(mcp_error)?;
         Ok(json_text(
             json!({"id":row.id,"title":row.title,"type":row.trace_type,"tier":row.tier,"author":row.author,"tags":row.tags,"derived_from":row.derived_from,"origin":row.origin,"created":row.created_at,"updated":row.updated_at,"body":trace.body,"content_hash":row.content_hash,"source_hash":row.source_hash,"source_locked":row.source_locked}),
         ))
@@ -471,13 +613,95 @@ impl NoemaServer {
     ) -> Result<String, ErrorData> {
         self.ensure_writable()?;
         let cx = self.open().await?;
-        let mut trace = Trace::new(p.title, p.trace_type, p.author, csv(&p.tags), p.body);
-        trace.frontmatter.derived_from = csv(&p.derived_from);
-        trace.frontmatter.origin = p.origin;
-        trace.frontmatter.source_hash = p.source_hash;
-        trace.frontmatter.source_locked = p.source_locked;
-        cx.add(&mut trace).map_err(mcp_error)?;
+        let mut trace = trace_from_create_params(p);
+        let started = Instant::now();
+        let result = cx.add(&mut trace);
+        record_mcp_op(
+            &cx,
+            "create_trace",
+            started,
+            result.is_ok(),
+            result.is_ok().then_some(1),
+            None,
+            None,
+        );
+        result.map_err(mcp_error)?;
         Ok(format!("Trace created: {}", trace.frontmatter.id))
+    }
+
+    #[tool(
+        description = "Persist 1-16 independent traces in one call. The entire request is validated before writes; each item is then transactionally persisted independently. Check status and failures because the batch is not cross-trace atomic. Successful receipts include id and content_hash and require no follow-up get_trace verification."
+    )]
+    async fn create_traces(
+        &self,
+        Parameters(p): Parameters<CreateTracesParams>,
+    ) -> Result<Json<CreateTracesOutput>, ErrorData> {
+        self.ensure_writable()?;
+        if p.traces.is_empty() || p.traces.len() > MAX_CREATE_TRACES {
+            return Err(ErrorData::invalid_params(
+                format!("traces must contain 1-{MAX_CREATE_TRACES} items"),
+                None,
+            ));
+        }
+        let requested = p.traces.len();
+        let mut traces = Vec::with_capacity(requested);
+        let mut ids = HashSet::with_capacity(requested);
+        for (index, item) in p.traces.into_iter().enumerate() {
+            let trace = trace_from_create_params(item);
+            trace.validate().map_err(|error| {
+                ErrorData::invalid_params(
+                    format!("trace at index {index} is invalid: {error}"),
+                    None,
+                )
+            })?;
+            if !ids.insert(trace.frontmatter.id.clone()) {
+                return Err(ErrorData::invalid_params(
+                    format!("traces contain duplicate generated ids at index {index}"),
+                    None,
+                ));
+            }
+            traces.push(trace);
+        }
+
+        let cx = self.open().await?;
+        let started = Instant::now();
+        let mut receipts = Vec::with_capacity(requested);
+        let mut failures = Vec::new();
+        for (index, trace) in traces.iter_mut().enumerate() {
+            match cx.add(trace) {
+                Ok(()) => receipts.push(CreateTraceReceipt {
+                    index,
+                    id: trace.frontmatter.id.clone(),
+                    content_hash: trace.frontmatter.content_hash.clone(),
+                }),
+                Err(_) => failures.push(CreateTraceFailure {
+                    index,
+                    error_code: "persistence_failed",
+                }),
+            }
+        }
+        record_mcp_op(
+            &cx,
+            "create_trace",
+            started,
+            failures.is_empty(),
+            Some(i64::try_from(receipts.len()).unwrap_or(i64::MAX)),
+            None,
+            None,
+        );
+        Ok(Json(CreateTracesOutput {
+            status: if failures.is_empty() {
+                "completed"
+            } else {
+                "partial"
+            },
+            requested,
+            persisted: receipts.len(),
+            failed: failures.len(),
+            atomic: false,
+            receipts,
+            failures,
+        }))
     }
 
     #[tool(description = "Full-text search across traces")]
@@ -486,61 +710,136 @@ impl NoemaServer {
         Parameters(p): Parameters<SearchParams>,
     ) -> Result<String, ErrorData> {
         let mut cx = self.open().await?;
-        let (mode, embedder, model, weight) =
-            resolve_search_mode(&cx, &p.mode).map_err(mcp_error)?;
-        let mut note = String::new();
-        let rows = if matches!(mode.as_str(), "semantic" | "hybrid") {
-            if let Some(embedder) = embedder {
-                let options = SemanticOptions {
-                    model,
-                    include_archived: p.all,
-                    ..Default::default()
-                };
-                let scored = if mode == "hybrid" {
-                    cx.hybrid_search(&embedder, &p.query, &options, weight)
-                        .await
-                } else {
-                    cx.semantic_search(&embedder, &p.query, &options).await
-                };
-                match scored {
-                    Ok(scored) => scored.into_iter().map(|item| item.row).collect(),
-                    Err(_) => {
-                        note = format!(
-                            "[{mode} search temporarily unavailable; showing lexical results]\n"
-                        );
-                        cx.search(
-                            &p.query,
-                            &ListOptions {
-                                all: p.all,
-                                ..Default::default()
-                            },
-                        )
-                        .map_err(mcp_error)?
-                    }
-                }
-            } else {
-                note = "[semantic search not configured; showing lexical results]\n".into();
-                cx.search(
-                    &p.query,
-                    &ListOptions {
-                        all: p.all,
-                        ..Default::default()
-                    },
-                )
-                .map_err(mcp_error)?
+        let started = Instant::now();
+        match execute_search(&mut cx, &p.query, p.all, &p.mode).await {
+            Ok(search) => {
+                let rows = search.rows;
+                cx.bump_search_hits(&rows);
+                record_mcp_op(
+                    &cx,
+                    "search_traces",
+                    started,
+                    true,
+                    Some(rows.len() as i64),
+                    Some(search.mode.as_str()),
+                    None,
+                );
+                Ok(search.note + &format_rows(&rows))
             }
-        } else {
-            cx.search(
-                &p.query,
-                &ListOptions {
-                    all: p.all,
+            Err(err) => {
+                record_mcp_op(&cx, "search_traces", started, false, None, None, None);
+                Err(mcp_error(err))
+            }
+        }
+    }
+
+    #[tool(
+        description = "Retrieve startup preferences and bounded full trace bodies for several task queries in one read-only call. Use this continuity fast path instead of separate list/search/get calls when available."
+    )]
+    async fn recall_context(
+        &self,
+        Parameters(p): Parameters<RecallContextParams>,
+    ) -> Result<Json<RecallContextOutput>, ErrorData> {
+        if p.queries.len() > MAX_RECALL_QUERIES {
+            return Err(ErrorData::invalid_params(
+                format!("queries accepts at most {MAX_RECALL_QUERIES} entries"),
+                None,
+            ));
+        }
+        let include_preferences = p.include_preferences.unwrap_or(true);
+        if p.queries.is_empty() && !include_preferences {
+            return Err(ErrorData::invalid_params(
+                "provide at least one query or include preferences",
+                None,
+            ));
+        }
+        let limit = p.limit_per_query.unwrap_or(DEFAULT_RECALL_MATCHES);
+        if !(1..=MAX_RECALL_MATCHES).contains(&limit) {
+            return Err(ErrorData::invalid_params(
+                format!("limit_per_query must be between 1 and {MAX_RECALL_MATCHES}"),
+                None,
+            ));
+        }
+        let max_body_chars = p.max_body_chars.unwrap_or(DEFAULT_RECALL_BODY_CHARS);
+        if !(1..=MAX_RECALL_BODY_CHARS).contains(&max_body_chars) {
+            return Err(ErrorData::invalid_params(
+                format!("max_body_chars must be between 1 and {MAX_RECALL_BODY_CHARS}"),
+                None,
+            ));
+        }
+
+        let mut cx = self.open().await?;
+        let started = Instant::now();
+        let outcome: Result<RecallContextOutput> = async {
+            let preference_rows = if include_preferences {
+                cx.list(&ListOptions {
+                    tag: "user-preference".into(),
                     ..Default::default()
-                },
-            )
-            .map_err(mcp_error)?
-        };
-        cx.bump_search_hits(&rows);
-        Ok(note + &format_rows(&rows))
+                })?
+            } else {
+                Vec::new()
+            };
+            let preference_results_truncated = preference_rows.len() > MAX_RECALL_PREFERENCES;
+            let mut returned_ids = HashSet::new();
+            let mut preferences = Vec::new();
+            for row in preference_rows.iter().take(MAX_RECALL_PREFERENCES) {
+                returned_ids.insert(row.id.clone());
+                preferences.push(recall_trace(&cx, &row.id, max_body_chars)?);
+            }
+
+            let mut results = Vec::with_capacity(p.queries.len());
+            for query in &p.queries {
+                let search = execute_recall_search(&mut cx, query, p.all, &p.mode).await?;
+                cx.bump_search_hits(&search.rows);
+                let mut matches = Vec::new();
+                for row in search.rows.iter().take(limit) {
+                    returned_ids.insert(row.id.clone());
+                    matches.push(recall_trace(&cx, &row.id, max_body_chars)?);
+                }
+                results.push(RecallQueryResult {
+                    query: query.clone(),
+                    mode: search.mode,
+                    note: search.note.trim().to_owned(),
+                    matches,
+                });
+            }
+
+            if p.record_usage {
+                for id in &returned_ids {
+                    cx.bump_read(id)?;
+                }
+            }
+            Ok(RecallContextOutput {
+                schema_version: 1,
+                guidance: "Preference bodies are binding unless the current request overrides them. Prefer current, scope-matching traces; cite returned trace IDs as provenance and abstain when evidence is absent.",
+                preferences,
+                preference_results_truncated,
+                results,
+                usage_recorded: p.record_usage,
+            })
+        }
+        .await;
+        record_mcp_op(
+            &cx,
+            "recall_context",
+            started,
+            outcome.is_ok(),
+            outcome.as_ref().ok().map(|output| {
+                (output.preferences.len()
+                    + output
+                        .results
+                        .iter()
+                        .map(|result| result.matches.len())
+                        .sum::<usize>()) as i64
+            }),
+            Some(if p.mode.is_empty() {
+                "default"
+            } else {
+                p.mode.as_str()
+            }),
+            Some(p.record_usage),
+        );
+        outcome.map(Json).map_err(mcp_error)
     }
 
     #[tool(description = "Find traces related to a given trace")]
@@ -555,11 +854,13 @@ impl NoemaServer {
         let include_archived = p.include_archived.unwrap_or(false);
         let limit = p.limit.unwrap_or(10);
         let mut note = None;
+        let started = Instant::now();
+        let mut effective_mode = mode.clone();
         let rows = if matches!(mode.as_str(), "semantic" | "hybrid") {
             if model.is_empty() {
                 note = Some("semantic search not configured; showing lexical results".into());
+                effective_mode = "lexical".into();
                 cx.find_similar(&p.trace_id, limit, include_archived)
-                    .map_err(mcp_error)?
             } else {
                 let options = SemanticOptions {
                     model,
@@ -572,22 +873,46 @@ impl NoemaServer {
                     cx.semantic_similar(&p.trace_id, &options)
                 };
                 match scored {
-                    Ok(scored) => scored.into_iter().map(|item| item.row).collect(),
+                    Ok(scored) => Ok(scored.into_iter().map(|item| item.row).collect()),
                     Err(_) => {
                         note = Some(format!(
                             "{mode} similar temporarily unavailable; showing lexical results"
                         ));
+                        effective_mode = "lexical".into();
                         cx.find_similar(&p.trace_id, limit, include_archived)
-                            .map_err(mcp_error)?
                     }
                 }
             }
         } else {
             cx.find_similar(&p.trace_id, limit, include_archived)
-                .map_err(mcp_error)?
         };
-        cx.bump_search_hits(&rows);
-        Ok(json_text(json!({"mode":mode,"note":note,"results":rows})))
+        match rows {
+            Ok(rows) => {
+                cx.bump_search_hits(&rows);
+                record_mcp_op(
+                    &cx,
+                    "find_similar",
+                    started,
+                    true,
+                    Some(rows.len() as i64),
+                    Some(effective_mode.as_str()),
+                    None,
+                );
+                Ok(json_text(json!({"mode":mode,"note":note,"results":rows})))
+            }
+            Err(err) => {
+                record_mcp_op(
+                    &cx,
+                    "find_similar",
+                    started,
+                    false,
+                    None,
+                    Some(effective_mode.as_str()),
+                    None,
+                );
+                Err(mcp_error(err))
+            }
+        }
     }
 
     #[tool(
@@ -885,6 +1210,20 @@ impl NoemaServer {
             "activity": cx.consolidation_activity(since).map_err(mcp_error)?,
             "latency": cx.promotion_latency().map_err(mcp_error)?,
             "one_source_mid": cx.one_source_mid_count().map_err(mcp_error)?,
+        })))
+    }
+    #[tool(
+        description = "Local MCP/CLI operation metrics for the lookback window: per-op counts and p50/p95 latency, daily volume (opens/searches/creates), source mix, and get_trace usage-open rate. Local-only and pruneable — not federated telemetry. Lets an agent answer 'is search getting slow?' or 'are agents actually opening traces?' without SQL."
+    )]
+    async fn metrics_summary(
+        &self,
+        Parameters(p): Parameters<HealthParam>,
+    ) -> Result<String, ErrorData> {
+        let since = parse_since(p.since.as_deref().unwrap_or("24h")).map_err(mcp_error)?;
+        let cx = self.open().await?;
+        Ok(json_text(json!({
+            "schema_version": 1,
+            "report": cx.op_metrics_report(since).map_err(mcp_error)?,
         })))
     }
     #[tool(
@@ -1800,6 +2139,11 @@ Choose the most specific trace type:
 ## Creating Traces
 When create_trace is exposed, pass title, type, and body plus optional author,
 tags, derived_from, origin, source_locked, and source_hash per the tool schema.
+When create_traces is exposed, prefer it for two or more independent traces.
+Its complete input is validated before writing, then each trace is persisted in
+its own crash-safe transaction. Check the returned status and failures because
+the operation is not cross-trace atomic. Successful id and content_hash receipts
+are persistence verification; do not call get_trace solely to verify them.
 
 Aim for titles under 80 characters. Do NOT include a date in the title — the ID
 generator prepends today's date automatically, and leading YYYYMMDD- or
@@ -1917,7 +2261,7 @@ fn build_cortex_usage(cortex: &Cortex) -> Result<CortexUsageOutput> {
         })),
         trace_model: value_object(json!({
             "types":trace_types,
-            "id":{"format":"YYYYMMDD-slugified-title","slug_max_len":crate::trace::MAX_SLUG_LEN,"generated_by":"create_trace"},
+            "id":{"format":"YYYYMMDD-slugified-title","slug_max_len":crate::trace::MAX_SLUG_LEN,"generated_by":"create_trace or create_traces"},
             "title_rules":[
                 "Aim for titles under 80 characters.",
                 "Do not include a date in the title; create_trace prepends today's date automatically.",
@@ -1947,6 +2291,7 @@ fn build_cortex_usage(cortex: &Cortex) -> Result<CortexUsageOutput> {
             ],
             "write":[
                 "create_trace creates a new trace when exposed.",
+                "create_traces validates 1-16 traces before writing, persists each independently, and returns receipts plus explicit partial failures without requiring verification reads.",
                 "update_trace changes selected fields when exposed.",
                 "append_trace appends content without reading the full trace first.",
                 "set_trace_tags replaces retrieval tags without touching title, body, type, or lineage.",
@@ -1994,6 +2339,144 @@ fn trace_type_description(trace_type: &str) -> &'static str {
         "divergence" => "concurrent edit conflict, created by federation",
         _ => "fallback for anything else",
     }
+}
+
+struct SearchExecution {
+    rows: Vec<crate::cortex::Row>,
+    mode: String,
+    note: String,
+}
+
+async fn execute_recall_search(
+    cortex: &mut Cortex,
+    query: &str,
+    all: bool,
+    requested_mode: &str,
+) -> Result<SearchExecution> {
+    let mut search = execute_search(cortex, query, all, requested_mode).await?;
+    if !search.rows.is_empty() {
+        return Ok(search);
+    }
+    let broadened = broaden_recall_query(query);
+    if broadened.is_empty() || broadened == query {
+        return Ok(search);
+    }
+    let rows = cortex.search(
+        &broadened,
+        &ListOptions {
+            all,
+            ..Default::default()
+        },
+    )?;
+    if !rows.is_empty() {
+        search.rows = rows;
+        search.mode = "lexical".into();
+        search
+            .note
+            .push_str("[no conjunctive matches; broadened lexical query]\n");
+    }
+    Ok(search)
+}
+
+fn broaden_recall_query(query: &str) -> String {
+    const STOP_WORDS: &[&str] = &[
+        "a", "an", "and", "for", "in", "of", "on", "or", "return", "the", "to", "what", "which",
+    ];
+    let mut seen = HashSet::new();
+    query
+        .split_whitespace()
+        .filter_map(|token| {
+            let token = token.trim_matches(|character: char| {
+                !character.is_alphanumeric() && character != '_' && character != '-'
+            });
+            let normalized = token.to_ascii_lowercase();
+            (!token.is_empty()
+                && token.chars().count() >= 3
+                && !STOP_WORDS.contains(&normalized.as_str())
+                && seen.insert(normalized))
+            .then(|| token.to_owned())
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+async fn execute_search(
+    cortex: &mut Cortex,
+    query: &str,
+    all: bool,
+    requested_mode: &str,
+) -> Result<SearchExecution> {
+    let (mode, embedder, model, weight) = resolve_search_mode(cortex, requested_mode)?;
+    let list = ListOptions {
+        all,
+        ..Default::default()
+    };
+    if matches!(mode.as_str(), "semantic" | "hybrid") {
+        if let Some(embedder) = embedder {
+            let options = SemanticOptions {
+                model,
+                include_archived: all,
+                ..Default::default()
+            };
+            let scored = if mode == "hybrid" {
+                cortex
+                    .hybrid_search(&embedder, query, &options, weight)
+                    .await
+            } else {
+                cortex.semantic_search(&embedder, query, &options).await
+            };
+            if let Ok(scored) = scored {
+                return Ok(SearchExecution {
+                    rows: scored.into_iter().map(|item| item.row).collect(),
+                    mode,
+                    note: String::new(),
+                });
+            }
+            return Ok(SearchExecution {
+                rows: cortex.search(query, &list)?,
+                note: format!("[{mode} search temporarily unavailable; showing lexical results]\n"),
+                mode: "lexical".into(),
+            });
+        }
+        return Ok(SearchExecution {
+            rows: cortex.search(query, &list)?,
+            mode: "lexical".into(),
+            note: "[semantic search not configured; showing lexical results]\n".into(),
+        });
+    }
+    Ok(SearchExecution {
+        rows: cortex.search(query, &list)?,
+        mode,
+        note: String::new(),
+    })
+}
+
+fn recall_trace(cortex: &Cortex, id: &str, max_body_chars: usize) -> Result<RecallTrace> {
+    let (row, trace) = cortex.get_trace(id)?;
+    let (body, body_truncated) = truncate_chars(&trace.body, max_body_chars);
+    Ok(RecallTrace {
+        id: row.id,
+        title: row.title,
+        trace_type: row.trace_type,
+        tier: row.tier,
+        author: row.author,
+        origin: row.origin,
+        tags: row.tags,
+        derived_from: row.derived_from,
+        created: row.created_at,
+        updated: row.updated_at,
+        content_hash: row.content_hash,
+        source_hash: row.source_hash,
+        source_locked: row.source_locked,
+        body,
+        body_truncated,
+    })
+}
+
+fn truncate_chars(value: &str, limit: usize) -> (String, bool) {
+    let mut chars = value.chars();
+    let body: String = chars.by_ref().take(limit).collect();
+    (body, chars.next().is_some())
 }
 
 fn resolve_search_mode(
@@ -2073,6 +2556,40 @@ fn csv(value: &str) -> Vec<String> {
         .map(str::to_owned)
         .collect()
 }
+
+fn trace_from_create_params(p: CreateParams) -> Trace {
+    let mut trace = Trace::new(p.title, p.trace_type, p.author, csv(&p.tags), p.body);
+    trace.frontmatter.derived_from = csv(&p.derived_from);
+    trace.frontmatter.origin = p.origin;
+    trace.frontmatter.source_hash = p.source_hash;
+    trace.frontmatter.source_locked = p.source_locked;
+    trace
+}
+
+fn elapsed_ms(started: Instant) -> i64 {
+    i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
+}
+
+fn record_mcp_op(
+    cx: &Cortex,
+    op: &str,
+    started: Instant,
+    ok: bool,
+    result_count: Option<i64>,
+    mode: Option<&str>,
+    usage_recorded: Option<bool>,
+) {
+    cx.record_op_metric_lossy(&OpMetricInput {
+        op,
+        source: "mcp",
+        duration_ms: elapsed_ms(started),
+        ok,
+        result_count,
+        mode,
+        usage_recorded,
+    });
+}
+
 fn json_text<T: Serialize>(value: T) -> String {
     serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".into())
 }
@@ -2236,6 +2753,20 @@ fn mcp_error(error: impl std::fmt::Display) -> ErrorData {
 mod tests {
     use super::*;
 
+    fn create_params(title: &str, body: &str) -> CreateParams {
+        CreateParams {
+            title: title.into(),
+            trace_type: "fact".into(),
+            body: body.into(),
+            author: "agent-test".into(),
+            tags: "bulk,test".into(),
+            derived_from: String::new(),
+            origin: String::new(),
+            source_hash: String::new(),
+            source_locked: false,
+        }
+    }
+
     #[test]
     fn cortex_usage_schema_uses_portable_schema_version() {
         let schema = serde_json::to_value(schemars::schema_for!(CortexUsageOutput)).unwrap();
@@ -2244,6 +2775,158 @@ mod tests {
             schema["properties"]["schema_version"],
             json!({"type": "integer", "minimum": 0})
         );
+    }
+
+    #[test]
+    fn create_traces_output_schema_uses_portable_integer_fields() {
+        let schema = serde_json::to_string(&schemars::schema_for!(CreateTracesOutput)).unwrap();
+
+        assert!(!schema.contains("\"format\":\"uint\""));
+    }
+
+    #[test]
+    fn continuity_profiles_expose_only_their_bounded_tools() {
+        let full = NoemaServer::tool_router_for_profile("").unwrap();
+        assert!(full.map.len() > 1);
+        assert!(full.map.contains_key("recall_context"));
+        assert!(full.map.contains_key("create_traces"));
+
+        let filtered = NoemaServer::tool_router_for_profile("continuity-read").unwrap();
+        assert_eq!(filtered.map.len(), 1);
+        assert!(filtered.map.contains_key("recall_context"));
+
+        let capture = NoemaServer::tool_router_for_profile("continuity-capture").unwrap();
+        assert_eq!(capture.map.len(), 2);
+        assert!(capture.map.contains_key("get_instructions"));
+        assert!(capture.map.contains_key("create_traces"));
+        assert!(NoemaServer::tool_router_for_profile("unknown").is_err());
+    }
+
+    #[tokio::test]
+    async fn create_traces_persists_batch_and_returns_verification_receipts() {
+        let temp = tempfile::tempdir().unwrap();
+        Cortex::create("test", temp.path()).unwrap();
+        let root = temp.path().join("test");
+        let server = NoemaServer::new("test", &root, false).unwrap();
+
+        let output = server
+            .create_traces(Parameters(CreateTracesParams {
+                traces: vec![
+                    create_params("Bulk first", "first body"),
+                    create_params("Bulk second", "second body"),
+                ],
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(output.status, "completed");
+        assert_eq!(output.requested, 2);
+        assert_eq!(output.persisted, 2);
+        assert_eq!(output.failed, 0);
+        assert!(!output.atomic);
+        assert!(output.failures.is_empty());
+        assert_eq!(output.receipts.len(), 2);
+        assert!(output.receipts.iter().all(|receipt| {
+            !receipt.id.is_empty() && receipt.content_hash.starts_with("sha256:")
+        }));
+        let cx = server.open().await.unwrap();
+        for receipt in output.receipts {
+            let (row, _) = cx.get_trace(&receipt.id).unwrap();
+            assert_eq!(row.content_hash, receipt.content_hash);
+        }
+    }
+
+    #[tokio::test]
+    async fn create_traces_rejects_invalid_batch_before_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        Cortex::create("test", temp.path()).unwrap();
+        let root = temp.path().join("test");
+        let server = NoemaServer::new("test", &root, false).unwrap();
+
+        assert!(
+            server
+                .create_traces(Parameters(CreateTracesParams { traces: vec![] }))
+                .await
+                .is_err()
+        );
+        assert!(
+            server
+                .create_traces(Parameters(CreateTracesParams {
+                    traces: vec![
+                        create_params("Duplicate title", "first"),
+                        create_params("Duplicate title", "second"),
+                    ],
+                }))
+                .await
+                .is_err()
+        );
+        assert!(
+            server
+                .create_traces(Parameters(CreateTracesParams {
+                    traces: (0..=MAX_CREATE_TRACES)
+                        .map(|index| create_params(&format!("Too many {index}"), "body"))
+                        .collect(),
+                }))
+                .await
+                .is_err()
+        );
+        let cx = server.open().await.unwrap();
+        assert!(cx.list(&ListOptions::default()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_traces_obeys_remote_publish_write_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        Cortex::create("test", temp.path()).unwrap();
+        let root = temp.path().join("test");
+        let mut server = NoemaServer::new("test", &root, false).unwrap();
+        server.federation_mode = "publish".into();
+
+        assert!(
+            server
+                .create_traces(Parameters(CreateTracesParams {
+                    traces: vec![create_params("Blocked", "body")],
+                }))
+                .await
+                .is_err()
+        );
+        let cx = server.open().await.unwrap();
+        assert!(cx.list(&ListOptions::default()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_traces_reports_partial_persistence_without_hiding_receipts() {
+        let temp = tempfile::tempdir().unwrap();
+        Cortex::create("test", temp.path()).unwrap();
+        let root = temp.path().join("test");
+        let cx = Cortex::open("test", &root).unwrap();
+        let mut existing = Trace::new("Existing title", "fact", "", vec![], "original");
+        let existing_id = existing.frontmatter.id.clone();
+        cx.add(&mut existing).unwrap();
+        drop(cx);
+        let server = NoemaServer::new("test", &root, false).unwrap();
+
+        let output = server
+            .create_traces(Parameters(CreateTracesParams {
+                traces: vec![
+                    create_params("Fresh title", "fresh"),
+                    create_params("Existing title", "conflicting"),
+                ],
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(output.status, "partial");
+        assert_eq!(output.persisted, 1);
+        assert_eq!(output.failed, 1);
+        assert_eq!(output.receipts[0].index, 0);
+        assert_eq!(output.failures[0].index, 1);
+        assert_eq!(output.failures[0].error_code, "persistence_failed");
+        let cx = server.open().await.unwrap();
+        assert_eq!(cx.get_trace(&existing_id).unwrap().1.body, "original");
+        assert!(cx.get_trace(&output.receipts[0].id).is_ok());
     }
 
     #[tokio::test]
@@ -2311,6 +2994,111 @@ mod tests {
             cx.get(&lower_id).unwrap().tags,
             vec!["artificial-intelligence"]
         );
+    }
+
+    #[tokio::test]
+    async fn recall_context_batches_preferences_and_full_search_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        Cortex::create("test", temp.path()).unwrap();
+        let root = temp.path().join("test");
+        let cx = Cortex::open("test", &root).unwrap();
+        let mut preference = Trace::new(
+            "Response style",
+            "preference",
+            "mark",
+            vec!["user-preference".into()],
+            "Use concise evidence blocks",
+        );
+        let preference_id = preference.frontmatter.id.clone();
+        cx.add(&mut preference).unwrap();
+        let mut fact = Trace::new(
+            "Deployment color",
+            "fact",
+            "benchmark",
+            vec!["project-a".into()],
+            "The deployment color is ULTRAVIOLET",
+        );
+        let fact_id = fact.frontmatter.id.clone();
+        cx.add(&mut fact).unwrap();
+        drop(cx);
+
+        let server = NoemaServer::new("test", &root, false).unwrap();
+        let output = server
+            .recall_context(Parameters(RecallContextParams {
+                queries: vec!["return current value for memory ULTRAVIOLET".into()],
+                include_preferences: None,
+                limit_per_query: Some(1),
+                max_body_chars: None,
+                all: false,
+                mode: "lexical".into(),
+                record_usage: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(output.schema_version, 1);
+        assert_eq!(output.preferences.len(), 1);
+        assert_eq!(output.preferences[0].id, preference_id);
+        assert_eq!(output.preferences[0].body, "Use concise evidence blocks");
+        assert!(!output.preference_results_truncated);
+        assert_eq!(output.results.len(), 1);
+        assert_eq!(output.results[0].mode, "lexical");
+        assert!(output.results[0].note.contains("broadened lexical query"));
+        assert_eq!(output.results[0].matches.len(), 1);
+        assert_eq!(output.results[0].matches[0].id, fact_id);
+        assert_eq!(
+            output.results[0].matches[0].body,
+            "The deployment color is ULTRAVIOLET"
+        );
+        assert!(!output.usage_recorded);
+    }
+
+    #[tokio::test]
+    async fn get_trace_metrics_report_a_failed_usage_update() {
+        let temp = tempfile::tempdir().unwrap();
+        Cortex::create("test", temp.path()).unwrap();
+        let root = temp.path().join("test");
+        let cx = Cortex::open("test", &root).unwrap();
+        let mut trace = Trace::new("Example", "fact", "test", vec![], "body");
+        let id = trace.frontmatter.id.clone();
+        cx.add(&mut trace).unwrap();
+        drop(cx);
+
+        let connection = rusqlite::Connection::open(root.join("db/noema.db")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_usage_insert BEFORE INSERT ON trace_usage
+                 BEGIN SELECT RAISE(FAIL, 'forced usage failure'); END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let server = NoemaServer::new("test", &root, false).unwrap();
+        let result = server
+            .get_trace(Parameters(GetParams {
+                id,
+                record_usage: true,
+            }))
+            .await;
+        assert!(result.is_err());
+
+        let cx = server.open().await.unwrap();
+        let report = cx.op_metrics_report(chrono::Duration::hours(1)).unwrap();
+        let metric = report
+            .by_op
+            .iter()
+            .find(|metric| metric.op == "get_trace")
+            .unwrap();
+        assert_eq!(metric.count, 1);
+        assert_eq!(metric.errors, 1);
+        assert_eq!(report.usage_open_rate, 0.0);
+    }
+
+    #[test]
+    fn recall_body_limit_preserves_unicode_boundaries() {
+        assert_eq!(truncate_chars("abé🙂z", 4), ("abé🙂".into(), true));
+        assert_eq!(truncate_chars("abé", 4), ("abé".into(), false));
     }
 
     #[test]
