@@ -1,5 +1,5 @@
 // Tiny MCP-over-HTTP client. We deliberately don't pull in
-// @modelcontextprotocol/sdk: this plugin only needs two tools, and
+// @modelcontextprotocol/sdk: this plugin only needs a small tool subset, and
 // the SDK's discovery / multi-transport surface would dominate the
 // bundle size. The whole protocol surface we use is JSON-RPC 2.0 POSTs
 // to a single /mcp endpoint, with a Bearer-key Authorization header
@@ -227,6 +227,16 @@ export class McpClient {
 		});
 	}
 
+	// updateTraceTitle changes only the semantic title. The trace ID and
+	// canonical filename stay stable; lineage and federation references keep
+	// pointing at the same identity.
+	async updateTraceTitle(traceId: string, title: string): Promise<void> {
+		await this.callToolText("update_trace", {
+			id: traceId,
+			title,
+		});
+	}
+
 	// createTrace invokes the create_trace MCP tool. The server
 	// generates the canonical YYYYMMDD-<slug>.md filename, computes
 	// the content_hash, sets origin to the local cortex name, and
@@ -343,7 +353,7 @@ export class McpClient {
 			params: {
 				protocolVersion: MCP_PROTOCOL_VERSION,
 				capabilities: {},
-				clientInfo: { name: "noema-obsidian", version: "0.4.0" },
+				clientInfo: { name: "noema-obsidian", version: "0.5.2" },
 			},
 		};
 		const resp = await mcpFetch(
