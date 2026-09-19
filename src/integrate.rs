@@ -2169,11 +2169,12 @@ fn install_json_member(
         if check {
             return Ok(State::WouldReplace);
         }
-        let mut next = source;
-        next.replace_range(
-            member.value_start..member.value_end,
+        let encoded = indent_multiline(
             &serde_json::to_string_pretty(expected)?,
+            &line_indent(&source, member.value_start),
         );
+        let mut next = source;
+        next.replace_range(member.value_start..member.value_end, &encoded);
         write_atomic(path, next.as_bytes())?;
         return Ok(State::Replaced);
     }
@@ -3496,6 +3497,44 @@ bearer_token_env_var = "NOEMA_MCP_KEY"
                 .ends_with("noema-session-bootstrap.ts")
         );
         assert!(!opencode_plugin_source().contains("@opencode-ai/plugin"));
+    }
+
+    #[test]
+    fn jsonc_transport_replacement_preserves_nested_indentation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.jsonc");
+        for indent in ["  ", "\t"] {
+            let prefix = format!(
+                "{{\n{indent}// keep this comment\n{indent}\"mcp\": {{\n{indent}{indent}\"noema\": "
+            );
+            let suffix =
+                format!(",\n{indent}{indent}\"docs\": {{\"enabled\": true}},\n{indent}}}\n}}\n");
+            let source =
+                format!("{prefix}{{\"type\":\"local\",\"command\":[\"noema\",\"serve\"]}}{suffix}");
+            fs::write(&path, &source).unwrap();
+            let expected =
+                json!({"type": "remote", "url": "https://example.com/mcp", "enabled": true});
+            assert_eq!(
+                install_json_member(&path, &["mcp"], "noema", &expected, |_| true, false, true)
+                    .unwrap(),
+                State::Replaced
+            );
+            let installed = fs::read_to_string(&path).unwrap();
+            let encoded = serde_json::to_string_pretty(&expected)
+                .unwrap()
+                .replace('\n', &format!("\n{indent}{indent}"));
+            assert_eq!(installed, format!("{prefix}{encoded}{suffix}"));
+            assert_eq!(
+                parse_jsonc_value(&installed).unwrap()["mcp"]["noema"],
+                expected
+            );
+            assert_eq!(
+                install_json_member(&path, &["mcp"], "noema", &expected, |_| true, false, true)
+                    .unwrap(),
+                State::Unchanged
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), installed);
+        }
     }
 
     #[test]
