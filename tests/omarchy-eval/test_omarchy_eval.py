@@ -476,6 +476,22 @@ class AnalysisTests(unittest.TestCase):
 
 
 class HarnessControlTests(unittest.TestCase):
+    def test_ignore_check_accepts_external_private_storage_symlink(self):
+        import benchmark
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            external = root / "external"
+            external.mkdir()
+            script_dir = root / "harness"
+            script_dir.mkdir()
+            (script_dir / ".private").symlink_to(external, target_is_directory=True)
+            with mock.patch.object(benchmark, "SCRIPT_DIR", script_dir), mock.patch.object(
+                benchmark, "run_command", return_value=mock.Mock(returncode=0),
+            ) as run:
+                self.assertEqual(benchmark.check_ignored(root / "config.json"), (True, ""))
+            self.assertEqual(run.call_args_list[0].args[0][-1], str(script_dir / ".private"))
+
     def test_smoke_reuse_requires_identical_locked_state_and_clean_restoration(self) -> None:
         locked = {
             field: {"value": field}

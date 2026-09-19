@@ -16,6 +16,8 @@
 
 # Local MCP config (machine-specific paths)
 .mcp.json
+/.opencode
+/opencode.jsonc
 
 # Caches
 **/__pycache__

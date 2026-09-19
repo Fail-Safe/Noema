@@ -5483,6 +5483,7 @@ fn is_trace_snapshot_event(event: &Event) -> bool {
 fn normalize_legacy_trace_type(value: &str) -> &str {
     match value {
         "reference" => "note",
+        "incident" => "observation",
         _ => value,
     }
 }
@@ -6752,29 +6753,80 @@ mod tests {
     }
 
     #[test]
-    fn recovery_normalizes_legacy_reference_event_to_current_note_type() {
-        let (_temp, cx) = cortex();
-        let mut trace = Trace::new("Legacy reference", "note", "", vec![], "body");
-        cx.add(&mut trace).unwrap();
-        let id = trace.frontmatter.id.clone();
-        cx.promote(&id, "mid").unwrap();
-        cx.promote(&id, "long").unwrap();
-        cx.connection
+    fn recovery_normalizes_legacy_event_types() {
+        for (legacy, current) in [("reference", "note"), ("incident", "observation")] {
+            let (_temp, cx) = cortex();
+            let mut trace = Trace::new("Legacy recovery", current, "", vec![], "body");
+            cx.add(&mut trace).unwrap();
+            let id = trace.frontmatter.id.clone();
+            cx.promote(&id, "mid").unwrap();
+            cx.promote(&id, "long").unwrap();
+            cx.connection
             .execute(
-                "UPDATE events SET data=json_set(data,'$.type','reference') WHERE trace_id=?1 AND action='create'",
-                [&id],
+                "UPDATE events SET data=json_set(data,'$.type',?2) WHERE trace_id=?1 AND action='create'",
+                params![id, legacy],
             )
             .unwrap();
-        let path = cx.trace_file(&id, false);
-        fs::remove_file(&path).unwrap();
+            let path = cx.trace_file(&id, false);
+            fs::remove_file(&path).unwrap();
 
-        let result = cx.sync_with_recovery(true).unwrap();
+            let result = cx.sync_with_recovery(true).unwrap();
 
-        assert_eq!((result.recovered, result.orphaned), (1, 0));
+            assert_eq!((result.recovered, result.orphaned), (1, 0));
+            assert_eq!(
+                Trace::parse_file(&path).unwrap().frontmatter.trace_type,
+                current
+            );
+        }
+    }
+
+    #[test]
+    fn signed_replay_normalizes_legacy_incident_without_rewriting_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let alpha = signed_cortex(temp.path(), "alpha");
+        let beta = signed_cortex(temp.path(), "beta");
+        let mut trace = Trace::new("Legacy replay", "observation", "", vec![], "original body");
+        alpha.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        let mut event = event_for(&alpha, &id, "create", &alpha.id);
+        event.data["type"] = json!("incident");
+        event.signature = eventsig::sign(alpha.signing_key.as_ref().unwrap(), &event);
+        let original = serde_json::to_value(&event).unwrap();
+
+        beta.replay_event(&event).unwrap();
+        beta.replay_event(&event).unwrap();
+
+        let materialized = beta.get_trace(&id).unwrap().1;
+        assert_eq!(materialized.frontmatter.trace_type, "observation");
+        assert_eq!(materialized.body, "original body");
+        assert_eq!(materialized.frontmatter.origin, event.origin);
+        let history = beta.history(&id).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(serde_json::to_value(&history[0]).unwrap(), original);
+        eventsig::verify(&history[0].pubkey, &history[0], &history[0].signature).unwrap();
+
+        let mut tampered = event.clone();
+        tampered.data["type"] = json!("observation");
+        assert!(beta.replay_event(&tampered).is_err());
+
+        trace.body = "current body".into();
+        alpha.update_trace(&id, &mut trace, false).unwrap();
+        let update = event_for(&alpha, &id, "update", &alpha.id);
+        beta.replay_event(&update).unwrap();
+        assert_eq!(beta.get_trace(&id).unwrap().1.body, "current body");
         assert_eq!(
-            Trace::parse_file(&path).unwrap().frontmatter.trace_type,
-            "note"
+            serde_json::to_value(event_for(&beta, &id, "create", &alpha.id)).unwrap(),
+            original
         );
+    }
+
+    #[test]
+    fn legacy_event_normalization_does_not_relax_new_trace_validation() {
+        for invalid in ["incident", "reference", "unknown-type"] {
+            let trace = Trace::new("Invalid new trace", invalid, "", vec![], "body");
+            assert!(trace.validate().is_err());
+        }
+        assert_eq!(normalize_legacy_trace_type("unknown-type"), "unknown-type");
     }
 
     #[test]
