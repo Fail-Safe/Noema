@@ -9,7 +9,7 @@ HOST_ARCH := $(shell uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
 HOST_ARTIFACT := $(DIST_DIR)/$(BIN)-$(HOST_OS)-$(HOST_ARCH)
 
 .PHONY: help build check test release release-check clean obsidian-publish \
-	tui-pty storage-fault historical-report
+	tui-pty storage-fault historical-report omarchy-eval-test
 
 help:
 	@echo "Noema build targets:"
@@ -35,6 +35,10 @@ check:
 
 test: check
 	cargo test --all-targets --locked
+	$(MAKE) omarchy-eval-test
+
+omarchy-eval-test:
+	python3 -m unittest discover -s tests/omarchy-eval -p 'test_*.py' -v
 
 release: | $(DIST_DIR)
 	cargo build --release --locked

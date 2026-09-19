@@ -5,6 +5,7 @@ export interface NoemaSettings {
 	endpoint: string;
 	bearerKey: string;
 	tracesFolder: string;
+	showFileExplorerTierBadges: boolean;
 	defaultAuthor: string;
 	searchMode: "lexical" | "semantic" | "hybrid";
 }
@@ -13,14 +14,16 @@ export interface NoemaSettings {
 // the plugin starts in "disconnected" state on a fresh install rather
 // than blindly trying to reach a localhost URL. tracesFolder defaults
 // to "traces" because that's the cortex layout convention; users with
-// a non-standard layout (rare) can override. defaultAuthor is empty
-// by default — the create-trace flow omits the author field entirely
-// when the setting is empty, letting the cortex's own author logic
-// decide what to record.
+// a non-standard layout (rare) can override. File explorer badges are
+// visible by default and can be hidden as an Obsidian display preference.
+// defaultAuthor is empty by default — the create-trace flow omits the
+// author field entirely when the setting is empty, letting the cortex's
+// own author logic decide what to record.
 export const DEFAULT_SETTINGS: NoemaSettings = {
 	endpoint: "",
 	bearerKey: "",
 	tracesFolder: "traces",
+	showFileExplorerTierBadges: true,
 	defaultAuthor: "",
 	searchMode: "hybrid",
 };
@@ -100,6 +103,20 @@ export class NoemaSettingTab extends PluginSettingTab {
 					.onChange(async (value) => {
 						this.plugin.settings.tracesFolder = value.trim() || "traces";
 						await this.plugin.saveSettings();
+						this.plugin.refreshFileExplorerTierBadges();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Show tier badges in file explorer")
+			.setDesc("Show [s], [m], and [L] beside traces in the configured traces folder.")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.showFileExplorerTierBadges)
+					.onChange(async (value) => {
+						this.plugin.settings.showFileExplorerTierBadges = value;
+						await this.plugin.saveSettings();
+						this.plugin.refreshFileExplorerTierBadges();
 					})
 			);
 

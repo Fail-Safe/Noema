@@ -1,12 +1,15 @@
 import { Notice, Plugin, TFile, WorkspaceLeaf } from "obsidian";
 import { DEFAULT_SETTINGS, NoemaSettings, NoemaSettingTab } from "./settings";
 import { LineageView, LINEAGE_VIEW_TYPE } from "./lineage-view";
-import { McpClient, UnauthorizedError } from "./mcp-client";
+import { describeConnectionError, McpClient, UnauthorizedError } from "./mcp-client";
 import { readTraceMetadata, tierGlyph, tierLabel } from "./tier-status";
 import { CreateTraceModal } from "./create-modal";
 import { ImmutableWarning } from "./immutable-warning";
 import { openAppendModalFromActive } from "./append-modal";
 import { SearchModal } from "./search-modal";
+import { FileExplorerTierBadges } from "./file-explorer-tiers";
+import { EditTraceTitleModal } from "./edit-title-modal";
+import { titleFromFilenameRename } from "./rename-title";
 
 const STATUS_PING_INTERVAL_MS = 30_000;
 
@@ -15,6 +18,7 @@ const STATUS_PING_INTERVAL_MS = 30_000;
 // "disconnected" because the remedy is different and we want to nudge
 // the user toward it (see setConnState's one-shot Notice).
 type ConnState = "connected" | "disconnected" | "unauthorized";
+type ProbeResult = { state: ConnState; error?: unknown };
 
 // NoemaPlugin is the Obsidian-side entry point. It wires up:
 //
@@ -43,6 +47,7 @@ export default class NoemaPlugin extends Plugin {
 	// unreachable server (actionable: check the endpoint/network).
 	private connState: ConnState = "disconnected";
 	private immutableWarning: ImmutableWarning | null = null;
+	private fileExplorerTierBadges: FileExplorerTierBadges | null = null;
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -92,6 +97,21 @@ export default class NoemaPlugin extends Plugin {
 			},
 		});
 
+		this.addCommand({
+			id: "edit-trace-title",
+			name: "Edit trace title",
+			checkCallback: (checking: boolean) => {
+				const file = this.app.workspace.getActiveFile();
+				if (!(file instanceof TFile)) return false;
+				const meta = readTraceMetadata(this.app, file);
+				if (!meta?.id) return false;
+				if (!checking) {
+					new EditTraceTitleModal(this.app, this, meta.id, meta.title ?? "").open();
+				}
+				return true;
+			},
+		});
+
 		// Append-to-trace uses checkCallback so the command is greyed
 		// out in the palette unless the active editor is a trace.
 		// That's the right UX hint: "no trace open" reads as an
@@ -118,6 +138,13 @@ export default class NoemaPlugin extends Plugin {
 		});
 
 		this.immutableWarning = new ImmutableWarning(this.app, this);
+		this.fileExplorerTierBadges = new FileExplorerTierBadges(
+			this.app,
+			this,
+			() => this.settings.tracesFolder,
+			() => this.settings.showFileExplorerTierBadges
+		);
+		this.fileExplorerTierBadges.start();
 
 		// Re-render the status bar AND immutable-warning banner when
 		// the active file changes (tier glyph follows the user) or
@@ -135,8 +162,23 @@ export default class NoemaPlugin extends Plugin {
 				this.immutableWarning?.refresh();
 			})
 		);
-		// Initial render in case a trace file is already open at
-		// plugin start.
+		this.registerEvent(
+			this.app.vault.on("rename", (file, oldPath) => {
+				if (!(file instanceof TFile) || file.extension !== "md") return;
+				const folder = this.settings.tracesFolder.replace(/^\/+|\/+$/g, "");
+				const oldParent = oldPath.slice(0, Math.max(0, oldPath.lastIndexOf("/")));
+				if (file.parent?.path !== folder || oldParent !== folder) return;
+				const meta = readTraceMetadata(this.app, file);
+				const oldName = oldPath.slice(oldPath.lastIndexOf("/") + 1).replace(/\.md$/, "");
+				if (!meta?.id || meta.id !== oldName || file.basename === meta.id) return;
+				const proposedTitle = titleFromFilenameRename(meta.id, file.basename);
+				new EditTraceTitleModal(this.app, this, meta.id, proposedTitle).open();
+				new Notice(
+					"Noema is restoring the stable ID filename. Confirm the trace title in the dialog.",
+					8000
+				);
+			})
+		);
 		this.immutableWarning.refresh();
 
 		// Initial connection probe + periodic ping. We don't block
@@ -158,6 +200,7 @@ export default class NoemaPlugin extends Plugin {
 		// Clean up any lingering banner DOM so a plugin reload during
 		// active development doesn't leave orphan elements behind.
 		this.immutableWarning?.removeAll();
+		this.fileExplorerTierBadges?.stop();
 	}
 
 	async loadSettings(): Promise<void> {
@@ -167,6 +210,10 @@ export default class NoemaPlugin extends Plugin {
 
 	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
+	}
+
+	refreshFileExplorerTierBadges(): void {
+		this.fileExplorerTierBadges?.refresh();
 	}
 
 	// refreshClient is called from the settings tab when the
@@ -198,27 +245,31 @@ export default class NoemaPlugin extends Plugin {
 	// result. Both the background ping and the settings "Test
 	// connection" button build on it so they classify failures
 	// identically.
-	private async probe(): Promise<ConnState> {
+	private async probe(): Promise<ProbeResult> {
 		if (!this.client) {
 			this.cortexName = "";
-			return "disconnected";
+			return { state: "disconnected" };
 		}
 		try {
 			const id = await this.client.cortexIdentity();
 			this.cortexName = id.name;
-			return "connected";
+			return { state: "connected" };
 		} catch (err) {
 			this.cortexName = "";
 			// A bearer-key rejection is distinct from "server's not
 			// there" — the AuthMiddleware 401 surfaces as
 			// UnauthorizedError, everything else (DNS, TLS, refused
 			// connection, 5xx) is a plain disconnect.
-			return err instanceof UnauthorizedError ? "unauthorized" : "disconnected";
+			return {
+				state: err instanceof UnauthorizedError ? "unauthorized" : "disconnected",
+				error: err,
+			};
 		}
 	}
 
 	private async pingConnection(): Promise<void> {
-		this.setConnState(await this.probe());
+		const result = await this.probe();
+		this.setConnState(result.state);
 		this.renderStatus();
 	}
 
@@ -240,10 +291,10 @@ export default class NoemaPlugin extends Plugin {
 		if (!this.client) {
 			this.client = new McpClient(this.settings.endpoint, this.settings.bearerKey);
 		}
-		const state = await this.probe();
-		this.connState = state;
+		const result = await this.probe();
+		this.connState = result.state;
 		this.renderStatus();
-		switch (state) {
+		switch (result.state) {
 			case "connected":
 				new Notice(`Noema: connected to ${this.cortexName || this.settings.endpoint}.`);
 				break;
@@ -256,7 +307,10 @@ export default class NoemaPlugin extends Plugin {
 				);
 				break;
 			case "disconnected":
-				new Notice(`Noema: couldn't reach ${this.settings.endpoint}.`);
+				new Notice(
+					`Noema: couldn't connect to ${this.settings.endpoint}: ${describeConnectionError(result.error)}.`,
+					8000
+				);
 				break;
 		}
 	}

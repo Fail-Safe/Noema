@@ -54,6 +54,38 @@ pub fn compare(left: &VectorClock, right: &VectorClock) -> Relation {
     }
 }
 
+pub fn compare_for_replay(left: &VectorClock, right: &VectorClock) -> Relation {
+    let relation = compare(left, right);
+    if relation != Relation::Concurrent
+        || !left
+            .keys()
+            .chain(right.keys())
+            .any(|key| ulid::Ulid::from_string(key).is_err())
+    {
+        return relation;
+    }
+
+    let stable_left: VectorClock = left
+        .iter()
+        .filter(|(key, _)| ulid::Ulid::from_string(key).is_ok())
+        .map(|(key, value)| (key.clone(), *value))
+        .collect();
+    let stable_right: VectorClock = right
+        .iter()
+        .filter(|(key, _)| ulid::Ulid::from_string(key).is_ok())
+        .map(|(key, value)| (key.clone(), *value))
+        .collect();
+    if stable_left.is_empty() || stable_right.is_empty() {
+        return relation;
+    }
+
+    match compare(&stable_left, &stable_right) {
+        Relation::Before => Relation::Before,
+        Relation::After => Relation::After,
+        Relation::Equal | Relation::Concurrent => relation,
+    }
+}
+
 pub fn merge(left: &mut VectorClock, right: &VectorClock) {
     for (key, value) in right {
         left.entry(key.clone())
@@ -778,11 +810,47 @@ fn public_keys_equal(left: &str, right: &str) -> bool {
 mod tests {
     use super::*;
 
+    const CORTEX_A: &str = "01KNJX4991ASW6NNKS9BQHNCGB";
+    const CORTEX_B: &str = "01KPAA8VQNG3TKMCY1XJ0JJG0Z";
+
     #[test]
     fn detects_concurrency() {
         let a = BTreeMap::from([("a".into(), 2), ("b".into(), 1)]);
         let b = BTreeMap::from([("a".into(), 1), ("b".into(), 2)]);
         assert_eq!(compare(&a, &b), Relation::Concurrent);
+    }
+
+    #[test]
+    fn replay_ignores_retired_name_key_when_stable_clocks_are_ordered() {
+        let historical = BTreeMap::from([
+            (CORTEX_A.into(), 10),
+            (CORTEX_B.into(), 20),
+            ("legacy-name".into(), 3),
+        ]);
+        let current = BTreeMap::from([(CORTEX_A.into(), 11), (CORTEX_B.into(), 21)]);
+
+        assert_eq!(compare(&historical, &current), Relation::Concurrent);
+        assert_eq!(compare_for_replay(&historical, &current), Relation::Before);
+    }
+
+    #[test]
+    fn replay_preserves_stable_id_concurrency() {
+        let left = BTreeMap::from([
+            (CORTEX_A.into(), 11),
+            (CORTEX_B.into(), 20),
+            ("legacy-name".into(), 3),
+        ]);
+        let right = BTreeMap::from([(CORTEX_A.into(), 10), (CORTEX_B.into(), 21)]);
+
+        assert_eq!(compare_for_replay(&left, &right), Relation::Concurrent);
+    }
+
+    #[test]
+    fn replay_preserves_ambiguous_legacy_only_concurrency() {
+        let legacy = BTreeMap::from([("legacy-name".into(), 3)]);
+        let current = BTreeMap::from([(CORTEX_A.into(), 11)]);
+
+        assert_eq!(compare_for_replay(&legacy, &current), Relation::Concurrent);
     }
 
     #[test]
