@@ -118,10 +118,12 @@ impl HttpEmbedder {
             bail!("embedding endpoint is empty");
         }
         let endpoint = endpoint.trim_end_matches('/').to_owned();
-        reqwest::Url::parse(&endpoint).context("invalid embedding endpoint")?;
+        let parsed = reqwest::Url::parse(&endpoint).context("invalid embedding endpoint")?;
+        let api_key = env::var(api_key_env).unwrap_or_default();
+        ensure_keyed_endpoint_is_encrypted(&parsed, !api_key.is_empty())?;
         Ok(Self {
             endpoint,
-            api_key: env::var(api_key_env).unwrap_or_default(),
+            api_key,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5 * 60))
                 .build()?,
@@ -223,6 +225,36 @@ pub fn text(title: &str, body: &str, max_chars: usize) -> String {
     }
 }
 
+fn ensure_keyed_endpoint_is_encrypted(endpoint: &reqwest::Url, keyed: bool) -> Result<()> {
+    if !keyed {
+        return Ok(());
+    }
+    match endpoint.scheme() {
+        "https" => Ok(()),
+        "http" if endpoint_is_loopback(endpoint) => Ok(()),
+        "http" => bail!(
+            "refusing to send embedding API key over cleartext HTTP to {endpoint}; use https:// or a loopback http:// endpoint"
+        ),
+        other => bail!("unsupported embedding endpoint scheme {other}"),
+    }
+}
+
+fn endpoint_is_loopback(endpoint: &reqwest::Url) -> bool {
+    match endpoint.host_str() {
+        Some(host) => {
+            let host = host
+                .trim_matches(|c| c == '[' || c == ']')
+                .to_ascii_lowercase();
+            host == "localhost"
+                || host == "localhost."
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        }
+        None => false,
+    }
+}
+
 pub fn encode(vector: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + vector.len() * 4);
     out.push(CODEC_VERSION);
@@ -287,5 +319,31 @@ mod tests {
         let mut vector = vec![3.0, 4.0];
         normalize(&mut vector);
         assert_eq!(vector, vec![0.6, 0.8]);
+    }
+
+    #[test]
+    fn keyed_remote_http_endpoint_is_rejected() {
+        let endpoint = reqwest::Url::parse("http://embeddings.example/v1").unwrap();
+        let error = ensure_keyed_endpoint_is_encrypted(&endpoint, true).unwrap_err();
+        assert!(error.to_string().contains("cleartext HTTP"));
+    }
+
+    #[test]
+    fn keyed_https_and_loopback_http_are_allowed() {
+        for endpoint in [
+            "https://embeddings.example/v1",
+            "http://127.0.0.1:9000/v1",
+            "http://[::1]:9000/v1",
+            "http://localhost:9000/v1",
+        ] {
+            let endpoint = reqwest::Url::parse(endpoint).unwrap();
+            ensure_keyed_endpoint_is_encrypted(&endpoint, true).unwrap();
+        }
+    }
+
+    #[test]
+    fn unkeyed_remote_http_remains_allowed() {
+        let endpoint = reqwest::Url::parse("http://embeddings.example/v1").unwrap();
+        ensure_keyed_endpoint_is_encrypted(&endpoint, false).unwrap();
     }
 }
