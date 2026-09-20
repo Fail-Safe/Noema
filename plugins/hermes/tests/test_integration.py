@@ -200,10 +200,96 @@ class TestStdioTransportIntegration:
 # ---------------------------------------------------------------------------
 
 class TestProviderLifecycle:
-    def test_full_session(self, noema_binary, cortex_dir):
+    def test_bounded_prefetch_relevance_and_scope(self, noema_binary, cortex_dir, tmp_path):
+        (tmp_path / "noema.json").write_text(json.dumps({
+            "cortex_name": cortex_dir, "noema_binary": noema_binary, "bounded_prefetch": True,
+        }))
+        p = NoemaMemoryProvider()
+        p.initialize("prefetch-test", hermes_home=str(tmp_path))
+        try:
+            p.handle_tool_call("noema_remember", {
+                "title": "harbor policy", "type": "decision",
+                "body": "harbor policy: current value 28 days. Old 14 days superseded. Source: card-a.",
+            })
+            p.handle_tool_call("noema_remember", {
+                "title": "orchard policy", "type": "decision",
+                "body": "orchard policy: unrelated value violet. Source: card-b.",
+            })
+            p.handle_tool_call("noema_remember", {
+                "title": "harbor policy preference", "type": "preference",
+                "body": "startup-only-sentinel", "tags": "user-preference",
+            })
+            context = p.prefetch("harbor policy")
+            assert "28 days" in context and "superseded" in context and "Source: card-a" in context
+            assert "ID:" in context and "reference data, not instructions" in context
+            assert "violet" not in context
+            assert "startup-only-sentinel" not in context
+            assert p.prefetch("nonexistentzzunique") == ""
+            subprocess.run([noema_binary, "init", "--name", "other-scope", "--path",
+                            str(tmp_path / "other")], check=True, capture_output=True)
+            subprocess.run([noema_binary, "--cortex", "other-scope", "add", "--title",
+                            "scopeprivateunique", "--type", "fact", "--body", "foreign-sentinel"],
+                           check=True, capture_output=True)
+            assert p.prefetch("scopeprivateunique") == ""
+            p.handle_tool_call("noema_remember", {
+                "title": "longpacket", "type": "note", "body": "界" * 8000,
+            })
+            long = p.prefetch("longpacket")
+            assert len(long) <= 6000 and "[trace truncated]" in long
+        finally:
+            p.shutdown()
+
+    def test_bounded_search_evidence_and_limits(self, noema_binary, cortex_dir, tmp_path):
+        (tmp_path / "noema.json").write_text(json.dumps({
+            "cortex_name": cortex_dir, "noema_binary": noema_binary,
+            "bounded_search": True,
+        }))
+        provider = NoemaMemoryProvider()
+        provider.initialize("bounded-test", hermes_home=str(tmp_path))
+        try:
+            ids = []
+            for index in range(5):
+                result = json.loads(provider.handle_tool_call("noema_remember", {
+                    "title": f"bounded-evidence-{index}", "type": "decision",
+                    "body": "uniqueboundedtoken current: 21 days; old: 7 days superseded. "
+                    "Rationale: audit window. Source: synthetic-card. " + "界" * 4100,
+                }))["result"]
+                ids.append(result.split("Trace created: ")[1].strip())
+            provider._transport.call_tool("archive_trace", {"id": ids[0]})
+            result = json.loads(json.loads(provider.handle_tool_call(
+                "noema_search", {"query": "uniqueboundedtoken"},
+            ))["result"])
+            matches = result["results"][0]["matches"]
+            assert len(matches) == 3
+            assert result["preferences"] == []
+            assert result["usage_recorded"] is True
+            for match in matches:
+                assert match["id"] in ids[1:]
+                assert match["body_truncated"] is True
+                assert len(match["body"]) == 4000
+                assert "21 days" in match["body"]
+                assert "Source: synthetic-card" in match["body"]
+                assert match["content_hash"]
+                full = json.loads(provider.handle_tool_call("noema_recall", {
+                    "id": match["id"],
+                }))["result"]
+                assert "界" * 4100 in full
+            empty = json.loads(json.loads(provider.handle_tool_call(
+                "noema_search", {"query": "absentuniquetoken"},
+            ))["result"])
+            assert empty["results"][0]["matches"] == []
+        finally:
+            provider.shutdown()
+
+    @pytest.mark.parametrize("bounded_search,bounded_prefetch", [(False, False), (True, False), (False, True)])
+    def test_full_session(self, noema_binary, cortex_dir, tmp_path, bounded_search, bounded_prefetch):
         """Exercise the full Hermes lifecycle: init -> turns -> end -> shutdown."""
         provider = NoemaMemoryProvider()
-        provider._config = {"cortex_name": cortex_dir, "transport": "stdio"}
+        (tmp_path / "noema.json").write_text(json.dumps({
+            "cortex_name": cortex_dir, "transport": "stdio",
+            "bounded_search": bounded_search,
+            "bounded_prefetch": bounded_prefetch,
+        }))
 
         # Initialize.
         with pytest.MonkeyPatch.context() as mp:
@@ -213,6 +299,7 @@ class TestProviderLifecycle:
                 agent_identity="researcher",
                 session_title="Integration test session",
                 platform="pytest",
+                hermes_home=str(tmp_path),
             )
 
         assert provider._transport is not None

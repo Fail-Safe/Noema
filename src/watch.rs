@@ -1,9 +1,10 @@
 use anyhow::{Context, Result, bail};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use serde::Deserialize;
+use serde_yaml::Value;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    fs,
+    fs::{self, File},
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     sync::mpsc::{self, RecvTimeoutError, SyncSender},
     thread::JoinHandle,
@@ -260,6 +261,17 @@ impl Reconciler {
         row: Option<Row>,
     ) -> Result<()> {
         let parsed = Trace::parse_file(path);
+        let embedded_id = match &parsed {
+            Ok(trace) => Some(trace.frontmatter.id.clone()),
+            Err(_) => frontmatter_id(path)?,
+        };
+        if let Some(embedded_id) = embedded_id
+            && embedded_id != id
+            && trace::is_valid_id(&embedded_id)
+            && let Some(existing) = get_optional(&self.cortex, &embedded_id)?
+        {
+            return self.restore_canonical_filename(path, directory, existing);
+        }
         let valid = parsed
             .as_ref()
             .is_ok_and(|trace| trace.frontmatter.id == id && trace.validate().is_ok());
@@ -279,6 +291,13 @@ impl Reconciler {
                 return Ok(());
             }
             if self.settings.auto_onboard && directory == TraceDir::Active && row.is_none() {
+                if let Some(embedded_id) = frontmatter_id(path)? {
+                    self.log_skip(
+                        path,
+                        format!("trace frontmatter id {embedded_id:?} cannot be auto-onboarded"),
+                    );
+                    return Ok(());
+                }
                 match self.onboard_file(path) {
                     Ok(mut trace) => {
                         self.cortex.add(&mut trace)?;
@@ -365,7 +384,7 @@ impl Reconciler {
         let Some(row) = row else {
             return Ok(());
         };
-        if self.exists_in_any_dir(id) {
+        if self.exists_in_any_dir(id) || self.find_noncanonical_trace(id)?.is_some() {
             return Ok(());
         }
         match directory {
@@ -400,6 +419,70 @@ impl Reconciler {
         ]
         .iter()
         .any(|path| path.exists())
+    }
+
+    fn find_noncanonical_trace(&self, id: &str) -> Result<Option<PathBuf>> {
+        for directory in [
+            self.cortex.traces_dir(),
+            self.cortex.archive_dir(),
+            self.cortex.trash_dir(),
+        ] {
+            for entry in fs::read_dir(&directory)
+                .with_context(|| format!("scanning {} for renamed trace", directory.display()))?
+            {
+                let path = entry?.path();
+                if !is_trace_file(&path)
+                    || path.file_stem().and_then(|value| value.to_str()) == Some(id)
+                {
+                    continue;
+                }
+                if frontmatter_id(&path)?.as_deref() == Some(id) {
+                    return Ok(Some(path));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn restore_canonical_filename(
+        &mut self,
+        path: &Path,
+        directory: TraceDir,
+        existing: Row,
+    ) -> Result<()> {
+        let id = existing.id.clone();
+        let target = match directory {
+            TraceDir::Active => self.cortex.trace_file(&id, false),
+            TraceDir::Archive => self.cortex.trace_file(&id, true),
+            TraceDir::Trash => self.cortex.trash_dir().join(format!("{id}.md")),
+        };
+        if target.exists() {
+            self.log_skip(
+                path,
+                format!(
+                    "frontmatter id {id:?} belongs to existing canonical file {}",
+                    target.display()
+                ),
+            );
+            return Ok(());
+        }
+        fs::rename(path, &target).with_context(|| {
+            format!(
+                "restoring canonical trace filename {} -> {}",
+                path.display(),
+                target.display()
+            )
+        })?;
+        if let Some(parent) = target.parent() {
+            trace::sync_directory(parent)?;
+        }
+        self.last_skip.remove(path);
+        eprintln!(
+            "[watch] restored canonical filename {} -> {} (edit the title property instead)",
+            path.display(),
+            target.display()
+        );
+        self.reconcile_existing(&target, &id, directory, Some(existing))
     }
 
     fn log_skip(&mut self, path: &Path, reason: String) {
@@ -445,6 +528,13 @@ impl Reconciler {
             partial.tags,
             body,
         );
+        trace.frontmatter.extra = partial.extra;
+        if get_optional(&self.cortex, &trace.frontmatter.id)?.is_some() {
+            bail!(
+                "trace id {:?} already exists; refusing to overwrite its canonical file",
+                trace.frontmatter.id
+            );
+        }
         let target = self.cortex.trace_file(&trace.frontmatter.id, false);
         if target != path && target.exists() {
             bail!("target path already exists: {}", target.display());
@@ -476,6 +566,7 @@ impl Reconciler {
                 content_hash: trace::content_hash(&body),
                 source_hash: row.source_hash.clone(),
                 source_locked: row.source_locked,
+                extra: Default::default(),
             },
             body,
         };
@@ -484,16 +575,13 @@ impl Reconciler {
     }
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default)]
 struct PartialFrontmatter {
-    #[serde(default)]
     title: Option<String>,
-    #[serde(default, rename = "type")]
     trace_type: Option<String>,
-    #[serde(default)]
     author: Option<String>,
-    #[serde(default)]
     tags: Vec<String>,
+    extra: BTreeMap<String, Value>,
 }
 
 fn partial_trace(source: &str) -> (PartialFrontmatter, &str) {
@@ -503,11 +591,69 @@ fn partial_trace(source: &str) -> (PartialFrontmatter, &str) {
     let Some(end) = rest.find("\n---\n") else {
         return (PartialFrontmatter::default(), source);
     };
-    let partial = serde_yaml::from_str(&rest[..end]).unwrap_or_default();
+    let partial = serde_yaml::from_str(&rest[..end])
+        .ok()
+        .and_then(partial_frontmatter)
+        .unwrap_or_default();
     let body = rest[end + 5..]
         .strip_prefix('\n')
         .unwrap_or(&rest[end + 5..]);
     (partial, body)
+}
+
+fn partial_frontmatter(value: Value) -> Option<PartialFrontmatter> {
+    let Value::Mapping(mapping) = value else {
+        return None;
+    };
+    let mut partial = PartialFrontmatter::default();
+    for (key, value) in mapping {
+        let Some(key) = key.as_str() else {
+            continue;
+        };
+        match key {
+            "title" => partial.title = yaml_string(&value),
+            "type" => partial.trace_type = yaml_string(&value),
+            "author" => {
+                let authors = yaml_strings(&value);
+                partial.author = (!authors.is_empty()).then(|| authors.join(", "));
+            }
+            "tags" => partial.tags = yaml_tags(&value),
+            "id" | "tier" | "derived_from" | "origin" | "created" | "updated" | "content_hash"
+            | "source_hash" | "source_locked" => {}
+            _ => {
+                partial.extra.insert(key.to_owned(), value);
+            }
+        }
+    }
+    Some(partial)
+}
+
+fn yaml_string(value: &Value) -> Option<String> {
+    value.as_str().map(str::to_owned)
+}
+
+fn yaml_strings(value: &Value) -> Vec<String> {
+    match value {
+        Value::String(value) if !value.is_empty() => vec![value.clone()],
+        Value::Sequence(values) => values
+            .iter()
+            .filter_map(yaml_string)
+            .filter(|value| !value.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn yaml_tags(value: &Value) -> Vec<String> {
+    match value {
+        Value::String(value) => value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        _ => yaml_strings(value),
+    }
 }
 
 fn extract_h1(body: &str) -> Option<String> {
@@ -558,6 +704,34 @@ fn metadata_drift(trace: &Trace, row: &Row) -> bool {
         || trace.frontmatter.author != row.author
         || trace_tags != row_tags
         || trace_sources != row_sources
+}
+
+fn frontmatter_id(path: &Path) -> Result<Option<String>> {
+    const MAX_FRONTMATTER_BYTES: usize = 64 * 1024;
+
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 || line.trim_end() != "---" {
+        return Ok(None);
+    }
+    let mut yaml = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 || yaml.len() + line.len() > MAX_FRONTMATTER_BYTES {
+            return Ok(None);
+        }
+        if line.trim_end() == "---" {
+            break;
+        }
+        yaml.push_str(&line);
+    }
+    let Ok(Value::Mapping(mapping)) = serde_yaml::from_str(&yaml) else {
+        return Ok(None);
+    };
+    Ok(mapping
+        .get(Value::String("id".into()))
+        .and_then(Value::as_str)
+        .map(str::to_owned))
 }
 
 fn is_trace_file(path: &Path) -> bool {
@@ -681,6 +855,57 @@ mod tests {
     }
 
     #[test]
+    fn derives_web_clipper_fields_independently() {
+        let source = r#"---
+title: Clipped page
+source: https://example.com/article
+author:
+  - "[[Author One]]"
+  - "[[Author Two]]"
+published: 2026-08-27
+description: Useful reference
+tags:
+  - clippings
+  - research
+---
+
+Body
+"#;
+        let (partial, body) = partial_trace(source);
+
+        assert_eq!(partial.title.as_deref(), Some("Clipped page"));
+        assert_eq!(
+            partial.author.as_deref(),
+            Some("[[Author One]], [[Author Two]]")
+        );
+        assert_eq!(partial.tags, ["clippings", "research"]);
+        assert_eq!(
+            partial.extra.get("source").and_then(|value| value.as_str()),
+            Some("https://example.com/article")
+        );
+        assert_eq!(
+            partial
+                .extra
+                .get("description")
+                .and_then(|value| value.as_str()),
+            Some("Useful reference")
+        );
+        assert!(partial.extra.contains_key("published"));
+        assert_eq!(body, "Body\n");
+    }
+
+    #[test]
+    fn unsupported_author_does_not_erase_valid_neighboring_fields() {
+        let source = "---\ntitle: Clipped page\nauthor: {name: Writer}\ntags: [docs]\nsource: https://example.com\n---\n\nBody\n";
+        let (partial, _) = partial_trace(source);
+
+        assert_eq!(partial.title.as_deref(), Some("Clipped page"));
+        assert_eq!(partial.author, None);
+        assert_eq!(partial.tags, ["docs"]);
+        assert!(partial.extra.contains_key("source"));
+    }
+
+    #[test]
     fn fallback_scan_reports_same_second_changes() {
         let temp = tempfile::tempdir().unwrap();
         for relative in ["traces", "archive/traces", "trash/traces"] {
@@ -740,6 +965,142 @@ mod tests {
                 .filter(|event| event.action == "update")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn tracked_filename_rename_restores_canonical_path_without_onboarding() {
+        let (_temp, mut reconciler, id) = setup();
+        let canonical = reconciler.cortex.trace_file(&id, false);
+        let original = fs::read(&canonical).unwrap();
+        let renamed = reconciler
+            .cortex
+            .traces_dir()
+            .join("20260101-renamed-trace.md");
+        fs::rename(&canonical, &renamed).unwrap();
+
+        reconciler
+            .reconcile(&renamed, &CancellationToken::new())
+            .unwrap();
+
+        assert!(!renamed.exists());
+        assert_eq!(fs::read(&canonical).unwrap(), original);
+        assert_eq!(reconciler.cortex.get(&id).unwrap().title, "Seed");
+        assert_eq!(
+            reconciler
+                .cortex
+                .history(&id)
+                .unwrap()
+                .into_iter()
+                .map(|event| event.action)
+                .collect::<Vec<_>>(),
+            ["create"]
+        );
+    }
+
+    #[test]
+    fn tracked_rename_with_partial_frontmatter_restores_without_onboarding() {
+        let (_temp, mut reconciler, id) = setup();
+        let canonical = reconciler.cortex.trace_file(&id, false);
+        let renamed = reconciler
+            .cortex
+            .traces_dir()
+            .join("20260101-renamed-partial-trace.md");
+        let partial = fs::read_to_string(&canonical)
+            .unwrap()
+            .replacen("title: Seed\n", "", 1);
+        fs::write(&canonical, &partial).unwrap();
+        fs::rename(&canonical, &renamed).unwrap();
+
+        reconciler
+            .reconcile(&renamed, &CancellationToken::new())
+            .unwrap();
+
+        assert!(!renamed.exists());
+        assert_eq!(fs::read_to_string(&canonical).unwrap(), partial);
+        assert!(!partial.contains("Auto-onboarded"));
+        assert_eq!(
+            reconciler
+                .cortex
+                .history(&id)
+                .unwrap()
+                .into_iter()
+                .map(|event| event.action)
+                .collect::<Vec<_>>(),
+            ["create"]
+        );
+    }
+
+    #[test]
+    fn auto_onboard_id_collision_does_not_write_or_remove_files() {
+        let (_temp, mut reconciler, id) = setup();
+        let canonical = reconciler.cortex.trace_file(&id, false);
+        fs::remove_file(&canonical).unwrap();
+        let incoming = reconciler.cortex.traces_dir().join("incoming.md");
+        let source = "---\ntitle: Seed\n---\n\nbody\n";
+        fs::write(&incoming, source).unwrap();
+
+        reconciler
+            .reconcile(&incoming, &CancellationToken::new())
+            .unwrap();
+
+        assert!(!canonical.exists());
+        assert_eq!(fs::read_to_string(&incoming).unwrap(), source);
+        assert_eq!(
+            reconciler
+                .cortex
+                .history(&id)
+                .unwrap()
+                .into_iter()
+                .map(|event| event.action)
+                .collect::<Vec<_>>(),
+            ["create"]
+        );
+    }
+
+    #[test]
+    fn tracked_rename_defers_missing_path_and_accepts_title_property_edit() {
+        let (_temp, mut reconciler, id) = setup();
+        let canonical = reconciler.cortex.trace_file(&id, false);
+        let renamed = reconciler
+            .cortex
+            .traces_dir()
+            .join("20260101-new-display-title.md");
+        let edited = fs::read_to_string(&canonical).unwrap().replacen(
+            "title: Seed",
+            "title: New display title",
+            1,
+        );
+        fs::write(&canonical, edited).unwrap();
+        fs::rename(&canonical, &renamed).unwrap();
+
+        reconciler
+            .reconcile(&canonical, &CancellationToken::new())
+            .unwrap();
+        assert!(reconciler.cortex.get(&id).unwrap().trashed_at.is_empty());
+
+        reconciler
+            .reconcile(&renamed, &CancellationToken::new())
+            .unwrap();
+
+        assert!(!renamed.exists());
+        assert!(canonical.exists());
+        assert_eq!(
+            reconciler.cortex.get(&id).unwrap().title,
+            "New display title"
+        );
+        let stored = Trace::parse_file(&canonical).unwrap();
+        assert_eq!(stored.frontmatter.title, "New display title");
+        assert!(!stored.body.contains("Auto-onboarded"));
+        assert_eq!(
+            reconciler
+                .cortex
+                .history(&id)
+                .unwrap()
+                .into_iter()
+                .map(|event| event.action)
+                .collect::<Vec<_>>(),
+            ["create", "update"]
         );
     }
 
@@ -806,5 +1167,65 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn onboards_web_clipper_frontmatter_without_losing_properties() {
+        let (_temp, mut reconciler, _) = setup();
+        let dropped = reconciler.cortex.traces_dir().join("Clipped page.md");
+        fs::write(
+            &dropped,
+            r#"---
+title: Clipped page
+source: https://example.com/article
+author:
+  - "[[Author One]]"
+  - "[[Author Two]]"
+published: 2026-08-27
+created: 2026-08-27
+description: Useful reference
+tags:
+  - clippings
+  - research
+---
+
+Clipped body
+"#,
+        )
+        .unwrap();
+
+        reconciler
+            .reconcile(&dropped, &CancellationToken::new())
+            .unwrap();
+
+        let row = reconciler
+            .cortex
+            .list(&ListOptions::default())
+            .unwrap()
+            .into_iter()
+            .find(|row| row.title == "Clipped page")
+            .unwrap();
+        assert_eq!(row.author, "[[Author One]], [[Author Two]]");
+        assert_eq!(row.tags, ["clippings", "research"]);
+        let stored = Trace::parse_file(&reconciler.cortex.trace_file(&row.id, false)).unwrap();
+        assert_eq!(
+            stored
+                .frontmatter
+                .extra
+                .get("source")
+                .and_then(|value| value.as_str()),
+            Some("https://example.com/article")
+        );
+        assert_eq!(
+            stored
+                .frontmatter
+                .extra
+                .get("description")
+                .and_then(|value| value.as_str()),
+            Some("Useful reference")
+        );
+        assert!(stored.frontmatter.extra.contains_key("published"));
+        assert!(stored.body.contains("Clipped body"));
+        assert!(!dropped.exists());
     }
 }

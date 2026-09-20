@@ -49,6 +49,9 @@ jobs:
       - name: Test
         run: cargo test --all-targets --locked
 
+      - name: Test continuity benchmark mechanics
+        run: python3 -m unittest discover -s tests/omarchy-eval -p 'test_*.py' -v
+
       - name: Build release binary
         run: cargo build --release --locked
 

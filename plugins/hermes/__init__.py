@@ -17,6 +17,7 @@ __version__ = "0.1.0"
 import json
 import logging
 import os
+import subprocess
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -379,7 +380,18 @@ class NoemaMemoryProvider(MemoryProvider):
         self._create_session_trace()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return list(ALL_TOOL_SCHEMAS)
+        schemas = list(ALL_TOOL_SCHEMAS)
+        if self._config.get("bounded_search") is True:
+            schemas[0] = {
+                **SEARCH_SCHEMA,
+                "description": (
+                    "Search memory and read up to three matching trace bodies in one call, "
+                    "with provenance and body_truncated flags. Use relevant current evidence "
+                    "directly; use noema_recall by ID if a needed body is truncated. "
+                    "An empty result is not proof that a fact does not exist."
+                ),
+            }
+        return schemas
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         noema_tool = _TOOL_MAP.get(tool_name)
@@ -393,7 +405,19 @@ class NoemaMemoryProvider(MemoryProvider):
         mcp_args: Dict[str, Any] = {}
 
         if tool_name == "noema_search":
-            mcp_args["query"] = args.get("query", "")
+            if self._config.get("bounded_search") is True:
+                noema_tool = "recall_context"
+                mcp_args = {
+                    "queries": [args.get("query", "")],
+                    "include_preferences": False,
+                    "limit_per_query": 3,
+                    "max_body_chars": 4000,
+                    "all": False,
+                    "mode": "lexical",
+                    "record_usage": True,
+                }
+            else:
+                mcp_args["query"] = args.get("query", "")
 
         elif tool_name == "noema_remember":
             mcp_args["title"] = args.get("title", "")
@@ -445,16 +469,20 @@ class NoemaMemoryProvider(MemoryProvider):
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if not self._transport or not query.strip():
             return ""
+        if self._config.get("bounded_prefetch") is True:
+            return self._bounded_prefetch(query)
         try:
             result = self._transport.call_tool("search_traces", {"query": query[:500]})
             if not result or result == "No traces found.":
                 return ""
-            # Filter out session log traces from prefetch results.
+            # Filter out session log traces from prefetch results. Match on
+            # title/id conventions (and legacy hub tags) so infrastructure
+            # logs stay out of agent context without relying on taxonomy tags.
             lines = result.split("\n")
             filtered = []
             skip_until_next = False
             for line in lines:
-                if "hermes-session" in line and "hermes-session-summary" not in line:
+                if self._is_session_log_prefetch_line(line):
                     skip_until_next = True
                     continue
                 if skip_until_next and line.startswith("["):
@@ -474,6 +502,39 @@ class NoemaMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.debug("Noema prefetch failed: %s", e)
             return ""
+
+    def _bounded_prefetch(self, query: str) -> str:
+        unavailable = "[Noema prefetch unavailable. Use memory tools if evidence is needed.]"
+        if self._config.get("transport", "stdio") != "stdio":
+            return unavailable
+        binary = find_binary(self._config.get("noema_binary"))
+        if not binary or not self._cortex_name:
+            return unavailable
+        try:
+            result = subprocess.run(
+                [binary, "--cortex", self._cortex_name, "prefetch",
+                 "--output", "json", "--max-results", "3",
+                 "--max-preferences", "0", "--exclude-startup-preferences",
+                 "--max-chars", "6000"],
+                input=query[:8000], text=True, capture_output=True, timeout=2,
+                check=True,
+            )
+            payload = json.loads(result.stdout)
+            context = payload["context"]
+            if payload.get("schema_version") != 1 or not isinstance(context, str) or len(context) > 6000:
+                return unavailable
+            # Reject the whole packet if a session log slipped into the bounded
+            # selection; never inject log bodies or attempt to refill the budget.
+            if any(
+                self._is_session_log_prefetch_line("[" + line)
+                for line in context.splitlines()
+                if line.startswith(("ID: ", "Title: ", "Tags: "))
+            ):
+                return ""
+            return context
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+            logger.warning("Noema bounded prefetch unavailable; memory tools remain available")
+            return unavailable
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         # No-op in v1 — FTS5 on local SQLite is sub-millisecond.
@@ -530,7 +591,6 @@ class NoemaMemoryProvider(MemoryProvider):
                     "title": f"session-summary: {title}",
                     "type": "observation",
                     "author": self._author,
-                    "tags": f"hermes-session-summary, session-{self._session_id[:12]}",
                     "derived_from": session_trace_id,
                     "body": body,
                 })
@@ -705,6 +765,10 @@ class NoemaMemoryProvider(MemoryProvider):
         session re-initializes on the same day the id collides
         deterministically; we detect the collision envelope and reuse the
         existing trace instead of failing.
+
+        Session logs intentionally carry no taxonomy tags: title/id already
+        identify them, and hub tags like ``hermes-session`` / ``session-*``
+        pollute tag graphs and search without adding retrieval value.
         """
         sid = self._session_id[:12]
         label = self._session_title or sid
@@ -714,7 +778,6 @@ class NoemaMemoryProvider(MemoryProvider):
             f"hermes-session: {label} ({sid})" if label != sid
             else f"hermes-session: {sid}"
         )
-        session_tag = f"session-{sid}"
         body = (
             f"Session ID: {self._session_id}\n"
             f"Agent: {self._agent_identity}\n"
@@ -726,7 +789,6 @@ class NoemaMemoryProvider(MemoryProvider):
                 "title": title,
                 "type": "context",
                 "author": self._author,
-                "tags": f"hermes-session, {session_tag}",
                 "body": body,
             })
         except Exception as e:
@@ -745,8 +807,8 @@ class NoemaMemoryProvider(MemoryProvider):
             self._session_trace_id = collision["id"]
             logger.info("Session trace already exists, reusing %s", collision["id"])
         elif collision:
-            # Malformed envelope (no id) — fall back to a tag lookup.
-            self._recover_session_trace(session_tag)
+            # Malformed envelope (no id) — fall back to a title/id search.
+            self._recover_session_trace(title, sid)
         else:
             logger.warning("Unexpected create_trace response: %s", result)
 
@@ -768,20 +830,53 @@ class NoemaMemoryProvider(MemoryProvider):
             return payload
         return None
 
-    def _recover_session_trace(self, session_tag: str) -> None:
-        """Find an existing session trace by tag and reuse it."""
+    def _recover_session_trace(self, title: str, sid: str) -> None:
+        """Find an existing session log by title/id convention and reuse it."""
+        queries = (title, f"hermes-session: {sid}", sid)
         try:
-            result = self._transport.call_tool(
-                "search_traces", {"query": session_tag}
+            for query in queries:
+                result = self._transport.call_tool(
+                    "search_traces", {"query": query}
+                )
+                trace_id = self._extract_session_log_trace_id(result or "")
+                if trace_id:
+                    self._session_trace_id = trace_id
+                    logger.info("Recovered session trace: %s", trace_id)
+                    return
+            logger.warning(
+                "Could not find existing session trace for title=%r sid=%r",
+                title,
+                sid,
             )
-            trace_id = self._extract_first_trace_id(result)
-            if trace_id:
-                self._session_trace_id = trace_id
-                logger.info("Recovered session trace: %s", trace_id)
-            else:
-                logger.warning("Could not find existing session trace for %s", session_tag)
         except Exception as e:
             logger.warning("Failed to recover session trace: %s", e)
+
+    @staticmethod
+    def _is_session_log_prefetch_line(line: str) -> bool:
+        """True for session *log* list lines that should stay out of prefetch.
+
+        Session summaries (``session-summary`` title/id, or legacy
+        ``hermes-session-summary`` tag) are kept. Session logs are identified
+        by title/id convention or the legacy ``hermes-session`` hub tag.
+        """
+        if not line.startswith("["):
+            return False
+        # Summaries win: their id/title/tag all contain "session-summary".
+        if "session-summary" in line:
+            return False
+        return "-hermes-session" in line or "hermes-session" in line
+
+    @classmethod
+    def _extract_session_log_trace_id(cls, list_output: str) -> Optional[str]:
+        """Return the first session-log trace id from search/list output."""
+        for line in list_output.split("\n"):
+            line = line.strip()
+            if not cls._is_session_log_prefetch_line(line):
+                continue
+            trace_id = cls._extract_first_trace_id(line)
+            if trace_id:
+                return trace_id
+        return None
 
     @staticmethod
     def _extract_first_trace_id(list_output: str) -> Optional[str]:

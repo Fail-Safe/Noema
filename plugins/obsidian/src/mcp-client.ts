@@ -1,5 +1,5 @@
 // Tiny MCP-over-HTTP client. We deliberately don't pull in
-// @modelcontextprotocol/sdk: this plugin only needs two tools, and
+// @modelcontextprotocol/sdk: this plugin only needs a small tool subset, and
 // the SDK's discovery / multi-transport surface would dominate the
 // bundle size. The whole protocol surface we use is JSON-RPC 2.0 POSTs
 // to a single /mcp endpoint, with a Bearer-key Authorization header
@@ -41,6 +41,55 @@ export class UnauthorizedError extends Error {
 	constructor(public serverMessage?: string) {
 		super("MCP server rejected the bearer key (HTTP 401)");
 		this.name = "UnauthorizedError";
+	}
+}
+
+export class TransportError extends Error {
+	constructor(operation: string, error: unknown) {
+		super(`${operation}: ${describeConnectionError(error)}`);
+		this.name = "TransportError";
+	}
+}
+
+export function describeConnectionError(error: unknown): string {
+	if (error === undefined || error === null) return "unknown connection error";
+	const message = error instanceof Error ? error.message.trim() : String(error).trim();
+	const cause =
+		error instanceof Error
+			? (error as Error & { cause?: unknown }).cause
+			: undefined;
+	const code = errorCode(cause) ?? errorCode(error);
+	if (code) {
+		const category: string | undefined = {
+			ECONNREFUSED: "connection refused",
+			ECONNRESET: "connection reset",
+			ETIMEDOUT: "connection timed out",
+			ENOTFOUND: "DNS lookup failed",
+			EAI_AGAIN: "DNS lookup temporarily failed",
+			CERT_HAS_EXPIRED: "TLS certificate expired",
+			DEPTH_ZERO_SELF_SIGNED_CERT: "TLS certificate is self-signed",
+			UNABLE_TO_VERIFY_LEAF_SIGNATURE: "TLS certificate could not be verified",
+		}[code];
+		return `${category ?? (message || "connection failed")} (${code})`;
+	}
+	return message || "unknown connection error";
+}
+
+function errorCode(error: unknown): string | null {
+	if (!error || typeof error !== "object" || !("code" in error)) return null;
+	const code = (error as { code?: unknown }).code;
+	return typeof code === "string" && code ? code : null;
+}
+
+async function mcpFetch(
+	url: string,
+	init: RequestInit,
+	operation: string
+): Promise<Response> {
+	try {
+		return await fetch(url, init);
+	} catch (error) {
+		throw new TransportError(operation, error);
 	}
 }
 
@@ -178,6 +227,16 @@ export class McpClient {
 		});
 	}
 
+	// updateTraceTitle changes only the semantic title. The trace ID and
+	// canonical filename stay stable; lineage and federation references keep
+	// pointing at the same identity.
+	async updateTraceTitle(traceId: string, title: string): Promise<void> {
+		await this.callToolText("update_trace", {
+			id: traceId,
+			title,
+		});
+	}
+
 	// createTrace invokes the create_trace MCP tool. The server
 	// generates the canonical YYYYMMDD-<slug>.md filename, computes
 	// the content_hash, sets origin to the local cortex name, and
@@ -294,14 +353,18 @@ export class McpClient {
 			params: {
 				protocolVersion: MCP_PROTOCOL_VERSION,
 				capabilities: {},
-				clientInfo: { name: "noema-obsidian", version: "0.3.0" },
+				clientInfo: { name: "noema-obsidian", version: "0.5.2" },
 			},
 		};
-		const resp = await fetch(url, {
-			method: "POST",
-			headers,
-			body: JSON.stringify(initBody),
-		});
+		const resp = await mcpFetch(
+			url,
+			{
+				method: "POST",
+				headers,
+				body: JSON.stringify(initBody),
+			},
+			"initialize request"
+		);
 		if (resp.status === 401) {
 			// Keyed-mode server, missing/wrong bearer key. Surface this
 			// distinctly — re-handshaking won't help, the credential is
@@ -322,15 +385,27 @@ export class McpClient {
 		// for a JSON-RPC notification (no id field), but we still POST
 		// it so the server can advance its session state-machine.
 		const notifyHeaders = { ...this.buildHeaders(), "Mcp-Session-Id": sid };
-		await fetch(url, {
-			method: "POST",
-			headers: notifyHeaders,
-			body: JSON.stringify({
-				jsonrpc: "2.0",
-				method: "notifications/initialized",
-				params: {},
-			}),
-		});
+		const initialized = await mcpFetch(
+			url,
+			{
+				method: "POST",
+				headers: notifyHeaders,
+				body: JSON.stringify({
+					jsonrpc: "2.0",
+					method: "notifications/initialized",
+					params: {},
+				}),
+			},
+			"initialized notification"
+		);
+		if (initialized.status === 401) {
+			throw new UnauthorizedError(await read401Message(initialized));
+		}
+		if (!initialized.ok) {
+			throw new Error(
+				`initialized notification: HTTP ${initialized.status}: ${initialized.statusText}`
+			);
+		}
 	}
 
 	// rpc sends an arbitrary JSON-RPC request (method + params) on the
@@ -343,11 +418,15 @@ export class McpClient {
 		if (this.sessionId) {
 			headers["Mcp-Session-Id"] = this.sessionId;
 		}
-		const resp = await fetch(this.mcpUrl(), {
-			method: "POST",
-			headers,
-			body: JSON.stringify({ jsonrpc: "2.0", id, ...body }),
-		});
+		const resp = await mcpFetch(
+			this.mcpUrl(),
+			{
+				method: "POST",
+				headers,
+				body: JSON.stringify({ jsonrpc: "2.0", id, ...body }),
+			},
+			"MCP request"
+		);
 		if (resp.status === 401) {
 			// Bearer key rejected mid-session (e.g. the server was
 			// restarted into keyed mode, or the key was rotated). The

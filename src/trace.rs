@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, OpenOptions},
     io::Write,
     path::Path,
@@ -52,6 +53,8 @@ pub struct Frontmatter {
     pub source_hash: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub source_locked: bool,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, serde_yaml::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +88,7 @@ impl Trace {
                 content_hash: String::new(),
                 source_hash: String::new(),
                 source_locked: false,
+                extra: BTreeMap::new(),
             },
             body: body.into(),
         }
@@ -125,8 +129,9 @@ impl Trace {
         }
         if !VALID_TYPES.contains(&f.trace_type.as_str()) {
             bail!(
-                "invalid trace frontmatter: unrecognized type {:?}",
-                f.trace_type
+                "invalid trace frontmatter: unrecognized type {:?}; expected one of: {}",
+                f.trace_type,
+                VALID_TYPES.join(", ")
             );
         }
         if f.created.is_empty() || f.updated.is_empty() {
@@ -169,6 +174,10 @@ impl Trace {
 }
 
 pub(crate) fn write_bytes_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    write_bytes_atomic_with_mode(path, data, 0o640)
+}
+
+pub(crate) fn write_bytes_atomic_with_mode(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     let directory = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("trace path has no parent directory"))?;
@@ -181,7 +190,7 @@ pub(crate) fn write_bytes_atomic(path: &Path, data: &[u8]) -> Result<()> {
             .write(true)
             .create_new(true)
             .open(&temporary)?;
-        set_private_permissions(&temporary)?;
+        set_permissions(&temporary, mode)?;
         file.write_all(data)?;
         file.sync_all()?;
         drop(file);
@@ -203,7 +212,7 @@ fn write_bytes_compatible(path: &Path, data: &[u8]) -> Result<()> {
         .truncate(true)
         .open(path)?;
     if !existed {
-        set_private_permissions(path)?;
+        set_permissions(path, 0o640)?;
     }
     file.write_all(data)?;
     Ok(())
@@ -278,14 +287,14 @@ fn strip_leading_date_prefix(value: &str) -> &str {
 }
 
 #[cfg(unix)]
-fn set_private_permissions(path: &Path) -> Result<()> {
+fn set_permissions(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o640))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_private_permissions(_path: &Path) -> Result<()> {
+fn set_permissions(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
 

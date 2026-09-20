@@ -56,8 +56,21 @@ Cortexes.
 | `transport` | No | No | — | `stdio` | `stdio` or `http` |
 | `http_url` | No | No | `NOEMA_HTTP_URL` | — | MCP endpoint URL (HTTP transport only) |
 | `bearer_key` | No | Yes | `NOEMA_MCP_KEY` | — | Bearer key for keyed mode |
+| `bounded_search` | No | No | — | `false` | Opt in to bounded search-and-read through `recall_context` |
+| `bounded_prefetch` | No | No | — | `false` | Opt in to local CLI evidence prefetch before model requests |
 
 Config is saved to `{hermes_home}/noema.json`.
+
+With `"bounded_search": true`, `noema_search` calls `recall_context` instead of
+`search_traces`. It returns up to three active matches, at most 4,000 Unicode
+characters per body, with provenance and truncation flags. The agent can use
+`noema_recall` for a needed truncated body. Search remains lexical, startup
+preferences are not added to task results, and returned bodies count as reads.
+This requires a server exposing `recall_context`; an unsupported server returns
+an error rather than silently changing retrieval behavior. Omit the option or
+set it to `false` to restore list-only search. Prefetch and all capture/lifecycle
+hooks are unchanged. This option does not enforce project access control; use
+separate Cortexes when isolation is required.
 
 ### Transport modes
 
@@ -93,13 +106,32 @@ The plugin automatically manages session state:
 - **On context compression** — appends the compressed context to the session log
   and returns a breadcrumb pointing back to the trace.
 - **On session end** — creates a summary trace (`type: observation`) derived
-  from the session log, then archives the session log.
+  from the session log, then archives the session log. Session logs and
+  summaries are identified by title/id conventions (`hermes-session: …`,
+  `session-summary: …`) rather than hub taxonomy tags.
 
 ## Prefetch
 
 On each turn, `prefetch()` searches the Cortex with the user's message and
 returns the top 5 matching traces (excluding verbose session logs). FTS5 on
 local SQLite is sub-millisecond, so no cache warming is needed.
+
+### Bounded local prefetch
+
+With `"bounded_prefetch": true`, the provider's prefetch hook uses the local
+`noema prefetch` command instead of list-only search. It applies the CLI's
+relevance checks, selects at most three records, and returns at most 6,000
+Unicode characters of reference context with provenance and truncation markers.
+No startup preferences are included. Input is capped at 8,000 characters and
+the subprocess has a two-second timeout. Packets containing session-log headers
+are conservatively discarded rather than refilled.
+
+This option requires stdio transport and a binary supporting `prefetch`; HTTP
+connections are not redirected to a local Cortex. Failures produce a generic
+unavailable notice without exposing subprocess output. Memory tools remain
+available for missing or truncated evidence. Relevance matching is not access
+control: separate Cortexes are still required for isolation. The option is
+independent of `bounded_search`, defaults off, and does not change capture hooks.
 
 ## Memory mirroring
 

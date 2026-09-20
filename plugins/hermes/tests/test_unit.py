@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -354,7 +355,7 @@ class TestSessionTrace:
         assert args["title"] == "hermes-session: hey max (abcdef123456)"
         assert args["type"] == "context"
         assert args["author"] == "hermes/tester"
-        assert args["tags"] == "hermes-session, session-abcdef123456"
+        assert "tags" not in args
         assert p._session_trace_id == "20260531-hermes-session-hey-max-abcdef123456"
 
     def test_title_omits_redundant_sid_when_no_session_title(self):
@@ -378,15 +379,18 @@ class TestSessionTrace:
         assert p._session_trace_id == "20260531-hermes-session-hey-max-abcdef123456"
         assert p._transport.call_tool.call_count == 1
 
-    def test_collision_without_id_falls_back_to_tag_search(self):
+    def test_collision_without_id_falls_back_to_title_search(self):
         p = self._provider()
         p._transport.call_tool.side_effect = [
             json.dumps({"kind": "trace_id_collision"}),
-            "[context] 20260531-hermes-session-hey-max-abcdef123456 (2026-05-31) — max [hermes-session]",
+            "[context] 20260531-hermes-session-hey-max-abcdef123456 (2026-05-31) — max",
         ]
         p._create_session_trace()
         assert p._session_trace_id == "20260531-hermes-session-hey-max-abcdef123456"
         assert p._transport.call_tool.call_count == 2
+        recover_call = p._transport.call_tool.call_args_list[1]
+        assert recover_call[0][0] == "search_traces"
+        assert recover_call[0][1]["query"] == "hermes-session: hey max (abcdef123456)"
 
     def test_unexpected_response_leaves_trace_id_unset(self):
         p = self._provider()
@@ -533,6 +537,47 @@ class TestHandleToolCallRouting:
             "search_traces", {"query": "sqlite"}
         )
 
+    def test_bounded_search_routes_with_explicit_limits(self):
+        self.provider._config["bounded_search"] = True
+        self.provider.handle_tool_call("noema_search", {"query": "sqlite"})
+        self.provider._transport.call_tool.assert_called_once_with(
+            "recall_context", {
+                "queries": ["sqlite"], "include_preferences": False,
+                "limit_per_query": 3, "max_body_chars": 4000,
+                "all": False, "mode": "lexical", "record_usage": True,
+            },
+        )
+
+    def test_bounded_schema_does_not_mutate_other_providers(self):
+        original = NoemaMemoryProvider().get_tool_schemas()
+        self.provider._config["bounded_search"] = True
+        bounded = self.provider.get_tool_schemas()
+        assert "body_truncated" in bounded[0]["description"]
+        assert bounded[0]["parameters"] == original[0]["parameters"]
+        assert bounded[1:] == original[1:]
+        assert NoemaMemoryProvider().get_tool_schemas() == original
+
+    def test_bounded_search_requires_boolean_opt_in(self):
+        self.provider._config["bounded_search"] = "false"
+        self.test_search_routes_correctly()
+
+    def test_bounded_search_preserves_payload(self):
+        self.provider._config["bounded_search"] = True
+        payload = json.dumps({"results": [{"matches": [{
+            "id": "trace-a", "body": "Evidence", "body_truncated": True,
+            "derived_from": ["source-a"], "content_hash": "abc",
+        }]}]})
+        self.provider._transport.call_tool.return_value = payload
+        result = json.loads(self.provider.handle_tool_call("noema_search", {"query": "x"}))
+        assert result["result"] == payload
+
+    def test_bounded_search_failure_is_visible_without_silent_fallback(self):
+        self.provider._config["bounded_search"] = True
+        self.provider._transport.call_tool.side_effect = RuntimeError("Unknown tool")
+        result = json.loads(self.provider.handle_tool_call("noema_search", {"query": "x"}))
+        assert result == {"error": "Unknown tool"}
+        assert self.provider._transport.call_tool.call_count == 1
+
     def test_remember_includes_author(self):
         self.provider.handle_tool_call("noema_remember", {
             "title": "test", "type": "fact", "body": "content",
@@ -591,6 +636,60 @@ class TestHandleToolCallRouting:
 # ---------------------------------------------------------------------------
 
 class TestPrefetch:
+    @pytest.fixture
+    def bounded(self):
+        p = NoemaMemoryProvider()
+        p._transport = MagicMock()
+        p._config = {"bounded_prefetch": True}
+        p._cortex_name = "isolated"
+        return p
+
+    def test_bounded_prefetch_arguments_and_budget(self, bounded):
+        with patch("plugins.hermes.find_binary", return_value="/bin/noema"), patch(
+            "plugins.hermes.subprocess.run",
+            return_value=MagicMock(stdout=json.dumps({"schema_version": 1, "context": "evidence"})),
+        ) as run:
+            assert bounded.prefetch("x" * 9000) == "evidence"
+        assert run.call_args.args[0] == [
+            "/bin/noema", "--cortex", "isolated", "prefetch", "--output", "json",
+            "--max-results", "3", "--max-preferences", "0",
+            "--exclude-startup-preferences", "--max-chars", "6000",
+        ]
+        assert len(run.call_args.kwargs["input"]) == 8000
+        assert run.call_args.kwargs["timeout"] == 2
+        assert run.call_args.kwargs["check"] is True
+        bounded._transport.call_tool.assert_not_called()
+
+    @pytest.mark.parametrize("context", ["", "ID: x-hermes-session-abc\nsecret log"])
+    def test_bounded_empty_and_logs_not_injected(self, bounded, context):
+        with patch("plugins.hermes.find_binary", return_value="/bin/noema"), patch(
+            "plugins.hermes.subprocess.run",
+            return_value=MagicMock(stdout=json.dumps({"schema_version": 1, "context": context})),
+        ):
+            assert bounded.prefetch("query") == ""
+
+    @pytest.mark.parametrize("payload", ["invalid", "{}", '{"schema_version":2,"context":"x"}',
+                                        json.dumps({"schema_version": 1, "context": "x" * 6001})])
+    def test_bounded_bad_output_is_not_injected(self, bounded, payload):
+        with patch("plugins.hermes.find_binary", return_value="/bin/noema"), patch(
+            "plugins.hermes.subprocess.run", return_value=MagicMock(stdout=payload),
+        ):
+            assert "unavailable" in bounded.prefetch("query")
+
+    def test_bounded_timeout_does_not_expose_output(self, bounded):
+        with patch("plugins.hermes.find_binary", return_value="/bin/noema"), patch(
+            "plugins.hermes.subprocess.run",
+            side_effect=subprocess.TimeoutExpired("noema", 2, output="private-output"),
+        ):
+            result = bounded.prefetch("query")
+        assert "unavailable" in result and "private-output" not in result
+
+    def test_bounded_http_never_reads_local_cortex(self, bounded):
+        bounded._config["transport"] = "http"
+        with patch("plugins.hermes.subprocess.run") as run:
+            assert "unavailable" in bounded.prefetch("query")
+        run.assert_not_called()
+
     def test_empty_query(self):
         p = NoemaMemoryProvider()
         p._transport = MagicMock()
@@ -616,14 +715,34 @@ class TestPrefetch:
         p = NoemaMemoryProvider()
         p._transport = MagicMock()
         p._transport.call_tool.return_value = (
-            "[context] 20260412-hermes-session (2026-04-12) — hermes/agent [hermes-session]\n"
+            "[context] 20260412-hermes-session-abc (2026-04-12) — hermes/agent\n"
             "[fact] 20260412-real-trace (2026-04-12) — agent [useful]"
         )
         result = p.prefetch("test")
-        assert "hermes-session" not in result or "hermes-session-summary" in result
+        assert "20260412-hermes-session-abc" not in result
+        assert "20260412-real-trace" in result
+
+    def test_filters_legacy_session_log_tags(self):
+        p = NoemaMemoryProvider()
+        p._transport = MagicMock()
+        p._transport.call_tool.return_value = (
+            "[context] 20260412-other-id (2026-04-12) — hermes/agent [hermes-session]\n"
+            "[fact] 20260412-real-trace (2026-04-12) — agent [useful]"
+        )
+        result = p.prefetch("test")
+        assert "20260412-other-id" not in result
         assert "20260412-real-trace" in result
 
     def test_keeps_session_summaries(self):
+        p = NoemaMemoryProvider()
+        p._transport = MagicMock()
+        p._transport.call_tool.return_value = (
+            "[observation] 20260412-session-summary-abc (2026-04-12) — hermes/agent"
+        )
+        result = p.prefetch("test")
+        assert "20260412-session-summary-abc" in result
+
+    def test_keeps_legacy_session_summary_tags(self):
         p = NoemaMemoryProvider()
         p._transport = MagicMock()
         p._transport.call_tool.return_value = (
@@ -631,6 +750,7 @@ class TestPrefetch:
         )
         result = p.prefetch("test")
         assert "hermes-session-summary" in result
+        assert "20260412-session-summary" in result
 
     def test_truncates_long_query(self):
         p = NoemaMemoryProvider()

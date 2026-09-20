@@ -67,3 +67,75 @@ test("MCP client accepts and decodes Streamable HTTP SSE responses", async () =>
 		globalThis.fetch = originalFetch;
 	}
 });
+
+test("MCP client reports the failed transport phase and network category", async () => {
+	const { McpClient } = await loadClient();
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => {
+		const error = new TypeError("fetch failed");
+		error.cause = { code: "ECONNREFUSED" };
+		throw error;
+	};
+
+	try {
+		const client = new McpClient("https://memory.example.com:3000", "test-key");
+		await assert.rejects(
+			client.cortexIdentity(),
+			/initialize request: connection refused \(ECONNREFUSED\)/
+		);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("connection errors retain useful HTTP and protocol messages", async () => {
+	const { describeConnectionError } = await loadClient();
+
+	assert.equal(
+		describeConnectionError(new Error("initialize: HTTP 403: Forbidden")),
+		"initialize: HTTP 403: Forbidden"
+	);
+	assert.equal(describeConnectionError(undefined), "unknown connection error");
+});
+
+test("title updates change only the semantic title field", async () => {
+	const { McpClient } = await loadClient();
+	const requests = [];
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init) => {
+		requests.push({ url, init });
+		switch (requests.length) {
+			case 1:
+				return sse(
+					{ jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-03-26" } },
+					{ "Mcp-Session-Id": "title-session" }
+				);
+			case 2:
+				return new Response(null, { status: 202 });
+			case 3:
+				return sse({
+					jsonrpc: "2.0",
+					id: 2,
+					result: { content: [{ type: "text", text: "Trace updated" }] },
+				});
+			default:
+				throw new Error("unexpected fetch");
+		}
+	};
+
+	try {
+		const client = new McpClient("https://memory.example.com:3000", "test-key");
+		await client.updateTraceTitle("20260101-existing-id", "New display title");
+		const payload = JSON.parse(requests[2].init.body);
+		assert.equal(payload.method, "tools/call");
+		assert.deepEqual(payload.params, {
+			name: "update_trace",
+			arguments: {
+				id: "20260101-existing-id",
+				title: "New display title",
+			},
+		});
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
