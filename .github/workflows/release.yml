@@ -84,7 +84,7 @@ jobs:
           Compress-Archive -Path release-package/* -DestinationPath $archive
 
       - name: Upload archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: noema-${{ matrix.os }}-${{ matrix.arch }}
           path: noema_*
