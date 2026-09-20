@@ -17,6 +17,7 @@ __version__ = "0.1.0"
 import json
 import logging
 import os
+import subprocess
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -379,7 +380,18 @@ class NoemaMemoryProvider(MemoryProvider):
         self._create_session_trace()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return list(ALL_TOOL_SCHEMAS)
+        schemas = list(ALL_TOOL_SCHEMAS)
+        if self._config.get("bounded_search") is True:
+            schemas[0] = {
+                **SEARCH_SCHEMA,
+                "description": (
+                    "Search memory and read up to three matching trace bodies in one call, "
+                    "with provenance and body_truncated flags. Use relevant current evidence "
+                    "directly; use noema_recall by ID if a needed body is truncated. "
+                    "An empty result is not proof that a fact does not exist."
+                ),
+            }
+        return schemas
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         noema_tool = _TOOL_MAP.get(tool_name)
@@ -393,7 +405,19 @@ class NoemaMemoryProvider(MemoryProvider):
         mcp_args: Dict[str, Any] = {}
 
         if tool_name == "noema_search":
-            mcp_args["query"] = args.get("query", "")
+            if self._config.get("bounded_search") is True:
+                noema_tool = "recall_context"
+                mcp_args = {
+                    "queries": [args.get("query", "")],
+                    "include_preferences": False,
+                    "limit_per_query": 3,
+                    "max_body_chars": 4000,
+                    "all": False,
+                    "mode": "lexical",
+                    "record_usage": True,
+                }
+            else:
+                mcp_args["query"] = args.get("query", "")
 
         elif tool_name == "noema_remember":
             mcp_args["title"] = args.get("title", "")
@@ -445,6 +469,8 @@ class NoemaMemoryProvider(MemoryProvider):
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if not self._transport or not query.strip():
             return ""
+        if self._config.get("bounded_prefetch") is True:
+            return self._bounded_prefetch(query)
         try:
             result = self._transport.call_tool("search_traces", {"query": query[:500]})
             if not result or result == "No traces found.":
@@ -476,6 +502,39 @@ class NoemaMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.debug("Noema prefetch failed: %s", e)
             return ""
+
+    def _bounded_prefetch(self, query: str) -> str:
+        unavailable = "[Noema prefetch unavailable. Use memory tools if evidence is needed.]"
+        if self._config.get("transport", "stdio") != "stdio":
+            return unavailable
+        binary = find_binary(self._config.get("noema_binary"))
+        if not binary or not self._cortex_name:
+            return unavailable
+        try:
+            result = subprocess.run(
+                [binary, "--cortex", self._cortex_name, "prefetch",
+                 "--output", "json", "--max-results", "3",
+                 "--max-preferences", "0", "--exclude-startup-preferences",
+                 "--max-chars", "6000"],
+                input=query[:8000], text=True, capture_output=True, timeout=2,
+                check=True,
+            )
+            payload = json.loads(result.stdout)
+            context = payload["context"]
+            if payload.get("schema_version") != 1 or not isinstance(context, str) or len(context) > 6000:
+                return unavailable
+            # Reject the whole packet if a session log slipped into the bounded
+            # selection; never inject log bodies or attempt to refill the budget.
+            if any(
+                self._is_session_log_prefetch_line("[" + line)
+                for line in context.splitlines()
+                if line.startswith(("ID: ", "Title: ", "Tags: "))
+            ):
+                return ""
+            return context
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+            logger.warning("Noema bounded prefetch unavailable; memory tools remain available")
+            return unavailable
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         # No-op in v1 — FTS5 on local SQLite is sub-millisecond.

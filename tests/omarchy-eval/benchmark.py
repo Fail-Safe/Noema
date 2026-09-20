@@ -320,7 +320,8 @@ def scoped_external_permissions(path: Path) -> dict[str, str]:
 
 def check_ignored(config_path: Path) -> tuple[bool, str]:
     del config_path
-    samples = [SCRIPT_DIR / ".private/probe", SCRIPT_DIR / "reports/probe"]
+    private = SCRIPT_DIR / ".private"
+    samples = [private if private.is_symlink() else private / "probe", SCRIPT_DIR / "reports/probe"]
     errors: list[str] = []
     for sample in samples:
         completed = run_command(["git", "check-ignore", "--quiet", str(sample)], cwd=SCRIPT_DIR)

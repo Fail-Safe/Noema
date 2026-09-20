@@ -116,7 +116,7 @@ impl NoemaServer {
     }
 }
 
-#[tool_handler(router = self.tool_router, name = "noema", version = "0.21.3")]
+#[tool_handler(router = self.tool_router, name = "noema")]
 impl ServerHandler for NoemaServer {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -340,6 +340,7 @@ struct RecallQueryResult {
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct RecallContextOutput {
+    #[schemars(schema_with = "schema_version_schema")]
     schema_version: u32,
     guidance: &'static str,
     preferences: Vec<RecallTrace>,
@@ -2753,6 +2754,19 @@ fn mcp_error(error: impl std::fmt::Display) -> ErrorData {
 mod tests {
     use super::*;
 
+    #[test]
+    fn server_info_uses_package_version() {
+        let temp = tempfile::tempdir().unwrap();
+        Cortex::create("test", temp.path()).unwrap();
+        let root = temp.path().join("test");
+        let server = NoemaServer::new("test", &root, false).unwrap();
+        let info = ServerHandler::get_info(&server);
+
+        assert_eq!(info.server_info.name, "noema");
+        assert_eq!(info.server_info.version, VERSION);
+        assert!(info.capabilities.tools.is_some());
+    }
+
     fn create_params(title: &str, body: &str) -> CreateParams {
         CreateParams {
             title: title.into(),
@@ -2771,6 +2785,15 @@ mod tests {
     fn cortex_usage_schema_uses_portable_schema_version() {
         let schema = serde_json::to_value(schemars::schema_for!(CortexUsageOutput)).unwrap();
 
+        assert_eq!(
+            schema["properties"]["schema_version"],
+            json!({"type": "integer", "minimum": 0})
+        );
+    }
+
+    #[test]
+    fn recall_context_schema_uses_portable_schema_version() {
+        let schema = serde_json::to_value(schemars::schema_for!(RecallContextOutput)).unwrap();
         assert_eq!(
             schema["properties"]["schema_version"],
             json!({"type": "integer", "minimum": 0})
