@@ -42,7 +42,7 @@ tar = { version = "0.4.46", default-features = false }
 thiserror = "2.0"
 tokio = { version = "1.49", features = ["full"] }
 tokio-util = "0.7"
-ulid = { version = "1.2", features = ["serde"] }
+ulid = { version = "3.0", features = ["serde"] }
 x509-parser = "0.18.1"
 
 [dev-dependencies]
