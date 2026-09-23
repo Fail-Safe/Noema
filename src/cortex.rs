@@ -791,8 +791,9 @@ pub struct Cortex {
     pub id: String,
     pub name: String,
     pub dir: PathBuf,
+    pub db_dir: PathBuf,
     pub manifest: Manifest,
-    connection: Connection,
+    connection: db::Database,
     force_source_lock: bool,
     signing_key: Option<SigningKey>,
     durability: DurabilityProfile,
@@ -1014,7 +1015,8 @@ pub fn inspect_recovery_status(dir: &Path) -> RecoveryStatus {
 }
 
 fn inspect_recovery_status_inner(dir: &Path) -> Result<RecoveryStatus> {
-    let database_path = dir.join("db/noema.db");
+    let _storage_lock = crate::storage::StorageLock::acquire(dir, false)?;
+    let database_path = db::directory(dir)?.join("noema.db");
     if !fs::metadata(&database_path)?.is_file() {
         bail!("cortex database is not a regular file")
     }
@@ -1132,11 +1134,13 @@ impl Cortex {
             );
         }
         let connection = db::open(&dir)?;
+        let db_dir = db::directory(&dir)?;
         let signing_key = load_signing_key(&dir, &manifest)?;
         let mut cortex = Self {
             id: manifest.id.clone(),
             name,
             dir,
+            db_dir,
             manifest,
             connection,
             force_source_lock: false,
@@ -1742,7 +1746,7 @@ impl Cortex {
     }
 
     fn pending_mutation_lock_directory(&self) -> PathBuf {
-        self.dir.join("db/pending-mutations")
+        self.db_dir.join("pending-mutations")
     }
 
     pub fn resolve(name_override: Option<&str>) -> Result<Self> {
@@ -4480,7 +4484,7 @@ impl Cortex {
         let path = self.file_path(&row);
         let original_bytes = fs::read(&path)
             .with_context(|| format!("reading drifted trace {id:?} for recovery artifact"))?;
-        let artifact_directory = self.dir.join("db/reconciliations");
+        let artifact_directory = self.db_dir.join("reconciliations");
         fs::create_dir_all(&artifact_directory)?;
         #[cfg(unix)]
         {
@@ -4490,7 +4494,10 @@ impl Cortex {
         let artifact_name = format!("{id}-{}.md", ulid::Ulid::new());
         let artifact_path = artifact_directory.join(&artifact_name);
         trace::write_bytes_atomic_with_mode(&artifact_path, &original_bytes, 0o600)?;
-        let recovery_artifact = format!("db/reconciliations/{artifact_name}");
+        let recovery_artifact = artifact_path
+            .strip_prefix(&self.dir)?
+            .to_string_lossy()
+            .replace('\\', "/");
         let (_, mut canonical) = self.canonical_long_term_trace(&row)?;
         canonical.frontmatter.extra = Trace::parse(&original_bytes)?.frontmatter.extra;
         let now = trace::now_rfc3339();
@@ -4542,7 +4549,7 @@ impl Cortex {
                     current.row.id
                 )
             })?;
-            let artifact_directory = self.dir.join("db/markdown-normalizations");
+            let artifact_directory = self.db_dir.join("markdown-normalizations");
             fs::create_dir_all(&artifact_directory)?;
             #[cfg(unix)]
             {
@@ -4552,7 +4559,10 @@ impl Cortex {
             let artifact_name = format!("{}-{}.md", current.row.id, ulid::Ulid::new());
             let artifact_path = artifact_directory.join(&artifact_name);
             trace::write_bytes_atomic_with_mode(&artifact_path, &original_bytes, 0o600)?;
-            let recovery_artifact = format!("db/markdown-normalizations/{artifact_name}");
+            let recovery_artifact = artifact_path
+                .strip_prefix(&self.dir)?
+                .to_string_lossy()
+                .replace('\\', "/");
 
             let mut normalized = current.trace.clone();
             normalized.body = current.normalized_body;
@@ -5326,18 +5336,8 @@ impl Cortex {
     }
 
     fn rebuild_fts_if_stale(&mut self) -> Result<()> {
-        let traces: i64 = self
-            .connection
-            .query_row("SELECT COUNT(*) FROM traces", [], |row| row.get(0))?;
-        let fts: i64 = self
-            .connection
-            .query_row("SELECT COUNT(*) FROM traces_fts", [], |row| row.get(0))?;
-        if traces == fts {
-            return Ok(());
-        }
         let tx = self.connection.unchecked_transaction()?;
-        tx.execute("DELETE FROM traces_fts", [])?;
-        let ids: Vec<String> = {
+        let paths: BTreeMap<String, PathBuf> = {
             let mut statement = tx.prepare("SELECT id,archived_at,trashed_at FROM traces")?;
             statement
                 .query_map([], |row| {
@@ -5349,16 +5349,44 @@ impl Cortex {
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
                 .into_iter()
-                .filter_map(|(id, archived, trashed)| {
+                .map(|(id, archived, trashed)| {
                     let path = if trashed.is_some() {
                         self.trash_dir().join(format!("{id}.md"))
                     } else {
                         self.trace_file(&id, archived.is_some())
                     };
-                    path.exists().then_some(id)
+                    (id, path)
                 })
                 .collect()
         };
+        let indexed: Vec<String> = {
+            let mut statement = tx.prepare("SELECT id FROM traces_fts")?;
+            statement
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let indexed_ids: BTreeSet<&String> = indexed.iter().collect();
+        let mut stale = indexed_ids.len() != indexed.len()
+            || indexed_ids.iter().any(|id| !paths.contains_key(*id));
+        // Missing files cannot be indexed. Only a missing index entry with an
+        // available file warrants a rebuild; otherwise every open repeats it.
+        for (id, path) in &paths {
+            if !indexed_ids.contains(id) && path.try_exists()? {
+                stale = true;
+                break;
+            }
+        }
+        if !stale {
+            tx.commit()?;
+            return Ok(());
+        }
+        let mut ids = Vec::new();
+        for (id, path) in paths {
+            if path.try_exists()? {
+                ids.push(id);
+            }
+        }
+        tx.execute("DELETE FROM traces_fts", [])?;
         for id in ids {
             let row = self.get_from_tx(&tx, &id)?;
             let trace = Trace::parse_file(&self.file_path(&row))?;
@@ -6163,6 +6191,111 @@ mod tests {
         let mut cx = Cortex::open("test", temp.path().join("test")).unwrap();
         cx.durability = DurabilityProfile::Strong;
         (temp, cx)
+    }
+
+    #[test]
+    fn fts_reopen_skips_missing_files_and_indexes_them_when_restored() {
+        for location in ["active", "archive", "trash"] {
+            let (_temp, cx) = cortex();
+            let mut present = Trace::new("Present", "fact", "", vec![], "searchable quartz");
+            cx.add(&mut present).unwrap();
+            let mut absent = Trace::new("Absent", "fact", "", vec![], "restored zircon");
+            cx.add(&mut absent).unwrap();
+            let id = absent.frontmatter.id.clone();
+            match location {
+                "archive" => cx.archive(&id).unwrap(),
+                "trash" => cx.trash(&id).unwrap(),
+                _ => (),
+            }
+            let path = match location {
+                "archive" => cx.archive_dir(),
+                "trash" => cx.trash_dir(),
+                _ => cx.traces_dir(),
+            }
+            .join(format!("{id}.md"));
+            let saved = fs::read(&path).unwrap();
+            fs::remove_file(&path).unwrap();
+            cx.connection
+                .execute("DELETE FROM traces_fts WHERE id=?1", [&id])
+                .unwrap();
+            let root = cx.dir.clone();
+            drop(cx);
+            for _ in 0..3 {
+                let cx = Cortex::open("test", &root).unwrap();
+                assert_eq!(
+                    cx.connection.total_changes(),
+                    0,
+                    "unnecessary writes for {location}"
+                );
+                let hits: i64 = cx
+                    .connection
+                    .query_row(
+                        "SELECT count(*) FROM traces_fts WHERE traces_fts MATCH 'quartz'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(hits, 1);
+            }
+            fs::write(&path, saved).unwrap();
+            let cx = Cortex::open("test", &root).unwrap();
+            let hits: i64 = cx
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM traces_fts WHERE traces_fts MATCH 'zircon'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(hits, 1);
+            drop(cx);
+            let cx = Cortex::open("test", &root).unwrap();
+            assert_eq!(cx.connection.total_changes(), 0);
+        }
+    }
+
+    #[test]
+    fn fts_reopen_repairs_wrong_ids_and_duplicates_even_when_counts_match() {
+        for duplicate in [false, true] {
+            let (_temp, cx) = cortex();
+            let mut first = Trace::new("First", "fact", "", vec![], "quartz");
+            let mut second = Trace::new("Second", "fact", "", vec![], "zircon");
+            cx.add(&mut first).unwrap();
+            cx.add(&mut second).unwrap();
+            cx.connection
+                .execute(
+                    "DELETE FROM traces_fts WHERE id=?1",
+                    [&second.frontmatter.id],
+                )
+                .unwrap();
+            cx.connection
+                .execute(
+                    "INSERT INTO traces_fts(id,title,body,tags) VALUES (?1,'','stale','')",
+                    [if duplicate {
+                        first.frontmatter.id.as_str()
+                    } else {
+                        "orphan"
+                    }],
+                )
+                .unwrap();
+            let root = cx.dir.clone();
+            drop(cx);
+            let cx = Cortex::open("test", &root).unwrap();
+            let ids: Vec<String> = cx
+                .connection
+                .prepare("SELECT id FROM traces_fts ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let mut expected = vec![first.frontmatter.id, second.frontmatter.id];
+            expected.sort();
+            assert_eq!(ids, expected);
+            drop(cx);
+            let cx = Cortex::open("test", &root).unwrap();
+            assert_eq!(cx.connection.total_changes(), 0);
+        }
     }
 
     #[test]

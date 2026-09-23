@@ -506,6 +506,30 @@ enum EmbeddingCommand {
 #[derive(Debug, Subcommand)]
 enum CortexCommand {
     List,
+    /// Inspect or safely change database storage (stop all clients before changing)
+    Storage {
+        name: String,
+        #[arg(long, value_enum, conflicts_with = "resume")]
+        database: Option<crate::storage::DatabaseStorage>,
+        /// Required migration backup, outside the cortex
+        #[arg(long, requires = "database", conflicts_with = "resume")]
+        backup: Option<PathBuf>,
+        /// Finish an interrupted storage migration
+        #[arg(long)]
+        resume: bool,
+        /// Emit storage statistics as JSON
+        #[arg(long, conflicts_with_all = ["database", "backup", "resume"])]
+        json: bool,
+    },
+    /// Compact a database after stopping all clients; requires an external backup
+    Compact {
+        name: String,
+        /// New backup archive outside the cortex (never overwritten)
+        #[arg(long)]
+        backup: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// Write a gzipped tarball of a cortex
     Backup {
         name: String,
@@ -1354,8 +1378,13 @@ fn migrate_command(selected: Option<&str>, command: MigrateCommand) -> Result<()
         );
     }
     println!(
-        "  backups: cortex.md.{}.bak, db/noema.db.{}.bak",
-        result.stamp, result.stamp
+        "  backups: cortex.md.{}.bak, {}/noema.db.{}.bak",
+        result.stamp,
+        crate::db::directory(&entry.path)?
+            .file_name()
+            .unwrap()
+            .to_string_lossy(),
+        result.stamp
     );
     Ok(())
 }
@@ -1495,6 +1524,88 @@ fn use_cortex(name: &str) -> Result<()> {
 
 fn cortex_command(command: CortexCommand) -> Result<()> {
     match command {
+        CortexCommand::Storage {
+            name,
+            database,
+            backup,
+            resume,
+            json,
+        } => {
+            let cfg = Config::load()?;
+            let entry = cfg
+                .cortexes
+                .get(&name)
+                .ok_or_else(|| anyhow::anyhow!("unknown cortex"))?;
+            if database.is_some() || resume {
+                let mode =
+                    crate::storage::migrate(&entry.path, database, backup.as_deref(), resume)?;
+                println!(
+                    "Database storage: {} ({})",
+                    mode.as_str(),
+                    mode.directory_name()
+                );
+                if mode == crate::storage::DatabaseStorage::Nosync {
+                    println!(
+                        "The database stays local in iCloud Drive. Keep separate backups and keep the parent folder downloaded."
+                    );
+                }
+            } else {
+                let stats = crate::maintenance::storage_stats(&entry.path)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&stats)?);
+                } else {
+                    println!("Database storage: {}", stats.database.as_str());
+                    println!("Database path: {}", stats.database_path.display());
+                    println!("Database file: {}", human_bytes(stats.database_bytes));
+                    println!("Logical database: {}", human_bytes(stats.logical_bytes));
+                    println!(
+                        "Reusable free space: {} ({:.1}%; {} pages)",
+                        human_bytes(stats.reusable_bytes),
+                        stats.reusable_percent,
+                        stats.free_pages
+                    );
+                    println!("WAL file: {}", human_bytes(stats.wal_bytes));
+                    println!("Auto-vacuum: {}", stats.auto_vacuum);
+                    println!(
+                        "Available disk space: {}",
+                        human_bytes(stats.available_disk_bytes)
+                    );
+                    println!(
+                        "Compaction headroom required: {} (plus backup space)",
+                        human_bytes(stats.compact_required_free_bytes)
+                    );
+                    println!(
+                        "Reusable space can serve future writes; it is not an exact estimate of compaction savings."
+                    );
+                }
+            }
+        }
+        CortexCommand::Compact { name, backup, json } => {
+            let cfg = Config::load()?;
+            let entry = cfg
+                .cortexes
+                .get(&name)
+                .ok_or_else(|| anyhow::anyhow!("unknown cortex"))?;
+            let result = crate::maintenance::compact(&entry.path, &backup)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("Database compacted and integrity verified.");
+                println!(
+                    "Database file: {} -> {} ({} reclaimed)",
+                    human_bytes(result.before.database_bytes),
+                    human_bytes(result.after.database_bytes),
+                    human_bytes(result.reclaimed_bytes)
+                );
+                println!(
+                    "Reusable free space: {} -> {}",
+                    human_bytes(result.before.reusable_bytes),
+                    human_bytes(result.after.reusable_bytes)
+                );
+                println!("WAL file: {}", human_bytes(result.after.wal_bytes));
+                println!("Backup: {}", result.backup_path.display());
+            }
+        }
         CortexCommand::List => {
             let cfg = Config::load()?;
             for (name, entry) in cfg.cortexes {
@@ -3250,7 +3361,7 @@ fn check_cortex_layout(cx: &Cortex) -> CheckResult {
         ("traces/", cx.traces_dir()),
         ("archive/traces/", cx.archive_dir()),
         ("trash/traces/", cx.trash_dir()),
-        ("db/", cx.dir.join("db")),
+        ("database directory", cx.db_dir.clone()),
     ];
     let missing = required
         .into_iter()

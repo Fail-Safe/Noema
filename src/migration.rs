@@ -100,6 +100,7 @@ pub fn migrate_cortex_id(
     config_path: Option<&Path>,
 ) -> Result<MigrationResult> {
     let dir = &entry.path;
+    let _storage_lock = crate::storage::StorageLock::acquire(dir, false)?;
     let _lock = MigrationLock::acquire(dir)?;
     let journal_path = dir.join(JOURNAL_NAME);
     let existing_journal = read_journal(&journal_path)?;
@@ -143,7 +144,7 @@ pub fn migrate_cortex_id(
 
     db::checkpoint_wal(dir).context("checkpointing database before backup")?;
     let manifest_path = dir.join("cortex.md");
-    let database_path = dir.join("db/noema.db");
+    let database_path = db::directory(dir)?.join("noema.db");
     copy_backup_atomic(
         &manifest_path,
         &PathBuf::from(format!("{}.{}.bak", manifest_path.display(), journal.stamp)),

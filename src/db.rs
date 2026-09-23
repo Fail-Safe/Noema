@@ -1,4 +1,8 @@
-use std::{fs, path::Path, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use include_dir::{Dir, include_dir};
@@ -6,17 +10,39 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 static MIGRATIONS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
-pub fn open(cortex_dir: &Path) -> Result<Connection> {
-    let db_dir = cortex_dir.join("db");
+pub fn directory(cortex_dir: &Path) -> Result<PathBuf> {
+    crate::storage::directory(cortex_dir)
+}
+
+#[derive(Debug)]
+pub struct Database {
+    connection: Connection,
+    _storage_lock: crate::storage::StorageLock,
+}
+
+impl std::ops::Deref for Database {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.connection
+    }
+}
+
+pub fn open(cortex_dir: &Path) -> Result<Database> {
+    let storage_lock = crate::storage::StorageLock::acquire(cortex_dir, false)?;
+    let db_dir = directory(cortex_dir)?;
     fs::create_dir_all(&db_dir)?;
     let connection = Connection::open(db_dir.join("noema.db"))?;
     configure(&connection)?;
     migrate(&connection)?;
-    Ok(connection)
+    Ok(Database {
+        connection,
+        _storage_lock: storage_lock,
+    })
 }
 
-pub fn open_existing_without_migrations(cortex_dir: &Path) -> Result<Option<Connection>> {
-    let path = cortex_dir.join("db/noema.db");
+pub fn open_existing_without_migrations(cortex_dir: &Path) -> Result<Option<Database>> {
+    let storage_lock = crate::storage::StorageLock::acquire(cortex_dir, false)?;
+    let path = directory(cortex_dir)?.join("noema.db");
     if !path.exists() {
         return Ok(None);
     }
@@ -25,7 +51,10 @@ pub fn open_existing_without_migrations(cortex_dir: &Path) -> Result<Option<Conn
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
     )?;
     connection.busy_timeout(Duration::from_secs(5))?;
-    Ok(Some(connection))
+    Ok(Some(Database {
+        connection,
+        _storage_lock: storage_lock,
+    }))
 }
 
 fn configure(connection: &Connection) -> Result<()> {

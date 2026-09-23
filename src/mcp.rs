@@ -49,11 +49,60 @@ const MAX_RECALL_BODY_CHARS: usize = 12_000;
 const MAX_RECALL_PREFERENCES: usize = 24;
 const MAX_CREATE_TRACES: usize = 16;
 
+const AGENT_TOOLS: &[&str] = &[
+    "get_instructions",
+    "cortex_usage",
+    "list_traces",
+    "get_trace",
+    "create_trace",
+    "create_traces",
+    "search_traces",
+    "recall_context",
+    "find_similar_traces",
+    "delete_trace",
+    "recover_trace",
+    "archive_trace",
+    "unarchive_trace",
+    "update_trace",
+    "set_trace_tags",
+    "append_trace_tags",
+    "tag_stats",
+    "vote_trace",
+    "search_activity",
+    "append_trace",
+    "trace_history",
+    "trace_lineage",
+    "resolve_divergence",
+    "cortex_identity",
+];
+const MAINTAINER_TOOLS: &[&str] = &[
+    "tag_doctor",
+    "rename_tag",
+    "delete_tag",
+    "metrics_summary",
+    "consolidation_health",
+    "federation_status",
+];
+const CURATOR_TOOLS: &[&str] = &[
+    "list_consolidation_candidates",
+    "record_consolidation_result",
+];
+const FEDERATION_TOOLS: &[&str] = &["cortex_identity", "sync_events", "sync_read_signal"];
+const HTTP_TOOL_ENDPOINTS: &[(&str, &str)] = &[
+    ("/mcp", "full"),
+    ("/mcp/agent", "agent"),
+    ("/mcp/maintainer", "maintainer"),
+    ("/mcp/curator", "curator"),
+    ("/mcp/federation", "federation"),
+];
+
 #[derive(Clone)]
 pub struct NoemaServer {
     cortex: Arc<Mutex<Cortex>>,
     federation_mode: String,
     tool_router: ToolRouter<Self>,
+    tool_profile: String,
+    http_transport: bool,
 }
 
 impl NoemaServer {
@@ -62,6 +111,8 @@ impl NoemaServer {
         path: impl Into<PathBuf>,
         remote_transport: bool,
     ) -> Result<Self> {
+        let tool_profile = std::env::var("NOEMA_MCP_TOOL_PROFILE").unwrap_or_default();
+        validate_http_tool_profile(remote_transport, &tool_profile)?;
         let name = name.into();
         let cortex = Cortex::open(&name, path.into())?;
         let federation_mode = if remote_transport {
@@ -76,11 +127,16 @@ impl NoemaServer {
         } else {
             String::new()
         };
-        let tool_profile = std::env::var("NOEMA_MCP_TOOL_PROFILE").unwrap_or_default();
         Ok(Self {
             cortex: Arc::new(Mutex::new(cortex)),
+            http_transport: remote_transport,
             federation_mode,
             tool_router: Self::tool_router_for_profile(&tool_profile)?,
+            tool_profile: if tool_profile.is_empty() {
+                "full".into()
+            } else {
+                tool_profile
+            },
         })
     }
 
@@ -88,6 +144,18 @@ impl NoemaServer {
         let mut router = Self::tool_router();
         match profile {
             "" | "full" => {}
+            "agent" | "maintainer" | "curator" | "federation" => {
+                router.map.retain(|name, _| {
+                    if profile == "federation" {
+                        FEDERATION_TOOLS.contains(&name.as_ref())
+                    } else {
+                        AGENT_TOOLS.contains(&name.as_ref())
+                            || (profile == "maintainer"
+                                && MAINTAINER_TOOLS.contains(&name.as_ref()))
+                            || (profile == "curator" && CURATOR_TOOLS.contains(&name.as_ref()))
+                    }
+                });
+            }
             "continuity-read" => {
                 router.map.retain(|name, _| name == "recall_context");
             }
@@ -99,6 +167,53 @@ impl NoemaServer {
             _ => bail!("unsupported NOEMA_MCP_TOOL_PROFILE {profile:?}"),
         }
         Ok(router)
+    }
+
+    fn endpoint_guidance(&self) -> (String, serde_json::Value) {
+        let http = self.http_transport;
+        let mut guidance = format!(
+            "\n\n## Additional capabilities\n\nCurrent tool profile: `{}`. ",
+            self.tool_profile
+        );
+        guidance.push_str(if http {
+            "These MCP endpoints are on the same server:\n"
+        } else {
+            "This is a stdio connection. If this cortex is also served over HTTP, these paths are available on that HTTP server:\n"
+        });
+        let endpoints = HTTP_TOOL_ENDPOINTS.iter().map(|&(path, profile)| {
+            let purpose = match profile {
+                "full" => "Complete tool set",
+                "agent" => "Everyday memory retrieval, capture, editing, and lifecycle operations",
+                "maintainer" => "Everyday tools plus cortex-wide tag cleanup and operational diagnostics",
+                "curator" => "Everyday tools plus consolidation candidates and distilled-memory creation",
+                "federation" => "Cortex identity, event exchange, and usage-signal exchange",
+                _ => unreachable!("built-in endpoint profile"),
+            };
+            let router = Self::tool_router_for_profile(profile).expect("built-in endpoint profile");
+            let additional_tools = router.map.keys().filter(|name| !self.tool_router.map.contains_key(*name)).count();
+            let current = http && profile == self.tool_profile;
+            let availability = if current {
+                "current endpoint"
+            } else if additional_tools == 0 {
+                "capabilities already available in this profile"
+            } else {
+                "additional capabilities require another connection"
+            };
+            let _ = writeln!(guidance, "- `{path}`: {purpose} ({availability}).");
+            json!({"path":path,"profile":profile,"purpose":purpose,"current_endpoint":current,"additional_tool_count":additional_tools})
+        }).collect::<Vec<_>>();
+        let policy = "Only tools advertised by this connection are callable here. If a task needs additional capabilities, use an appropriately configured MCP connection if your client supports it; otherwise explain which endpoint is needed. Endpoint awareness does not automatically establish a connection or grant access.";
+        guidance.push_str(policy);
+        (
+            guidance,
+            json!({
+                "current_profile":self.tool_profile,
+                "transport":if http { "http" } else { "stdio" },
+                "path_base":if http { "same HTTP server" } else { "HTTP server for this cortex, if configured" },
+                "endpoints":endpoints,
+                "connection_policy":policy,
+            }),
+        )
     }
 
     async fn open(&self) -> Result<OwnedMutexGuard<Cortex>, ErrorData> {
@@ -544,25 +659,40 @@ struct CortexContractOutput {
 #[tool_router(router = tool_router)]
 impl NoemaServer {
     #[tool(
-        description = "Returns concise Markdown guidance for agent use of this Cortex. Call this first if you are unfamiliar with Noema; use cortex_usage for structured MCP/client context."
+        description = "Returns concise Markdown guidance for agent use of this Cortex. Call this first if you are unfamiliar with Noema; use cortex_usage for structured MCP/client context.",
+        annotations(read_only_hint = true)
     )]
     async fn get_instructions(&self, _: Parameters<Empty>) -> Result<String, ErrorData> {
         let cx = self.open().await?;
-        Ok(render_instructions(&cx.manifest))
+        Ok(render_instructions(&cx.manifest) + &self.endpoint_guidance().0)
     }
 
     #[tool(
-        description = "Returns structured JSON context for MCP clients: active Cortex identity, trace semantics, startup preference pattern, runtime posture, and operational constraints. Tool discovery remains authoritative for callable tools."
+        description = "Returns structured JSON context for MCP clients: active Cortex identity, trace semantics, startup preference pattern, runtime posture, and operational constraints. Tool discovery remains authoritative for callable tools.",
+        annotations(read_only_hint = true)
     )]
     async fn cortex_usage(
         &self,
         _: Parameters<Empty>,
     ) -> Result<Json<CortexUsageOutput>, ErrorData> {
         let cx = self.open().await?;
-        build_cortex_usage(&cx).map(Json).map_err(mcp_error)
+        let mut output = build_cortex_usage(&cx).map_err(mcp_error)?;
+        output
+            .runtime
+            .insert("mcp_tool_profile".into(), json!(self.tool_profile));
+        output
+            .runtime
+            .insert("mcp_tool_count".into(), json!(self.tool_router.map.len()));
+        output
+            .runtime
+            .insert("mcp_endpoints".into(), self.endpoint_guidance().1);
+        Ok(Json(output))
     }
 
-    #[tool(description = "List traces in the cortex")]
+    #[tool(
+        description = "List traces in the cortex",
+        annotations(read_only_hint = true)
+    )]
     async fn list_traces(
         &self,
         Parameters(p): Parameters<ListParams>,
@@ -582,7 +712,10 @@ impl NoemaServer {
         Ok(format_rows(&rows))
     }
 
-    #[tool(description = "Get a trace by ID, including its full body")]
+    #[tool(
+        description = "Get a trace by ID, including its full body",
+        annotations(read_only_hint = true)
+    )]
     async fn get_trace(&self, Parameters(p): Parameters<GetParams>) -> Result<String, ErrorData> {
         let cx = self.open().await?;
         let started = Instant::now();
@@ -705,7 +838,10 @@ impl NoemaServer {
         }))
     }
 
-    #[tool(description = "Full-text search across traces")]
+    #[tool(
+        description = "Full-text search across traces",
+        annotations(read_only_hint = true)
+    )]
     async fn search_traces(
         &self,
         Parameters(p): Parameters<SearchParams>,
@@ -735,7 +871,8 @@ impl NoemaServer {
     }
 
     #[tool(
-        description = "Retrieve startup preferences and bounded full trace bodies for several task queries in one read-only call. Use this continuity fast path instead of separate list/search/get calls when available."
+        description = "Retrieve startup preferences and bounded full trace bodies for several task queries in one read-only call. Use this continuity fast path instead of separate list/search/get calls when available.",
+        annotations(read_only_hint = true)
     )]
     async fn recall_context(
         &self,
@@ -843,7 +980,10 @@ impl NoemaServer {
         outcome.map(Json).map_err(mcp_error)
     }
 
-    #[tool(description = "Find traces related to a given trace")]
+    #[tool(
+        description = "Find traces related to a given trace",
+        annotations(read_only_hint = true)
+    )]
     async fn find_similar_traces(
         &self,
         Parameters(p): Parameters<SimilarParams>,
@@ -1016,7 +1156,8 @@ impl NoemaServer {
         }))
     }
     #[tool(
-        description = "Tag taxonomy statistics across active and archived traces, including assignment, tier, visibility, and engagement counts."
+        description = "Tag taxonomy statistics across active and archived traces, including assignment, tier, visibility, and engagement counts.",
+        annotations(read_only_hint = true)
     )]
     async fn tag_stats(
         &self,
@@ -1159,7 +1300,8 @@ impl NoemaServer {
     }
 
     #[tool(
-        description = "Internal tool. Returns short-term traces within the rolling consolidation window along with their usage signals (read_count, modify_count, tier_votes, derived_from_count). Consumer scores these and submits distilled mid-tier traces via record_consolidation_result."
+        description = "Internal tool. Returns short-term traces within the rolling consolidation window along with their usage signals (read_count, modify_count, tier_votes, derived_from_count). Consumer scores these and submits distilled mid-tier traces via record_consolidation_result.",
+        annotations(read_only_hint = true)
     )]
     async fn list_consolidation_candidates(
         &self,
@@ -1198,7 +1340,8 @@ impl NoemaServer {
         })))
     }
     #[tool(
-        description = "Recent consolidation pipeline health: daily success/fail/promote/distill counts within the lookback window, short→mid and mid→long promotion-latency percentiles, and the 1-source mid leak detector. Lets an agent or operator answer 'is consolidation actually happening, and is anything leaking?' without raw SQL against the events table."
+        description = "Recent consolidation pipeline health: daily success/fail/promote/distill counts within the lookback window, short→mid and mid→long promotion-latency percentiles, and the 1-source mid leak detector. Lets an agent or operator answer 'is consolidation actually happening, and is anything leaking?' without raw SQL against the events table.",
+        annotations(read_only_hint = true)
     )]
     async fn consolidation_health(
         &self,
@@ -1214,7 +1357,8 @@ impl NoemaServer {
         })))
     }
     #[tool(
-        description = "Local MCP/CLI operation metrics for the lookback window: per-op counts and p50/p95 latency, daily volume (opens/searches/creates), source mix, and get_trace usage-open rate. Local-only and pruneable — not federated telemetry. Lets an agent answer 'is search getting slow?' or 'are agents actually opening traces?' without SQL."
+        description = "Local MCP/CLI operation metrics for the lookback window: per-op counts and p50/p95 latency, daily volume (opens/searches/creates), source mix, and get_trace usage-open rate. Local-only and pruneable — not federated telemetry. Lets an agent answer 'is search getting slow?' or 'are agents actually opening traces?' without SQL.",
+        annotations(read_only_hint = true)
     )]
     async fn metrics_summary(
         &self,
@@ -1228,7 +1372,8 @@ impl NoemaServer {
         })))
     }
     #[tool(
-        description = "Top-N traces by federation-wide search popularity (search_hit_count then read_count) plus top-N tags by aggregate engagement. Lets an agent answer 'what's worth reading?' or 'which topics are hot?' without scanning every trace. Active traces only; archived/trashed are excluded."
+        description = "Top-N traces by federation-wide search popularity (search_hit_count then read_count) plus top-N tags by aggregate engagement. Lets an agent answer 'what's worth reading?' or 'which topics are hot?' without scanning every trace. Active traces only; archived/trashed are excluded.",
+        annotations(read_only_hint = true)
     )]
     async fn search_activity(
         &self,
@@ -1290,7 +1435,8 @@ impl NoemaServer {
         Ok(format!("Content appended to trace {}.", p.id))
     }
     #[tool(
-        description = "Show the event log (audit trail) for a trace: all mutations in chronological order."
+        description = "Show the event log (audit trail) for a trace: all mutations in chronological order.",
+        annotations(read_only_hint = true)
     )]
     async fn trace_history(&self, Parameters(p): Parameters<IdParam>) -> Result<String, ErrorData> {
         let events = self.open().await?.history(&p.id).map_err(mcp_error)?;
@@ -1307,7 +1453,8 @@ impl NoemaServer {
         Ok(output)
     }
     #[tool(
-        description = "Show the derivation graph for a trace: what it was derived from and what was derived from it."
+        description = "Show the derivation graph for a trace: what it was derived from and what was derived from it.",
+        annotations(read_only_hint = true)
     )]
     async fn trace_lineage(&self, Parameters(p): Parameters<IdParam>) -> Result<String, ErrorData> {
         let (from, by) = self.open().await?.lineage(&p.id).map_err(mcp_error)?;
@@ -1350,7 +1497,8 @@ impl NoemaServer {
         }
     }
     #[tool(
-        description = "Returns this cortex's stable identity (ULID, name, manifest version). Federation peers call this on every sync to verify the remote endpoint still belongs to the cortex they originally paired with."
+        description = "Returns this cortex's stable identity (ULID, name, manifest version). Federation peers call this on every sync to verify the remote endpoint still belongs to the cortex they originally paired with.",
+        annotations(read_only_hint = true)
     )]
     async fn cortex_identity(&self, _: Parameters<Empty>) -> Result<String, ErrorData> {
         let cx = self.open().await?;
@@ -1379,7 +1527,8 @@ impl NoemaServer {
         Ok(json_text(payload))
     }
     #[tool(
-        description = "Returns events from this cortex for federation sync. Remote peers call this to pull new events. Returns a JSON array of event objects."
+        description = "Returns events from this cortex for federation sync. Remote peers call this to pull new events. Returns a JSON array of event objects.",
+        annotations(read_only_hint = true)
     )]
     async fn sync_events(
         &self,
@@ -1413,7 +1562,8 @@ impl NoemaServer {
         serde_json::to_string(&cx.events_since(since, limit).map_err(mcp_error)?).map_err(mcp_error)
     }
     #[tool(
-        description = "Returns per-peer tier-usage deltas (read_count, modify_count, search_hit_count, last_read_at) for federation sync. Each peer publishes only its own rows — the ring aggregates by SUMing over every peer's contribution, so consolidation decisions operate on a federation-wide signal rather than the local slice. Returns a JSON array of trace_usage rows owned by this cortex with updated_at > since. search_hit_count is omitted when zero for wire compatibility with pre-migration-015 peers."
+        description = "Returns per-peer tier-usage deltas (read_count, modify_count, search_hit_count, last_read_at) for federation sync. Each peer publishes only its own rows — the ring aggregates by SUMing over every peer's contribution, so consolidation decisions operate on a federation-wide signal rather than the local slice. Returns a JSON array of trace_usage rows owned by this cortex with updated_at > since. search_hit_count is omitted when zero for wire compatibility with pre-migration-015 peers.",
+        annotations(read_only_hint = true)
     )]
     async fn sync_read_signal(
         &self,
@@ -1443,7 +1593,10 @@ impl NoemaServer {
         )
         .map_err(mcp_error)
     }
-    #[tool(description = "Show federation configuration, peer sync state, and local vector clock.")]
+    #[tool(
+        description = "Show federation configuration, peer sync state, and local vector clock.",
+        annotations(read_only_hint = true)
+    )]
     async fn federation_status(&self, _: Parameters<Empty>) -> Result<String, ErrorData> {
         let cx = self.open().await?;
         render_federation_status(&cx).map_err(mcp_error)
@@ -1681,6 +1834,38 @@ fn local_interface_addresses() -> Result<HashSet<std::net::IpAddr>> {
     bail!("dynamic interface discovery is not implemented on this platform")
 }
 
+fn validate_http_tool_profile(remote_transport: bool, profile: &str) -> Result<()> {
+    if remote_transport && !matches!(profile, "" | "full") {
+        bail!(
+            "NOEMA_MCP_TOOL_PROFILE is only supported for stdio; HTTP /mcp always exposes all tools. Unset it and select a role endpoint such as /mcp/agent instead."
+        );
+    }
+    Ok(())
+}
+
+fn build_http_tool_router(
+    server: &NoemaServer,
+    allowed_hosts: Vec<String>,
+) -> Result<axum::Router> {
+    let mut router = axum::Router::new();
+    for &(endpoint, profile) in HTTP_TOOL_ENDPOINTS {
+        let mut role_server = server.clone();
+        role_server.http_transport = true;
+        role_server.tool_router = NoemaServer::tool_router_for_profile(profile)?;
+        role_server.tool_profile = profile.into();
+        let service: StreamableHttpService<NoemaServer, LocalSessionManager> =
+            StreamableHttpService::new(
+                move || Ok(role_server.clone()),
+                Default::default(),
+                StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts.clone()),
+            );
+        router = router
+            .route_service(endpoint, service.clone())
+            .route_service(&format!("{endpoint}/"), service);
+    }
+    Ok(router)
+}
+
 pub async fn serve_http(
     name: String,
     path: PathBuf,
@@ -1705,16 +1890,10 @@ pub async fn serve_http(
         )
     };
     let background_lock = CortexLock::try_acquire_background(&cortex_id)?;
-    let service: StreamableHttpService<NoemaServer, LocalSessionManager> =
-        StreamableHttpService::new(
-            move || Ok(server.clone()),
-            Default::default(),
-            StreamableHttpServerConfig::default().with_allowed_hosts(allowed_http_hosts(
-                &hosts,
-                &dynamic_hosts,
-                &allowed_hosts,
-            )),
-        );
+    let http_router = build_http_tool_router(
+        &server,
+        allowed_http_hosts(&hosts, &dynamic_hosts, &allowed_hosts),
+    )?;
     let certificate_path = tls.as_ref().map(|(certificate, _)| certificate.clone());
     let tls_config = match tls {
         Some((certificate, private_key)) => Some(
@@ -1795,10 +1974,7 @@ pub async fn serve_http(
             listener.local_addr()?
         );
     }
-    let router = apply_http_middleware(
-        axum::Router::new().nest_service("/mcp", service),
-        &access_key,
-    );
+    let router = apply_http_middleware(http_router, &access_key);
     let server_handles = listeners
         .iter()
         .map(|_| axum_server::Handle::new())
@@ -2808,6 +2984,44 @@ mod tests {
     }
 
     #[test]
+    fn tool_discovery_classifies_reads_by_purpose_including_usage_tracking() {
+        let tools = NoemaServer::tool_router_for_profile("").unwrap().list_all();
+        let expected = [
+            "get_trace",
+            "search_traces",
+            "recall_context",
+            "find_similar_traces",
+            "metrics_summary",
+            "get_instructions",
+            "cortex_usage",
+            "list_traces",
+            "tag_stats",
+            "list_consolidation_candidates",
+            "consolidation_health",
+            "search_activity",
+            "trace_history",
+            "trace_lineage",
+            "cortex_identity",
+            "sync_events",
+            "sync_read_signal",
+            "federation_status",
+        ];
+        assert_eq!(tools.len(), 35);
+        for tool in tools {
+            let wire = serde_json::to_value(&tool).unwrap();
+            let read_only = wire["annotations"]["readOnlyHint"]
+                .as_bool()
+                .unwrap_or(false);
+            assert_eq!(
+                read_only,
+                expected.contains(&tool.name.as_ref()),
+                "{}",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
     fn continuity_profiles_expose_only_their_bounded_tools() {
         let full = NoemaServer::tool_router_for_profile("").unwrap();
         assert!(full.map.len() > 1);
@@ -3075,6 +3289,38 @@ mod tests {
             "The deployment color is ULTRAVIOLET"
         );
         assert!(!output.usage_recorded);
+        let cx = server.open().await.unwrap();
+        let usage = cx.local_usage_since("", 100).unwrap();
+        let row = usage.iter().find(|row| row.trace_id == fact_id).unwrap();
+        assert_eq!(row.search_hit_count, 1);
+        assert_eq!(row.read_count, 0);
+    }
+
+    #[tokio::test]
+    async fn read_hint_preserves_get_trace_usage_tracking() {
+        let temp = tempfile::tempdir().unwrap();
+        Cortex::create("test", temp.path()).unwrap();
+        let root = temp.path().join("test");
+        let cx = Cortex::open("test", &root).unwrap();
+        let mut trace = Trace::new("Example", "fact", "test", vec![], "body");
+        let id = trace.frontmatter.id.clone();
+        cx.add(&mut trace).unwrap();
+        drop(cx);
+        let server = NoemaServer::new("test", &root, false).unwrap();
+        for record_usage in [false, true, true] {
+            server
+                .get_trace(Parameters(GetParams {
+                    id: id.clone(),
+                    record_usage,
+                }))
+                .await
+                .unwrap();
+        }
+        let cx = server.open().await.unwrap();
+        let usage = cx.local_usage_since("", 100).unwrap();
+        let row = usage.iter().find(|row| row.trace_id == id).unwrap();
+        assert_eq!(row.read_count, 2);
+        assert_eq!(cx.get_trace(&id).unwrap().1.body, "body");
     }
 
     #[tokio::test]
@@ -3287,3 +3533,6 @@ mod tests {
         assert!(addresses.contains(&std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
     }
 }
+
+#[cfg(test)]
+mod http_role_tests;

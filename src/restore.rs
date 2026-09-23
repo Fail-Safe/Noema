@@ -91,6 +91,16 @@ struct RestoreTransaction {
 }
 
 pub fn backup(source: &Path, output: &Path, force: bool) -> Result<u64> {
+    let _storage_lock = crate::storage::StorageLock::acquire(source, false)?;
+    crate::storage::directory(source)?;
+    backup_without_storage_lock(source, output, force)
+}
+
+pub(crate) fn backup_without_storage_lock(
+    source: &Path,
+    output: &Path,
+    force: bool,
+) -> Result<u64> {
     let source_metadata = fs::metadata(source)
         .with_context(|| format!("reading cortex directory {}", source.display()))?;
     if !source_metadata.is_dir() {
@@ -774,6 +784,7 @@ where
     let scratch = ScratchDirectory::create()?;
     let staged_cortex = extract_archive(tarball, &scratch.path)
         .with_context(|| format!("extracting restore archive {}", tarball.display()))?;
+    crate::storage::directory(&staged_cortex).context("validating restored database storage")?;
     let mut manifest = read_manifest(&staged_cortex).context("reading cortex.md from archive")?;
     validate_name(&manifest.name).context("invalid cortex name in archive")?;
     if !manifest.id.is_empty() {
