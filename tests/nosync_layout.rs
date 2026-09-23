@@ -73,6 +73,11 @@ fn nosync_preserves_history_and_round_trips_through_backup_restore() {
             archive.to_str().unwrap(),
         ],
     );
+    let decoder = flate2::read::GzDecoder::new(fs::File::open(&archive).unwrap());
+    let mut archived = tar::Archive::new(decoder);
+    assert!(archived.entries().unwrap().all(|entry| {
+        entry.unwrap().path().unwrap() != Path::new("sample/.noema-storage.lock")
+    }));
     let destination = temp.path().join("restored");
     cli(
         &temp.path().join("restore-config"),

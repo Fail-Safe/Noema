@@ -159,9 +159,16 @@ pub fn compact(root: &Path, backup: &Path) -> Result<CompactResult> {
         before.compact_required_free_bytes,
     )?;
     checkpoint(&connection)?;
+    connection
+        .close()
+        .map_err(|(_, error)| error)
+        .context("closing database before compaction backup")?;
     crate::restore::backup_without_storage_lock(root, backup, false)
         .context("creating required compaction backup")?;
     let result = (|| -> Result<StorageStats> {
+        let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.execute_batch("PRAGMA synchronous=FULL")?;
         // The backup may share this volume, so check again after it has consumed space.
         require_headroom(
             fs2::available_space(path.parent().unwrap())?,

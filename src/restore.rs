@@ -183,6 +183,13 @@ fn append_backup_entry(
     source: &Path,
     archive_path: &Path,
 ) -> Result<()> {
+    if archive_path.components().count() == 2
+        && archive_path
+            .file_name()
+            .is_some_and(|name| name == ".noema-storage.lock")
+    {
+        return Ok(());
+    }
     let metadata = fs::symlink_metadata(source)?;
     let mut header = tar::Header::new_gnu();
     header.set_uid(0);
@@ -215,7 +222,9 @@ fn append_backup_entry(
         header.set_size(metadata.len());
         header.set_mode(metadata_mode(&metadata, 0o640));
         let mut file = File::open(source)?;
-        builder.append_data(&mut header, archive_path, &mut file)?;
+        builder
+            .append_data(&mut header, archive_path, &mut file)
+            .with_context(|| format!("archiving {}", archive_path.display()))?;
     } else if metadata.file_type().is_symlink()
         && is_legacy_trash_alias(archive_path, &fs::read_link(source)?)
     {
@@ -847,6 +856,8 @@ where
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(error) => return Err(error).context("inspecting restore destination"),
     };
+    // Recreate transient coordination state before recording the recovery hash.
+    drop(crate::storage::StorageLock::acquire(&staged_cortex, false)?);
     let restored_hash = tree_hash(&staged_cortex).context("hashing staged restored cortex")?;
     let previous_hash = existing_destination
         .then(|| tree_hash(&final_path).context("hashing existing restore destination"))

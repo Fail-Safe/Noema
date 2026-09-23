@@ -47,9 +47,10 @@ The command:
 
 1. Acquires the exclusive Noema storage lock and opens the existing database.
 2. Checks database integrity and available space.
-3. Checkpoints the WAL and creates a complete cortex backup. Existing backup files
+3. Checkpoints and closes SQLite while retaining the Noema maintenance lock, then
+   creates a complete cortex backup. Existing backup files
    are never overwritten, and backup paths inside the cortex are refused.
-4. Rechecks space after creating the backup, then runs SQLite `VACUUM`.
+4. Reopens SQLite, rechecks space after creating the backup, then runs `VACUUM`.
 5. Checks integrity again, checkpoints/truncates the WAL, and reports the result.
 
 Supported Noema clients prevent compaction while their database connection is
