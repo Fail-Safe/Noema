@@ -200,6 +200,12 @@ noema get 20260329-we-chose-local-sqlite
 noema init --name <name> [--path <dir>]   Create a new Cortex
 noema use <name>                          Set the default Cortex
 noema cortex list                         List all known Cortexes
+noema cortex storage <name> [--json]      Inspect database, WAL, and reusable-space statistics
+noema cortex storage <name> --database <default|nosync> --backup <path>
+                                          Safely change database storage with a backup
+noema cortex storage <name> --resume       Finish an interrupted storage migration
+noema cortex compact <name> --backup <path> [--json]
+                                          Compact a stopped database with backup and integrity checks
 noema cortex remove <name> [--purge] [--force]
                                           Unregister a Cortex (--purge also deletes its directory)
 noema cortex backup <name> [-o <path>] [--force]
@@ -346,6 +352,22 @@ noema version                             Print version, commit, and build date
 2. `NOEMA_CORTEX` environment variable
 3. Default set via `noema use <name>`
 
+### Database storage in iCloud Drive
+
+Use opt-in `nosync` storage to keep the database and its SQLite sidecar files in
+`db.nosync/` while Markdown traces continue syncing. The storage command creates
+a backup and safely moves an existing database. See
+[database storage](docs/database-storage.md) for enabling, reversing, recovering,
+and backing up this layout, including iCloud's parent-folder eviction limits.
+
+### Database maintenance
+
+`noema cortex storage <name>` reports database size, reusable free space, WAL size,
+and compaction headroom. Add `--json` for structured output. For deliberate
+compaction, stop clients and use `noema cortex compact <name> --backup <archive>`.
+Noema requires a complete external backup and verifies database integrity before
+and after compaction. See [database maintenance](docs/database-maintenance.md).
+
 ### Durability profiles
 
 Noema defaults to the `standard` durability profile. It matches the mutation
@@ -372,6 +394,16 @@ for measurements and the full trade-off.
 ---
 
 ## Agent Integrations
+
+MCP read-only hints describe the purpose of a tool. Retrieval tools such as
+`get_trace`, `search_traces`, `recall_context`, and `find_similar_traces` advertise
+`readOnlyHint: true` while retaining Noema's built-in access and search-hit
+tracking. These signals help Noema assess memory importance and are part of
+retrieval, not a separate operation agents must remember to perform. The existing
+`record_usage` argument controls explicit read counts; it does not change the
+read hint or disable automatic search-hit tracking. Read hints do not promise
+zero database writes: internal metrics and metrics retention also continue.
+Tools that can explicitly change trace content, tags, or lifecycle remain writes.
 
 `noema integrate` connects a Cortex to supported coding agents and installs the
 small startup bootstrap that tells each agent to call `get_instructions`. An MCP
@@ -555,10 +587,29 @@ Noema can run as an [MCP](https://modelcontextprotocol.io) server, giving any MC
 
 Call `get_instructions` first in any new agent session for concise Markdown guidance. Use `cortex_usage` when a client needs structured JSON context. MCP tool discovery and each tool's schema remain the authoritative callable tool reference.
 
-Set `NOEMA_MCP_TOOL_PROFILE=continuity-read` on an MCP server process to expose only
-`recall_context`, or `NOEMA_MCP_TOOL_PROFILE=continuity-capture` to expose only
-`get_instructions` and `create_traces`. These opt-in profiles reduce model-facing tool schemas for
-bounded continuity tasks; the default remains the full tool set.
+HTTP servers expose the full tool set at `/mcp` and optional role endpoints:
+
+| Endpoint | Tool set |
+| --- | --- |
+| `/mcp` | All tools, including future additions; existing clients remain compatible |
+| `/mcp/agent` | Everyday memory retrieval, capture, editing, tagging, voting, and lifecycle tools |
+| `/mcp/maintainer` | Agent tools plus tag cleanup and operational diagnostics |
+| `/mcp/curator` | Agent tools plus consolidation candidates and distilled-memory creation |
+| `/mcp/federation` | Cortex identity, event exchange, and usage-signal exchange |
+
+All endpoints share the same cortex and usage tracking. Role endpoints enforce
+explicit tool allowlists for both discovery and execution; they share the existing
+authentication and are not separate authorization roles. Existing clients and
+federation peers can keep using `/mcp`. See [MCP tool endpoints](docs/mcp-endpoints.md)
+for exact tool sets and configuration.
+
+For **stdio** servers, `NOEMA_MCP_TOOL_PROFILE` accepts `full` (the default),
+`agent`, `maintainer`, `curator`, or `federation`. The existing bounded profiles
+remain available: `continuity-read` exposes only `recall_context`, and
+`continuity-capture` exposes only `get_instructions` and `create_traces`.
+HTTP servers reject a restricted `NOEMA_MCP_TOOL_PROFILE` at startup; unset it
+and choose a role URL instead. This prevents an existing restricted configuration
+from silently widening access when `/mcp` becomes the full interface.
 
 ### stdio (Claude Desktop, Claude Code, any MCP client)
 
