@@ -1770,7 +1770,19 @@ struct DynamicListener {
     task: tokio::task::JoinHandle<Result<()>>,
 }
 
-fn bind_static_listeners(hosts: &[String], port: u16) -> Result<Vec<std::net::TcpListener>> {
+async fn bind_static_listeners(hosts: &[String], port: u16) -> Result<Vec<std::net::TcpListener>> {
+    bind_static_listeners_with(hosts, port, std::time::Duration::from_secs(30), |address| {
+        std::net::TcpListener::bind(address)
+    })
+    .await
+}
+
+async fn bind_static_listeners_with(
+    hosts: &[String],
+    port: u16,
+    timeout: std::time::Duration,
+    mut bind: impl FnMut(std::net::SocketAddr) -> std::io::Result<std::net::TcpListener>,
+) -> Result<Vec<std::net::TcpListener>> {
     let mut addresses = Vec::new();
     let mut seen = HashSet::new();
     for host in hosts {
@@ -1789,12 +1801,47 @@ fn bind_static_listeners(hosts: &[String], port: u16) -> Result<Vec<std::net::Tc
         }
     }
 
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut listeners = Vec::with_capacity(addresses.len());
-    for (host, address) in addresses {
-        let listener = std::net::TcpListener::bind(address)
-            .with_context(|| format!("binding static address {host} ({address})"))?;
-        listener.set_nonblocking(true)?;
-        listeners.push(listener);
+    let mut first_attempt = true;
+    while !addresses.is_empty() {
+        let mut pending = Vec::new();
+        for (host, address) in addresses {
+            match bind(address) {
+                Ok(listener) => {
+                    listener.set_nonblocking(true)?;
+                    listeners.push(listener);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "binding static address {host} ({address}): local address still unavailable after {timeout:?} startup wait"
+                            )
+                        });
+                    }
+                    if first_attempt {
+                        eprintln!(
+                            "[serve] waiting up to {timeout:?} for local static address {host} ({address}) to become available"
+                        );
+                    }
+                    pending.push((host, address));
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("binding static address {host} ({address})"));
+                }
+            }
+        }
+        if pending.is_empty() {
+            break;
+        }
+        first_attempt = false;
+        addresses = pending;
+        tokio::time::sleep_until(
+            deadline.min(tokio::time::Instant::now() + std::time::Duration::from_secs(1)),
+        )
+        .await;
     }
     Ok(listeners)
 }
@@ -1901,7 +1948,7 @@ pub async fn serve_http(
         ),
         None => None,
     };
-    let listeners = bind_static_listeners(&hosts, port)?;
+    let listeners = bind_static_listeners(&hosts, port).await?;
     let cancellation = CancellationToken::new();
     let registry = Arc::new(crate::consolidation::InFlightRegistry::default());
     let (scheduler, eligibility, cadence, watchdog, watcher, embedder) =
@@ -2457,7 +2504,9 @@ fn build_cortex_usage(cortex: &Cortex) -> Result<CortexUsageOutput> {
             "embedding_endpoint_configured":!manifest.resolved_embedding_endpoint()?.is_empty(),
             "embedding_model_configured":search.is_some_and(|config| !config.embedding_model.is_empty()),
             "hybrid_weight":hybrid_weight,
-            "max_chars":max_chars
+            "max_chars":max_chars,
+            "max_tokens":search.map(|config| config.max_tokens).unwrap_or(0),
+            "tokenizer_path":search.map(|config| config.tokenizer_path.as_str()).unwrap_or("")
         })),
         workflows: value_object(json!({
             "read":[
@@ -3496,14 +3545,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn static_listener_binding_covers_every_resolved_address() {
+    #[tokio::test]
+    async fn static_listener_binding_covers_every_resolved_address() {
         let expected = ("localhost", 0)
             .to_socket_addrs()
             .unwrap()
             .map(|address| address.ip())
             .collect::<HashSet<_>>();
-        let listeners = bind_static_listeners(&["localhost".to_owned()], 0).unwrap();
+        let listeners = bind_static_listeners(&["localhost".to_owned()], 0)
+            .await
+            .unwrap();
         let actual = listeners
             .iter()
             .map(|listener| listener.local_addr().unwrap().ip())
@@ -3513,10 +3564,11 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    #[test]
-    fn static_listener_binding_deduplicates_repeated_addresses() {
-        let listeners =
-            bind_static_listeners(&["127.0.0.1".to_owned(), "127.0.0.1".to_owned()], 0).unwrap();
+    #[tokio::test]
+    async fn static_listener_binding_deduplicates_repeated_addresses() {
+        let listeners = bind_static_listeners(&["127.0.0.1".to_owned(), "127.0.0.1".to_owned()], 0)
+            .await
+            .unwrap();
 
         assert_eq!(listeners.len(), 1);
         assert_eq!(
@@ -3531,6 +3583,94 @@ mod tests {
         let addresses = local_interface_addresses().unwrap();
         assert!(addresses.contains(&std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)));
         assert!(addresses.contains(&std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
+    }
+
+    #[tokio::test]
+    async fn static_listener_binding_recovers_without_rebinding_ready_addresses() {
+        let hosts = ["127.0.0.1".to_owned(), "192.0.2.10".to_owned()];
+        let mut attempts = Vec::new();
+        let listeners =
+            bind_static_listeners_with(&hosts, 0, std::time::Duration::from_secs(2), |address| {
+                attempts.push(address.ip());
+                if attempts.len() == 2 {
+                    return Err(std::io::ErrorKind::AddrNotAvailable.into());
+                }
+                std::net::TcpListener::bind("127.0.0.1:0")
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(listeners.len(), 2);
+        assert_eq!(attempts.len(), 3);
+        assert_eq!(attempts[1], attempts[2]);
+        assert_ne!(attempts[0], attempts[1]);
+    }
+
+    #[tokio::test]
+    async fn static_listener_binding_timeout_releases_ready_listeners() {
+        let hosts = [
+            "127.0.0.1".to_owned(),
+            "192.0.2.10".to_owned(),
+            "192.0.2.11".to_owned(),
+        ];
+        let mut ready_address = None;
+        let mut unavailable_attempts = 0;
+        let error = bind_static_listeners_with(
+            &hosts,
+            0,
+            std::time::Duration::from_millis(20),
+            |address| {
+                if address.ip().is_loopback() {
+                    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+                    ready_address = Some(listener.local_addr()?);
+                    Ok(listener)
+                } else {
+                    unavailable_attempts += 1;
+                    Err(std::io::ErrorKind::AddrNotAvailable.into())
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(unavailable_attempts >= 3);
+        assert!(error.to_string().contains("after 20ms startup wait"));
+        assert!(error.to_string().contains("192.0.2.10"));
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::AddrNotAvailable
+        );
+        std::net::TcpListener::bind(ready_address.unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn static_listener_binding_does_not_retry_other_errors() {
+        for kind in [
+            std::io::ErrorKind::AddrInUse,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let mut attempts = 0;
+            let error = bind_static_listeners_with(
+                &["192.0.2.10".to_owned(), "127.0.0.1".to_owned()],
+                0,
+                std::time::Duration::from_secs(30),
+                |_| {
+                    attempts += 1;
+                    Err(if attempts == 1 {
+                        std::io::ErrorKind::AddrNotAvailable
+                    } else {
+                        kind
+                    }
+                    .into())
+                },
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(attempts, 2);
+            assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), kind);
+            assert!(error.to_string().contains("127.0.0.1"));
+        }
     }
 }
 

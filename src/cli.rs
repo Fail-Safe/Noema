@@ -1226,6 +1226,8 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
                 println!("  embedded (up-to-date): {}", status.embedded);
                 println!("  stale (changed or other model): {}", status.stale);
                 println!("  missing: {}", status.missing);
+                println!("  truncated (up-to-date): {}", status.truncated);
+                println!("  deferred (retry cooldown): {}", status.deferred);
             }
             EmbeddingCommand::Backfill { force, limit } => {
                 let (client, model, _) = semantic_client(cx)?;
@@ -1250,9 +1252,24 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
                     )
                     .await?;
                 println!(
-                    "Done: {} considered, {} embedded.",
-                    result.considered, result.embedded
+                    "Done: {} considered, {} embedded, {} truncated, {} failed, {} deferred by cooldown.",
+                    result.considered,
+                    result.embedded,
+                    result.truncated,
+                    result.failures.len(),
+                    result.deferred
                 );
+                for failure in &result.failures {
+                    eprintln!(
+                        "  trace {}: {}; retry after {}",
+                        failure.trace_id, failure.reason, failure.retry_after
+                    );
+                }
+                if !result.failures.is_empty() || result.deferred > 0 {
+                    bail!(
+                        "embedding coverage incomplete; successful embeddings were saved. Retry after cooldown or use --force after correcting the input policy/server limits"
+                    );
+                }
             }
         },
         Command::Tui { theme } => {
