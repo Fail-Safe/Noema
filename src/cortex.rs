@@ -29,6 +29,8 @@ use crate::{
     trace::{self, Trace},
 };
 
+mod embedding_backfill;
+
 pub const MANIFEST_VERSION: u32 = 2;
 pub const MAX_SEARCH_QUERY_LEN: usize = 1000;
 pub const ACCESS_KEY_ENV: &str = "NOEMA_MCP_KEY";
@@ -369,6 +371,10 @@ pub struct SearchConfig {
     #[serde(default)]
     pub max_chars: usize,
     #[serde(default)]
+    pub max_tokens: usize,
+    #[serde(default)]
+    pub tokenizer_path: String,
+    #[serde(default)]
     pub embed_interval_seconds: u64,
 }
 
@@ -506,6 +512,8 @@ pub struct EmbeddingStatus {
     pub embedded: usize,
     pub stale: usize,
     pub missing: usize,
+    pub truncated: usize,
+    pub deferred: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -520,6 +528,16 @@ pub struct EmbedBackfillOptions {
 pub struct EmbedBackfillResult {
     pub considered: usize,
     pub embedded: usize,
+    pub truncated: usize,
+    pub deferred: usize,
+    pub failures: Vec<EmbedFailure>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbedFailure {
+    pub trace_id: String,
+    pub reason: String,
+    pub retry_after: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2461,138 +2479,6 @@ impl Cortex {
             })
             .collect();
         Ok(report)
-    }
-
-    pub fn embedding_status(&self, model: &str) -> Result<EmbeddingStatus> {
-        let embeddable: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM traces WHERE trashed_at IS NULL",
-            [],
-            |row| row.get(0),
-        )?;
-        let with_row: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM traces t JOIN trace_embeddings te ON te.trace_id=t.id WHERE t.trashed_at IS NULL",
-            [],
-            |row| row.get(0),
-        )?;
-        let embedded: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM traces t JOIN trace_embeddings te ON te.trace_id=t.id
-             WHERE t.trashed_at IS NULL AND te.embedding_model=?1 AND te.source_hash=t.content_hash",
-            [model],
-            |row| row.get(0),
-        )?;
-        Ok(EmbeddingStatus {
-            model: model.to_owned(),
-            embeddable: embeddable as usize,
-            embedded: embedded as usize,
-            stale: (with_row - embedded) as usize,
-            missing: (embeddable - with_row) as usize,
-        })
-    }
-
-    pub async fn embed_backfill(
-        &mut self,
-        embedder: &HttpEmbedder,
-        model: &str,
-        options: &EmbedBackfillOptions,
-    ) -> Result<EmbedBackfillResult> {
-        if model.is_empty() {
-            bail!("embedding model is empty");
-        }
-        let batch_size = if options.batch_size == 0 {
-            64
-        } else {
-            options.batch_size
-        };
-        let max_chars = if options.max_chars == 0 {
-            32_000
-        } else {
-            options.max_chars
-        };
-        let mut sql = String::from(
-            "SELECT t.id,COALESCE(t.content_hash,'') FROM traces t
-             LEFT JOIN trace_embeddings te ON te.trace_id=t.id
-             WHERE t.trashed_at IS NULL",
-        );
-        let mut values = Vec::new();
-        if !options.force {
-            sql.push_str(
-                " AND (te.trace_id IS NULL OR te.embedding_model!=? OR te.source_hash!=t.content_hash OR t.content_hash IS NULL OR t.content_hash='')",
-            );
-            values.push(Value::Text(model.to_owned()));
-        }
-        sql.push_str(" ORDER BY t.created_at");
-        if options.limit > 0 {
-            sql.push_str(" LIMIT ?");
-            values.push(Value::Integer(options.limit as i64));
-        }
-        let candidates = {
-            let mut statement = self.connection.prepare(&sql)?;
-            statement
-                .query_map(params_from_iter(values), |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let mut result = EmbedBackfillResult {
-            considered: candidates.len(),
-            ..Default::default()
-        };
-        let updated_at = trace::now_rfc3339();
-        for batch in candidates.chunks(batch_size) {
-            let mut inputs = Vec::with_capacity(batch.len());
-            let mut ids = Vec::with_capacity(batch.len());
-            let mut hashes = Vec::with_capacity(batch.len());
-            for (id, indexed_hash) in batch {
-                let Ok((row, parsed)) = self.get_trace(id) else {
-                    continue;
-                };
-                let source_hash = if indexed_hash.is_empty() {
-                    let hash = trace::content_hash(&parsed.body);
-                    self.connection.execute(
-                        "UPDATE traces SET content_hash=?1 WHERE id=?2 AND (content_hash IS NULL OR content_hash='')",
-                        params![hash, id],
-                    )?;
-                    hash
-                } else {
-                    indexed_hash.clone()
-                };
-                inputs.push(embedding::text(&row.title, &parsed.body, max_chars));
-                ids.push(id.clone());
-                hashes.push(source_hash);
-            }
-            if inputs.is_empty() {
-                continue;
-            }
-            let vectors = embedder
-                .embed(model, &inputs)
-                .await
-                .context("embed batch")?;
-            if vectors.len() != inputs.len() {
-                bail!(
-                    "embedder returned {} vectors for {} inputs",
-                    vectors.len(),
-                    inputs.len()
-                );
-            }
-            let tx = self.connection.unchecked_transaction()?;
-            for ((id, source_hash), mut vector) in ids.iter().zip(&hashes).zip(vectors) {
-                embedding::normalize(&mut vector);
-                tx.execute(
-                    "INSERT INTO trace_embeddings(trace_id,embedding_model,dim,embedding,source_hash,updated_at)
-                     VALUES (?1,?2,?3,?4,?5,?6)
-                     ON CONFLICT(trace_id) DO UPDATE SET
-                       embedding_model=excluded.embedding_model,
-                       dim=excluded.dim,
-                       embedding=excluded.embedding,
-                       source_hash=excluded.source_hash,
-                       updated_at=excluded.updated_at",
-                    params![id, model, vector.len() as i64, embedding::encode(&vector), source_hash, updated_at],
-                )?;
-                result.embedded += 1;
-            }
-            tx.commit()?;
-        }
-        Ok(result)
     }
 
     pub async fn semantic_search(

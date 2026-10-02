@@ -832,7 +832,9 @@ search:
                                              # inherits consolidation.local_llm_endpoint if unset
   # default_mode: hybrid    # lexical | semantic | hybrid (default lexical)
   # hybrid_weight: 0.5      # vector weight in hybrid fusion (0..1)
-  # max_chars: 32000        # per-trace embed-text budget; lower for small-context models
+  # max_chars: 32000        # character ceiling for title + body; not a token limit
+  # max_tokens: 2048        # optional exact token budget, including special tokens
+  # tokenizer_path: /tokenize # optional same-server llama.cpp-compatible tokenizer path
 ```
 
 Then build the index and search:
@@ -846,6 +848,42 @@ noema similar <id> --semantic
 ```
 
 Over MCP, `search_traces` and `find_similar_traces` take a `mode` arg (`lexical` | `semantic` | `hybrid`). If semantic search isn't configured or the embedding endpoint is unreachable, both **degrade to lexical results with a note** rather than erroring. Under `noema serve`, a background maintainer re-embeds new and edited traces on an interval, so the index stays fresh without a manual backfill.
+
+`max_tokens` defaults to `0` (no proactive tokenization). When configured, Noema
+counts the complete embedding input with the serving model's tokenizer and trims
+a Unicode-safe prefix to fit. The tokenizer must implement llama.cpp's
+`POST /tokenize` contract, including `add_special: true`. By default Noema derives
+that path from the embedding endpoint, removing a trailing `/v1`; a custom
+`tokenizer_path` stays on the same server. Character counts are never treated as
+token counts. Unsupported tokenization with an explicit budget is a configuration
+error, not an excuse to send unchecked input.
+
+Recognized context-size and physical-batch-size rejections split a failed batch
+to isolate the oversized trace while saving successful neighbors. An isolated
+oversized input uses the server tokenizer to fit the reported context limit;
+when the server omits a usable limit, recovery halves the measured token budget
+with at most eight embedding retries. This changes only the derived embedding
+input, never the stored trace. Providers without compatible tokenization leave
+that trace unembedded and report the reason. Unrecognized errors, authentication
+failures, and outages stop the pass; they are not treated as oversized traces.
+Provider error bodies are not printed.
+
+Unrecoverable size failures have a one-hour cooldown. Backfill applies that
+cooldown **before** `--limit`, allowing later traces to progress. A trace edit,
+model change, or preparation-policy change makes it eligible immediately;
+`--force` bypasses cooldown and rebuilds all selected embeddings. The CLI reports
+individual failures and exits unsuccessfully when failures or active deferrals
+remain, even though successful embeddings have been saved.
+
+`embeddings status` reports truncated current embeddings and active deferrals.
+Each vector records its input hash, measured token count when available, title,
+and preparation policy. Changes to the endpoint, character/token budget, or
+tokenizer path mark existing vectors stale. Vectors created before this metadata
+was introduced also become stale and are rebuilt by the next backfill. If the
+model artifact or server limits change behind the same endpoint/model name, use
+`--force` to regenerate previously truncated vectors. A truncated vector covers
+only the retained prefix; later sections remain in the original trace and lexical
+index, but have no separate semantic vectors.
 
 ---
 
