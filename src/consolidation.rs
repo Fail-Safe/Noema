@@ -19,7 +19,7 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use rand::TryRngCore;
+use rand::TryRng;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -124,7 +124,7 @@ fn get_rank(cx: &Cortex, key: &str) -> Result<RankEntry> {
 }
 
 pub fn generate_rank() -> Result<u8> {
-    let mut rng = rand::rngs::OsRng;
+    let mut rng = rand::rngs::SysRng;
     loop {
         let mut sample = [0_u8; 1];
         rng.try_fill_bytes(&mut sample)?;
