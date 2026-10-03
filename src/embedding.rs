@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf, time::Duration};
+use std::{env, fmt, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -41,7 +41,6 @@ impl Maintainer {
                 return None;
             }
         };
-        let max_chars = search.effective_max_chars();
         let interval = Duration::from_secs(if search.embed_interval_seconds == 0 {
             300
         } else {
@@ -58,20 +57,21 @@ impl Maintainer {
                             cortex.embed_backfill(
                                 &client,
                                 &model,
-                                &EmbedBackfillOptions {
-                                    max_chars,
-                                    ..Default::default()
-                                },
+                                &EmbedBackfillOptions::default(),
                             ).await
                         };
                         tokio::select! {
                             _ = cancellation.cancelled() => break,
                             result = result => match result {
-                                Ok(result) if result.embedded > 0 => {
-                                    eprintln!("[embed] embedded {} trace(s)", result.embedded);
+                                Ok(result) if result.embedded > 0 || !result.failures.is_empty() => {
+                                    eprintln!("[embed] embedded {} trace(s), {} truncated, {} failed, {} deferred",
+                                        result.embedded, result.truncated, result.failures.len(), result.deferred);
+                                    for failure in result.failures {
+                                        eprintln!("[embed] trace {}: {}; retry after {}", failure.trace_id, failure.reason, failure.retry_after);
+                                    }
                                 }
                                 Ok(_) => {}
-                                Err(_) => eprintln!("[embed] backfill pass failed"),
+                                Err(error) => eprintln!("[embed] backfill pass failed: {error}"),
                             }
                         }
                     }
@@ -108,8 +108,86 @@ struct EmbeddingData {
 
 #[derive(Deserialize)]
 struct ProviderError {
-    #[serde(default, rename = "message")]
-    _message: String,
+    #[serde(default)]
+    message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeLimit {
+    Context,
+    PhysicalBatch,
+}
+
+#[derive(Debug, Clone)]
+pub struct InputSizeError {
+    pub kind: SizeLimit,
+    pub tokens: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+impl fmt::Display for InputSizeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self.kind {
+            SizeLimit::Context => "embedding input exceeds the server context limit",
+            SizeLimit::PhysicalBatch => {
+                "embedding input exceeds the server physical batch size (n_ubatch / --ubatch-size)"
+            }
+        })?;
+        if let Some(tokens) = self.tokens {
+            write!(f, "; input_tokens={tokens}")?;
+        }
+        if let Some(limit) = self.limit {
+            write!(f, "; limit={limit}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for InputSizeError {}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "embedding server has no compatible /tokenize endpoint; configure search.tokenizer_path or raise the server's supported input limits"
+)]
+pub struct TokenizerUnavailable;
+
+#[derive(Debug, Clone)]
+pub struct PreparedInput {
+    pub text: String,
+    pub tokens: Option<usize>,
+    pub truncated: bool,
+}
+
+// Only known size diagnostics and their numeric fields may leave a provider
+// response. Provider messages can contain the input itself or credentials.
+fn input_size_error(status: reqwest::StatusCode, message: &str) -> Option<InputSizeError> {
+    let message = message.to_ascii_lowercase();
+    let kind = if matches!(status.as_u16(), 400 | 413 | 422)
+        && (message.contains("larger than the max context size")
+            || message.contains("exceeds the available context size")
+            || message.contains("maximum context length"))
+    {
+        SizeLimit::Context
+    } else if matches!(status.as_u16(), 400 | 500)
+        && message.contains("increase the physical batch size")
+    {
+        SizeLimit::PhysicalBatch
+    } else {
+        return None;
+    };
+    fn number(message: &str, pattern: &str) -> Option<usize> {
+        regex::Regex::new(pattern).ok()?.captures(message)?[1]
+            .parse()
+            .ok()
+    }
+    Some(InputSizeError {
+        kind,
+        tokens: number(&message, r"input \((\d+) tokens\)"),
+        limit: number(
+            &message,
+            r"(?:max context size|available context size|maximum context length)(?: is)?[ :\(]+(\d+)",
+        ),
+    })
 }
 
 impl HttpEmbedder {
@@ -144,6 +222,145 @@ impl HttpEmbedder {
         Ok(output)
     }
 
+    pub fn preparation_key(
+        &self,
+        max_chars: usize,
+        max_tokens: usize,
+        tokenizer_path: &str,
+    ) -> String {
+        preparation_key(&self.endpoint, max_chars, max_tokens, tokenizer_path)
+    }
+
+    fn tokenizer_url(&self, path: &str) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(&self.endpoint)?;
+        if path.is_empty() {
+            let base = url.path().trim_end_matches('/').trim_end_matches("/v1");
+            url.set_path(&format!("{base}/tokenize"));
+        } else {
+            if !path.starts_with('/') || path.starts_with("//") || path.contains(['?', '#']) {
+                bail!("search.tokenizer_path must be an absolute path on the embedding server");
+            }
+            url.set_path(path);
+        }
+        url.set_query(None);
+        url.set_fragment(None);
+        Ok(url)
+    }
+
+    pub async fn token_count(&self, input: &str, tokenizer_path: &str) -> Result<usize> {
+        let mut request = self
+            .client
+            .post(self.tokenizer_url(tokenizer_path)?)
+            .json(&serde_json::json!({"content":input,"add_special":true,"parse_special":true}));
+        if !self.api_key.is_empty() {
+            request = request.bearer_auth(&self.api_key);
+        }
+        let response = request
+            .send()
+            .await
+            .context("posting tokenization request")?;
+        let status = response.status();
+        if matches!(status.as_u16(), 404 | 405 | 501) {
+            return Err(TokenizerUnavailable.into());
+        }
+        if !status.is_success() {
+            bail!("tokenization endpoint returned {status}");
+        }
+        #[derive(Deserialize)]
+        struct Tokens {
+            tokens: Vec<u32>,
+        }
+        let parsed: Tokens = response
+            .json()
+            .await
+            .map_err(|_| anyhow::anyhow!("tokenization endpoint returned an invalid response"))?;
+        Ok(parsed.tokens.len())
+    }
+
+    pub async fn fit_input(
+        &self,
+        input: &mut PreparedInput,
+        budget: usize,
+        tokenizer_path: &str,
+    ) -> Result<()> {
+        if budget == 0 {
+            bail!("embedding token budget must be positive");
+        }
+        let count = match input.tokens {
+            Some(count) => count,
+            None => self.token_count(&input.text, tokenizer_path).await?,
+        };
+        input.tokens = Some(count);
+        if count <= budget {
+            return Ok(());
+        }
+        let boundaries: Vec<usize> = input
+            .text
+            .char_indices()
+            .map(|(offset, _)| offset)
+            .chain(std::iter::once(input.text.len()))
+            .collect();
+        let (mut low, mut high) = (0, boundaries.len() - 1);
+        let mut best = None;
+        while low + 1 < high {
+            let mid = low + (high - low) / 2;
+            let tokens = self
+                .token_count(&input.text[..boundaries[mid]], tokenizer_path)
+                .await?;
+            if tokens <= budget {
+                best = Some((boundaries[mid], tokens));
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        let Some((end, tokens)) = best else {
+            return Err(InputSizeError {
+                kind: SizeLimit::Context,
+                tokens: Some(count),
+                limit: Some(budget),
+            }
+            .into());
+        };
+        input.text.truncate(end);
+        input.tokens = Some(tokens);
+        input.truncated = true;
+        Ok(())
+    }
+
+    pub async fn recover_input(
+        &self,
+        model: &str,
+        input: &mut PreparedInput,
+        mut error: InputSizeError,
+        tokenizer_path: &str,
+    ) -> Result<Vec<f32>> {
+        // Bound recovery even if a provider reports inconsistent limits.
+        for _ in 0..8 {
+            let count = match input.tokens {
+                Some(count) => count,
+                None => self.token_count(&input.text, tokenizer_path).await?,
+            };
+            input.tokens = Some(count);
+            let budget = match error.limit {
+                Some(limit) if limit < count => limit,
+                _ => count / 2,
+            };
+            if budget == 0 {
+                break;
+            }
+            self.fit_input(input, budget, tokenizer_path).await?;
+            match self.embed(model, std::slice::from_ref(&input.text)).await {
+                Ok(mut vectors) => return Ok(vectors.remove(0)),
+                Err(next) => match next.downcast_ref::<InputSizeError>() {
+                    Some(size) => error = size.clone(),
+                    None => return Err(next),
+                },
+            }
+        }
+        Err(error.into())
+    }
+
     async fn embed_batch(&self, model: &str, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
         let mut request = self
             .client
@@ -164,13 +381,16 @@ impl HttpEmbedder {
         let parsed = serde_json::from_slice::<EmbeddingResponse>(&bytes);
         if !status.is_success() {
             if let Ok(parsed) = parsed
-                && parsed.error.is_some()
+                && let Some(error) = parsed.error
+                && let Some(error) = input_size_error(status, &error.message)
             {
-                bail!("embeddings endpoint returned {status}");
+                return Err(anyhow::Error::new(error)
+                    .context(format!("embeddings endpoint returned {status}")));
             }
             bail!("embeddings endpoint returned {status}");
         }
-        let parsed = parsed.context("parsing embeddings response")?;
+        let parsed = parsed
+            .map_err(|_| anyhow::anyhow!("embedding endpoint returned an invalid response"))?;
         if parsed.error.is_some() {
             bail!("embeddings endpoint returned an error");
         }
@@ -193,6 +413,24 @@ impl HttpEmbedder {
         }
         Ok(vectors)
     }
+}
+
+pub fn preparation_key(
+    endpoint: &str,
+    max_chars: usize,
+    max_tokens: usize,
+    tokenizer_path: &str,
+) -> String {
+    crate::trace::content_hash(
+        &serde_json::json!([
+            "token-budget-v1",
+            endpoint.trim_end_matches('/'),
+            max_chars,
+            max_tokens,
+            tokenizer_path
+        ])
+        .to_string(),
+    )
 }
 
 fn indices_are_permutation(data: &[EmbeddingData], count: usize) -> bool {
@@ -345,5 +583,51 @@ mod tests {
     fn unkeyed_remote_http_remains_allowed() {
         let endpoint = reqwest::Url::parse("http://embeddings.example/v1").unwrap();
         ensure_keyed_endpoint_is_encrypted(&endpoint, false).unwrap();
+    }
+
+    #[test]
+    fn size_diagnostics_only_expose_known_numeric_fields() {
+        let error = input_size_error(reqwest::StatusCode::BAD_REQUEST,
+            "input (8533 tokens) is larger than the max context size (2048): private-input secret=abc"
+        ).unwrap();
+        assert_eq!(error.kind, SizeLimit::Context);
+        assert_eq!((error.tokens, error.limit), (Some(8533), Some(2048)));
+        assert!(!error.to_string().contains("private-input"));
+        assert!(!error.to_string().contains("abc"));
+        assert!(
+            input_size_error(
+                reqwest::StatusCode::UNAUTHORIZED,
+                "input (8533 tokens) is larger than the max context size (2048)"
+            )
+            .is_none()
+        );
+        assert!(
+            input_size_error(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                "backend unavailable: private-input"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn tokenizer_paths_keep_input_and_credentials_on_the_embedding_origin() {
+        let client = HttpEmbedder::new("https://embeddings.example/proxy/v1", "").unwrap();
+        assert_eq!(
+            client.tokenizer_url("").unwrap().as_str(),
+            "https://embeddings.example/proxy/tokenize"
+        );
+        assert_eq!(
+            client.tokenizer_url("/custom/tokenize").unwrap().as_str(),
+            "https://embeddings.example/custom/tokenize"
+        );
+        for path in [
+            "https://other.example/tokenize",
+            "//other.example/tokenize",
+            "/tokenize?key=secret",
+            "/tokenize#fragment",
+        ] {
+            assert!(client.tokenizer_url(path).is_err());
+        }
     }
 }

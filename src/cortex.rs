@@ -29,6 +29,8 @@ use crate::{
     trace::{self, Trace},
 };
 
+mod embedding_backfill;
+
 pub const MANIFEST_VERSION: u32 = 2;
 pub const MAX_SEARCH_QUERY_LEN: usize = 1000;
 pub const ACCESS_KEY_ENV: &str = "NOEMA_MCP_KEY";
@@ -369,6 +371,10 @@ pub struct SearchConfig {
     #[serde(default)]
     pub max_chars: usize,
     #[serde(default)]
+    pub max_tokens: usize,
+    #[serde(default)]
+    pub tokenizer_path: String,
+    #[serde(default)]
     pub embed_interval_seconds: u64,
 }
 
@@ -506,6 +512,8 @@ pub struct EmbeddingStatus {
     pub embedded: usize,
     pub stale: usize,
     pub missing: usize,
+    pub truncated: usize,
+    pub deferred: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -520,6 +528,16 @@ pub struct EmbedBackfillOptions {
 pub struct EmbedBackfillResult {
     pub considered: usize,
     pub embedded: usize,
+    pub truncated: usize,
+    pub deferred: usize,
+    pub failures: Vec<EmbedFailure>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbedFailure {
+    pub trace_id: String,
+    pub reason: String,
+    pub retry_after: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -791,8 +809,9 @@ pub struct Cortex {
     pub id: String,
     pub name: String,
     pub dir: PathBuf,
+    pub db_dir: PathBuf,
     pub manifest: Manifest,
-    connection: Connection,
+    connection: db::Database,
     force_source_lock: bool,
     signing_key: Option<SigningKey>,
     durability: DurabilityProfile,
@@ -1014,7 +1033,8 @@ pub fn inspect_recovery_status(dir: &Path) -> RecoveryStatus {
 }
 
 fn inspect_recovery_status_inner(dir: &Path) -> Result<RecoveryStatus> {
-    let database_path = dir.join("db/noema.db");
+    let _storage_lock = crate::storage::StorageLock::acquire(dir, false)?;
+    let database_path = db::directory(dir)?.join("noema.db");
     if !fs::metadata(&database_path)?.is_file() {
         bail!("cortex database is not a regular file")
     }
@@ -1132,11 +1152,13 @@ impl Cortex {
             );
         }
         let connection = db::open(&dir)?;
+        let db_dir = db::directory(&dir)?;
         let signing_key = load_signing_key(&dir, &manifest)?;
         let mut cortex = Self {
             id: manifest.id.clone(),
             name,
             dir,
+            db_dir,
             manifest,
             connection,
             force_source_lock: false,
@@ -1742,7 +1764,7 @@ impl Cortex {
     }
 
     fn pending_mutation_lock_directory(&self) -> PathBuf {
-        self.dir.join("db/pending-mutations")
+        self.db_dir.join("pending-mutations")
     }
 
     pub fn resolve(name_override: Option<&str>) -> Result<Self> {
@@ -2457,138 +2479,6 @@ impl Cortex {
             })
             .collect();
         Ok(report)
-    }
-
-    pub fn embedding_status(&self, model: &str) -> Result<EmbeddingStatus> {
-        let embeddable: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM traces WHERE trashed_at IS NULL",
-            [],
-            |row| row.get(0),
-        )?;
-        let with_row: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM traces t JOIN trace_embeddings te ON te.trace_id=t.id WHERE t.trashed_at IS NULL",
-            [],
-            |row| row.get(0),
-        )?;
-        let embedded: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM traces t JOIN trace_embeddings te ON te.trace_id=t.id
-             WHERE t.trashed_at IS NULL AND te.embedding_model=?1 AND te.source_hash=t.content_hash",
-            [model],
-            |row| row.get(0),
-        )?;
-        Ok(EmbeddingStatus {
-            model: model.to_owned(),
-            embeddable: embeddable as usize,
-            embedded: embedded as usize,
-            stale: (with_row - embedded) as usize,
-            missing: (embeddable - with_row) as usize,
-        })
-    }
-
-    pub async fn embed_backfill(
-        &mut self,
-        embedder: &HttpEmbedder,
-        model: &str,
-        options: &EmbedBackfillOptions,
-    ) -> Result<EmbedBackfillResult> {
-        if model.is_empty() {
-            bail!("embedding model is empty");
-        }
-        let batch_size = if options.batch_size == 0 {
-            64
-        } else {
-            options.batch_size
-        };
-        let max_chars = if options.max_chars == 0 {
-            32_000
-        } else {
-            options.max_chars
-        };
-        let mut sql = String::from(
-            "SELECT t.id,COALESCE(t.content_hash,'') FROM traces t
-             LEFT JOIN trace_embeddings te ON te.trace_id=t.id
-             WHERE t.trashed_at IS NULL",
-        );
-        let mut values = Vec::new();
-        if !options.force {
-            sql.push_str(
-                " AND (te.trace_id IS NULL OR te.embedding_model!=? OR te.source_hash!=t.content_hash OR t.content_hash IS NULL OR t.content_hash='')",
-            );
-            values.push(Value::Text(model.to_owned()));
-        }
-        sql.push_str(" ORDER BY t.created_at");
-        if options.limit > 0 {
-            sql.push_str(" LIMIT ?");
-            values.push(Value::Integer(options.limit as i64));
-        }
-        let candidates = {
-            let mut statement = self.connection.prepare(&sql)?;
-            statement
-                .query_map(params_from_iter(values), |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let mut result = EmbedBackfillResult {
-            considered: candidates.len(),
-            ..Default::default()
-        };
-        let updated_at = trace::now_rfc3339();
-        for batch in candidates.chunks(batch_size) {
-            let mut inputs = Vec::with_capacity(batch.len());
-            let mut ids = Vec::with_capacity(batch.len());
-            let mut hashes = Vec::with_capacity(batch.len());
-            for (id, indexed_hash) in batch {
-                let Ok((row, parsed)) = self.get_trace(id) else {
-                    continue;
-                };
-                let source_hash = if indexed_hash.is_empty() {
-                    let hash = trace::content_hash(&parsed.body);
-                    self.connection.execute(
-                        "UPDATE traces SET content_hash=?1 WHERE id=?2 AND (content_hash IS NULL OR content_hash='')",
-                        params![hash, id],
-                    )?;
-                    hash
-                } else {
-                    indexed_hash.clone()
-                };
-                inputs.push(embedding::text(&row.title, &parsed.body, max_chars));
-                ids.push(id.clone());
-                hashes.push(source_hash);
-            }
-            if inputs.is_empty() {
-                continue;
-            }
-            let vectors = embedder
-                .embed(model, &inputs)
-                .await
-                .context("embed batch")?;
-            if vectors.len() != inputs.len() {
-                bail!(
-                    "embedder returned {} vectors for {} inputs",
-                    vectors.len(),
-                    inputs.len()
-                );
-            }
-            let tx = self.connection.unchecked_transaction()?;
-            for ((id, source_hash), mut vector) in ids.iter().zip(&hashes).zip(vectors) {
-                embedding::normalize(&mut vector);
-                tx.execute(
-                    "INSERT INTO trace_embeddings(trace_id,embedding_model,dim,embedding,source_hash,updated_at)
-                     VALUES (?1,?2,?3,?4,?5,?6)
-                     ON CONFLICT(trace_id) DO UPDATE SET
-                       embedding_model=excluded.embedding_model,
-                       dim=excluded.dim,
-                       embedding=excluded.embedding,
-                       source_hash=excluded.source_hash,
-                       updated_at=excluded.updated_at",
-                    params![id, model, vector.len() as i64, embedding::encode(&vector), source_hash, updated_at],
-                )?;
-                result.embedded += 1;
-            }
-            tx.commit()?;
-        }
-        Ok(result)
     }
 
     pub async fn semantic_search(
@@ -4480,7 +4370,7 @@ impl Cortex {
         let path = self.file_path(&row);
         let original_bytes = fs::read(&path)
             .with_context(|| format!("reading drifted trace {id:?} for recovery artifact"))?;
-        let artifact_directory = self.dir.join("db/reconciliations");
+        let artifact_directory = self.db_dir.join("reconciliations");
         fs::create_dir_all(&artifact_directory)?;
         #[cfg(unix)]
         {
@@ -4490,7 +4380,10 @@ impl Cortex {
         let artifact_name = format!("{id}-{}.md", ulid::Ulid::new());
         let artifact_path = artifact_directory.join(&artifact_name);
         trace::write_bytes_atomic_with_mode(&artifact_path, &original_bytes, 0o600)?;
-        let recovery_artifact = format!("db/reconciliations/{artifact_name}");
+        let recovery_artifact = artifact_path
+            .strip_prefix(&self.dir)?
+            .to_string_lossy()
+            .replace('\\', "/");
         let (_, mut canonical) = self.canonical_long_term_trace(&row)?;
         canonical.frontmatter.extra = Trace::parse(&original_bytes)?.frontmatter.extra;
         let now = trace::now_rfc3339();
@@ -4542,7 +4435,7 @@ impl Cortex {
                     current.row.id
                 )
             })?;
-            let artifact_directory = self.dir.join("db/markdown-normalizations");
+            let artifact_directory = self.db_dir.join("markdown-normalizations");
             fs::create_dir_all(&artifact_directory)?;
             #[cfg(unix)]
             {
@@ -4552,7 +4445,10 @@ impl Cortex {
             let artifact_name = format!("{}-{}.md", current.row.id, ulid::Ulid::new());
             let artifact_path = artifact_directory.join(&artifact_name);
             trace::write_bytes_atomic_with_mode(&artifact_path, &original_bytes, 0o600)?;
-            let recovery_artifact = format!("db/markdown-normalizations/{artifact_name}");
+            let recovery_artifact = artifact_path
+                .strip_prefix(&self.dir)?
+                .to_string_lossy()
+                .replace('\\', "/");
 
             let mut normalized = current.trace.clone();
             normalized.body = current.normalized_body;
@@ -5326,18 +5222,8 @@ impl Cortex {
     }
 
     fn rebuild_fts_if_stale(&mut self) -> Result<()> {
-        let traces: i64 = self
-            .connection
-            .query_row("SELECT COUNT(*) FROM traces", [], |row| row.get(0))?;
-        let fts: i64 = self
-            .connection
-            .query_row("SELECT COUNT(*) FROM traces_fts", [], |row| row.get(0))?;
-        if traces == fts {
-            return Ok(());
-        }
         let tx = self.connection.unchecked_transaction()?;
-        tx.execute("DELETE FROM traces_fts", [])?;
-        let ids: Vec<String> = {
+        let paths: BTreeMap<String, PathBuf> = {
             let mut statement = tx.prepare("SELECT id,archived_at,trashed_at FROM traces")?;
             statement
                 .query_map([], |row| {
@@ -5349,16 +5235,44 @@ impl Cortex {
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
                 .into_iter()
-                .filter_map(|(id, archived, trashed)| {
+                .map(|(id, archived, trashed)| {
                     let path = if trashed.is_some() {
                         self.trash_dir().join(format!("{id}.md"))
                     } else {
                         self.trace_file(&id, archived.is_some())
                     };
-                    path.exists().then_some(id)
+                    (id, path)
                 })
                 .collect()
         };
+        let indexed: Vec<String> = {
+            let mut statement = tx.prepare("SELECT id FROM traces_fts")?;
+            statement
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let indexed_ids: BTreeSet<&String> = indexed.iter().collect();
+        let mut stale = indexed_ids.len() != indexed.len()
+            || indexed_ids.iter().any(|id| !paths.contains_key(*id));
+        // Missing files cannot be indexed. Only a missing index entry with an
+        // available file warrants a rebuild; otherwise every open repeats it.
+        for (id, path) in &paths {
+            if !indexed_ids.contains(id) && path.try_exists()? {
+                stale = true;
+                break;
+            }
+        }
+        if !stale {
+            tx.commit()?;
+            return Ok(());
+        }
+        let mut ids = Vec::new();
+        for (id, path) in paths {
+            if path.try_exists()? {
+                ids.push(id);
+            }
+        }
+        tx.execute("DELETE FROM traces_fts", [])?;
         for id in ids {
             let row = self.get_from_tx(&tx, &id)?;
             let trace = Trace::parse_file(&self.file_path(&row))?;
@@ -6163,6 +6077,111 @@ mod tests {
         let mut cx = Cortex::open("test", temp.path().join("test")).unwrap();
         cx.durability = DurabilityProfile::Strong;
         (temp, cx)
+    }
+
+    #[test]
+    fn fts_reopen_skips_missing_files_and_indexes_them_when_restored() {
+        for location in ["active", "archive", "trash"] {
+            let (_temp, cx) = cortex();
+            let mut present = Trace::new("Present", "fact", "", vec![], "searchable quartz");
+            cx.add(&mut present).unwrap();
+            let mut absent = Trace::new("Absent", "fact", "", vec![], "restored zircon");
+            cx.add(&mut absent).unwrap();
+            let id = absent.frontmatter.id.clone();
+            match location {
+                "archive" => cx.archive(&id).unwrap(),
+                "trash" => cx.trash(&id).unwrap(),
+                _ => (),
+            }
+            let path = match location {
+                "archive" => cx.archive_dir(),
+                "trash" => cx.trash_dir(),
+                _ => cx.traces_dir(),
+            }
+            .join(format!("{id}.md"));
+            let saved = fs::read(&path).unwrap();
+            fs::remove_file(&path).unwrap();
+            cx.connection
+                .execute("DELETE FROM traces_fts WHERE id=?1", [&id])
+                .unwrap();
+            let root = cx.dir.clone();
+            drop(cx);
+            for _ in 0..3 {
+                let cx = Cortex::open("test", &root).unwrap();
+                assert_eq!(
+                    cx.connection.total_changes(),
+                    0,
+                    "unnecessary writes for {location}"
+                );
+                let hits: i64 = cx
+                    .connection
+                    .query_row(
+                        "SELECT count(*) FROM traces_fts WHERE traces_fts MATCH 'quartz'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(hits, 1);
+            }
+            fs::write(&path, saved).unwrap();
+            let cx = Cortex::open("test", &root).unwrap();
+            let hits: i64 = cx
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM traces_fts WHERE traces_fts MATCH 'zircon'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(hits, 1);
+            drop(cx);
+            let cx = Cortex::open("test", &root).unwrap();
+            assert_eq!(cx.connection.total_changes(), 0);
+        }
+    }
+
+    #[test]
+    fn fts_reopen_repairs_wrong_ids_and_duplicates_even_when_counts_match() {
+        for duplicate in [false, true] {
+            let (_temp, cx) = cortex();
+            let mut first = Trace::new("First", "fact", "", vec![], "quartz");
+            let mut second = Trace::new("Second", "fact", "", vec![], "zircon");
+            cx.add(&mut first).unwrap();
+            cx.add(&mut second).unwrap();
+            cx.connection
+                .execute(
+                    "DELETE FROM traces_fts WHERE id=?1",
+                    [&second.frontmatter.id],
+                )
+                .unwrap();
+            cx.connection
+                .execute(
+                    "INSERT INTO traces_fts(id,title,body,tags) VALUES (?1,'','stale','')",
+                    [if duplicate {
+                        first.frontmatter.id.as_str()
+                    } else {
+                        "orphan"
+                    }],
+                )
+                .unwrap();
+            let root = cx.dir.clone();
+            drop(cx);
+            let cx = Cortex::open("test", &root).unwrap();
+            let ids: Vec<String> = cx
+                .connection
+                .prepare("SELECT id FROM traces_fts ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let mut expected = vec![first.frontmatter.id, second.frontmatter.id];
+            expected.sort();
+            assert_eq!(ids, expected);
+            drop(cx);
+            let cx = Cortex::open("test", &root).unwrap();
+            assert_eq!(cx.connection.total_changes(), 0);
+        }
     }
 
     #[test]

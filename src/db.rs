@@ -1,4 +1,8 @@
-use std::{fs, path::Path, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use include_dir::{Dir, include_dir};
@@ -6,17 +10,39 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 static MIGRATIONS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
-pub fn open(cortex_dir: &Path) -> Result<Connection> {
-    let db_dir = cortex_dir.join("db");
+pub fn directory(cortex_dir: &Path) -> Result<PathBuf> {
+    crate::storage::directory(cortex_dir)
+}
+
+#[derive(Debug)]
+pub struct Database {
+    connection: Connection,
+    _storage_lock: crate::storage::StorageLock,
+}
+
+impl std::ops::Deref for Database {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.connection
+    }
+}
+
+pub fn open(cortex_dir: &Path) -> Result<Database> {
+    let storage_lock = crate::storage::StorageLock::acquire(cortex_dir, false)?;
+    let db_dir = directory(cortex_dir)?;
     fs::create_dir_all(&db_dir)?;
     let connection = Connection::open(db_dir.join("noema.db"))?;
     configure(&connection)?;
     migrate(&connection)?;
-    Ok(connection)
+    Ok(Database {
+        connection,
+        _storage_lock: storage_lock,
+    })
 }
 
-pub fn open_existing_without_migrations(cortex_dir: &Path) -> Result<Option<Connection>> {
-    let path = cortex_dir.join("db/noema.db");
+pub fn open_existing_without_migrations(cortex_dir: &Path) -> Result<Option<Database>> {
+    let storage_lock = crate::storage::StorageLock::acquire(cortex_dir, false)?;
+    let path = directory(cortex_dir)?.join("noema.db");
     if !path.exists() {
         return Ok(None);
     }
@@ -25,7 +51,10 @@ pub fn open_existing_without_migrations(cortex_dir: &Path) -> Result<Option<Conn
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
     )?;
     connection.busy_timeout(Duration::from_secs(5))?;
-    Ok(Some(connection))
+    Ok(Some(Database {
+        connection,
+        _storage_lock: storage_lock,
+    }))
 }
 
 fn configure(connection: &Connection) -> Result<()> {
@@ -103,7 +132,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 21);
+        assert_eq!(version, 22);
         let fts: String = connection
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE name='traces_fts'",
@@ -112,6 +141,58 @@ mod tests {
             )
             .unwrap();
         assert!(fts.contains("fts5"));
+    }
+
+    #[test]
+    fn embedding_metadata_upgrade_preserves_legacy_vectors() {
+        let connection = Connection::open_in_memory().unwrap();
+        configure(&connection).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY)",
+                [],
+            )
+            .unwrap();
+        let mut files: Vec<_> = MIGRATIONS.files().collect();
+        files.sort_by_key(|file| file.path().to_owned());
+        for file in files {
+            let version: i64 = file
+                .path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .split('_')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            if version >= 22 {
+                continue;
+            }
+            connection
+                .execute_batch(file.contents_utf8().unwrap())
+                .unwrap();
+            connection
+                .execute("INSERT INTO schema_migrations VALUES (?1)", [version])
+                .unwrap();
+        }
+        connection.execute_batch("INSERT INTO traces(id,title,type,tier,author,origin,cortex_id,created_at,updated_at,content_hash,source_locked)
+            VALUES ('20260101-sample','Sample','fact','short','','local','sample','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','test-hash',0);
+            INSERT INTO trace_embeddings(trace_id,embedding_model,dim,embedding,source_hash,updated_at)
+            VALUES ('20260101-sample','test-model',1,x'010000803f','test-hash','2026-01-01T00:00:00Z');").unwrap();
+        migrate(&connection).unwrap();
+        migrate(&connection).unwrap();
+        let (blob, policy, tokens): (Vec<u8>, String, Option<i64>) = connection
+            .query_row(
+                "SELECT embedding,preparation_key,input_tokens FROM trace_embeddings",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(blob, vec![1, 0, 0, 128, 63]);
+        assert!(policy.is_empty());
+        assert_eq!(tokens, None);
     }
 
     #[test]

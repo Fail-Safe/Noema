@@ -51,6 +51,9 @@ jobs:
           package_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
           test "$tag_version" = "$package_version"
 
+      - name: Test storage and maintenance
+        run: cargo test --locked --test nosync_layout --test database_maintenance
+
       - name: Build release binary
         env:
           RUSTFLAGS: -D warnings
@@ -141,15 +144,19 @@ jobs:
           case "$GITHUB_REF_NAME" in
             *-*) release_flags+=(--prerelease) ;;
           esac
+          notes_flags=(--generate-notes)
+          if [ -f "docs/releases/$GITHUB_REF_NAME.md" ]; then
+            notes_flags=(--notes-file "docs/releases/$GITHUB_REF_NAME.md")
+          fi
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber
           else
             gh release create "$GITHUB_REF_NAME" dist/* \
-              --title "Noema $GITHUB_REF_NAME" --generate-notes "${release_flags[@]}"
+              --title "Noema $GITHUB_REF_NAME" "${notes_flags[@]}" "${release_flags[@]}"
           fi
 
       - name: Update Homebrew tap
-        if: env.HOMEBREW_TAP_TOKEN != ''
+        if: env.HOMEBREW_TAP_TOKEN != '' && !contains(github.ref_name, '-')
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
