@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use rmcp::{
     ServiceExt,
-    model::{CallToolRequestParams, ClientInfo},
+    model::{CallToolRequestParams, ClientConfig},
     transport::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     },
@@ -497,7 +497,7 @@ pub async fn sync_peer(cx: &mut Cortex, peer: &PeerEntry) -> Result<SyncReport> 
         .build()
         .context("building federation HTTP client")?;
     let transport = StreamableHttpClientTransport::with_client(http_client, transport_config);
-    let mut client = ClientInfo::default()
+    let mut client = ClientConfig::default()
         .serve(transport)
         .await
         .with_context(|| format!("connecting to peer {:?} at {endpoint}", peer.name))?;
@@ -611,7 +611,7 @@ pub async fn sync_peer(cx: &mut Cortex, peer: &PeerEntry) -> Result<SyncReport> 
 
 async fn sync_usage(
     cx: &mut Cortex,
-    client: &rmcp::service::RunningService<rmcp::RoleClient, ClientInfo>,
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ClientConfig>,
     peer: &PeerEntry,
     peer_id: &str,
     report: &mut SyncReport,
