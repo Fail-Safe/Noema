@@ -203,6 +203,7 @@ impl HttpEmbedder {
             endpoint,
             api_key,
             client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(5 * 60))
                 .build()?,
         })
