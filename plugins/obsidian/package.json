@@ -11,10 +11,15 @@
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^26",
-    "builtin-modules": "^5.3.0",
+    "builtin-modules": "^5.4.0",
     "esbuild": "^0.28.2",
     "obsidian": "^1.4.11",
     "tslib": "^2.6.0",
     "typescript": "^5.4.0"
+  },
+  "overrides": {
+    "obsidian": {
+      "moment": "^2.31.0"
+    }
   }
 }

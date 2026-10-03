@@ -1,6 +1,6 @@
 use super::*;
 use rmcp::{
-    model::{CallToolRequestParams, ClientInfo},
+    model::{CallToolRequestParams, ClientConfig},
     transport::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     },
@@ -100,7 +100,7 @@ async fn role_endpoints_enforce_discovery_calls_and_share_usage() {
             http.clone(),
             StreamableHttpClientTransportConfig::with_uri(endpoint).auth_header("test-secret"),
         );
-        let client = ClientInfo::default().serve(transport).await.unwrap();
+        let client = ClientConfig::default().serve(transport).await.unwrap();
         let listed = client.list_all_tools().await.unwrap();
         let mut actual = listed
             .iter()
