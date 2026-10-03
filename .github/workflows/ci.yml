@@ -113,3 +113,15 @@ jobs:
           npm run build
           npx tsc --noEmit
           git diff --exit-code -- main.js
+
+  windows-storage:
+    name: Windows storage + recovery
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v7
+      - name: Select Rust toolchain
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+      - name: Test storage and maintenance
+        run: cargo test --locked --test nosync_layout --test database_maintenance
