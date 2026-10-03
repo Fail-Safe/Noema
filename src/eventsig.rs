@@ -3,7 +3,7 @@ use std::io::Write;
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand::TryRngCore;
+use rand::TryRng;
 use sha2::{Digest, Sha256};
 
 use crate::event::Event;
@@ -51,7 +51,7 @@ pub fn verify(public_key: &str, event: &Event, signature: &str) -> Result<()> {
 
 pub fn generate() -> Result<(SigningKey, String, String)> {
     let mut seed = [0u8; 32];
-    rand::rngs::OsRng.try_fill_bytes(&mut seed)?;
+    rand::rngs::SysRng.try_fill_bytes(&mut seed)?;
     let key = SigningKey::from_bytes(&seed);
     let public = encode_public(&key.verifying_key());
     Ok((key, public, STANDARD.encode(seed)))
