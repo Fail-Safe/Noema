@@ -5063,8 +5063,17 @@ impl Cortex {
         let tx = self.connection.unchecked_transaction()?;
         {
             let mut statement = tx.prepare(
+                // A peer can publish usage for a trace this cortex no longer holds —
+                // typically one it purged locally while the peer kept it, because the
+                // local purge event is never replayed back (events are only pulled).
+                // trace_usage.trace_id is FK-constrained to traces(id), so a bare
+                // INSERT aborts the whole batch with SQLITE_CONSTRAINT_FOREIGNKEY
+                // (787) and, on the federation path, every usage sync tick warns and
+                // the cursor never advances. Guard the insert on the parent row:
+                // usage for a trace we do not have simply is not ours to record.
                 "INSERT INTO trace_usage(trace_id,peer_cortex_id,read_count,modify_count,search_hit_count,last_read_at,updated_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7)
+                 SELECT ?1,?2,?3,?4,?5,?6,?7
+                 WHERE EXISTS(SELECT 1 FROM traces WHERE id=?1)
                  ON CONFLICT(trace_id,peer_cortex_id) DO UPDATE SET
                    read_count=MAX(read_count,excluded.read_count),
                    modify_count=MAX(modify_count,excluded.modify_count),
@@ -7617,6 +7626,40 @@ mod tests {
         let beta_rows = beta.local_usage_since("", 100).unwrap();
         assert_eq!(beta_rows.len(), 1);
         assert_eq!(beta_rows[0].peer_cortex_id, beta.id);
+    }
+
+    #[test]
+    fn merge_remote_usage_skips_traces_absent_locally() {
+        // Regression: a peer publishes usage for a trace this cortex no longer holds
+        // (e.g. it purged locally and the purge never replayed back). A bare INSERT
+        // violated trace_usage's FK to traces(id) with code 787 and aborted the whole
+        // merge batch; the row must be skipped, and merge must not fail.
+        let temp = tempfile::tempdir().unwrap();
+        let alpha = signed_cortex(temp.path(), "alpha");
+        let beta = signed_cortex(temp.path(), "beta");
+
+        let mut trace = Trace::new("Usage", "fact", "", vec![], "body");
+        alpha.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        beta.replay_event(&event_for(&alpha, &id, "create", &alpha.id))
+            .unwrap();
+
+        // beta has the trace; alpha publishes a usage row for it, which merges fine.
+        alpha.bump_read(&id).unwrap();
+        let rows = alpha.local_usage_since("", 100).unwrap();
+        assert_eq!(rows.len(), 1);
+        beta.merge_remote_usage(&rows).unwrap();
+
+        // Now beta purges the trace locally while alpha keeps its usage row.
+        beta.trash(&id).unwrap();
+        beta.apply_external_purge(&id).unwrap();
+        assert!(beta.get(&id).is_err());
+        assert_eq!(beta.local_usage_since("", 100).unwrap().len(), 0);
+
+        // The same remote batch must now be a no-op, not an FK-787 abort.
+        beta.merge_remote_usage(&rows)
+            .expect("merge must tolerate usage for a trace we no longer hold");
+        assert_eq!(beta.local_usage_since("", 100).unwrap().len(), 0);
     }
 
     #[test]
