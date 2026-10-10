@@ -56,8 +56,11 @@ nonempty or the configured endpoint URL contains credentials. This policy
 applies to remote, localhost, and loopback endpoints alike. Client construction
 rejects credentialed non-HTTPS configurations without including the endpoint
 or credentials in the rejection message; the request transport is also
-HTTPS-only for credentialed clients. Redirects are refused for both request
-types, so trace-derived input is not forwarded to a redirect destination.
+HTTPS-only for credentialed clients. Embedding CLI status/backfill diagnostics
+do not print configured endpoint URLs, and request/response errors omit request
+URLs so URL credentials and query values are not exposed in diagnostic output.
+Redirects are refused for both request types, so trace-derived input is not
+forwarded to a redirect destination.
 
 Credential-free HTTP remains supported for local providers. Such requests are
 not encrypted: operators must still choose a trusted endpoint and network for

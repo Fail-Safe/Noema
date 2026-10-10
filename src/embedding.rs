@@ -268,6 +268,7 @@ impl HttpEmbedder {
         let response = request
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("posting tokenization request")?;
         let status = response.status();
         if matches!(status.as_u16(), 404 | 405 | 501) {
@@ -382,11 +383,16 @@ impl HttpEmbedder {
         if !self.api_key.is_empty() {
             request = request.bearer_auth(&self.api_key);
         }
-        let response = request.send().await.context("posting embeddings request")?;
+        let response = request
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("posting embeddings request")?;
         let status = response.status();
         let bytes = response
             .bytes()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("reading embeddings response")?;
         let parsed = serde_json::from_slice::<EmbeddingResponse>(&bytes);
         if !status.is_success() {
