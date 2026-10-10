@@ -243,12 +243,17 @@ pub fn is_valid_id(id: &str) -> bool {
 
 pub fn new_id(title: &str) -> String {
     let date = Utc::now().format("%Y%m%d");
-    let mut value = strip_leading_date_prefix(&slug(title)).to_owned();
-    if value.chars().count() > MAX_SLUG_LEN {
-        value = value.chars().take(MAX_SLUG_LEN).collect::<String>();
-        while value.ends_with('-') {
-            value.pop();
-        }
+    let mut value = slug(title);
+    let prefix_len = value.len() - strip_leading_date_prefix(&value).len();
+    value.drain(..prefix_len);
+    value.truncate(MAX_SLUG_LEN);
+    while value.ends_with('-') {
+        value.pop();
+    }
+    if value.is_empty() {
+        let digest = Sha256::digest(title.as_bytes());
+        let hash = u64::from_be_bytes(digest[..8].try_into().unwrap());
+        value = format!("trace-{hash:016x}");
     }
     format!("{date}-{value}")
 }
@@ -256,16 +261,19 @@ pub fn new_id(title: &str) -> String {
 fn slug(input: &str) -> String {
     let mut out = String::new();
     let mut previous_hyphen = true;
-    for ch in input.to_lowercase().chars() {
-        if ch.is_alphanumeric() {
-            out.push(ch);
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
             previous_hyphen = false;
         } else if !previous_hyphen {
             out.push('-');
             previous_hyphen = true;
         }
     }
-    out.trim_end_matches('-').to_owned()
+    if out.ends_with('-') {
+        out.pop();
+    }
+    out
 }
 
 fn strip_leading_date_prefix(value: &str) -> &str {
@@ -307,6 +315,38 @@ mod tests {
         let id = new_id("2026-04-02 Why We Chose Local Storage!");
         assert!(id.ends_with("-why-we-chose-local-storage"));
         assert!(is_valid_id(&id));
+    }
+
+    #[test]
+    fn empty_slugs_use_title_specific_hashes() {
+        let titles = ["Тест", "中文", "🧠", "!!!", ""];
+        let mut ids = std::collections::HashSet::new();
+        for title in titles {
+            let id = new_id(title);
+            assert!(is_valid_id(&id), "{title:?}: {id}");
+            assert_eq!(id, new_id(title));
+            assert!(ids.insert(id), "different titles must not share a fallback");
+        }
+    }
+
+    #[test]
+    fn ascii_slug_rules_and_truncation_are_preserved() {
+        assert_eq!(&new_id("Hello 世界 １２３ World!")[9..], "hello-world");
+        let title = format!("{} -- tail", "A".repeat(MAX_SLUG_LEN - 1));
+        assert_eq!(&new_id(&title)[9..], "a".repeat(MAX_SLUG_LEN - 1));
+        assert_eq!(
+            &new_id(&"Z".repeat(MAX_SLUG_LEN + 1))[9..],
+            "z".repeat(MAX_SLUG_LEN)
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn generated_ids_always_match_public_rules(title in proptest::collection::vec(proptest::char::any(), 0..256)) {
+            let title: String = title.into_iter().collect();
+            let id = new_id(&title);
+            proptest::prop_assert!(is_valid_id(&id), "{:?}: {}", title, id);
+        }
     }
 
     #[test]

@@ -1128,6 +1128,8 @@ indexing and search without putting memory data in a cloud service.
 
 **Trace IDs and titles.** The ID is `YYYYMMDD-<slug>` — today's date prepended to a slugified title. The slug portion is capped at 100 characters (longer titles are silently truncated); aim for titles under 80 characters for scannability. Don't include the date in the title — `noema` prepends today's date automatically, and leading `YYYYMMDD-` / `YYYY-MM-DD-` prefixes in the title are stripped to prevent doubled-date IDs. Mid-title date fragments aren't stripped, so put date context in a tag (`tags: [event-2026-04-02]`) or the body instead of the title.
 
+Titles and bodies retain their original Unicode text. IDs use lowercase ASCII letters, digits, and hyphens; other characters act as separators. If no slug remains, the ID uses `trace-` followed by a deterministic 16-digit SHA-256-derived hex suffix. Cyrillic, CJK, and emoji-only titles therefore work without changing the filename format or renaming existing traces.
+
 **Tag conventions.** The cortex accepts any string as a tag — the constraints here are about what *renders correctly in Obsidian's tag panel* if a user is authoring through Obsidian (a common but optional surface). Non-Obsidian authoring (CLI, MCP, TUI, agent integrations) is unaffected.
 
 - **Tags must contain at least one letter.** A pure-numeric tag like `2026` or `42` is stored, indexed, and searchable via `search_traces` / FTS5, but Obsidian silently drops it from the tag panel. Use `y2026`, `2026q1`, or `event-2026-04-02` instead.
