@@ -49,6 +49,21 @@ sync is refused, bypassing first-use entirely. Even so, signing makes federation
 guarantees **after** a key is correctly pinned — signature forgery, verification
 bypass, source-lock bypass under `enforce`, or downgrade attacks — are in scope.
 
+## Embedding Credential Transport
+
+Embedding and tokenization clients require HTTPS if a resolved API key is
+nonempty or the configured endpoint URL contains credentials. This policy
+applies to remote, localhost, and loopback endpoints alike. Client construction
+rejects credentialed non-HTTPS configurations without including the endpoint
+or credentials in the rejection message; the request transport is also
+HTTPS-only for credentialed clients. Redirects are refused for both request
+types, so trace-derived input is not forwarded to a redirect destination.
+
+Credential-free HTTP remains supported for local providers. Such requests are
+not encrypted: operators must still choose a trusted endpoint and network for
+their trace data. Authenticated local providers previously using HTTP must
+enable TLS or remove their credentials.
+
 ## Supported Versions
 
 Only the latest release is actively supported with security patches. Upgrade to the latest version before reporting.
