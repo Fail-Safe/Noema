@@ -42,7 +42,6 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
             {
                 "model": request.get("model"),
                 "input": request.get("input"),
-                "authorization": self.headers.get("Authorization", ""),
             }
         )
         inputs = request.get("input", [])
@@ -73,6 +72,8 @@ def topic_vector(text: str) -> list[float]:
 
 @contextmanager
 def embedding_server() -> tuple[str, list[dict[str, object]]]:
+    # Credentials require HTTPS; focused Rust transport tests cover refusal.
+    # Keep this semantic differential fixture credential-free over local HTTP.
     EmbeddingHandler.requests = []
     server = ThreadingHTTPServer(("127.0.0.1", free_port()), EmbeddingHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -106,7 +107,6 @@ def configure(manifest: Path, endpoint: str, model: str = "topic-v1") -> None:
         "  semantic_enabled: true",
         f"  embedding_endpoint: {endpoint}",
         f"  embedding_model: {model}",
-        "  api_key_env: NOEMA_SYNTHETIC_EMBED_KEY",
         "  default_mode: lexical",
         "  hybrid_weight: 0.5",
         "  max_chars: 40",
@@ -410,11 +410,8 @@ def exercise(
     )
 
     requests = list(request_log)
-    if not requests or any(
-        request["authorization"] != "Bearer synthetic-embedding-token"
-        for request in requests
-    ):
-        raise AssertionError(f"{node.name}: bearer-key indirection was not preserved")
+    if not requests:
+        raise AssertionError(f"{node.name}: embedding requests were not observed")
     if any(
         len(text) > 40
         for request in requests
@@ -466,7 +463,6 @@ def main() -> None:
         (root / "home").mkdir()
         (root / "config").mkdir()
         env = environment(root)
-        env["NOEMA_SYNTHETIC_EMBED_KEY"] = "synthetic-embedding-token"
         nodes = {
             "go": Node("go-semantic", args.go.resolve(), False, free_port()),
             "rust": Node("rust-semantic", args.rust.resolve(), True, free_port()),
@@ -498,7 +494,7 @@ def main() -> None:
     if "Gamma Research" in reports["go"]["non_finite"]:  # type: ignore[operator]
         raise AssertionError("non-finite vector was ranked")
 
-    print("ok - Go/Rust embedding request, auth, batching, and max_chars parity")
+    print("ok - Go/Rust embedding request, batching, and max_chars parity")
     print("ok - Go/Rust codec bytes, normalization, freshness, and idempotency")
     print("ok - Go/Rust edit/model staleness and bounded backfill")
     print("ok - Go/Rust semantic cosine and hybrid RRF ranking")
