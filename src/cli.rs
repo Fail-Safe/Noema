@@ -1212,11 +1212,7 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
                     .as_ref()
                     .is_some_and(|search| search.semantic_enabled)
                 {
-                    println!(
-                        "Semantic search: enabled (model={}, endpoint={})",
-                        model,
-                        cx.manifest.resolved_embedding_endpoint()?
-                    );
+                    println!("Semantic search: enabled (model={model})");
                 } else {
                     println!(
                         "Semantic search: disabled (set search.semantic_enabled + search.embedding_model in cortex.md)"
@@ -1237,8 +1233,7 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
                     .as_ref()
                     .map(|search| search.effective_max_chars())
                     .unwrap_or(32_000);
-                let endpoint = cx.manifest.resolved_embedding_endpoint()?;
-                println!("Backfilling embeddings (model={model}, endpoint={endpoint})...");
+                println!("Backfilling embeddings (model={model})...");
                 let result = cx
                     .embed_backfill(
                         &client,
