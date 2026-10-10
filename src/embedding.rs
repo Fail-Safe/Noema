@@ -192,17 +192,26 @@ fn input_size_error(status: reqwest::StatusCode, message: &str) -> Option<InputS
 
 impl HttpEmbedder {
     pub fn new(endpoint: &str, api_key_env: &str) -> Result<Self> {
+        Self::with_api_key(endpoint, env::var(api_key_env).unwrap_or_default())
+    }
+
+    fn with_api_key(endpoint: &str, api_key: String) -> Result<Self> {
         if endpoint.is_empty() {
             bail!("embedding endpoint is empty");
         }
         let endpoint = endpoint.trim_end_matches('/').to_owned();
         let parsed = reqwest::Url::parse(&endpoint).context("invalid embedding endpoint")?;
-        let api_key = env::var(api_key_env).unwrap_or_default();
-        ensure_keyed_endpoint_is_encrypted(&parsed, !api_key.is_empty())?;
+        // Reqwest turns URL userinfo into Basic auth even without an API key.
+        let credentials =
+            !api_key.is_empty() || !parsed.username().is_empty() || parsed.password().is_some();
+        if credentials && parsed.scheme() != "https" {
+            bail!("embedding credentials require HTTPS; refusing cleartext HTTP or other schemes");
+        }
         Ok(Self {
             endpoint,
             api_key,
             client: reqwest::Client::builder()
+                .https_only(credentials)
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(5 * 60))
                 .build()?,
@@ -259,6 +268,7 @@ impl HttpEmbedder {
         let response = request
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("posting tokenization request")?;
         let status = response.status();
         if matches!(status.as_u16(), 404 | 405 | 501) {
@@ -373,11 +383,16 @@ impl HttpEmbedder {
         if !self.api_key.is_empty() {
             request = request.bearer_auth(&self.api_key);
         }
-        let response = request.send().await.context("posting embeddings request")?;
+        let response = request
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("posting embeddings request")?;
         let status = response.status();
         let bytes = response
             .bytes()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("reading embeddings response")?;
         let parsed = serde_json::from_slice::<EmbeddingResponse>(&bytes);
         if !status.is_success() {
@@ -464,36 +479,6 @@ pub fn text(title: &str, body: &str, max_chars: usize) -> String {
     }
 }
 
-fn ensure_keyed_endpoint_is_encrypted(endpoint: &reqwest::Url, keyed: bool) -> Result<()> {
-    if !keyed {
-        return Ok(());
-    }
-    match endpoint.scheme() {
-        "https" => Ok(()),
-        "http" if endpoint_is_loopback(endpoint) => Ok(()),
-        "http" => bail!(
-            "refusing to send embedding API key over cleartext HTTP to {endpoint}; use https:// or a loopback http:// endpoint"
-        ),
-        other => bail!("unsupported embedding endpoint scheme {other}"),
-    }
-}
-
-fn endpoint_is_loopback(endpoint: &reqwest::Url) -> bool {
-    match endpoint.host_str() {
-        Some(host) => {
-            let host = host
-                .trim_matches(|c| c == '[' || c == ']')
-                .to_ascii_lowercase();
-            host == "localhost"
-                || host == "localhost."
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        }
-        None => false,
-    }
-}
-
 pub fn encode(vector: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + vector.len() * 4);
     out.push(CODEC_VERSION);
@@ -561,29 +546,101 @@ mod tests {
     }
 
     #[test]
-    fn keyed_remote_http_endpoint_is_rejected() {
-        let endpoint = reqwest::Url::parse("http://embeddings.example/v1").unwrap();
-        let error = ensure_keyed_endpoint_is_encrypted(&endpoint, true).unwrap_err();
-        assert!(error.to_string().contains("cleartext HTTP"));
-    }
-
-    #[test]
-    fn keyed_https_and_loopback_http_are_allowed() {
+    fn credentials_require_https_including_loopback() {
         for endpoint in [
-            "https://embeddings.example/v1",
+            "http://embeddings.example/v1",
             "http://127.0.0.1:9000/v1",
+            "http://127.1:9000/v1",
             "http://[::1]:9000/v1",
             "http://localhost:9000/v1",
+            "http://localhost.:9000/v1",
+            "ftp://embeddings.example/v1",
         ] {
-            let endpoint = reqwest::Url::parse(endpoint).unwrap();
-            ensure_keyed_endpoint_is_encrypted(&endpoint, true).unwrap();
+            let error = HttpEmbedder::with_api_key(endpoint, "synthetic-key".into())
+                .err()
+                .expect("credentials must require HTTPS");
+            assert!(!error.to_string().contains(endpoint));
+            assert!(!error.to_string().contains("synthetic-key"));
         }
     }
 
     #[test]
-    fn unkeyed_remote_http_remains_allowed() {
-        let endpoint = reqwest::Url::parse("http://embeddings.example/v1").unwrap();
-        ensure_keyed_endpoint_is_encrypted(&endpoint, false).unwrap();
+    fn url_credentials_require_https_without_an_api_key() {
+        for endpoint in [
+            "http://synthetic-user:synthetic-password@embeddings.example/v1",
+            "http://synthetic-user@embeddings.example/v1",
+            "http://:synthetic-password@embeddings.example/v1",
+            "http://synthetic-user:synthetic-password@localhost:9000/v1",
+        ] {
+            let error = HttpEmbedder::new(endpoint, "").err().unwrap();
+            let message = error.to_string();
+            assert!(!message.contains("synthetic-user"));
+            assert!(!message.contains("synthetic-password"));
+            assert!(!message.contains(endpoint));
+        }
+    }
+
+    #[tokio::test]
+    async fn credentialed_client_blocks_both_posts_if_endpoint_downgrades() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        for (endpoint, key, userinfo) in [
+            ("https://embeddings.example/v1", "synthetic-key", ""),
+            (
+                "https://synthetic-user:synthetic-password@embeddings.example/v1",
+                "",
+                "synthetic-user:synthetic-password@",
+            ),
+        ] {
+            let mut client = HttpEmbedder::with_api_key(endpoint, key.into()).unwrap();
+            // Exercise the transport invariant independently of constructor rejection.
+            client.endpoint = format!("http://{userinfo}{}/v1", listener.local_addr().unwrap());
+            assert!(
+                client
+                    .embed("synthetic-model", &["synthetic-input".into()])
+                    .await
+                    .is_err()
+            );
+            for path in ["", "/custom/tokenize"] {
+                assert!(client.token_count("synthetic-input", path).await.is_err());
+            }
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_free_http_still_embeds_and_tokenizes() {
+        use axum::{Json, Router, http::HeaderMap, routing::post};
+        async fn response(headers: HeaderMap) -> Json<serde_json::Value> {
+            assert!(!headers.contains_key("authorization"));
+            Json(serde_json::json!({"tokens":[1,2],"data":[{"index":0,"embedding":[1.0]}]}))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/v1/embeddings", post(response))
+            .route("/tokenize", post(response))
+            .route("/custom/tokenize", post(response));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = HttpEmbedder::new(&endpoint, "").unwrap();
+        assert_eq!(
+            client
+                .embed("synthetic-model", &["synthetic-input".into()])
+                .await
+                .unwrap(),
+            vec![vec![1.0]]
+        );
+        for path in ["", "/custom/tokenize"] {
+            assert_eq!(
+                client.token_count("synthetic-input", path).await.unwrap(),
+                2
+            );
+        }
+        server.abort();
     }
 
     #[test]

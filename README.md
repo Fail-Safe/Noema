@@ -837,6 +837,17 @@ search:
   # tokenizer_path: /tokenize # optional same-server llama.cpp-compatible tokenizer path
 ```
 
+Embedding and tokenization requests require **HTTPS whenever credentials are
+sent**. This includes a nonempty API key resolved from `search.api_key_env`
+(or the inherited `consolidation.api_key_env`) and credentials in the endpoint
+URL. There is no localhost or loopback exception: authenticated local providers
+must use TLS, or remove their credentials to keep using HTTP. Credential-free
+HTTP endpoints, such as the example above, remain supported. Missing or empty
+API-key environment variables do not add an Authorization header. Embedding
+status/backfill diagnostics do not print configured endpoint URLs, and request
+errors omit URLs to keep endpoint credentials and query values out of output.
+Both request types refuse redirects; configure the final provider endpoint directly.
+
 Then build the index and search:
 
 ```sh
