@@ -5064,7 +5064,8 @@ impl Cortex {
         {
             let mut statement = tx.prepare(
                 "INSERT INTO trace_usage(trace_id,peer_cortex_id,read_count,modify_count,search_hit_count,last_read_at,updated_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7)
+                 SELECT ?1,?2,?3,?4,?5,?6,?7
+                 WHERE EXISTS(SELECT 1 FROM traces WHERE id=?1)
                  ON CONFLICT(trace_id,peer_cortex_id) DO UPDATE SET
                    read_count=MAX(read_count,excluded.read_count),
                    modify_count=MAX(modify_count,excluded.modify_count),
@@ -7617,6 +7618,75 @@ mod tests {
         let beta_rows = beta.local_usage_since("", 100).unwrap();
         assert_eq!(beta_rows.len(), 1);
         assert_eq!(beta_rows[0].peer_cortex_id, beta.id);
+    }
+
+    #[test]
+    fn merge_remote_usage_skips_purged_traces_and_keeps_valid_neighbors() {
+        let temp = tempfile::tempdir().unwrap();
+        let alpha = signed_cortex(temp.path(), "alpha");
+        let beta = signed_cortex(temp.path(), "beta");
+        let mut purged = Trace::new("Purged usage", "fact", "", vec![], "body");
+        let mut retained = Trace::new("Retained usage", "fact", "", vec![], "body");
+        for trace in [&mut purged, &mut retained] {
+            alpha.add(trace).unwrap();
+            beta.replay_event(&event_for(
+                &alpha,
+                &trace.frontmatter.id,
+                "create",
+                &alpha.id,
+            ))
+            .unwrap();
+            alpha.bump_read(&trace.frontmatter.id).unwrap();
+        }
+        let rows = alpha.local_usage_since("", 100).unwrap();
+        beta.merge_remote_usage(&rows).unwrap();
+        beta.trash(&purged.frontmatter.id).unwrap();
+        beta.apply_external_purge(&purged.frontmatter.id).unwrap();
+        assert!(beta.get(&purged.frontmatter.id).is_err());
+
+        let mut missing = rows
+            .iter()
+            .find(|row| row.trace_id == purged.frontmatter.id)
+            .unwrap()
+            .clone();
+        let mut present = rows
+            .iter()
+            .find(|row| row.trace_id == retained.frontmatter.id)
+            .unwrap()
+            .clone();
+        missing.read_count = 7;
+        present.read_count = 3;
+        present.search_hit_count = 2;
+        let mixed = [missing, present];
+        beta.merge_remote_usage(&mixed).unwrap();
+        beta.merge_remote_usage(&mixed).unwrap();
+        let counts: (i64, i64) = beta.connection.query_row(
+            "SELECT read_count,search_hit_count FROM trace_usage WHERE trace_id=?1 AND peer_cortex_id=?2",
+            params![retained.frontmatter.id, alpha.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(counts, (3, 2));
+        let orphan_rows: i64 = beta
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM trace_usage WHERE trace_id=?1",
+                [&purged.frontmatter.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_rows, 0);
+        assert!(
+            !beta
+                .connection
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .exists([])
+                .unwrap()
+        );
+
+        let mut invalid = mixed[0].clone();
+        invalid.read_count = -1;
+        assert!(beta.merge_remote_usage(&[invalid]).is_err());
     }
 
     #[test]
