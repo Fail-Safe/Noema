@@ -3089,6 +3089,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_trace_preserves_unicode_titles_with_valid_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        Cortex::create("test", temp.path()).unwrap();
+        let root = temp.path().join("test");
+        let server = NoemaServer::new("test", &root, false).unwrap();
+
+        for title in [
+            "Тест кириллицы заголовок",
+            "中文标题",
+            "🧠✨",
+            "Hello 世界 １２３",
+        ] {
+            let output = server
+                .create_trace(Parameters(create_params(title, "Unicode body: 内容")))
+                .await
+                .unwrap();
+            let id = output.strip_prefix("Trace created: ").unwrap();
+            assert!(crate::trace::is_valid_id(id), "{id}");
+            let cx = server.open().await.unwrap();
+            let (row, trace) = cx.get_trace(id).unwrap();
+            assert_eq!(row.title, title);
+            assert_eq!(trace.frontmatter.title, title);
+            assert_eq!(trace.body, "Unicode body: 内容");
+        }
+    }
+
+    #[tokio::test]
     async fn create_traces_persists_batch_and_returns_verification_receipts() {
         let temp = tempfile::tempdir().unwrap();
         Cortex::create("test", temp.path()).unwrap();
