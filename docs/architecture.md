@@ -44,6 +44,9 @@ Body content here.
 Valid trace types are `fact`, `decision`, `preference`, `context`, `skill`,
 `intent`, `observation`, `note`, and `divergence`.
 
+For chat and agent paste recognition, cite traces as `noema:{id}` without
+renaming the durable ID. See [Trace citations](trace-citations.md).
+
 ## Database And Migrations
 
 SQLite stores indexes, tags, lineage, event history, federation state, usage

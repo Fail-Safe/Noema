@@ -1921,9 +1921,7 @@ impl Cortex {
     }
 
     pub fn get(&self, id: &str) -> Result<Row> {
-        if !trace::is_valid_id(id) {
-            bail!("invalid trace ID");
-        }
+        let id = Self::canonical_trace_id(id)?;
         let mut row = self.connection.query_row(
             "SELECT id,title,type,tier,author,origin,cortex_id,archived_at,trashed_at,created_at,updated_at,content_hash,source_locked,source_hash FROM traces WHERE id=?1",
             [id],
@@ -1932,6 +1930,14 @@ impl Cortex {
         row.tags = self.tags_for(id)?;
         row.derived_from = self.lineage_for(id)?;
         Ok(row)
+    }
+
+    fn canonical_trace_id(id: &str) -> Result<&str> {
+        let id = trace::normalize_id(id);
+        if !trace::is_valid_id(id) {
+            bail!("invalid trace ID");
+        }
+        Ok(id)
     }
 
     pub fn get_trace(&self, id: &str) -> Result<(Row, Trace)> {
@@ -2965,11 +2971,12 @@ impl Cortex {
 
     pub fn update_trace(&self, id: &str, trace: &mut Trace, actor_agent: bool) -> Result<()> {
         let existing = self.get(id)?;
+        let id = existing.id.as_str();
         self.check_source_lock(&existing)?;
         if existing.tier == "long" {
             bail!("long-term trace is immutable");
         }
-        trace.frontmatter.id = id.to_owned();
+        trace.frontmatter.id = existing.id.clone();
         trace.frontmatter.origin = existing.origin.clone();
         trace.frontmatter.created = existing.created_at.clone();
         trace.frontmatter.tier = existing.tier.clone();
@@ -3000,6 +3007,7 @@ impl Cortex {
 
     pub fn update_from_file(&self, id: &str) -> Result<()> {
         let existing = self.get(id)?;
+        let id = existing.id.as_str();
         self.check_source_lock(&existing)?;
         if existing.tier == "long" {
             bail!("long-term trace is immutable");
@@ -3053,6 +3061,7 @@ impl Cortex {
 
     fn replace_trace_tags(&self, id: &str, tags: Vec<String>, actor_agent: bool) -> Result<()> {
         let row = self.get(id)?;
+        let id = row.id.as_str();
         self.check_source_lock(&row)?;
         let (_, mut trace) = self.get_trace(id)?;
         if trace.frontmatter.tags == tags {
@@ -3466,7 +3475,8 @@ impl Cortex {
         if delta == 0 || !(-2..=2).contains(&delta) {
             bail!("vote delta must be ±1 or ±2");
         }
-        self.get(id)?;
+        let row = self.get(id)?;
+        let id = row.id.as_str();
         let tx = self.connection.unchecked_transaction()?;
         tx.execute(
             "UPDATE traces SET tier_votes=tier_votes+?1 WHERE id=?2",
@@ -5139,7 +5149,7 @@ impl Cortex {
     pub fn bump_read(&self, id: &str) -> Result<()> {
         let row = self.get(id)?;
         if row.tier != "long" {
-            self.bump_usage(id, true, false)?;
+            self.bump_usage(&row.id, true, false)?;
         }
         Ok(())
     }
@@ -6078,6 +6088,18 @@ mod tests {
         let mut cx = Cortex::open("test", temp.path().join("test")).unwrap();
         cx.durability = DurabilityProfile::Strong;
         (temp, cx)
+    }
+
+    #[test]
+    fn get_accepts_noema_citation_forms() {
+        let (_temp, cx) = cortex();
+        let mut trace = Trace::new("Citation Lookup", "fact", "tester", vec![], "body");
+        cx.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        assert_eq!(cx.get(&format!("noema:{id}")).unwrap().id, id);
+        assert_eq!(cx.get(&format!("NOEMA:{id}")).unwrap().id, id);
+        assert_eq!(cx.get(&format!("noe://trace/{id}")).unwrap().id, id);
+        cx.bump_read(&format!("noema:{id}")).unwrap();
     }
 
     #[test]
