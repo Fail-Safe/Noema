@@ -5,6 +5,10 @@ evaluate retrieval candidates. Inference uses a configured endpoint; model
 weights are not bundled. When evaluation is disabled or fails closed, native
 retrieval results are preserved.
 
+The default local endpoint is `http://127.0.0.1:18788/v1/decision`. Providers
+that still expose the older TypeSafe-compatible path `/v1/systemone` can be
+selected with an explicit `endpoint:`.
+
 ## Configuration
 
 ```yaml

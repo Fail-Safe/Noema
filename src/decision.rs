@@ -12,7 +12,7 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
-const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:18788/v1/systemone";
+const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:18788/v1/decision";
 const MAX_REQUEST_BYTES: usize = 30_000;
 pub(crate) const RESCUE_MARKER: &str = " [retrieval rescue; verify date and scope]";
 static CONCURRENCY: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
@@ -979,7 +979,7 @@ mod tests {
         let client = Client {
             token: "local".into(),
             model: "clef-flash".into(),
-            endpoint: "http://127.0.0.1:18788/v1/systemone".into(),
+            endpoint: "http://127.0.0.1:18788/v1/decision".into(),
             timeout: Duration::from_secs(30),
         };
         let (state, questions) = batch_fixture(16);
@@ -1298,12 +1298,12 @@ mod tests {
             enabled: Enablement::Explicit(true),
             provider: Provider::Local,
             model: "any-local-model".into(),
-            endpoint: "http://127.0.0.1:9/v1/systemone".into(),
+            endpoint: "http://127.0.0.1:9/v1/decision".into(),
             ..DecisionConfig::default()
         };
         let client = config.client().unwrap().unwrap();
         assert_eq!(client.token, "local-clef");
-        assert_eq!(client.endpoint, "http://127.0.0.1:9/v1/systemone");
+        assert_eq!(client.endpoint, "http://127.0.0.1:9/v1/decision");
         assert_eq!(config.credential().0, "local-clef");
     }
 

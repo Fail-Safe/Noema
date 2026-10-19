@@ -6,6 +6,10 @@ additive evaluation path over native lexical/vector retrieval. When the
 provider is disabled, unavailable, or returns an invalid response, Noema keeps
 native retrieval results.
 
+The default local endpoint is `http://127.0.0.1:18788/v1/decision`. Providers
+that still expose the older TypeSafe-compatible path `/v1/systemone` can be
+selected with an explicit `endpoint:`.
+
 ## Provider configuration
 
 Configure under `decision` in the Noema config file:

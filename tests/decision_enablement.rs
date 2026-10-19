@@ -186,7 +186,7 @@ fn local_clef_auto_does_not_use_cloud_key() {
 #[test]
 fn explicit_local_provider_activates_without_cloud_key() {
     let (_dir, mut command) = command(
-        "decision:\n  provider: local\n  enabled: true\n  model: local-eval\n  endpoint: http://127.0.0.1:18788/v1/systemone\n",
+        "decision:\n  provider: local\n  enabled: true\n  model: local-eval\n  endpoint: http://127.0.0.1:18788/v1/decision\n",
     );
     command
         .env("TYPESAFE_API_KEY", "synthetic-cloud-key-must-not-be-used")
