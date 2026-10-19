@@ -38,6 +38,7 @@ Contributor and architecture notes:
 
 - [Repository Guidelines](AGENTS.md)
 - [Architecture](docs/architecture.md)
+- [Trace citations](docs/trace-citations.md) — `noema:{id}` chat/copy form and flexible tag list inputs
 - [Development Guide](docs/development.md)
 - [Cross-agent continuity evaluation](docs/continuity-evaluation.md) — Codex/OpenCode benchmark evidence
 - [Why Noema switched to Rust](docs/why-rust.md) — benchmarked cutover rationale

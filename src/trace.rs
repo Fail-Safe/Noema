@@ -241,6 +241,36 @@ pub fn is_valid_id(id: &str) -> bool {
     VALID_ID.is_match(id)
 }
 
+/// Chat/copy citation form for a bare trace ID. Durable identity stays `YYYYMMDD-slug`.
+pub fn citation_ref(id: &str) -> String {
+    format!("noema:{id}")
+}
+
+/// Strip supported citation wrappers (`noema:` / `noe://trace/`) and surrounding whitespace.
+/// Returns the bare ID candidate; callers still validate with [`is_valid_id`].
+pub fn normalize_id(input: &str) -> &str {
+    let trimmed = input.trim();
+    if let Some(rest) = strip_ascii_prefix_ignore_case(trimmed, "noema:") {
+        return rest.trim();
+    }
+    if let Some(rest) = strip_ascii_prefix_ignore_case(trimmed, "noe://trace/") {
+        return rest.trim();
+    }
+    trimmed
+}
+
+fn strip_ascii_prefix_ignore_case<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
+    let input_bytes = input.as_bytes();
+    let prefix_bytes = prefix.as_bytes();
+    if input_bytes.len() < prefix_bytes.len() {
+        return None;
+    }
+    if !input_bytes[..prefix_bytes.len()].eq_ignore_ascii_case(prefix_bytes) {
+        return None;
+    }
+    Some(&input[prefix_bytes.len()..])
+}
+
 pub fn new_id(title: &str) -> String {
     let date = Utc::now().format("%Y%m%d");
     let mut value = slug(title);
@@ -315,6 +345,18 @@ mod tests {
         let id = new_id("2026-04-02 Why We Chose Local Storage!");
         assert!(id.ends_with("-why-we-chose-local-storage"));
         assert!(is_valid_id(&id));
+    }
+
+    #[test]
+    fn citation_forms_normalize_to_bare_ids() {
+        let id = "20261019-adopt-noema-citation-scheme-without-renaming-trace-ids";
+        assert_eq!(citation_ref(id), format!("noema:{id}"));
+        assert_eq!(normalize_id(&format!("noema:{id}")), id);
+        assert_eq!(normalize_id(&format!("NOEMA:{id}")), id);
+        assert_eq!(normalize_id(&format!("noe://trace/{id}")), id);
+        assert_eq!(normalize_id(&format!("  noema:{id}  ")), id);
+        assert_eq!(normalize_id(id), id);
+        assert!(is_valid_id(normalize_id(&format!("noema:{id}"))));
     }
 
     #[test]
