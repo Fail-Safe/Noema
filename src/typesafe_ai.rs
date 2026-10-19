@@ -929,7 +929,11 @@ mod tests {
                 if split && size > 1 {
                     return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "input is too large to process").into_response();
                 }
-                if deadline && number > 1 { tokio::time::sleep(Duration::from_millis(250)).await; }
+                // Second+ requests in deadline mode stall longer than the client
+                // budget so completed first-batch scores are retained.
+                if deadline && number > 1 {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
                 assert!(serde_json::to_vec(&request).unwrap().len() + LOCAL_SCHEMA_HEADROOM <= LOCAL_INPUT_ESTIMATE_LIMIT);
                 let answers = request["questions"].as_object().unwrap().keys().map(|key| (key.clone(), json!({"type":"noul","noul":0.8}))).collect::<BTreeMap<_,_>>();
                 Json(json!({"model":"clef-flash","answers":answers,"usage":{"input_tokens":100,"output_tokens":0}})).into_response()
@@ -945,7 +949,9 @@ mod tests {
             token: "synthetic".into(),
             model: "clef-flash".into(),
             endpoint: format!("http://{address}/"),
-            timeout: Duration::from_millis(if deadline { 80 } else { 5000 }),
+            // Keep the total budget large enough for the first batch on CI, but
+            // shorter than the intentional stall on later batches.
+            timeout: Duration::from_millis(if deadline { 2000 } else { 5000 }),
         };
         let (state, questions) = batch_fixture(8);
         let started = Instant::now();
@@ -1007,12 +1013,9 @@ mod tests {
     #[tokio::test]
     async fn partial_deadline_keeps_completed_scores_with_one_total_budget() {
         let (evaluation, sizes, elapsed) = run_batch_test(false, true).await;
-        // Under a tight total budget, at least one batch completes and the full
-        // candidate set is not evaluated. A second HTTP attempt may time out
-        // before the stub records it on slower hosts, so only require >=1 call.
         assert!(!evaluation.answers.is_empty() && evaluation.answers.len() < 8);
-        assert!(!sizes.is_empty() && sizes.len() <= 2);
-        assert!(elapsed < Duration::from_millis(500));
+        assert_eq!(sizes.len(), 2);
+        assert!(elapsed < Duration::from_secs(4));
     }
 
     #[test]
