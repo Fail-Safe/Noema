@@ -21,6 +21,7 @@ pub mod tag;
 pub mod tlsutil;
 pub mod trace;
 pub mod tui;
+pub mod typesafe_ai;
 pub mod watch;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

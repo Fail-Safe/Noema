@@ -1,6 +1,6 @@
 #!/bin/sh
 # __CURSOR_HOOK_MARKER__
-# Loads active tag=user-preference type=preference traces into additional_context.
+# Loads the server preference view into additional_context; full CLI fallback for older builds.
 cat >/dev/null
 python3 - <<'PY'
 import json
@@ -40,7 +40,7 @@ def preference_ids(noema):
     cortex = os.environ.get("NOEMA_CORTEX", "").strip()
     if cortex:
         argv.extend(["--cortex", cortex])
-    argv.extend(["list", "--tag", "user-preference", "--type", "preference"])
+    argv.extend(["list", "--tag", "user-preference"])
     lines = run(argv).splitlines()
     ids = []
     for line in lines[1:]:
@@ -67,6 +67,27 @@ def preference_body(noema, trace_id):
             break
     return title, body.strip()
 
+def snapshot(noema):
+    argv = [noema]
+    cortex = os.environ.get("NOEMA_CORTEX", "").strip()
+    if cortex:
+        argv.extend(["--cortex", cortex])
+    argv.extend(["preference-snapshot", "--max-body-chars", "12000"])
+    completed = subprocess.run(argv, capture_output=True, text=True)
+    if completed.returncode:
+        if "unrecognized subcommand 'preference-snapshot'" in completed.stderr:
+            return None
+        raise subprocess.CalledProcessError(completed.returncode, argv)
+    value = json.loads(completed.stdout)
+    view = value["recall_context"]
+    if view["preference_results_truncated"] or any(p["body_truncated"] for p in view["preferences"]):
+        # Preserve full binding startup bodies rather than adopting a bounded partial view.
+        return None
+    if view.get("preferences_unchanged") or not view.get("preferences_revision"):
+        raise ValueError("Invalid startup snapshot")
+    return value
+
+
 def main():
     noema = find_noema()
     if not noema:
@@ -79,13 +100,16 @@ def main():
         )
         return 0
     try:
-        ids = preference_ids(noema)
+        value = snapshot(noema)
         sections = []
-        for trace_id in ids:
-            title, body = preference_body(noema, trace_id)
-            sections.append(
-                "### {0}\nTitle: {1}\n\n{2}".format(trace_id, title, body)
-            )
+        if value is not None:
+            for preference in value["recall_context"]["preferences"]:
+                sections.append("### {0}\nTitle: {1}\n\n{2}".format(
+                    preference["id"], preference["title"], preference["body"]))
+        else:
+            for trace_id in preference_ids(noema):
+                title, body = preference_body(noema, trace_id)
+                sections.append("### {0}\nTitle: {1}\n\n{2}".format(trace_id, title, body))
         if sections:
             prefs = "\n\n---\n\n".join(sections)
             summary = "Loaded {0} active user-preference trace(s).".format(
@@ -94,6 +118,25 @@ def main():
         else:
             prefs = "(none)"
             summary = "No active user-preference traces (empty set is normal)."
+        reuse = ""
+        if value is not None:
+            metadata = {key: value[key] for key in
+                        ["cortex_id", "cortex_name", "cortex_directory", "max_body_chars"]}
+            metadata["preferences_revision"] = value["recall_context"]["preferences_revision"]
+            reuse = (
+                "\n\n[noema-preference-snapshot-v1] " + json.dumps(metadata)
+                + "\nThe matching full preference view above was delivered in this startup "
+                "context. This fulfills the initial preference load in the bootstrap policy. "
+                "For subsequent recall_context calls, use this revision with max_body_chars=12000 "
+                "after verifying that cortex_usage on your current MCP connection returns "
+                "cortex.id equal to this snapshot cortex_id. This applies to HTTP and stdio, "
+                "including a verified remote connection. A matching name or hostname alone "
+                "is insufficient. If the ID is different or unavailable, omit the revision "
+                "and perform a full MCP preference load. After a connection switch, verify "
+                "identity again; after compaction, "
+                "context loss, or a scope/body-limit change, omit it and reload. "
+                "A standalone revision surviving a summary does not authorize reuse."
+            )
         emit(
             BANNER
             + " Binding user-preference traces for this session. "
@@ -105,6 +148,7 @@ def main():
             + prefs
             + "\n\nMid-session Noema use: "
             + BOOTSTRAP
+            + reuse
         )
     except subprocess.CalledProcessError as exc:
         emit(

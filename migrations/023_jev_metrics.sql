@@ -1,0 +1,1 @@
+CREATE TABLE IF NOT EXISTS jev_metrics (id INTEGER PRIMARY KEY AUTOINCREMENT, recorded_at TEXT NOT NULL, operation TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, duration_ms INTEGER NOT NULL);

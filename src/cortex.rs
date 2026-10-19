@@ -30,6 +30,7 @@ use crate::{
 };
 
 mod embedding_backfill;
+mod trace_body_cache;
 
 pub const MANIFEST_VERSION: u32 = 2;
 pub const MAX_SEARCH_QUERY_LEN: usize = 1000;
@@ -815,6 +816,7 @@ pub struct Cortex {
     force_source_lock: bool,
     signing_key: Option<SigningKey>,
     durability: DurabilityProfile,
+    trace_body_cache: std::cell::RefCell<trace_body_cache::TraceBodyCache>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1164,6 +1166,7 @@ impl Cortex {
             force_source_lock: false,
             signing_key,
             durability,
+            trace_body_cache: Default::default(),
         };
         cortex.recover_pending_mutations()?;
         cortex.rebuild_fts_if_stale()?;
@@ -1946,6 +1949,26 @@ impl Cortex {
         Ok((row, trace))
     }
 
+    pub(crate) fn recall_body(&self, row: &Row) -> Result<std::sync::Arc<str>> {
+        self.trace_body_cache
+            .borrow_mut()
+            .read(&self.file_path(row), &row.content_hash)
+    }
+
+    pub(crate) fn recall_file_version(&self, row: &Row) -> Result<serde_json::Value> {
+        trace_body_cache::file_version(&self.file_path(row))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_recall_cache_enabled(&self, enabled: bool) {
+        self.trace_body_cache.borrow_mut().set_enabled(enabled);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recall_cache_counts(&self) -> (usize, usize) {
+        self.trace_body_cache.borrow().counts()
+    }
+
     pub fn list(&self, options: &ListOptions) -> Result<Vec<Row>> {
         let (sql, values) = list_query(options, false, None)?;
         self.query_rows(&sql, values)
@@ -2369,6 +2392,28 @@ impl Cortex {
     /// Best-effort record used by MCP/CLI wrappers so metrics never fail the primary op.
     pub fn record_op_metric_lossy(&self, input: &OpMetricInput<'_>) {
         let _ = self.record_op_metric(input);
+    }
+
+    pub fn jev_metrics_report(&self) -> Result<serde_json::Value> {
+        let usage = self.connection.query_row("SELECT COUNT(*),COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(MAX(duration_ms),0) FROM jev_metrics", [], |row| Ok((row.get::<_, i64>(0)?,row.get::<_, i64>(1)?,row.get::<_, i64>(2)?,row.get::<_, i64>(3)?)))?;
+        let fallbacks: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM op_metrics WHERE op='decision_retrieval' AND ok=0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(
+            json!({"successful_evaluations":usage.0,"input_tokens":usage.1,"output_tokens":usage.2,"max_duration_ms":usage.3,"retrieval_fallbacks":fallbacks}),
+        )
+    }
+
+    pub fn record_jev_evaluation(
+        &self,
+        operation: &str,
+        evaluation: &crate::typesafe_ai::Evaluation,
+        duration_ms: i64,
+    ) -> Result<()> {
+        self.connection.execute("INSERT INTO jev_metrics(recorded_at,operation,model,input_tokens,output_tokens,duration_ms) VALUES (?1,?2,?3,?4,?5,?6)", params![Utc::now().to_rfc3339(), operation, evaluation.model, i64::try_from(evaluation.usage.input_tokens)?, i64::try_from(evaluation.usage.output_tokens)?, duration_ms])?;
+        Ok(())
     }
 
     pub fn prune_op_metrics(&self, retain: Duration) -> Result<usize> {
@@ -6282,6 +6327,62 @@ mod tests {
             .effective_window(),
             std::time::Duration::from_secs(72 * 60 * 60)
         );
+    }
+
+    #[test]
+    fn decision_retrieval_upgrade_preserves_history_and_fallback_counts() {
+        let (_temp, cx) = cortex();
+        cx.connection
+            .execute("DELETE FROM schema_migrations WHERE version=24", [])
+            .unwrap();
+        for (op, duration_ms, ok, mode) in [
+            ("jev_retrieval", 30, true, "evaluated"),
+            ("jev_retrieval", 80, false, "fallback: unavailable"),
+            ("decision_retrieval", 50, true, "evaluated"),
+            ("search_traces", 11, false, "lexical"),
+        ] {
+            cx.record_op_metric(&OpMetricInput {
+                op,
+                source: "native",
+                duration_ms,
+                ok,
+                result_count: Some(2),
+                mode: Some(mode),
+                usage_recorded: None,
+            })
+            .unwrap();
+        }
+        let samples = || {
+            cx.connection
+                .prepare(
+                    "SELECT json_array(id,recorded_at,source,duration_ms,ok,result_count,mode,usage_recorded)
+                     FROM op_metrics ORDER BY id",
+                )
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let before = samples();
+        crate::db::migrate(&cx.connection).unwrap();
+        crate::db::migrate(&cx.connection).unwrap();
+        assert_eq!(samples(), before);
+
+        let report = cx.op_metrics_report(Duration::hours(24)).unwrap();
+        assert_eq!(report.total_ops, 4);
+        assert_eq!(report.total_errors, 2);
+        assert!(!report.by_op.iter().any(|row| row.op == "jev_retrieval"));
+        let retrieval = report
+            .by_op
+            .iter()
+            .find(|row| row.op == "decision_retrieval")
+            .unwrap();
+        assert_eq!(retrieval.count, 3);
+        assert_eq!(retrieval.errors, 1);
+        assert_eq!(retrieval.modes.get("evaluated"), Some(&2));
+        assert_eq!(retrieval.modes.get("fallback: unavailable"), Some(&1));
+        assert_eq!(cx.jev_metrics_report().unwrap()["retrieval_fallbacks"], 1);
     }
 
     #[test]
