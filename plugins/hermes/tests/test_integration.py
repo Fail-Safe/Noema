@@ -446,3 +446,41 @@ class TestProviderLifecycle:
         assert "Context compression" in session_content
 
         provider.shutdown()
+
+
+def test_preference_context_wrapper_against_real_noema(noema_binary, cortex_dir):
+    from plugins.hermes.preference_context import PreferenceScope, RecallContextClient
+
+    def cli(*args):
+        result = subprocess.run([noema_binary, "--cortex", cortex_dir, *args],
+                                capture_output=True, text=True, check=True)
+        return result.stdout
+
+    cli("add", "--title", "Example policy", "--type", "preference", "--tag", "user-preference",
+        "--body", "Use the documented procedure.")
+    snapshot = json.loads(cli("preference-snapshot", "--max-body-chars", "12000"))
+    scope = PreferenceScope(snapshot["cortex_id"], "stdio:" + noema_binary, 12000)
+    transport = StdioTransport(noema_binary, cortex_dir)
+    transport.start()
+    client = RecallContextClient(lambda arguments: json.loads(transport.call_tool("recall_context", arguments)))
+    try:
+        args = {"include_preferences": True, "queries": [], "record_usage": False}
+        # The context host consumes the complete server snapshot before acknowledging it.
+        _, ticket = client.context.prepare(args, scope)
+        seeded = client.context.apply(ticket, snapshot["recall_context"])
+        assert client.context.mark_delivered(seeded)
+        hit = client.recall(args, scope)
+        assert hit.output["preferences_unchanged"] and hit.output["preferences"] == []
+        assert len(client.context.preferences) == 1
+        cli("add", "--title", "Another policy", "--type", "preference", "--tag", "user-preference",
+            "--body", "Check the evidence.")
+        changed = client.recall(args, scope)
+        assert not changed.output["preferences_unchanged"]
+        assert len(client.context.preferences) == 2
+        assert client.context.mark_delivered(changed)
+        client.context.invalidate("compaction")
+        restored = client.recall(args, scope)
+        assert not restored.output["preferences_unchanged"]
+        assert len(restored.output["preferences"]) == 2
+    finally:
+        transport.close()

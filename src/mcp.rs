@@ -493,6 +493,9 @@ struct RecallContextParams {
     queries: Vec<String>,
     /// Include active traces tagged user-preference (default true)
     include_preferences: Option<bool>,
+    /// Revision of preference bodies still available in this client's context. Matching revisions omit preference bodies; task searches still run. Omit after context loss or compaction.
+    #[serde(default)]
+    known_preferences_revision: Option<String>,
     /// Maximum matches returned for each query (default 3, maximum 5)
     limit_per_query: Option<usize>,
     /// Maximum Unicode characters returned from each trace body (default 4000, maximum 12000)
@@ -542,6 +545,8 @@ struct RecallContextOutput {
     schema_version: u32,
     guidance: &'static str,
     preferences: Vec<RecallTrace>,
+    preferences_revision: Option<String>,
+    preferences_unchanged: bool,
     preference_results_truncated: bool,
     results: Vec<RecallQueryResult>,
     usage_recorded: bool,
@@ -963,7 +968,7 @@ impl NoemaServer {
     }
 
     #[tool(
-        description = "Retrieve startup preferences and bounded full trace bodies for several task queries in one read-only call. Use this continuity fast path instead of separate list/search/get calls when available.",
+        description = "Retrieve startup preferences and bounded full trace bodies for several task queries in one read-only call. Use this continuity fast path instead of separate list/search/get calls when available. Send known_preferences_revision only while the corresponding preference bodies remain available in the current context; matching revisions omit preference bodies while task searches still run.",
         annotations(read_only_hint = true)
     )]
     async fn recall_context(
@@ -1010,11 +1015,21 @@ impl NoemaServer {
                 Vec::new()
             };
             let preference_results_truncated = preference_rows.len() > MAX_RECALL_PREFERENCES;
+            let preferences_revision = if include_preferences {
+                Some(preference_revision(&cx, &preference_rows, max_body_chars)?)
+            } else {
+                None
+            };
+            let preferences_unchanged = cfg!(unix)
+                && preferences_revision.is_some()
+                && p.known_preferences_revision == preferences_revision;
             let mut returned_ids = HashSet::new();
             let mut preferences = Vec::new();
             for row in preference_rows.iter().take(MAX_RECALL_PREFERENCES) {
                 returned_ids.insert(row.id.clone());
-                preferences.push(recall_trace(&cx, &row.id, max_body_chars)?);
+                if !preferences_unchanged {
+                    preferences.push(recall_trace(&cx, &row.id, max_body_chars)?);
+                }
             }
 
             let mut results = Vec::with_capacity(p.queries.len());
@@ -1024,7 +1039,9 @@ impl NoemaServer {
                 let mut matches = Vec::new();
                 for row in search.rows.iter().take(limit) {
                     returned_ids.insert(row.id.clone());
-                    matches.push(recall_trace(&cx, &row.id, max_body_chars)?);
+                    let mut matched = recall_trace(&cx, &row.id, max_body_chars)?;
+                    matched.title = row.title.clone();
+                    matches.push(matched);
                 }
                 results.push(RecallQueryResult {
                     query: query.clone(),
@@ -1041,8 +1058,10 @@ impl NoemaServer {
             }
             Ok(RecallContextOutput {
                 schema_version: 1,
-                guidance: "Preference bodies are binding unless the current request overrides them. Prefer current, scope-matching traces; cite returned trace IDs as provenance and abstain when evidence is absent.",
+                guidance: "Preference bodies are binding unless the current request overrides them. Soft-band task matches are uncertain reference data, not binding preferences. Prefer current, scope-matching traces; cite returned trace IDs as provenance and abstain when evidence is absent.",
                 preferences,
+                preferences_revision,
+                preferences_unchanged,
                 preference_results_truncated,
                 results,
                 usage_recorded: p.record_usage,
@@ -2408,6 +2427,34 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+pub async fn preference_snapshot(
+    cortex: &Cortex,
+    max_body_chars: usize,
+) -> Result<serde_json::Value> {
+    let server = NoemaServer::new(&cortex.name, cortex.dir.clone(), false)?;
+    let output = server
+        .recall_context(Parameters(RecallContextParams {
+            queries: Vec::new(),
+            include_preferences: Some(true),
+            known_preferences_revision: None,
+            limit_per_query: None,
+            max_body_chars: Some(max_body_chars),
+            all: false,
+            mode: "lexical".into(),
+            record_usage: false,
+        }))
+        .await
+        .map_err(|_| anyhow::anyhow!("Preference snapshot retrieval failed"))?
+        .0;
+    Ok(json!({
+        "cortex_id": cortex.manifest.id,
+        "cortex_name": cortex.name,
+        "cortex_directory": cortex.dir,
+        "max_body_chars": max_body_chars,
+        "recall_context": output,
+    }))
+}
+
 fn render_instructions(manifest: &crate::cortex::Manifest) -> String {
     let purpose = if manifest.purpose.is_empty() {
         String::new()
@@ -2430,6 +2477,24 @@ Version:  noema {} (manifest v{})
 Before establishing user or project defaults, fetch durable preferences from
 this Cortex:
 
+Prefer recall_context with task-relevant queries, include_preferences=true, and
+record_usage=false. On the first call in a new context, omit
+known_preferences_revision. Retain the returned preference bodies and
+preferences_revision together.
+
+On later calls, send known_preferences_revision only while its corresponding
+bodies remain available in this model context. If preferences_unchanged=true,
+retain the previous preference view; an empty preferences array does not clear
+it. If preferences_unchanged=false and a revision is present, replace the view
+with the returned preferences, including an empty array. Task searches still run.
+
+Omit the revision after a new session, compaction/context loss, a cortex or server
+change, or a body-limit change unless the matching view has explicitly been
+restored. A copy in application memory alone does not establish that the model
+still has the bodies. If the server returns no revision, use its full response
+and discard any older saved revision.
+
+If recall_context is unavailable, use this fallback:
 1. list_traces with tag="user-preference".
 2. get_trace for each relevant result with record_usage=false; the body is the binding content.
 
@@ -2482,6 +2547,8 @@ Its complete input is validated before writing, then each trace is persisted in
 its own crash-safe transaction. Check the returned status and failures because
 the operation is not cross-trace atomic. Successful id and content_hash receipts
 are persistence verification; do not call get_trace solely to verify them.
+When mentioning a new or existing trace to a human or another agent, cite
+`noema:{{id}}`.
 
 Aim for titles under 80 characters. Do NOT include a date in the title — the ID
 generator prepends today's date automatically, and leading YYYYMMDD- or
@@ -2590,6 +2657,9 @@ fn build_cortex_usage(cortex: &Cortex) -> Result<CortexUsageOutput> {
             callable_tools_policy: "Use MCP tool discovery and each tool schema as the source of truth for callable operations in this client session.".into(),
         },
         startup: value_object(json!({
+            "preferred_preference_sequence":[{"tool":"recall_context","arguments":{"include_preferences":true,"record_usage":false},"queries_policy":"Use task-relevant queries; omit known_preferences_revision on the first call in a new context."}],
+            "preference_revision_policy":"Retain preferences_revision alongside the returned preference bodies. On later recall_context calls, send known_preferences_revision only while those bodies remain available in the same model context. preferences_unchanged=true means retain the previous preference view; preferences_unchanged=false with a revision means replace it, including an empty array. Task searches still run. Omit the revision after a new session, compaction/context loss, a cortex or server change, or a body-limit change unless the matching view has explicitly been restored. Application memory alone is insufficient. If a server returns no revision, use its full response and do not reuse an older token.",
+            "preference_sequence_role":"Fallback when recall_context is unavailable",
             "preference_sequence":[
                 {"tool":"list_traces","arguments":{"tag":"user-preference"}},
                 {"tool":"get_trace","for_each_result":true,"arguments":{"record_usage":false},"body_policy":"binding durable preference content"}
@@ -2709,7 +2779,7 @@ async fn execute_recall_search(
         },
     )?;
     if !rows.is_empty() {
-        search.rows = rows;
+        search.rows = crate::typesafe_ai::filter(cortex, query, rows).await?;
         search.mode = "lexical".into();
         search
             .note
@@ -2741,6 +2811,17 @@ fn broaden_recall_query(query: &str) -> String {
 }
 
 async fn execute_search(
+    cortex: &mut Cortex,
+    query: &str,
+    all: bool,
+    requested_mode: &str,
+) -> Result<SearchExecution> {
+    let mut result = execute_search_native(cortex, query, all, requested_mode).await?;
+    result.rows = crate::typesafe_ai::filter(cortex, query, result.rows).await?;
+    Ok(result)
+}
+
+async fn execute_search_native(
     cortex: &mut Cortex,
     query: &str,
     all: bool,
@@ -2791,9 +2872,32 @@ async fn execute_search(
     })
 }
 
+fn preference_revision(
+    cortex: &Cortex,
+    rows: &[crate::cortex::Row],
+    max_body_chars: usize,
+) -> Result<String> {
+    let versions = rows
+        .iter()
+        .take(MAX_RECALL_PREFERENCES)
+        .map(|row| cortex.recall_file_version(row))
+        .collect::<Result<Vec<_>>>()?;
+    let view = serde_json::to_vec(&(
+        "recall-preferences-v1",
+        &cortex.id,
+        &cortex.dir,
+        max_body_chars,
+        MAX_RECALL_PREFERENCES,
+        rows,
+        versions,
+    ))?;
+    Ok(format!("sha256:{:x}", Sha256::digest(view)))
+}
+
 fn recall_trace(cortex: &Cortex, id: &str, max_body_chars: usize) -> Result<RecallTrace> {
-    let (row, trace) = cortex.get_trace(id)?;
-    let (body, body_truncated) = truncate_chars(&trace.body, max_body_chars);
+    let row = cortex.get(id)?;
+    let cached_body = cortex.recall_body(&row)?;
+    let (body, body_truncated) = truncate_chars(&cached_body, max_body_chars);
     Ok(RecallTrace {
         id: row.id,
         title: row.title,
@@ -3524,6 +3628,7 @@ mod tests {
             .recall_context(Parameters(RecallContextParams {
                 queries: vec!["return current value for memory ULTRAVIOLET".into()],
                 include_preferences: None,
+                known_preferences_revision: None,
                 limit_per_query: Some(1),
                 max_body_chars: None,
                 all: false,
@@ -3887,3 +3992,9 @@ mod tests {
 
 #[cfg(test)]
 mod http_role_tests;
+
+#[cfg(test)]
+mod recall_cache_tests;
+
+#[cfg(test)]
+mod preference_revision_tests;
