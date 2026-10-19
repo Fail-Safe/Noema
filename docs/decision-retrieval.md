@@ -8,10 +8,10 @@ native retrieval results.
 
 ## Provider configuration
 
-Configure under `typesafe_ai` in the Noema config file:
+Configure under `decision` in the Noema config file:
 
 ```yaml
-typesafe_ai:
+decision:
   enabled: auto
   provider: auto   # auto | local | hosted
   model: clef-flash
@@ -26,6 +26,11 @@ typesafe_ai:
 | `hosted` | Hosted TypeSafe credentials required |
 
 Local mode never auto-falls back to hosted evaluation.
+
+## CLI
+
+`noema decision status|metrics|probe|gate|pair` inspects activation and runs
+advisory checks. See [native decision evaluation](testing/native-decision.md).
 
 ## Retrieval metrics
 

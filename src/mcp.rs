@@ -2779,7 +2779,7 @@ async fn execute_recall_search(
         },
     )?;
     if !rows.is_empty() {
-        search.rows = crate::typesafe_ai::filter(cortex, query, rows).await?;
+        search.rows = crate::decision::filter(cortex, query, rows).await?;
         search.mode = "lexical".into();
         search
             .note
@@ -2817,7 +2817,7 @@ async fn execute_search(
     requested_mode: &str,
 ) -> Result<SearchExecution> {
     let mut result = execute_search_native(cortex, query, all, requested_mode).await?;
-    result.rows = crate::typesafe_ai::filter(cortex, query, result.rows).await?;
+    result.rows = crate::decision::filter(cortex, query, result.rows).await?;
     Ok(result)
 }
 

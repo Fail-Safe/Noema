@@ -38,7 +38,7 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
-enum TypeSafeCommand {
+enum DecisionCommand {
     Status,
     Metrics,
     Probe,
@@ -56,11 +56,11 @@ enum TypeSafeCommand {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Inspect or exercise native TypeSafe AI integration
-    #[command(name = "typesafe")]
-    TypeSafe {
+    /// Inspect or exercise decision-assisted retrieval
+    #[command(name = "decision")]
+    Decision {
         #[command(subcommand)]
-        command: TypeSafeCommand,
+        command: DecisionCommand,
     },
     /// Add a new Trace
     Add(AddArgs),
@@ -935,13 +935,13 @@ struct ServeArgs {
 
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
-    Config::load()?.typesafe_ai.unwrap_or_default().client()?;
+    Config::load()?.decision.unwrap_or_default().client()?;
     let selected = cli.cortex.as_deref();
     match cli.command {
         Command::Init { name, path } => init(&name, path)?,
         Command::Use { name } => use_cortex(&name)?,
         Command::Cortex { command } => cortex_command(command)?,
-        Command::TypeSafe { command } => typesafe_command(selected, command).await?,
+        Command::Decision { command } => decision_command(selected, command).await?,
         Command::Version => println!("noema v{VERSION}\nimplementation: Rust"),
         Command::Completion { command } => completion_command(command)?,
         Command::Config { command } => config_command(command)?,
@@ -1064,7 +1064,7 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
                 cx.search(&query, &list.into())
             };
             let result = match result {
-                Ok(rows) => crate::typesafe_ai::filter(cx, &query, rows).await,
+                Ok(rows) => crate::decision::filter(cx, &query, rows).await,
                 Err(error) => Err(error),
             };
             record_cli_op(
@@ -1344,7 +1344,7 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
         | Command::Serve(_)
         | Command::Completion { .. }
         | Command::Version
-        | Command::TypeSafe { .. }
+        | Command::Decision { .. }
         | Command::Config { .. }
         | Command::Plugin { .. }
         | Command::Integrate { .. } => unreachable!(),
@@ -5087,25 +5087,25 @@ fn write_completion_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
-async fn typesafe_command(selected: Option<&str>, command: TypeSafeCommand) -> Result<()> {
+async fn decision_command(selected: Option<&str>, command: DecisionCommand) -> Result<()> {
     let result = match command {
-        TypeSafeCommand::Status => crate::typesafe_ai::status()?,
-        TypeSafeCommand::Metrics => Cortex::resolve(selected)?.jev_metrics_report()?,
-        TypeSafeCommand::Probe => serde_json::to_value(crate::typesafe_ai::probe().await?)?,
-        TypeSafeCommand::Gate { title, body } => {
+        DecisionCommand::Status => crate::decision::status()?,
+        DecisionCommand::Metrics => Cortex::resolve(selected)?.jev_metrics_report()?,
+        DecisionCommand::Probe => serde_json::to_value(crate::decision::probe().await?)?,
+        DecisionCommand::Gate { title, body } => {
             let mut cx = Cortex::resolve(selected)?;
-            crate::typesafe_ai::advisory(
+            crate::decision::advisory(
                 &mut cx,
                 "gate",
                 serde_json::json!({"draft":{"title":title,"body":body}}),
             )
             .await?
         }
-        TypeSafeCommand::Pair { primary, secondary } => {
+        DecisionCommand::Pair { primary, secondary } => {
             let mut cx = Cortex::resolve(selected)?;
             let (_, a) = cx.get_trace(&primary)?;
             let (_, b) = cx.get_trace(&secondary)?;
-            crate::typesafe_ai::advisory(&mut cx, "pair", serde_json::json!({"primary":{"title":a.frontmatter.title,"body":a.body},"secondary":{"title":b.frontmatter.title,"body":b.body}})).await?
+            crate::decision::advisory(&mut cx, "pair", serde_json::json!({"primary":{"title":a.frontmatter.title,"body":a.body},"secondary":{"title":b.frontmatter.title,"body":b.body}})).await?
         }
     };
     println!("{}", serde_json::to_string_pretty(&result)?);

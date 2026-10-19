@@ -3,6 +3,7 @@ pub mod config;
 pub mod consolidation;
 pub mod cortex;
 pub mod db;
+pub mod decision;
 pub mod embedding;
 pub mod event;
 pub mod eventsig;
@@ -21,7 +22,6 @@ pub mod tag;
 pub mod tlsutil;
 pub mod trace;
 pub mod tui;
-pub mod typesafe_ai;
 pub mod watch;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
