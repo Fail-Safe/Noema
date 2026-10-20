@@ -2409,7 +2409,7 @@ impl Cortex {
     pub fn record_jev_evaluation(
         &self,
         operation: &str,
-        evaluation: &crate::typesafe_ai::Evaluation,
+        evaluation: &crate::decision::Evaluation,
         duration_ms: i64,
     ) -> Result<()> {
         self.connection.execute("INSERT INTO jev_metrics(recorded_at,operation,model,input_tokens,output_tokens,duration_ms) VALUES (?1,?2,?3,?4,?5,?6)", params![Utc::now().to_rfc3339(), operation, evaluation.model, i64::try_from(evaluation.usage.input_tokens)?, i64::try_from(evaluation.usage.output_tokens)?, duration_ms])?;

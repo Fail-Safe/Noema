@@ -130,8 +130,7 @@ pub fn retrieve(cortex: &Cortex, prompt: &str, options: PrefetchOptions) -> Resu
     search_rows.truncate(candidate_match_count);
     let (search_rows, rescue_rows) =
         qualify_search_rows(cortex, prompt, &terms, search_rows, unique_single_candidate)?;
-    let mut search_rows =
-        crate::typesafe_ai::filter_sync(cortex, prompt, search_rows, rescue_rows)?;
+    let mut search_rows = crate::decision::filter_sync(cortex, prompt, search_rows, rescue_rows)?;
     search_rows.truncate(options.max_results);
     let preference_rows = cortex.list(&ListOptions {
         tag: "user-preference".into(),
@@ -432,8 +431,7 @@ fn render_context(
             trace.body.trim().to_owned()
         } else {
             let budget = 1024;
-            let mut excerpt =
-                crate::typesafe_ai::context_excerpt(trace.body.trim(), prompt, budget);
+            let mut excerpt = crate::decision::context_excerpt(trace.body.trim(), prompt, budget);
             if trace.body.trim().chars().count() > budget {
                 excerpt
                     .push_str("\n[trace excerpt; retrieve the full trace for additional evidence]");
@@ -530,7 +528,7 @@ mod tests {
         assert!(context.contains("[trace excerpt;"));
         assert!(context.chars().count() < 5000);
         let mut rescued = rows[0].clone();
-        rescued.title.push_str(crate::typesafe_ai::RESCUE_MARKER);
+        rescued.title.push_str(crate::decision::RESCUE_MARKER);
         let (context, count, truncated) =
             render_context(&cortex, &[&rescued], "ultraviolet routing", 8000).unwrap();
         assert_eq!(count, 1);

@@ -47,7 +47,7 @@ pub struct Config {
     #[serde(default)]
     pub default: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub typesafe_ai: Option<crate::typesafe_ai::TypeSafeConfig>,
+    pub decision: Option<crate::decision::DecisionConfig>,
     #[serde(default)]
     pub cortexes: BTreeMap<String, CortexEntry>,
     #[serde(default, skip_serializing_if = "is_zero")]
