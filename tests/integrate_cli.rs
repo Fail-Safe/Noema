@@ -945,3 +945,95 @@ fn integration_status_and_remove_do_not_require_a_cortex() {
         String::from_utf8_lossy(&remove.stderr)
     );
 }
+
+#[test]
+fn ohmypi_cli_respects_profile_and_directory_precedence() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let config = temp.path().join("config");
+    let cortexes = temp.path().join("cortexes");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&cortexes).unwrap();
+    let init = noema(&home, &config)
+        .args(["init", "--name", "shared", "--path"])
+        .arg(&cortexes)
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let override_dir = temp.path().join("custom-agent");
+    for (profile, legacy, expected) in [
+        (
+            Some("work"),
+            "legacy",
+            home.join(".custom-omp/profiles/work/agent"),
+        ),
+        (
+            None,
+            "legacy",
+            home.join(".custom-omp/profiles/legacy/agent"),
+        ),
+        (Some(""), "legacy", override_dir.clone()),
+        (Some("default"), "legacy", override_dir.clone()),
+    ] {
+        let mut command = noema(&home, &config);
+        command
+            .env("PI_CONFIG_DIR", ".custom-omp")
+            .env("PI_CODING_AGENT_DIR", &override_dir)
+            .env("PI_PROFILE", legacy)
+            .env_remove("OMP_PROFILE");
+        if let Some(profile) = profile {
+            command.env("OMP_PROFILE", profile);
+        }
+        let installed = command
+            .args([
+                "--cortex",
+                "shared",
+                "integrate",
+                "ohmypi",
+                "install",
+                "--scope",
+                "user",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            installed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        assert!(expected.join("mcp.json").exists());
+        assert!(expected.join("rules/noema.md").exists());
+        assert!(!home.join(".omp/mcp.json").exists());
+        assert!(!home.join(".custom-omp/agent/mcp.json").exists());
+    }
+
+    let project = temp.path().join("project");
+    fs::create_dir_all(project.join(".git")).unwrap();
+    let installed = noema(&home, &config)
+        .current_dir(&project)
+        .env("OMP_PROFILE", "work")
+        .env("PI_CODING_AGENT_DIR", &override_dir)
+        .args([
+            "--cortex",
+            "shared",
+            "integrate",
+            "ohmypi",
+            "install",
+            "--scope",
+            "project",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert!(project.join(".omp/mcp.json").exists());
+    assert!(project.join(".omp/rules/noema.md").exists());
+}

@@ -151,3 +151,11 @@ mirrors the operation as a Noema trace tagged `hermes-mirror`:
 ## License
 
 MIT — same as Noema.
+
+### Conditional preference client component
+
+`preference_context.py` is included for integrations that own model-context
+lifecycle and delivery. It requires explicit delivery acknowledgement and reset
+notifications; storing a response in RAM does not enable reuse. See
+[the preference revision contract](../../docs/preference-revisions.md).
+Hermes bounded search requests `include_preferences: false` and remains unchanged.

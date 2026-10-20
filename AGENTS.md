@@ -59,6 +59,16 @@ PR, run `make test` plus plugin checks for any plugin touched.
 
 ## Agent-Specific Instructions
 
+Prefer `recall_context` for startup and task retrieval. Retain its preference
+bodies and `preferences_revision` together; send `known_preferences_revision`
+on subsequent calls only while those bodies remain in the current model
+context. With `preferences_unchanged: true`, retain the previous preference
+view. With `false` and a revision, replace it, including an empty array. Clear
+the revision after context loss/compaction or a cortex/server/body-limit change
+unless the matching view has explicitly been restored. If no revision is
+returned, use the full response and discard an older token. See
+[the protocol contract](docs/preference-revisions.md).
+
 At session start, read Noema preference traces with `tag: "user-preference"`
 before assuming defaults. Treat trace bodies as binding unless the current user
 message overrides them. Do not print secrets or secret-bearing HTTP bodies;

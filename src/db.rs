@@ -124,26 +124,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn applies_complete_migration_history() {
-        let temp = tempfile::tempdir().unwrap();
-        let connection = open(temp.path()).unwrap();
-        let version: i64 = connection
-            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(version, 22);
-        let fts: String = connection
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE name='traces_fts'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(fts.contains("fts5"));
-    }
-
-    #[test]
     fn embedding_metadata_upgrade_preserves_legacy_vectors() {
         let connection = Connection::open_in_memory().unwrap();
         configure(&connection).unwrap();

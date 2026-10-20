@@ -38,7 +38,30 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+enum DecisionCommand {
+    Status,
+    Metrics,
+    Probe,
+    Gate {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        body: String,
+    },
+    Pair {
+        primary: String,
+        secondary: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum Command {
+    /// Inspect or exercise decision-assisted retrieval
+    #[command(name = "decision")]
+    Decision {
+        #[command(subcommand)]
+        command: DecisionCommand,
+    },
     /// Add a new Trace
     Add(AddArgs),
     /// List Traces
@@ -96,6 +119,11 @@ enum Command {
     },
     /// Retrieve bounded prompt-relevant context without a model tool round trip
     Prefetch(PrefetchArgs),
+    /// Read the server-defined preference snapshot and revision for context injection
+    PreferenceSnapshot {
+        #[arg(long, default_value_t = 12000)]
+        max_body_chars: usize,
+    },
     /// Find related Traces
     Similar {
         trace_id: String,
@@ -676,6 +704,7 @@ enum IntegrationClient {
     ClaudeCode,
     Cursor,
     Opencode,
+    Ohmypi,
 }
 
 impl From<IntegrationClient> for crate::integrate::Client {
@@ -685,6 +714,7 @@ impl From<IntegrationClient> for crate::integrate::Client {
             IntegrationClient::ClaudeCode => Self::ClaudeCode,
             IntegrationClient::Cursor => Self::Cursor,
             IntegrationClient::Opencode => Self::OpenCode,
+            IntegrationClient::Ohmypi => Self::OhMyPi,
         }
     }
 }
@@ -747,6 +777,11 @@ enum IntegrateCommand {
     },
     /// Manage the OpenCode integration
     Opencode {
+        #[command(subcommand)]
+        command: IntegrationAction,
+    },
+    /// Manage the Oh My Pi (OMP) integration
+    Ohmypi {
         #[command(subcommand)]
         command: IntegrationAction,
     },
@@ -900,11 +935,13 @@ struct ServeArgs {
 
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
+    Config::load()?.decision.unwrap_or_default().client()?;
     let selected = cli.cortex.as_deref();
     match cli.command {
         Command::Init { name, path } => init(&name, path)?,
         Command::Use { name } => use_cortex(&name)?,
         Command::Cortex { command } => cortex_command(command)?,
+        Command::Decision { command } => decision_command(selected, command).await?,
         Command::Version => println!("noema v{VERSION}\nimplementation: Rust"),
         Command::Completion { command } => completion_command(command)?,
         Command::Config { command } => config_command(command)?,
@@ -924,6 +961,10 @@ pub async fn run() -> Result<()> {
 
 async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()> {
     match command {
+        Command::PreferenceSnapshot { max_body_chars } => {
+            let snapshot = crate::mcp::preference_snapshot(cx, max_body_chars).await?;
+            println!("{}", serde_json::to_string(&snapshot)?);
+        }
         Command::Add(args) => {
             let (title, trace_type, author, tags, body) = collect_add_args(args)?;
             let started = Instant::now();
@@ -1021,6 +1062,10 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
                 }
             } else {
                 cx.search(&query, &list.into())
+            };
+            let result = match result {
+                Ok(rows) => crate::decision::filter(cx, &query, rows).await,
+                Err(error) => Err(error),
             };
             record_cli_op(
                 cx,
@@ -1299,6 +1344,7 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
         | Command::Serve(_)
         | Command::Completion { .. }
         | Command::Version
+        | Command::Decision { .. }
         | Command::Config { .. }
         | Command::Plugin { .. }
         | Command::Integrate { .. } => unreachable!(),
@@ -3910,6 +3956,9 @@ fn integrate_command(selected: Option<&str>, command: IntegrateCommand) -> Resul
         IntegrateCommand::Opencode { command } => {
             integrate_client_command(selected, crate::integrate::Client::OpenCode, command)?;
         }
+        IntegrateCommand::Ohmypi { command } => {
+            integrate_client_command(selected, crate::integrate::Client::OhMyPi, command)?;
+        }
     }
     Ok(())
 }
@@ -5036,6 +5085,31 @@ fn write_completion_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(temporary);
     }
     result
+}
+
+async fn decision_command(selected: Option<&str>, command: DecisionCommand) -> Result<()> {
+    let result = match command {
+        DecisionCommand::Status => crate::decision::status()?,
+        DecisionCommand::Metrics => Cortex::resolve(selected)?.jev_metrics_report()?,
+        DecisionCommand::Probe => serde_json::to_value(crate::decision::probe().await?)?,
+        DecisionCommand::Gate { title, body } => {
+            let mut cx = Cortex::resolve(selected)?;
+            crate::decision::advisory(
+                &mut cx,
+                "gate",
+                serde_json::json!({"draft":{"title":title,"body":body}}),
+            )
+            .await?
+        }
+        DecisionCommand::Pair { primary, secondary } => {
+            let mut cx = Cortex::resolve(selected)?;
+            let (_, a) = cx.get_trace(&primary)?;
+            let (_, b) = cx.get_trace(&secondary)?;
+            crate::decision::advisory(&mut cx, "pair", serde_json::json!({"primary":{"title":a.frontmatter.title,"body":a.body},"secondary":{"title":b.frontmatter.title,"body":b.body}})).await?
+        }
+    };
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
 }
 
 #[cfg(test)]

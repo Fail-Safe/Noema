@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-const BOOTSTRAP: &str = "[mem-bootstrap-v2]: call Noema recall_context once with task-relevant queries; it returns active preferences and bounded full traces. If recall_context is unavailable, call get_instructions and follow its startup policy. Surface tool failures explicitly.";
+const BOOTSTRAP: &str = "[mem-bootstrap-v2]: call Noema recall_context at startup with task-relevant queries, include_preferences=true, record_usage=false, and no known revision. Retain preferences_revision alongside the returned preference bodies. On later recall_context calls, send known_preferences_revision only while those bodies remain available in the same model context. preferences_unchanged=true means retain the previous preference view; preferences_unchanged=false with a revision means replace it, including an empty array. Task searches still run. Omit the revision after a new session, compaction/context loss, a cortex or server change, or a body-limit change unless the matching view has explicitly been restored. Application memory alone is insufficient. If a server returns no revision, use its full response and do not reuse an older token. If recall_context is unavailable, call get_instructions and follow its startup policy. Surface tool failures explicitly.";
 const CODEX_START: &str = "# >>> noema integrate codex v1";
 const CODEX_END: &str = "# <<< noema integrate codex v1";
 const CODEX_CONTINUITY_PROFILE_MARKER: &str = "noema-managed-codex-continuity-v1";
@@ -44,10 +44,17 @@ pub enum Client {
     ClaudeCode,
     Cursor,
     OpenCode,
+    OhMyPi,
 }
 
 impl Client {
-    pub const ALL: [Self; 4] = [Self::Codex, Self::ClaudeCode, Self::Cursor, Self::OpenCode];
+    pub const ALL: [Self; 5] = [
+        Self::Codex,
+        Self::ClaudeCode,
+        Self::Cursor,
+        Self::OpenCode,
+        Self::OhMyPi,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -55,6 +62,7 @@ impl Client {
             Self::ClaudeCode => "claude-code",
             Self::Cursor => "cursor",
             Self::OpenCode => "opencode",
+            Self::OhMyPi => "ohmypi",
         }
     }
 
@@ -64,6 +72,7 @@ impl Client {
             Self::ClaudeCode => "Claude Code MCP configuration and SessionStart hook",
             Self::Cursor => "Cursor MCP configuration and local/cloud bootstrap",
             Self::OpenCode => "OpenCode MCP configuration and bootstrap plugin",
+            Self::OhMyPi => "Oh My Pi native MCP configuration and startup rule",
         }
     }
 }
@@ -117,6 +126,7 @@ pub struct Target {
     pub project_root: PathBuf,
     pub home: PathBuf,
     pub xdg_config_home: Option<PathBuf>,
+    pub ohmypi_agent_dir: Option<PathBuf>,
 }
 
 impl Target {
@@ -125,12 +135,18 @@ impl Target {
             .map(PathBuf::from)
             .context("HOME is not set")?;
         let cwd = std::env::current_dir().context("resolving current directory")?;
+        let ohmypi_agent_dir = if client == Client::OhMyPi && scope == Scope::User {
+            Some(ohmypi_agent_dir(&home)?)
+        } else {
+            None
+        };
         Ok(Self {
             client,
             scope,
             project_root: find_project_root(&cwd),
             home,
             xdg_config_home: std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+            ohmypi_agent_dir,
         })
     }
 
@@ -212,6 +228,52 @@ impl Target {
     fn cursor_rule(&self) -> PathBuf {
         self.cursor_root().join("rules/noema.mdc")
     }
+
+    fn ohmypi_root(&self) -> PathBuf {
+        match self.scope {
+            Scope::User => self
+                .ohmypi_agent_dir
+                .clone()
+                .unwrap_or_else(|| self.home.join(".omp/agent")),
+            Scope::Project => self.project_root.join(".omp"),
+        }
+    }
+
+    fn ohmypi_mcp_config(&self) -> PathBuf {
+        self.ohmypi_root().join("mcp.json")
+    }
+
+    fn ohmypi_rule(&self) -> PathBuf {
+        self.ohmypi_root().join("rules/noema.md")
+    }
+}
+
+fn ohmypi_agent_dir(home: &Path) -> Result<PathBuf> {
+    let root = home.join(std::env::var_os("PI_CONFIG_DIR").unwrap_or_else(|| ".omp".into()));
+    let profile = std::env::var("OMP_PROFILE")
+        .or_else(|_| std::env::var("PI_PROFILE"))
+        .unwrap_or_default();
+    let profile = profile.trim();
+    if !profile.is_empty() && profile != "default" {
+        let mut components = Path::new(profile).components();
+        if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+        {
+            bail!("OMP profile must be a single directory name");
+        }
+        return Ok(root.join("profiles").join(profile).join("agent"));
+    }
+    Ok(match std::env::var_os("PI_CODING_AGENT_DIR") {
+        Some(path) if path == OsStr::new("~") => home.to_owned(),
+        Some(path) => {
+            let path = PathBuf::from(path);
+            match path.strip_prefix("~/") {
+                Ok(suffix) => home.join(suffix),
+                Err(_) => path,
+            }
+        }
+        None => root.join("agent"),
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -400,6 +462,7 @@ pub fn status(target: &Target) -> Result<Report> {
         Client::ClaudeCode => claude_status(target),
         Client::Cursor => cursor_status(target),
         Client::OpenCode => opencode_status(target),
+        Client::OhMyPi => ohmypi_status(target),
     }
 }
 
@@ -409,6 +472,7 @@ pub fn install(request: &Request, check: bool, force: bool) -> Result<Report> {
         Client::ClaudeCode => claude_install(request, check, force),
         Client::Cursor => cursor_install(request, check, force),
         Client::OpenCode => opencode_install(request, check, force),
+        Client::OhMyPi => ohmypi_install(request, check, force),
     }
 }
 
@@ -418,6 +482,7 @@ pub fn remove(target: &Target, check: bool, force: bool) -> Result<Report> {
         Client::ClaudeCode => claude_remove(target, check, force),
         Client::Cursor => cursor_remove(target, check, force),
         Client::OpenCode => opencode_remove(target, check, force),
+        Client::OhMyPi => ohmypi_remove(target, check, force),
     }
 }
 
@@ -436,6 +501,15 @@ pub fn print(request: &Request) -> Result<String> {
             )?
         )),
         Client::Cursor => cursor_print(request),
+        Client::OhMyPi => Ok(format!(
+            "# MCP target: {}\n{}\n\n# rule target: {}\n{}",
+            request.target.ohmypi_mcp_config().display(),
+            serde_json::to_string_pretty(
+                &json!({"mcpServers": {"noema": mcp_value(request, Client::OhMyPi)?}})
+            )?,
+            request.target.ohmypi_rule().display(),
+            ohmypi_rule_source()
+        )),
         Client::OpenCode => {
             require_opencode_v1(&request.target)?;
             Ok(format!(
@@ -466,12 +540,12 @@ pub fn capture(
             require_opencode_v1(target)?;
             inspect_json_mcp(&opencode_capture_config(target), &["mcp"], "noema")?
         }
-        Client::ClaudeCode | Client::Cursor => unreachable!(),
+        Client::ClaudeCode | Client::Cursor | Client::OhMyPi => unreachable!(),
     };
     let recognized = match target.client {
         Client::Codex => base_transport.is_some(),
         Client::OpenCode => base_state.healthy() && base_transport.is_some(),
-        Client::ClaudeCode | Client::Cursor => unreachable!(),
+        Client::ClaudeCode | Client::Cursor | Client::OhMyPi => unreachable!(),
     };
     if !recognized {
         bail!(
@@ -560,7 +634,7 @@ pub fn capture(
                 opencode_capture_override(request)?,
             );
         }
-        Client::ClaudeCode | Client::Cursor => unreachable!(),
+        Client::ClaudeCode | Client::Cursor | Client::OhMyPi => unreachable!(),
     }
     if !client_args_forwarded {
         command.args(client_args);
@@ -941,6 +1015,87 @@ fn codex_hook_tail() -> Result<String> {
     ))
 }
 
+fn ohmypi_status(target: &Target) -> Result<Report> {
+    let mcp_path = target.ohmypi_mcp_config();
+    let (mcp, transport) = inspect_json_mcp(&mcp_path, &["mcpServers"], "noema")?;
+    let rule_path = target.ohmypi_rule();
+    let rule = inspect_managed_file(&rule_path, ohmypi_rule_source().as_bytes(), false)?;
+    Ok(report(
+        target,
+        vec![
+            ("mcp", mcp_path, mcp, transport),
+            ("bootstrap rule", rule_path, rule, None),
+        ],
+    ))
+}
+
+fn ohmypi_install(request: &Request, check: bool, force: bool) -> Result<Report> {
+    if !check {
+        let preview = ohmypi_install(request, true, force)?;
+        if preview.refused() {
+            return Ok(preview);
+        }
+    }
+    let mcp_path = request.target.ohmypi_mcp_config();
+    let mcp = install_json_member(
+        &mcp_path,
+        &["mcpServers"],
+        "noema",
+        &mcp_value(request, Client::OhMyPi)?,
+        is_noema_mcp,
+        check,
+        force,
+    )?;
+    let rule_path = request.target.ohmypi_rule();
+    let rule = install_managed_file(
+        &rule_path,
+        ohmypi_rule_source().as_bytes(),
+        false,
+        check,
+        force,
+    )?;
+    Ok(report(
+        &request.target,
+        vec![
+            ("mcp", mcp_path, mcp, Some(request.connection.transport)),
+            ("bootstrap rule", rule_path, rule, None),
+        ],
+    ))
+}
+
+fn ohmypi_remove(target: &Target, check: bool, force: bool) -> Result<Report> {
+    if !check {
+        let preview = ohmypi_remove(target, true, force)?;
+        if preview.refused() {
+            return Ok(preview);
+        }
+    }
+    let mcp_path = target.ohmypi_mcp_config();
+    let mcp = remove_json_member(
+        &mcp_path,
+        &["mcpServers"],
+        "noema",
+        is_noema_mcp,
+        check,
+        force,
+    )?;
+    let rule_path = target.ohmypi_rule();
+    let rule = remove_managed_file(&rule_path, ohmypi_rule_source().as_bytes(), check, force)?;
+    Ok(report(
+        target,
+        vec![
+            ("mcp", mcp_path, mcp, None),
+            ("bootstrap rule", rule_path, rule, None),
+        ],
+    ))
+}
+
+fn ohmypi_rule_source() -> String {
+    format!(
+        "---\ndescription: Load Noema memory policy for every Oh My Pi agent session\nalwaysApply: true\n---\n\n{BOOTSTRAP}\n"
+    )
+}
+
 fn claude_status(target: &Target) -> Result<Report> {
     let mcp_path = target.claude_mcp_config();
     let hook_path = target.claude_settings();
@@ -1271,7 +1426,7 @@ fn report(target: &Target, components: Vec<ComponentState>) -> Report {
 fn mcp_value(request: &Request, client: Client) -> Result<Value> {
     match (request.connection.transport, client) {
         (Transport::Stdio, Client::Codex) => unreachable!(),
-        (Transport::Stdio, Client::ClaudeCode) => Ok(json!({
+        (Transport::Stdio, Client::ClaudeCode | Client::OhMyPi) => Ok(json!({
             "type": "stdio",
             "command": request.connection.binary,
             "args": ["--cortex", request.connection.cortex, "serve", "--transport", "stdio"]
@@ -1285,7 +1440,7 @@ fn mcp_value(request: &Request, client: Client) -> Result<Value> {
             "command": [request.connection.binary, "--cortex", request.connection.cortex, "serve", "--transport", "stdio"],
             "enabled": true
         })),
-        (Transport::Http, Client::ClaudeCode) => {
+        (Transport::Http, Client::ClaudeCode | Client::OhMyPi) => {
             let mut value =
                 json!({"type": "http", "url": request.connection.url.as_deref().unwrap()});
             if let Some(name) = &request.connection.bearer_token_env {
@@ -2851,7 +3006,86 @@ mod tests {
             project_root: root.join("project"),
             home: root.join("home"),
             xdg_config_home: Some(root.join("config")),
+            ohmypi_agent_dir: None,
         }
+    }
+
+    #[test]
+    fn ohmypi_lifecycle_preserves_unrelated_config_and_scopes() {
+        let temp = tempfile::tempdir().unwrap();
+        for scope in [Scope::User, Scope::Project] {
+            let mut request = request(temp.path(), Client::OhMyPi);
+            request.target.scope = scope;
+            let path = request.target.ohmypi_mcp_config();
+            let rule = request.target.ohmypi_rule();
+            let legacy_path = request.target.home.join(".omp/mcp.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+            let original = "{\n  // keep this comment\n  \"mcpServers\": {\"other\": {\"command\": \"other-server\"}},\n  \"disabledServers\": [\"other\"]\n}\n";
+            fs::write(&path, original).unwrap();
+            fs::write(&legacy_path, "legacy config must remain untouched").unwrap();
+
+            assert!(install(&request, true, false).unwrap().pending());
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            assert!(!rule.exists());
+
+            assert!(install(&request, false, false).unwrap().healthy());
+            let installed = fs::read(&path).unwrap();
+            let rule_bytes = fs::read(&rule).unwrap();
+            assert!(install(&request, false, false).unwrap().healthy());
+            assert_eq!(fs::read(&path).unwrap(), installed);
+            assert_eq!(fs::read(&rule).unwrap(), rule_bytes);
+            assert!(status(&request.target).unwrap().healthy());
+
+            assert!(remove(&request.target, true, false).unwrap().pending());
+            assert_eq!(fs::read(&path).unwrap(), installed);
+            assert_eq!(fs::read(&rule).unwrap(), rule_bytes);
+            remove(&request.target, false, false).unwrap();
+            assert!(!rule.exists());
+            let remaining_source = fs::read_to_string(&path).unwrap();
+            assert!(remaining_source.contains("// keep this comment"));
+            let remaining = parse_jsonc_value(&remaining_source).unwrap();
+            assert_eq!(
+                remaining["mcpServers"],
+                json!({"other": {"command": "other-server"}})
+            );
+            assert_eq!(remaining["disabledServers"], json!(["other"]));
+            assert_eq!(
+                fs::read_to_string(&legacy_path).unwrap(),
+                "legacy config must remain untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn ohmypi_preflight_refuses_rule_drift_and_unknown_mcp() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = request(temp.path(), Client::OhMyPi);
+        let path = request.target.ohmypi_mcp_config();
+        let rule = request.target.ohmypi_rule();
+        fs::create_dir_all(rule.parent().unwrap()).unwrap();
+        fs::write(&rule, "custom user rule").unwrap();
+        assert!(install(&request, false, false).unwrap().refused());
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(&rule).unwrap(), "custom user rule");
+        assert!(install(&request, false, true).unwrap().healthy());
+
+        fs::write(&rule, "modified bootstrap").unwrap();
+        let installed = fs::read(&path).unwrap();
+        assert!(remove(&request.target, false, false).unwrap().refused());
+        assert_eq!(fs::read(&path).unwrap(), installed);
+        assert_eq!(fs::read_to_string(&rule).unwrap(), "modified bootstrap");
+        assert!(install(&request, false, true).unwrap().healthy());
+
+        let unknown = "{\"mcpServers\":{\"noema\":{\"command\":\"other-server\"}}}\n";
+        fs::write(&path, unknown).unwrap();
+        let rule_bytes = fs::read(&rule).unwrap();
+        assert!(install(&request, false, true).unwrap().refused());
+        assert_eq!(fs::read_to_string(&path).unwrap(), unknown);
+        assert_eq!(fs::read(&rule).unwrap(), rule_bytes);
+        assert!(remove(&request.target, false, false).unwrap().refused());
+        assert_eq!(fs::read_to_string(&path).unwrap(), unknown);
+        assert_eq!(fs::read(&rule).unwrap(), rule_bytes);
     }
 
     fn request(root: &Path, client: Client) -> Request {

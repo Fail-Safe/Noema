@@ -30,6 +30,7 @@ use crate::{
 };
 
 mod embedding_backfill;
+mod trace_body_cache;
 
 pub const MANIFEST_VERSION: u32 = 2;
 pub const MAX_SEARCH_QUERY_LEN: usize = 1000;
@@ -815,6 +816,7 @@ pub struct Cortex {
     force_source_lock: bool,
     signing_key: Option<SigningKey>,
     durability: DurabilityProfile,
+    trace_body_cache: std::cell::RefCell<trace_body_cache::TraceBodyCache>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1164,6 +1166,7 @@ impl Cortex {
             force_source_lock: false,
             signing_key,
             durability,
+            trace_body_cache: Default::default(),
         };
         cortex.recover_pending_mutations()?;
         cortex.rebuild_fts_if_stale()?;
@@ -1921,9 +1924,7 @@ impl Cortex {
     }
 
     pub fn get(&self, id: &str) -> Result<Row> {
-        if !trace::is_valid_id(id) {
-            bail!("invalid trace ID");
-        }
+        let id = Self::canonical_trace_id(id)?;
         let mut row = self.connection.query_row(
             "SELECT id,title,type,tier,author,origin,cortex_id,archived_at,trashed_at,created_at,updated_at,content_hash,source_locked,source_hash FROM traces WHERE id=?1",
             [id],
@@ -1934,10 +1935,38 @@ impl Cortex {
         Ok(row)
     }
 
+    fn canonical_trace_id(id: &str) -> Result<&str> {
+        let id = trace::normalize_id(id);
+        if !trace::is_valid_id(id) {
+            bail!("invalid trace ID");
+        }
+        Ok(id)
+    }
+
     pub fn get_trace(&self, id: &str) -> Result<(Row, Trace)> {
         let row = self.get(id)?;
         let trace = Trace::parse_file(&self.file_path(&row))?;
         Ok((row, trace))
+    }
+
+    pub(crate) fn recall_body(&self, row: &Row) -> Result<std::sync::Arc<str>> {
+        self.trace_body_cache
+            .borrow_mut()
+            .read(&self.file_path(row), &row.content_hash)
+    }
+
+    pub(crate) fn recall_file_version(&self, row: &Row) -> Result<serde_json::Value> {
+        trace_body_cache::file_version(&self.file_path(row))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_recall_cache_enabled(&self, enabled: bool) {
+        self.trace_body_cache.borrow_mut().set_enabled(enabled);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recall_cache_counts(&self) -> (usize, usize) {
+        self.trace_body_cache.borrow().counts()
     }
 
     pub fn list(&self, options: &ListOptions) -> Result<Vec<Row>> {
@@ -2363,6 +2392,28 @@ impl Cortex {
     /// Best-effort record used by MCP/CLI wrappers so metrics never fail the primary op.
     pub fn record_op_metric_lossy(&self, input: &OpMetricInput<'_>) {
         let _ = self.record_op_metric(input);
+    }
+
+    pub fn jev_metrics_report(&self) -> Result<serde_json::Value> {
+        let usage = self.connection.query_row("SELECT COUNT(*),COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(MAX(duration_ms),0) FROM jev_metrics", [], |row| Ok((row.get::<_, i64>(0)?,row.get::<_, i64>(1)?,row.get::<_, i64>(2)?,row.get::<_, i64>(3)?)))?;
+        let fallbacks: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM op_metrics WHERE op='decision_retrieval' AND ok=0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(
+            json!({"successful_evaluations":usage.0,"input_tokens":usage.1,"output_tokens":usage.2,"max_duration_ms":usage.3,"retrieval_fallbacks":fallbacks}),
+        )
+    }
+
+    pub fn record_jev_evaluation(
+        &self,
+        operation: &str,
+        evaluation: &crate::decision::Evaluation,
+        duration_ms: i64,
+    ) -> Result<()> {
+        self.connection.execute("INSERT INTO jev_metrics(recorded_at,operation,model,input_tokens,output_tokens,duration_ms) VALUES (?1,?2,?3,?4,?5,?6)", params![Utc::now().to_rfc3339(), operation, evaluation.model, i64::try_from(evaluation.usage.input_tokens)?, i64::try_from(evaluation.usage.output_tokens)?, duration_ms])?;
+        Ok(())
     }
 
     pub fn prune_op_metrics(&self, retain: Duration) -> Result<usize> {
@@ -2965,11 +3016,12 @@ impl Cortex {
 
     pub fn update_trace(&self, id: &str, trace: &mut Trace, actor_agent: bool) -> Result<()> {
         let existing = self.get(id)?;
+        let id = existing.id.as_str();
         self.check_source_lock(&existing)?;
         if existing.tier == "long" {
             bail!("long-term trace is immutable");
         }
-        trace.frontmatter.id = id.to_owned();
+        trace.frontmatter.id = existing.id.clone();
         trace.frontmatter.origin = existing.origin.clone();
         trace.frontmatter.created = existing.created_at.clone();
         trace.frontmatter.tier = existing.tier.clone();
@@ -3000,6 +3052,7 @@ impl Cortex {
 
     pub fn update_from_file(&self, id: &str) -> Result<()> {
         let existing = self.get(id)?;
+        let id = existing.id.as_str();
         self.check_source_lock(&existing)?;
         if existing.tier == "long" {
             bail!("long-term trace is immutable");
@@ -3053,6 +3106,7 @@ impl Cortex {
 
     fn replace_trace_tags(&self, id: &str, tags: Vec<String>, actor_agent: bool) -> Result<()> {
         let row = self.get(id)?;
+        let id = row.id.as_str();
         self.check_source_lock(&row)?;
         let (_, mut trace) = self.get_trace(id)?;
         if trace.frontmatter.tags == tags {
@@ -3466,7 +3520,8 @@ impl Cortex {
         if delta == 0 || !(-2..=2).contains(&delta) {
             bail!("vote delta must be ±1 or ±2");
         }
-        self.get(id)?;
+        let row = self.get(id)?;
+        let id = row.id.as_str();
         let tx = self.connection.unchecked_transaction()?;
         tx.execute(
             "UPDATE traces SET tier_votes=tier_votes+?1 WHERE id=?2",
@@ -5139,7 +5194,7 @@ impl Cortex {
     pub fn bump_read(&self, id: &str) -> Result<()> {
         let row = self.get(id)?;
         if row.tier != "long" {
-            self.bump_usage(id, true, false)?;
+            self.bump_usage(&row.id, true, false)?;
         }
         Ok(())
     }
@@ -6081,6 +6136,18 @@ mod tests {
     }
 
     #[test]
+    fn get_accepts_noema_citation_forms() {
+        let (_temp, cx) = cortex();
+        let mut trace = Trace::new("Citation Lookup", "fact", "tester", vec![], "body");
+        cx.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        assert_eq!(cx.get(&format!("noema:{id}")).unwrap().id, id);
+        assert_eq!(cx.get(&format!("NOEMA:{id}")).unwrap().id, id);
+        assert_eq!(cx.get(&format!("noe://trace/{id}")).unwrap().id, id);
+        cx.bump_read(&format!("noema:{id}")).unwrap();
+    }
+
+    #[test]
     fn fts_reopen_skips_missing_files_and_indexes_them_when_restored() {
         for location in ["active", "archive", "trash"] {
             let (_temp, cx) = cortex();
@@ -6260,6 +6327,62 @@ mod tests {
             .effective_window(),
             std::time::Duration::from_secs(72 * 60 * 60)
         );
+    }
+
+    #[test]
+    fn decision_retrieval_upgrade_preserves_history_and_fallback_counts() {
+        let (_temp, cx) = cortex();
+        cx.connection
+            .execute("DELETE FROM schema_migrations WHERE version=24", [])
+            .unwrap();
+        for (op, duration_ms, ok, mode) in [
+            ("jev_retrieval", 30, true, "evaluated"),
+            ("jev_retrieval", 80, false, "fallback: unavailable"),
+            ("decision_retrieval", 50, true, "evaluated"),
+            ("search_traces", 11, false, "lexical"),
+        ] {
+            cx.record_op_metric(&OpMetricInput {
+                op,
+                source: "native",
+                duration_ms,
+                ok,
+                result_count: Some(2),
+                mode: Some(mode),
+                usage_recorded: None,
+            })
+            .unwrap();
+        }
+        let samples = || {
+            cx.connection
+                .prepare(
+                    "SELECT json_array(id,recorded_at,source,duration_ms,ok,result_count,mode,usage_recorded)
+                     FROM op_metrics ORDER BY id",
+                )
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let before = samples();
+        crate::db::migrate(&cx.connection).unwrap();
+        crate::db::migrate(&cx.connection).unwrap();
+        assert_eq!(samples(), before);
+
+        let report = cx.op_metrics_report(Duration::hours(24)).unwrap();
+        assert_eq!(report.total_ops, 4);
+        assert_eq!(report.total_errors, 2);
+        assert!(!report.by_op.iter().any(|row| row.op == "jev_retrieval"));
+        let retrieval = report
+            .by_op
+            .iter()
+            .find(|row| row.op == "decision_retrieval")
+            .unwrap();
+        assert_eq!(retrieval.count, 3);
+        assert_eq!(retrieval.errors, 1);
+        assert_eq!(retrieval.modes.get("evaluated"), Some(&2));
+        assert_eq!(retrieval.modes.get("fallback: unavailable"), Some(&1));
+        assert_eq!(cx.jev_metrics_report().unwrap()["retrieval_fallbacks"], 1);
     }
 
     #[test]

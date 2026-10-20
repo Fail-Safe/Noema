@@ -30,6 +30,10 @@ const HERMES_FILES: &[ManagedFile] = &[
         data: include_bytes!("../plugins/hermes/plugin.yaml"),
     },
     ManagedFile {
+        path: "preference_context.py",
+        data: include_bytes!("../plugins/hermes/preference_context.py"),
+    },
+    ManagedFile {
         path: "transport.py",
         data: include_bytes!("../plugins/hermes/transport.py"),
     },
@@ -413,6 +417,13 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bundled_plugin_definitions_are_valid() {
+        for definition in DEFINITIONS {
+            validate_definition(*definition).unwrap();
+        }
+    }
+
     use super::*;
 
     static TEST_FILES: &[ManagedFile] = &[

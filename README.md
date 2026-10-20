@@ -14,12 +14,12 @@
 
 **The intentional memory layer for your AI agents.**
 
-Noema gives AI agents — and the humans working alongside them — a persistent, structured place to record what they know, decide, observe, and intend. Every memory is a plain markdown file. The index is a local SQLite database. Nothing lives in the cloud; nothing requires an API key.
+Noema gives AI agents — and the humans working alongside them — a persistent, structured place to record what they know, decide, observe, and intend. Every memory is a plain markdown file. The index is a local SQLite database. Core storage and lexical retrieval run locally without an API key. Optional model integrations process data at their configured endpoints; choosing an external endpoint sends that integration's inputs to the external service.
 
 **In short:**
 
 - **Local-first agent memory** exposed as an [MCP](https://modelcontextprotocol.io/) server (stdio + Streamable HTTP). Works out of the box with Claude Code, GitHub Copilot, Zed, Cursor, Aider, and anything else that speaks MCP.
-- **Plain markdown on disk** as the source of truth; a local SQLite database with FTS5 as the index. No cloud, no API keys, no telemetry.
+- **Plain markdown on disk** as the source of truth; a local SQLite database with FTS5 as the index. Core memory storage requires no cloud service or API key.
 - **One cross-platform Rust binary** with SQLite and the Hermes and Obsidian plugin installers built in. Release archives cover macOS, Linux, and Windows on x86-64 and ARM64.
 - **Peer-to-peer federation** across Cortexes with vector clocks, event-log audit trail, and `divergence` traces on concurrent edits.
 - **Your editor is a first-class client.** A filesystem watcher turns Obsidian / VS Code / Finder / iCloud edits into real mutation events — same events as MCP-initiated writes, propagated through federation.
@@ -29,32 +29,35 @@ Noema gives AI agents — and the humans working alongside them — a persistent
 
 ## Concepts
 
-| Term | Meaning |
-|---|---|
-| **Trace** | A single memory — one markdown file + its database row |
+| Term       | Meaning                                                         |
+| ---------- | --------------------------------------------------------------- |
+| **Trace**  | A single memory — one markdown file + its database row          |
 | **Cortex** | A named collection of Traces, stored in a directory you control |
 
 Contributor and architecture notes:
 
 - [Repository Guidelines](AGENTS.md)
 - [Architecture](docs/architecture.md)
+- [Trace citations](docs/trace-citations.md) — `noema:{id}` chat/copy form and flexible tag list inputs
 - [Development Guide](docs/development.md)
 - [Cross-agent continuity evaluation](docs/continuity-evaluation.md) — Codex/OpenCode benchmark evidence
+- [Decision-assisted retrieval](docs/decision-retrieval.md) — current testing scope and data-processing boundaries
+- [Trace citations](docs/trace-citations.md) — `noema:{id}` chat/copy form without renaming durable IDs
 - [Why Noema switched to Rust](docs/why-rust.md) — benchmarked cutover rationale
 
 A Trace has a **type** that describes its intent:
 
-| Type | Meaning |
-|---|---|
-| `fact` | A discrete thing that is true |
-| `decision` | A choice made and why |
-| `preference` | A behavioral or stylistic lean |
-| `context` | Situational background |
-| `skill` | A learned capability or procedure |
-| `intent` | Something that needs to happen |
-| `observation` | Something witnessed but not yet verified |
-| `note` | Anything else |
-| `divergence` | A concurrent edit conflict, auto-created by federation sync |
+| Type          | Meaning                                                     |
+| ------------- | ----------------------------------------------------------- |
+| `fact`        | A discrete thing that is true                               |
+| `decision`    | A choice made and why                                       |
+| `preference`  | A behavioral or stylistic lean                              |
+| `context`     | Situational background                                      |
+| `skill`       | A learned capability or procedure                           |
+| `intent`      | Something that needs to happen                              |
+| `observation` | Something witnessed but not yet verified                    |
+| `note`        | Anything else                                               |
+| `divergence`  | A concurrent edit conflict, auto-created by federation sync |
 
 ---
 
@@ -405,29 +408,41 @@ read hint or disable automatic search-hit tracking. Read hints do not promise
 zero database writes: internal metrics and metrics retention also continue.
 Tools that can explicitly change trace content, tags, or lifecycle remain writes.
 
-`noema integrate` connects a Cortex to supported coding agents and installs the
-small startup bootstrap that tells each agent to call `get_instructions`. An MCP
-entry without that bootstrap is callable but not reliably memory-aware after a
-fresh session or compaction.
+`noema integrate` connects a Cortex to supported coding agents and installs a
+small startup bootstrap for memory retrieval and preference-revision reuse. An
+MCP entry without that bootstrap is callable but not reliably memory-aware after
+a fresh session or compaction.
 
-Supported clients are `codex`, `claude-code`, `cursor`, and `opencode`
-(OpenCode v1). Pi is listed as planned because it needs a first-class MCP
-extension rather than configuration alone.
+Supported clients are `codex`, `claude-code`, `cursor`, `opencode` (OpenCode v1),
+and `ohmypi` (Oh My Pi / OMP). Pi is listed as planned because it needs a
+first-class MCP extension rather than configuration alone; OMP has native MCP
+support.
 
 ### Choosing an integration mode
 
 Existing Noema integrations remain valid. Prefetch and capture are additive:
 they do not change the Cortex format or require a new day-to-day workflow.
 
-| Goal | Mode |
-|---|---|
-| Codex continuity plus normal Noema tools | Install Codex with `--prefetch`; relevant context arrives before the model responds, while the ordinary MCP connection remains available for reads, writes, and management. |
-| Preserve a hand-managed Codex MCP connection | Install Codex with `--prefetch-only`; Noema adds the bounded hooks without adopting or rewriting `config.toml`. |
-| Use a selectable read-only Codex session | Install Codex with `--continuity`, then launch `codex --profile noema-continuity`; the base MCP configuration remains unchanged. |
-| Deliberately record natural-language memories in Codex or OpenCode | Run `noema integrate CLIENT capture`; only the bounded capture tools are exposed to that child process, and the normal client configuration remains unchanged. |
-| Keep model-selected retrieval in any supported client | Use the ordinary installation without a prefetch flag. |
+| Goal                                                               | Mode                                                                                                                                                                        |
+| ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Codex continuity plus normal Noema tools                           | Install Codex with `--prefetch`; relevant context arrives before the model responds, while the ordinary MCP connection remains available for reads, writes, and management. |
+| Preserve a hand-managed Codex MCP connection                       | Install Codex with `--prefetch-only`; Noema adds the bounded hooks without adopting or rewriting `config.toml`.                                                             |
+| Use a selectable read-only Codex session                           | Install Codex with `--continuity`, then launch `codex --profile noema-continuity`; the base MCP configuration remains unchanged.                                            |
+| Deliberately record natural-language memories in Codex or OpenCode | Run `noema integrate CLIENT capture`; only the bounded capture tools are exposed to that child process, and the normal client configuration remains unchanged.              |
+| Keep model-selected retrieval in any supported client              | Use the ordinary installation without a prefetch flag.                                                                                                                      |
 
 The practical Codex default for proactive continuity is `--prefetch`.
+
+Prompt retrieval uses the installed `noema prefetch` command directly; no separate
+triage project, Python virtual environment, or evaluator wrapper is required.
+Use `--prefetch-only` to add these hooks while preserving an existing MCP
+configuration. Native retrieval follows Noema's configured evaluator.
+
+Cursor user integration loads preferences through `sessionStart` and uses MCP
+for task retrieval. Its `beforeSubmitPrompt` hook does not inject retrieval
+context, so Noema does not install a prompt-time file bridge. OpenCode's ordinary
+integration similarly uses its bootstrap and MCP rather than a separate triage
+plugin. Do not keep older experimental prompt hooks alongside these adapters.
 Use the capture launcher for intentional authoring sessions, not as a wrapper
 around every agent invocation. A preregistered Codex/OpenCode evaluation found
 that bounded prefetch preserved perfect Noema recall while removing the earlier
@@ -469,6 +484,19 @@ noema integrate opencode install --scope user \
   --transport http \
   --url https://memory.example.com/mcp \
   --bearer-token-env NOEMA_MCP_KEY
+
+# Install OMP's native user MCP connection and always-apply startup rule
+noema integrate ohmypi install --scope user
+
+# Configure OMP for an authenticated remote Cortex without storing the token
+noema integrate ohmypi install --scope user \
+  --transport http \
+  --url https://memory.example.com/mcp \
+  --bearer-token-env NOEMA_MCP_KEY
+
+# Inspect OMP's generated fragments or installed configuration
+noema integrate ohmypi print --scope user
+noema integrate ohmypi status --scope user --check
 
 # Launch an ephemeral capture-only session over an installed local connection
 noema integrate codex capture --scope user
@@ -525,6 +553,23 @@ client tools or provide a workspace access-control boundary.
 A named `noema` entry that is not recognizably a Noema MCP endpoint is
 reported as a conflict. Drifted managed components require `--force`.
 
+Oh My Pi user scope installs `~/.omp/agent/mcp.json` and
+`~/.omp/agent/rules/noema.md`; project scope installs `.omp/mcp.json` and
+`.omp/rules/noema.md` at the selected project root. The always-apply rule carries
+the startup preference and revision-reuse instructions; no extension or hook is
+required. OMP does **not** discover `~/.omp/mcp.json`, and the installer leaves
+that legacy location untouched.
+
+OMP user targets honor `PI_CONFIG_DIR`, `PI_CODING_AGENT_DIR`, and named profiles
+selected by `OMP_PROFILE` (or `PI_PROFILE` when `OMP_PROFILE` is unset). For
+example, `OMP_PROFILE=work noema integrate ohmypi install --scope user` targets
+`~/.omp/profiles/work/agent/`. Named profiles ignore `PI_CODING_AGENT_DIR`;
+project targets remain `.omp/` regardless of the profile. HTTP bearer headers
+use OMP's `Bearer ${ENV_NAME}` interpolation, so the named variable must be
+available to the OMP process. Installer status checks inspect local configuration,
+not remote reachability or authentication. Restart OMP after installation to
+load both the MCP connection and the startup rule.
+
 `integrate status` is observational: it detects each installed adapter's actual
 transport and checks that its MCP entry and startup bootstrap are complete and
 recognized. It does not assume a desired connection. Use `integrate CLIENT
@@ -555,33 +600,33 @@ Noema can run as an [MCP](https://modelcontextprotocol.io) server, giving any MC
 
 **Tools exposed:**
 
-| Tool | Purpose |
-|---|---|
-| `get_instructions` | Concise Markdown guidance for agent use of this Cortex |
-| `cortex_usage` | MCP structured content for clients: Cortex identity, trace semantics, startup pattern, runtime posture, and constraints, with a JSON text fallback |
-| `list_traces` | List traces, filterable by `type`, `author`, `tag`, `origin`, `archived`, `all` |
-| `get_trace` | Fetch a trace's full body, origin, and lineage |
-| `create_trace` | Create one trace (supports `derived_from`, `origin`) |
-| `create_traces` | Create 1-16 independently transactional traces with structured receipts and explicit partial failures |
-| `update_trace` | Update any subset of fields on an existing trace |
-| `append_trace` | Append content to an existing trace without reading it first (fire-and-forget logging) |
-| `set_trace_tags` | Replace a trace's retrieval tags without touching title, body, type, or lineage |
-| `append_trace_tags` | Add retrieval tags idempotently without touching title, body, type, or lineage |
-| `tag_stats` | Cortex-wide tag assignment, visibility, tier, and engagement statistics |
-| `tag_doctor` | Diagnose tag hygiene; optionally preview or apply deterministic repairs |
-| `rename_tag` | Preview or apply a cortex-wide exact tag rename; supports opt-in ASCII case-insensitive matching |
-| `delete_tag` | Preview or apply cortex-wide tag removal; supports opt-in ASCII case-insensitive matching |
-| `search_traces` | Search traces. `mode`: `lexical` (FTS5, default), `semantic` (embedding similarity), or `hybrid` (RRF fusion); semantic/hybrid need a configured `search:` block and fall back to lexical otherwise |
-| `find_similar_traces` | Surface traces related to one you hold. Default ranks by BM25 vocabulary overlap; `mode=semantic`/`hybrid` ranks by embedding similarity to the source trace's vector |
-| `metrics_summary` | Local MCP/CLI op latency and volume for a lookback window (not federated telemetry) |
-| `archive_trace` / `unarchive_trace` | Archive a trace or restore it |
-| `delete_trace` / `recover_trace` | Soft-delete (move to trash) or restore from trash |
-| `trace_history` | Event log (audit trail) for a trace |
-| `trace_lineage` | Derivation graph: `derived_from` + `derived_by` |
-| `resolve_divergence` | Resolve a concurrent edit conflict by accepting an origin or supplying a merged body |
-| `sync_events` | Pull events for federation sync (called by remote peers) |
-| `federation_status` | Federation config, peer sync state, vector clock, unresolved divergences |
-| `announce_peer` | Accept a peer announcement for mutual discovery |
+| Tool                                | Purpose                                                                                                                                                                                             |
+| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `get_instructions`                  | Concise Markdown guidance for agent use of this Cortex                                                                                                                                              |
+| `cortex_usage`                      | MCP structured content for clients: Cortex identity, trace semantics, startup pattern, runtime posture, and constraints, with a JSON text fallback                                                  |
+| `list_traces`                       | List traces, filterable by `type`, `author`, `tag`, `origin`, `archived`, `all`                                                                                                                     |
+| `get_trace`                         | Fetch a trace's full body, origin, and lineage                                                                                                                                                      |
+| `create_trace`                      | Create one trace (supports `derived_from`, `origin`)                                                                                                                                                |
+| `create_traces`                     | Create 1-16 independently transactional traces with structured receipts and explicit partial failures                                                                                               |
+| `update_trace`                      | Update any subset of fields on an existing trace                                                                                                                                                    |
+| `append_trace`                      | Append content to an existing trace without reading it first (fire-and-forget logging)                                                                                                              |
+| `set_trace_tags`                    | Replace a trace's retrieval tags without touching title, body, type, or lineage                                                                                                                     |
+| `append_trace_tags`                 | Add retrieval tags idempotently without touching title, body, type, or lineage                                                                                                                      |
+| `tag_stats`                         | Cortex-wide tag assignment, visibility, tier, and engagement statistics                                                                                                                             |
+| `tag_doctor`                        | Diagnose tag hygiene; optionally preview or apply deterministic repairs                                                                                                                             |
+| `rename_tag`                        | Preview or apply a cortex-wide exact tag rename; supports opt-in ASCII case-insensitive matching                                                                                                    |
+| `delete_tag`                        | Preview or apply cortex-wide tag removal; supports opt-in ASCII case-insensitive matching                                                                                                           |
+| `search_traces`                     | Search traces. `mode`: `lexical` (FTS5, default), `semantic` (embedding similarity), or `hybrid` (RRF fusion); semantic/hybrid need a configured `search:` block and fall back to lexical otherwise |
+| `find_similar_traces`               | Surface traces related to one you hold. Default ranks by BM25 vocabulary overlap; `mode=semantic`/`hybrid` ranks by embedding similarity to the source trace's vector                               |
+| `metrics_summary`                   | Local MCP/CLI op latency and volume for a lookback window (not federated telemetry)                                                                                                                 |
+| `archive_trace` / `unarchive_trace` | Archive a trace or restore it                                                                                                                                                                       |
+| `delete_trace` / `recover_trace`    | Soft-delete (move to trash) or restore from trash                                                                                                                                                   |
+| `trace_history`                     | Event log (audit trail) for a trace                                                                                                                                                                 |
+| `trace_lineage`                     | Derivation graph: `derived_from` + `derived_by`                                                                                                                                                     |
+| `resolve_divergence`                | Resolve a concurrent edit conflict by accepting an origin or supplying a merged body                                                                                                                |
+| `sync_events`                       | Pull events for federation sync (called by remote peers)                                                                                                                                            |
+| `federation_status`                 | Federation config, peer sync state, vector clock, unresolved divergences                                                                                                                            |
+| `announce_peer`                     | Accept a peer announcement for mutual discovery                                                                                                                                                     |
 
 `delete_trace` moves a trace to trash (soft-delete, recoverable). Use `recover_trace` to restore it.
 
@@ -589,13 +634,13 @@ Call `get_instructions` first in any new agent session for concise Markdown guid
 
 HTTP servers expose the full tool set at `/mcp` and optional role endpoints:
 
-| Endpoint | Tool set |
-| --- | --- |
-| `/mcp` | All tools, including future additions; existing clients remain compatible |
-| `/mcp/agent` | Everyday memory retrieval, capture, editing, tagging, voting, and lifecycle tools |
-| `/mcp/maintainer` | Agent tools plus tag cleanup and operational diagnostics |
-| `/mcp/curator` | Agent tools plus consolidation candidates and distilled-memory creation |
-| `/mcp/federation` | Cortex identity, event exchange, and usage-signal exchange |
+| Endpoint          | Tool set                                                                          |
+| ----------------- | --------------------------------------------------------------------------------- |
+| `/mcp`            | All tools, including future additions; existing clients remain compatible         |
+| `/mcp/agent`      | Everyday memory retrieval, capture, editing, tagging, voting, and lifecycle tools |
+| `/mcp/maintainer` | Agent tools plus tag cleanup and operational diagnostics                          |
+| `/mcp/curator`    | Agent tools plus consolidation candidates and distilled-memory creation           |
+| `/mcp/federation` | Cortex identity, event exchange, and usage-signal exchange                        |
 
 All endpoints share the same cortex and usage tracking. Role endpoints enforce
 explicit tool allowlists for both discovery and execution; they share the existing
@@ -692,7 +737,7 @@ If both are set, the env var wins and the server logs a warning so operators not
 access:
   shared_key_file: .access.secret
   tls_cert_path: /path/server.crt
-  tls_key_path:  /path/server.key
+  tls_key_path: /path/server.key
 ```
 
 CLI flags still win when both are present. With paths configured, `noema serve` parses the leaf cert at startup and:
@@ -707,14 +752,16 @@ CLI flags still win when both are present. With paths configured, `noema serve` 
 
 ```markdown
 <!-- cortex.md -->
+
 ---
+
 name: my-cortex
 purpose: Primary memory
 owner: example-user
 created: 2026-03-29
 version: 2
 access:
-  shared_key_file: .access.secret
+shared_key_file: .access.secret
 ---
 ```
 
@@ -808,8 +855,8 @@ Whenever `noema serve` is running on a cortex (under **either** `--transport std
 ```yaml
 # cortex.md frontmatter fragment
 watch:
-  enabled: true      # default; set false to opt out
-  debounce_ms: 300   # default; collapse editor save bursts
+  enabled: true # default; set false to opt out
+  debounce_ms: 300 # default; collapse editor save bursts
 ```
 
 Loopback is prevented by content hash comparison: when the watcher sees a write, it hashes the body and compares to the DB's `content_hash` — matches are skipped, so Noema's own writes don't trigger duplicate events. Source-locked foreign traces are refused on external edit and logged (the watcher will not silently circumvent a publisher's authority). Malformed drop-in files (missing frontmatter, invalid id) are skipped with a warning.
@@ -820,16 +867,17 @@ The watcher runs under both transports because stdio sessions are not always the
 
 ## Semantic search (optional)
 
-Lexical FTS5 search is always on. An **opt-in semantic layer** adds embedding-based ranking — useful when a query matches by *concept* rather than shared words (e.g. "how do we authenticate agents" surfacing a trace titled "bearer-key posture for the MCP endpoint"). It stays true to Noema's lightweight, local-first posture: embeddings are stored as a SQLite `BLOB` and cosine similarity is computed in-process — no vector extension or external vector database. Embeddings are a **local index** (never federated), like the FTS5 index.
+Lexical FTS5 search is always on. An **opt-in semantic layer** adds embedding-based ranking — useful when a query matches by _concept_ rather than shared words (e.g. "how do we authenticate agents" surfacing a trace titled "bearer-key posture for the MCP endpoint"). It stays true to Noema's lightweight, local-first posture: embeddings are stored as a SQLite `BLOB` and cosine similarity is computed in-process — no vector extension or external vector database. Embeddings are a **local index** (never federated), like the FTS5 index.
 
 Enable it with a `search:` block in `cortex.md`:
 
 ```yaml
 search:
   semantic_enabled: true
-  embedding_model: nomic-embed-text          # required — no default
-  embedding_endpoint: http://localhost:11434/v1   # OpenAI-compatible /embeddings;
-                                             # inherits consolidation.local_llm_endpoint if unset
+  embedding_model: nomic-embed-text # required — no default
+  embedding_endpoint:
+    http://localhost:11434/v1 # OpenAI-compatible /embeddings;
+    # inherits consolidation.local_llm_endpoint if unset
   # default_mode: hybrid    # lexical | semantic | hybrid (default lexical)
   # hybrid_weight: 0.5      # vector weight in hybrid fusion (0..1)
   # max_chars: 32000        # character ceiling for title + body; not a token limit
@@ -906,20 +954,20 @@ A Cortex can sync with peer Cortexes over Streamable HTTP: every mutation is rec
 
 ```markdown
 <!-- cortex.md -->
+
 ---
+
 name: alpha
 purpose: Primary research cortex
 owner: example-user
 created: 2026-03-29
 version: 2
 federation:
-  interval: 30s
-  peers:
-    - name: beta
-      endpoint: http://192.168.1.10:3000
-    - name: gamma
-      endpoint: https://192.168.1.11:3000
-      ca: /etc/noema/beta-ca.pem    # optional, for self-signed TLS
+interval: 30s
+peers: - name: beta
+endpoint: http://192.168.1.10:3000 - name: gamma
+endpoint: https://192.168.1.11:3000
+ca: /etc/noema/beta-ca.pem # optional, for self-signed TLS
 ---
 ```
 
@@ -933,11 +981,11 @@ noema federation add-peer beta http://192.168.1.10:3000
 
 The `federation.mode` field controls how a Cortex participates in the ring:
 
-| Mode | Syncer runs? | `sync_events` serves? | HTTP write tools? |
-|------|-------------|----------------------|-------------------|
-| `sync` (default) | Yes | Yes | Yes |
-| `publish` | No | Yes | Blocked |
-| `subscribe` | Yes | Blocked | Yes |
+| Mode             | Syncer runs? | `sync_events` serves? | HTTP write tools? |
+| ---------------- | ------------ | --------------------- | ----------------- |
+| `sync` (default) | Yes          | Yes                   | Yes               |
+| `publish`        | No           | Yes                   | Blocked           |
+| `subscribe`      | Yes          | Blocked               | Yes               |
 
 **Publish mode** is for source-of-truth cortexes: a company knowledgebase, a curated dataset, a reference corpus. Content is managed locally via stdio; remote peers pull events via `sync_events` but cannot write back. **Subscribe mode** is the complement: pull everything, share nothing.
 
@@ -951,7 +999,7 @@ federation:
       endpoint: https://consumer-1.example:3000
     - name: consumer-2
       endpoint: https://consumer-2.example:3000
-      mode: paused    # temporarily skip this peer
+      mode: paused # temporarily skip this peer
 ```
 
 Individual peers can be paused without affecting the rest of the ring:
@@ -976,7 +1024,7 @@ The three-tier model (short → mid → long) completes with an automatic mid→
 consolidation:
   enabled: true
   llm_enabled: true
-  auto_distillation_enabled: true     # run LLM distillation on every trigger
+  auto_distillation_enabled: true # run LLM distillation on every trigger
   local_llm_endpoint: http://localhost:11434/v1
   model_name: llama3.1:70b
   window_hours: 6
@@ -1041,28 +1089,28 @@ Locally, source-locking is enforced by refusing foreign-origin mutations. Across
 
 ### Federation event signing
 
-Content hashing proves a body matches its hash; it does not prove *who* wrote the event. On a shared-key federation, any peer holding the key could otherwise forge events under another cortex's identity, overwrite source-locked traces, or rewrite `source_hash` so drift checks still pass. Event signing closes that gap by authenticating the originating cortex with an Ed25519 signature.
+Content hashing proves a body matches its hash; it does not prove _who_ wrote the event. On a shared-key federation, any peer holding the key could otherwise forge events under another cortex's identity, overwrite source-locked traces, or rewrite `source_hash` so drift checks still pass. Event signing closes that gap by authenticating the originating cortex with an Ed25519 signature.
 
 ```bash
 noema keygen                  # generate this cortex's Ed25519 signing key
 noema keygen --force          # rotate the key (peers must re-pin)
 ```
 
-Once a cortex has a key, it signs every event it emits. Peers learn its public key through the `cortex_identity` handshake and pin it per cortex id (trust-on-first-use); a later key change is refused until you run `noema federation reset-peer`. Verification of *incoming* events is staged so a mixed-version ring never hard-partitions, controlled by `federation.verify` in `cortex.md`:
+Once a cortex has a key, it signs every event it emits. Peers learn its public key through the `cortex_identity` handshake and pin it per cortex id (trust-on-first-use); a later key change is refused until you run `noema federation reset-peer`. Verification of _incoming_ events is staged so a mixed-version ring never hard-partitions, controlled by `federation.verify` in `cortex.md`:
 
-| `federation.verify` | Behavior on a bad/unsigned event |
-|---|---|
-| `off` (default) | accept — no change for cortexes that haven't enabled signing |
-| `warn` | accept, but log every unsigned/forged/unverifiable event |
-| `enforce` | reject — only correctly-signed events from their owning cortex are replayed |
+| `federation.verify` | Behavior on a bad/unsigned event                                            |
+| ------------------- | --------------------------------------------------------------------------- |
+| `off` (default)     | accept — no change for cortexes that haven't enabled signing                |
+| `warn`              | accept, but log every unsigned/forged/unverifiable event                    |
+| `enforce`           | reject — only correctly-signed events from their owning cortex are replayed |
 
-> **Signing only protects you under `enforce`.** Generating a key and signing emitted events changes nothing about what a cortex *accepts*: in the default `off` mode no signature is checked, and `warn` logs problems but still applies the event. Until every cortex you trust is set to `verify: enforce`, the forgery and source-lock-bypass risks above remain fully open — `off`/`warn` are a rollout on-ramp, not protection. Move to `enforce` once you have confirmed the peers it talks to are signing.
+> **Signing only protects you under `enforce`.** Generating a key and signing emitted events changes nothing about what a cortex _accepts_: in the default `off` mode no signature is checked, and `warn` logs problems but still applies the event. Until every cortex you trust is set to `verify: enforce`, the forgery and source-lock-bypass risks above remain fully open — `off`/`warn` are a rollout on-ramp, not protection. Move to `enforce` once you have confirmed the peers it talks to are signing.
 
 Under `enforce`, source-lock enforcement extends to replay: a locked trace can only be mutated by the cortex that owns it.
 
 Trust-on-first-use has a first-contact window. For a high-assurance peer you can skip it by hard-pinning the peer's key out-of-band — add `pubkey: ed25519:<base64>` to that peer's entry under `federation.peers` in `cortex.md`. The peer must then advertise exactly that key at the handshake or the sync is refused (overriding TOFU); to rotate, edit the pinned value.
 
-**Rotating a key.** `noema keygen --force` retires the old key and signs future events with the new one. Peers that pinned the old key refuse the rotated cortex until they re-pin. For a peer that was already caught up, recover with `noema federation reset-peer <name> --key-rotated`: it drops only the pinned key (re-pinned on the next handshake) while keeping the cursor, so the peer pulls only post-rotation events. **Limitation under `enforce`:** a *from-scratch* resync of a rotated cortex — a brand-new peer, or a full `reset-peer` — cannot replay that cortex's **pre-rotation** events, because they were signed with the now-retired key and there is no key history. The peer pins the new key and rejects the older events. Rotate only when forfeiting verifiable replay of pre-rotation history to peers that resync from zero is acceptable; existing caught-up peers recovered with `--key-rotated` are unaffected.
+**Rotating a key.** `noema keygen --force` retires the old key and signs future events with the new one. Peers that pinned the old key refuse the rotated cortex until they re-pin. For a peer that was already caught up, recover with `noema federation reset-peer <name> --key-rotated`: it drops only the pinned key (re-pinned on the next handshake) while keeping the cursor, so the peer pulls only post-rotation events. **Limitation under `enforce`:** a _from-scratch_ resync of a rotated cortex — a brand-new peer, or a full `reset-peer` — cannot replay that cortex's **pre-rotation** events, because they were signed with the now-retired key and there is no key history. The peer pins the new key and rejects the older events. Rotate only when forfeiting verifiable replay of pre-rotation history to peers that resync from zero is acceptable; existing caught-up peers recovered with `--key-rotated` are unaffected.
 
 ### Authentication
 

@@ -3,6 +3,7 @@ pub mod config;
 pub mod consolidation;
 pub mod cortex;
 pub mod db;
+pub mod decision;
 pub mod embedding;
 pub mod event;
 pub mod eventsig;

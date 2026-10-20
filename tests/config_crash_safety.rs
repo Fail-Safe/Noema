@@ -23,6 +23,7 @@ fn killed_config_writer_preserves_old_yaml_and_retry_commits_cleanly() {
     fs::create_dir_all(&alpha).unwrap();
     fs::create_dir_all(&beta).unwrap();
     let original = Config {
+        decision: None,
         default: "alpha".into(),
         cortexes: BTreeMap::from([
             (
