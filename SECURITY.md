@@ -67,6 +67,14 @@ not encrypted: operators must still choose a trusted endpoint and network for
 their trace data. Authenticated local providers previously using HTTP must
 enable TLS or remove their credentials.
 
+## Dependency Security Updates
+
+The source dependency lockfile uses Rustls 0.23.46, which fixes
+GHSA-h2v8-394m-p7vv, GHSA-w44r-93j7-qv28, GHSA-c8m5-c952-6cm4, and
+GHSA-vp88-798v-h67f. Updating the lockfile does not patch an already-installed
+binary: rebuild from the updated source or install a release containing the
+fix, then restart Noema servers and stdio MCP clients.
+
 ## Supported Versions
 
 Only the latest release is actively supported with security patches. Upgrade to the latest version before reporting.
