@@ -247,6 +247,11 @@ enum Command {
         #[command(subcommand)]
         command: CompletionCommand,
     },
+    /// Print bundled agent setup guides without changing configuration
+    Instructions {
+        #[command(subcommand)]
+        command: Option<InstructionsCommand>,
+    },
     /// Show version details
     Version,
     /// Manage user configuration
@@ -324,6 +329,14 @@ enum CompletionCommand {
         #[arg(short = 'q', long)]
         quiet: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum InstructionsCommand {
+    /// Set up shell completions, a Cortex, and an agent's MCP connection
+    QuickStart,
+    /// Connect Cortexes with authenticated federation
+    Federation,
 }
 
 #[derive(Debug, Args)]
@@ -935,6 +948,9 @@ struct ServeArgs {
 
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
+    if let Command::Instructions { command } = &cli.command {
+        return instructions_command(command.as_ref());
+    }
     Config::load()?.decision.unwrap_or_default().client()?;
     let selected = cli.cortex.as_deref();
     match cli.command {
@@ -1343,6 +1359,7 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
         | Command::Consolidate(_)
         | Command::Serve(_)
         | Command::Completion { .. }
+        | Command::Instructions { .. }
         | Command::Version
         | Command::Decision { .. }
         | Command::Config { .. }
@@ -4983,6 +5000,25 @@ fn split_prompt_tags(value: &str) -> Vec<String> {
         .filter(|tag| !tag.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+fn instructions_command(command: Option<&InstructionsCommand>) -> Result<()> {
+    let guide = match command {
+        None => include_str!("../docs/instructions/index.md"),
+        Some(InstructionsCommand::QuickStart) => {
+            include_str!("../docs/instructions/quick-start.md")
+        }
+        Some(InstructionsCommand::Federation) => {
+            include_str!("../docs/instructions/federation.md")
+        }
+    };
+    let mut output = io::stdout().lock();
+    writeln!(
+        output,
+        "Noema v{VERSION} — bundled agent setup instructions\n"
+    )?;
+    output.write_all(guide.as_bytes())?;
+    Ok(())
 }
 
 fn completion_command(command: CompletionCommand) -> Result<()> {

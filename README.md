@@ -166,6 +166,23 @@ codegen unit, and strip symbols. `make help` lists all targets.
 
 ## Quick Start
 
+### Set up with your AI agent
+
+After installing Noema, tell your agent:
+
+> Run `noema instructions quick-start` and help me follow it. Inspect existing
+> setup first, ask before changing configuration, and verify memory access
+> through this agent's actual MCP connection.
+
+`noema instructions` prints an overview; `noema instructions quick-start` covers
+shell completions, your first Cortex, and MCP integration. Federation is optional:
+use `noema instructions federation` when you want separate Cortexes to exchange
+memories. These commands only print guides embedded in the installed binary;
+they work before a Cortex or configuration exists and never perform setup changes.
+The same guides are readable in [docs/instructions](docs/instructions/index.md).
+
+### Manual quick start
+
 ```bash
 # Create a Cortex
 noema init --name my-cortex
@@ -201,6 +218,9 @@ noema get 20260329-we-chose-local-sqlite
 
 ```
 noema init --name <name> [--path <dir>]   Create a new Cortex
+noema instructions                        Print the agent setup overview (read-only)
+noema instructions quick-start            Print the shell, Cortex, and MCP setup guide
+noema instructions federation             Print the optional federation setup guide
 noema use <name>                          Set the default Cortex
 noema cortex list                         List all known Cortexes
 noema cortex storage <name> [--json]      Inspect database, WAL, and reusable-space statistics
