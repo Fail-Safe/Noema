@@ -594,6 +594,7 @@ struct TagReviewAnalyzeParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct TagReviewDecideParams {
+    /// Local proposal ID returned by tag_review_queue.
     id: String,
     /// apply, undo, reject, defer, resume, or edit
     action: String,
