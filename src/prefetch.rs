@@ -1,15 +1,19 @@
-use std::{collections::HashSet, sync::OnceLock};
+use std::{
+    borrow::Cow,
+    collections::HashSet,
+    sync::{LazyLock, OnceLock},
+};
 
 use anyhow::Result;
 use regex::Regex;
 use serde::Serialize;
 
-use crate::{
-    cortex::{Cortex, ListOptions, Row},
-    trace::Trace,
-};
+use crate::cortex::{Cortex, ListOptions, Row};
+#[cfg(test)]
+use crate::trace::Trace;
 
 const MAX_QUERY_TERMS: usize = 16;
+const MAX_QUERY_TASKS: usize = 8;
 const CANDIDATE_MULTIPLIER: usize = 2;
 const MAX_CANDIDATE_MATCHES: usize = 32;
 const MIN_NATURAL_MATCH_COVERAGE: f64 = 0.55;
@@ -111,25 +115,56 @@ pub struct PrefetchResult {
 }
 
 pub fn retrieve(cortex: &Cortex, prompt: &str, options: PrefetchOptions) -> Result<PrefetchResult> {
-    let terms = query_terms(prompt);
-    let query = terms.join(" OR ");
-    let mut search_rows = if query.is_empty() {
-        Vec::new()
-    } else {
-        cortex.search(&query, &ListOptions::default())?
-    };
-    if options.exclude_startup_preferences_from_search {
-        search_rows.retain(|row| !row.tags.iter().any(|tag| tag == "user-preference"));
-    }
-    let unique_single_candidate = terms.len() == 1 && search_rows.len() == 1;
+    let mut tasks = query_plan(prompt);
+    let query_term_count = tasks
+        .iter()
+        .flat_map(|task| task.terms.iter())
+        .collect::<HashSet<_>>()
+        .len();
     let candidate_limit = options
         .max_results
         .saturating_mul(CANDIDATE_MULTIPLIER)
         .min(MAX_CANDIDATE_MATCHES);
-    let candidate_match_count = search_rows.len().min(candidate_limit);
-    search_rows.truncate(candidate_match_count);
-    let (search_rows, rescue_rows) =
-        qualify_search_rows(cortex, prompt, &terms, search_rows, unique_single_candidate)?;
+    let mut searches = Vec::with_capacity(tasks.len());
+    if candidate_limit > 0 {
+        for index in 0..tasks.len() {
+            let (previous, remaining) = tasks.split_at_mut(index);
+            let task = &mut remaining[0];
+            if let Some(duplicate) = previous.iter().find(|other| other.terms == task.terms) {
+                task.unique_single_candidate = duplicate.unique_single_candidate;
+                continue;
+            }
+            let mut rows = cortex.search(&lexical_query(&task.terms), &ListOptions::default())?;
+            if options.exclude_startup_preferences_from_search {
+                rows.retain(|row| !row.tags.iter().any(|tag| tag == "user-preference"));
+            }
+            // Uniqueness must be measured before the candidate/result caps.
+            task.unique_single_candidate = task.terms.len() == 1 && rows.len() == 1;
+            rows.truncate(candidate_limit);
+            searches.push(rows.into_iter());
+        }
+    }
+    let mut candidates = Vec::with_capacity(candidate_limit);
+    let mut seen = HashSet::with_capacity(candidate_limit);
+    while candidates.len() < candidate_limit {
+        let before = candidates.len();
+        for rows in &mut searches {
+            for row in rows.by_ref() {
+                if seen.insert(row.id.clone()) {
+                    candidates.push(row);
+                    break;
+                }
+            }
+            if candidates.len() == candidate_limit {
+                break;
+            }
+        }
+        if candidates.len() == before {
+            break;
+        }
+    }
+    let candidate_match_count = candidates.len();
+    let (search_rows, rescue_rows) = qualify_search_rows(cortex, &tasks, candidates)?;
     let mut search_rows = crate::decision::filter_sync(cortex, prompt, search_rows, rescue_rows)?;
     search_rows.truncate(options.max_results);
     let preference_rows = cortex.list(&ListOptions {
@@ -151,7 +186,7 @@ pub fn retrieve(cortex: &Cortex, prompt: &str, options: PrefetchOptions) -> Resu
         schema_version: 1,
         context_chars: context.chars().count(),
         context,
-        query_term_count: terms.len(),
+        query_term_count,
         candidate_match_count,
         search_match_count,
         rejected_match_count,
@@ -161,58 +196,116 @@ pub fn retrieve(cortex: &Cortex, prompt: &str, options: PrefetchOptions) -> Resu
     })
 }
 
+fn lexical_query(terms: &[String]) -> String {
+    let mut query = terms.join(" OR ");
+    for term in terms {
+        if let Some(captures) = identifier_regex().captures(term)
+            && captures
+                .get(0)
+                .is_some_and(|matched| matched.as_str() == term)
+        {
+            let prefix_len = captures["prefix"].len();
+            if term.as_bytes().get(prefix_len) == Some(&b'-') {
+                continue;
+            }
+            query.push_str(" OR ");
+            query.push_str(&term[..prefix_len]);
+            query.push('-');
+            query.push_str(&term[prefix_len..]);
+        }
+    }
+    query
+}
+
 fn qualify_search_rows(
     cortex: &Cortex,
-    prompt: &str,
-    terms: &[String],
+    tasks: &[TaskQuery],
     rows: Vec<Row>,
-    unique_single_candidate: bool,
 ) -> Result<(Vec<Row>, Vec<Row>)> {
-    let structured_identifiers = identifier_regex()
-        .captures_iter(prompt)
-        .filter_map(|captures| normalized_identifier(&captures))
-        .collect::<HashSet<_>>();
-    let original_terms = query_terms_with_conversation(prompt, true);
     let mut qualified = Vec::new();
     let mut rescue = Vec::new();
     for row in rows {
         let (_, trace) = cortex.get_trace(&row.id)?;
-        if is_relevant_match(
-            &row,
-            &trace,
-            terms,
-            &structured_identifiers,
-            unique_single_candidate,
-            true,
-        ) || is_relevant_match(
-            &row,
-            &trace,
-            &original_terms,
-            &structured_identifiers,
-            unique_single_candidate,
-            false,
-        ) {
+        let mut metadata =
+            searchable_terms(&format!("{} {} {}", row.id, row.title, row.tags.join(" ")));
+        extend_constraints(&mut metadata, &row.title);
+        for tag in &row.tags {
+            extend_constraints(&mut metadata, tag);
+        }
+        let mut all = metadata.clone();
+        all.extend(searchable_terms(&trace.body));
+        extend_constraints(&mut all, &trace.body);
+        let mut relevant = false;
+        let mut rescuable = false;
+        for task in tasks {
+            if task.overconstrained || task.required.iter().any(|term| !all.contains(term)) {
+                continue;
+            }
+            let evidence = match_indexed_terms(&metadata, &all, &task.terms);
+            if is_relevant_match(
+                &task.terms,
+                &task.identifiers,
+                &evidence,
+                task.unique_single_candidate,
+                true,
+            ) {
+                relevant = true;
+                break;
+            }
+            if task.original_terms != task.terms {
+                let original = match_indexed_terms(&metadata, &all, &task.original_terms);
+                if is_relevant_match(
+                    &task.original_terms,
+                    &task.identifiers,
+                    &original,
+                    task.unique_single_candidate,
+                    false,
+                ) {
+                    relevant = true;
+                    break;
+                }
+            }
+            rescuable |= !row.tags.iter().any(|tag| tag == "user-preference")
+                && is_rescue_evidence(&task.terms, &task.identifiers, &evidence);
+        }
+        if relevant {
             qualified.push(row);
-        } else if rescue.len() < 6
-            && is_rescue_candidate(&row, &trace, terms, &structured_identifiers)
-        {
+        } else if rescue.len() < 6 && rescuable {
             rescue.push(row);
         }
     }
     Ok((qualified, rescue))
 }
 
+fn extend_constraints(terms: &mut HashSet<String>, value: &str) {
+    for term in constraint_tokens(value).chain(named_constraints(value)) {
+        terms.insert(canonical_term(&term));
+        terms.insert(term);
+    }
+}
+
+#[cfg(test)]
 fn is_rescue_candidate(
     row: &Row,
     trace: &Trace,
     terms: &[String],
     identifiers: &HashSet<String>,
 ) -> bool {
-    if terms.len() < 2 || row.tags.iter().any(|tag| tag == "user-preference") {
+    if row.tags.iter().any(|tag| tag == "user-preference") {
         return false;
     }
-    let evidence = match_evidence(row, trace, terms);
-    if !requested_identifiers_present(terms, &evidence)
+    is_rescue_evidence(terms, identifiers, &match_evidence(row, trace, terms))
+}
+
+fn is_rescue_evidence(
+    terms: &[String],
+    identifiers: &HashSet<String>,
+    evidence: &MatchEvidence,
+) -> bool {
+    if terms.len() < 2 {
+        return false;
+    }
+    if !requested_identifiers_present(terms, evidence)
         || identifiers
             .iter()
             .any(|term| !evidence.matched.contains(&canonical_term(term)))
@@ -233,24 +326,24 @@ fn requested_identifiers_present(terms: &[String], evidence: &MatchEvidence) -> 
 }
 
 fn is_relevant_match(
-    row: &Row,
-    trace: &Trace,
     terms: &[String],
     structured_identifiers: &HashSet<String>,
+    evidence: &MatchEvidence,
     unique_single_term: bool,
     allow_metadata_anchor: bool,
 ) -> bool {
     if terms.is_empty() {
         return false;
     }
-    let evidence = match_evidence(row, trace, terms);
-    if !requested_identifiers_present(terms, &evidence) {
+    if !requested_identifiers_present(terms, evidence) {
         return false;
     }
-    if structured_identifiers
+    // An exact identifier-only request is sufficient, but an identifier must
+    // never erase the natural-language constraints in the same task.
+    if terms
         .iter()
-        .map(|term| canonical_term(term))
-        .any(|term| evidence.matched.contains(&term))
+        .all(|term| structured_identifiers.contains(term))
+        && evidence.term_matches == terms.len()
     {
         return true;
     }
@@ -278,10 +371,19 @@ struct MatchEvidence {
     metadata_matches: usize,
 }
 
+#[cfg(test)]
 fn match_evidence(row: &Row, trace: &Trace, terms: &[String]) -> MatchEvidence {
     let metadata = searchable_terms(&format!("{} {} {}", row.id, row.title, row.tags.join(" ")));
     let mut all = metadata.clone();
     all.extend(searchable_terms(&trace.body));
+    match_indexed_terms(&metadata, &all, terms)
+}
+
+fn match_indexed_terms(
+    metadata: &HashSet<String>,
+    all: &HashSet<String>,
+    terms: &[String],
+) -> MatchEvidence {
     let matched = terms
         .iter()
         .filter_map(|term| {
@@ -373,6 +475,528 @@ fn query_terms_with_conversation(prompt: &str, keep_conversation: bool) -> Vec<S
     .into_iter()
     .take(MAX_QUERY_TERMS)
     .collect()
+}
+
+#[derive(Debug)]
+struct TaskQuery {
+    terms: Vec<String>,
+    original_terms: Vec<String>,
+    identifiers: HashSet<String>,
+    required: Vec<String>,
+    overconstrained: bool,
+    unique_single_candidate: bool,
+}
+
+fn question_section_text(prompt: &str) -> Cow<'_, str> {
+    let mut in_questions = false;
+    let mut output: Option<String> = None;
+    let mut offset = 0;
+    for line in prompt.split_inclusive('\n') {
+        let heading = line.trim().trim_start_matches('#').trim();
+        if heading.ends_with(':') && !heading[..heading.len() - 1].contains(':') {
+            in_questions = heading.eq_ignore_ascii_case("questions:");
+        }
+        let replacement = in_questions
+            .then(|| strip_question_label(line).trim_start())
+            .and_then(|line| line.split_once(':'))
+            .filter(|(label, question)| {
+                !label.is_empty()
+                    && label
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+                    && question_line(question.trim_start()).is_some()
+            })
+            .map(|(_, question)| question.trim_start());
+        if let Some(replacement) = replacement {
+            let output = output.get_or_insert_with(|| {
+                let mut output = String::with_capacity(prompt.len());
+                output.push_str(&prompt[..offset]);
+                output
+            });
+            output.push_str(replacement);
+        } else if let Some(output) = &mut output {
+            output.push_str(line);
+        }
+        offset += line.len();
+    }
+    output.map_or(Cow::Borrowed(prompt), Cow::Owned)
+}
+
+fn query_plan(prompt: &str) -> Vec<TaskQuery> {
+    let text = question_section_text(prompt);
+    let prompt = text.as_ref();
+    let mut tasks = Vec::new();
+    let mut global_constraints = Vec::new();
+    let mut start = 0;
+    for (offset, ch) in prompt.char_indices() {
+        let decimal_or_name = ch == '.'
+            && offset > 0
+            && prompt.as_bytes()[offset - 1].is_ascii_alphanumeric()
+            && prompt
+                .as_bytes()
+                .get(offset + 1)
+                .is_some_and(u8::is_ascii_alphanumeric);
+        if !matches!(ch, '?' | '.' | '!') || decimal_or_name {
+            continue;
+        }
+        add_question_spans(&prompt[start..offset], ch == '?', &mut tasks);
+        collect_global_constraints(&prompt[start..offset], ch == '?', &mut global_constraints);
+        start = offset + ch.len_utf8();
+    }
+    add_question_spans(&prompt[start..], false, &mut tasks);
+    collect_global_constraints(&prompt[start..], false, &mut global_constraints);
+    // Unrecognized imperative tasks retain conservative whole-prompt behavior.
+    if tasks.is_empty() {
+        push_task(prompt, &mut tasks);
+    }
+    for task in &mut tasks {
+        if global_constraints.is_empty() {
+            break;
+        }
+        let mut required = bounded_terms(
+            global_constraints
+                .iter()
+                .cloned()
+                .chain(task.required.iter().cloned()),
+            MAX_QUERY_TERMS + 1,
+        );
+        task.overconstrained |= required.len() > MAX_QUERY_TERMS;
+        required.truncate(MAX_QUERY_TERMS);
+        task.terms = bounded_terms(
+            required.iter().cloned().chain(task.terms.drain(..)),
+            MAX_QUERY_TERMS,
+        );
+        task.original_terms = bounded_terms(
+            required
+                .iter()
+                .cloned()
+                .chain(task.original_terms.drain(..)),
+            MAX_QUERY_TERMS,
+        );
+        task.required = required;
+    }
+    tasks
+}
+
+fn add_question_spans(segment: &str, marked: bool, tasks: &mut Vec<TaskQuery>) {
+    if tasks.len() == MAX_QUERY_TASKS {
+        return;
+    }
+    if marked {
+        // Keep continuation clauses, but split separately labeled question lines
+        // even when only the last line carries a question mark.
+        let mut question_start = None;
+        for offset in
+            std::iter::once(0).chain(segment.match_indices('\n').map(|(i, s)| i + s.len()))
+        {
+            let suffix = &segment[offset..];
+            let line = suffix.lines().next().unwrap_or_default();
+            if let Some(question) = question_line(line) {
+                if let Some(start) = question_start {
+                    push_task(&segment[start..offset], tasks);
+                    if tasks.len() == MAX_QUERY_TASKS {
+                        return;
+                    }
+                }
+                let start = offset + line.find(question).unwrap_or_default();
+                question_start = Some(
+                    if question_start.is_none()
+                        && (named_scope_constraints(&segment[..start]).next().is_some()
+                            || constraint_tokens(&segment[..start]).next().is_some())
+                    {
+                        0
+                    } else {
+                        start
+                    },
+                );
+            }
+        }
+        if let Some(start) = question_start {
+            push_task(&segment[start..], tasks);
+            return;
+        }
+        let line = segment.trim();
+        if !line.is_empty() && !procedural_prefix(line) {
+            push_task(strip_question_label(line), tasks);
+        }
+    } else {
+        for line in segment.lines() {
+            if let Some(question) = question_line(line) {
+                push_task(question, tasks);
+                if tasks.len() == MAX_QUERY_TASKS {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn strip_question_label(line: &str) -> &str {
+    static LABEL: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)^\s*(?:[-*+]\s+|\d+[.)]\s+|[a-z][.)]\s+)*(?:(?:question|q)\s*(?:[a-z0-9]+)?\s*:\s*)?")
+            .expect("valid question label regex")
+    });
+    &line[LABEL.find(line).map_or(0, |matched| matched.end())..]
+}
+
+fn question_line(line: &str) -> Option<&str> {
+    let line = strip_question_label(line).trim();
+    let first = line
+        .split_whitespace()
+        .next()?
+        .trim_matches(|ch: char| !ch.is_alphabetic());
+    if first.eq_ignore_ascii_case("when")
+        && !line.split_whitespace().nth(1).is_some_and(is_question_word)
+    {
+        return None;
+    }
+    if is_question_word(first) && !procedural_prefix(line) {
+        return Some(line);
+    }
+    static WH: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b(?:what|which|who|whose|where|when|why|how)\b")
+            .expect("valid question opening regex")
+    });
+    let opening = WH.find(line)?;
+    let prefix = line[..opening.start()].trim_end();
+    if !prefix.ends_with(',') && !prefix.ends_with(':') {
+        return None;
+    }
+    if procedural_prefix(prefix)
+        && named_scope_constraints(prefix).next().is_none()
+        && constraint_tokens(prefix).next().is_none()
+    {
+        Some(&line[opening.start()..])
+    } else {
+        // Scope clauses such as "For project Cedar, what ..." are evidence.
+        Some(line)
+    }
+}
+
+fn is_question_word(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "what"
+            | "which"
+            | "who"
+            | "whose"
+            | "where"
+            | "when"
+            | "why"
+            | "how"
+            | "is"
+            | "are"
+            | "was"
+            | "were"
+            | "do"
+            | "does"
+            | "did"
+            | "can"
+            | "could"
+            | "has"
+            | "have"
+            | "will"
+            | "would"
+            | "should"
+    )
+}
+
+fn procedural_prefix(text: &str) -> bool {
+    let mut words = text.split_whitespace();
+    let first = words.next().unwrap_or_default();
+    [
+        "answer", "respond", "return", "cite", "include", "use", "using", "please",
+    ]
+    .iter()
+    .any(|word| first.eq_ignore_ascii_case(word))
+        || (first.eq_ignore_ascii_case("do")
+            && words
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case("not")))
+}
+
+fn coordinated_requests(span: &str, tasks: &mut Vec<TaskQuery>) -> bool {
+    let Some(subject) = question_subject(span) else {
+        return false;
+    };
+    let (body, suffix) = subject.find(',').map_or((subject, ""), |offset| {
+        (&subject[..offset], &subject[offset..])
+    });
+    let mut clauses = token_regex()
+        .find_iter(body)
+        .filter(|term| term.as_str().eq_ignore_ascii_case("for"));
+    let Some(first) = clauses.next() else {
+        return false;
+    };
+    let Some(last) = clauses.last() else {
+        return false;
+    };
+    static AND: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\s+and\s+").expect("valid coordination regex"));
+    let Some(separator) = AND
+        .find_iter(body)
+        .find(|separator| separator.start() > first.end() && separator.end() < last.start())
+    else {
+        return false;
+    };
+    let prefix = &span[..span.len() - subject.len()];
+    let left = &body[..separator.start()];
+    let right = &body[separator.end()..];
+    let mut request =
+        String::with_capacity(prefix.len() + left.len().max(right.len()) + suffix.len());
+    for clause in [left, right] {
+        request.clear();
+        request.push_str(prefix);
+        request.push_str(clause);
+        request.push_str(suffix);
+        push_task(&request, tasks);
+    }
+    true
+}
+
+fn push_task(span: &str, tasks: &mut Vec<TaskQuery>) {
+    if tasks.len() == MAX_QUERY_TASKS || coordinated_requests(span, tasks) {
+        return;
+    }
+    let identifiers = identifier_regex()
+        .captures_iter(span)
+        .filter_map(|captures| normalized_identifier(&captures))
+        .take(MAX_QUERY_TERMS + 1)
+        .collect::<HashSet<_>>();
+    let mut required = Vec::new();
+    for term in constraint_tokens(span)
+        .chain(
+            identifier_regex()
+                .captures_iter(span)
+                .filter_map(|captures| normalized_identifier(&captures)),
+        )
+        .chain(named_constraints(span))
+    {
+        if !required.contains(&term) {
+            required.push(term);
+            if required.len() > MAX_QUERY_TERMS {
+                break;
+            }
+        }
+    }
+    let overconstrained = required.len() > MAX_QUERY_TERMS;
+    required.truncate(MAX_QUERY_TERMS);
+    // A list consisting only of independent identifiers is a list of requests,
+    // not a demand that one record contain every identifier.
+    let terms = task_terms(span, &required, false);
+    if !overconstrained
+        && required.len() > 1
+        && required.iter().all(|term| {
+            term.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+                && term.bytes().any(|byte| byte.is_ascii_digit())
+        })
+        && terms
+            .iter()
+            .all(|term| required.contains(term) || matches!(term.as_str(), "and" | "or"))
+    {
+        for term in required {
+            if tasks.len() == MAX_QUERY_TASKS {
+                break;
+            }
+            if tasks
+                .iter()
+                .any(|task| task.terms.len() == 1 && task.terms[0] == term)
+            {
+                continue;
+            }
+            let task_identifiers = identifiers
+                .contains(&term)
+                .then(|| HashSet::from([term.clone()]))
+                .unwrap_or_default();
+            tasks.push(TaskQuery {
+                terms: vec![term.clone()],
+                original_terms: vec![term.clone()],
+                identifiers: task_identifiers,
+                required: vec![term],
+                overconstrained: false,
+                unique_single_candidate: false,
+            });
+        }
+        return;
+    }
+    if terms.is_empty()
+        || tasks
+            .iter()
+            .any(|task| task.terms == terms && task.required == required)
+    {
+        return;
+    }
+    let original_terms = task_terms(span, &required, true);
+    tasks.push(TaskQuery {
+        terms,
+        original_terms,
+        identifiers,
+        required,
+        overconstrained,
+        unique_single_candidate: false,
+    });
+}
+
+fn task_terms(span: &str, required: &[String], keep_conversation: bool) -> Vec<String> {
+    let natural = token_regex()
+        .find_iter(span)
+        .enumerate()
+        .filter(|(index, term)| *index != 0 || !is_question_word(term.as_str()))
+        .map(|(_, term)| term);
+    let mut terms = Vec::with_capacity(MAX_QUERY_TERMS);
+    for term in required.iter().cloned().chain(
+        token_regex()
+            .find_iter(question_subject(span).unwrap_or_default())
+            .chain(natural)
+            .map(|term| normalize_task_token(term.as_str()))
+            .filter(|term| {
+                !STOPWORDS.contains(&term.as_str())
+                    && !matches!(term.as_str(), "which" | "who" | "whose" | "where")
+                    && (keep_conversation || !CONVERSATIONAL_WORDS.contains(&term.as_str()))
+            }),
+    ) {
+        if !terms.contains(&term) {
+            terms.push(term);
+            if terms.len() == MAX_QUERY_TERMS {
+                break;
+            }
+        }
+    }
+    terms
+}
+
+fn question_subject(span: &str) -> Option<&str> {
+    static SUBJECT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b(?:for|to|the)\s+").expect("valid subject clause regex")
+    });
+    let clause = SUBJECT.find(span)?;
+    let mut words = span[..clause.start()].split_whitespace();
+    let first = words.next()?;
+    if ![
+        "what", "which", "who", "whose", "where", "when", "why", "how",
+    ]
+    .iter()
+    .any(|word| first.eq_ignore_ascii_case(word))
+    {
+        return None;
+    }
+    let mut field_terms = 0;
+    let mut generic_field = false;
+    let mut predicate_terms = 0;
+    for word in words {
+        let word = word.trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
+        if [
+            "is", "are", "was", "were", "do", "does", "did", "has", "have", "can", "could", "will",
+            "would", "should",
+        ]
+        .iter()
+        .any(|auxiliary| word.eq_ignore_ascii_case(auxiliary))
+        {
+            let direct_object = field_terms == 0
+                && span[clause.start()..clause.end()]
+                    .trim()
+                    .eq_ignore_ascii_case("the");
+            return (field_terms == 1 || direct_object).then_some(&span[clause.end()..]);
+        }
+        if word.len() < 3
+            || STOPWORDS.iter().any(|stop| word.eq_ignore_ascii_case(stop))
+            || CONVERSATIONAL_WORDS
+                .iter()
+                .any(|stop| word.eq_ignore_ascii_case(stop))
+            || (field_terms == 0 && word.eq_ignore_ascii_case("stored"))
+        {
+            continue;
+        }
+        if field_terms == 0 {
+            generic_field = ["value", "setting", "choice", "location", "status"]
+                .iter()
+                .any(|field| word.eq_ignore_ascii_case(field));
+        } else if !word
+            .get(word.len().saturating_sub(2)..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case("ly"))
+        {
+            predicate_terms += 1;
+        }
+        field_terms += 1;
+    }
+    // Framing changes the anchor, not the evidence denominator. Descriptive
+    // fields without a generic requested-value head keep their original anchor.
+    (generic_field && predicate_terms == 1).then_some(&span[clause.end()..])
+}
+
+fn normalize_task_token(token: &str) -> String {
+    let token = token.trim_end_matches('.');
+    identifier_regex()
+        .captures(token)
+        .filter(|captures| {
+            captures
+                .get(0)
+                .is_some_and(|matched| matched.as_str() == token)
+        })
+        .and_then(|captures| normalized_identifier(&captures))
+        .unwrap_or_else(|| token.to_ascii_lowercase())
+}
+
+fn constraint_tokens(value: &str) -> impl Iterator<Item = String> + '_ {
+    static TOKENS: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b(?:[a-z][a-z0-9_-]*\d[a-z0-9_.-]*|\d+(?:\.\d+)+(?:[-_][a-z0-9]+)*)\b")
+            .expect("valid constraint token regex")
+    });
+    TOKENS
+        .find_iter(value)
+        .map(|term| normalize_task_token(term.as_str()))
+}
+
+fn named_scope_constraints(value: &str) -> impl Iterator<Item = String> + '_ {
+    static SCOPES: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b(?:project|workspace|environment|tenant|scope|version|release)\s+([a-z0-9][a-z0-9_.-]*)")
+            .expect("valid scope constraint regex")
+    });
+    SCOPES
+        .captures_iter(value)
+        .filter_map(|captures| captures.get(1))
+        .map(|term| normalize_task_token(term.as_str()))
+}
+
+fn named_constraints(value: &str) -> impl Iterator<Item = String> + '_ {
+    named_scope_constraints(value).chain(token_regex().find_iter(value).filter_map(|term| {
+        let term = term.as_str();
+        (term.eq_ignore_ascii_case("current")
+            || term.eq_ignore_ascii_case("old")
+            || ((term.contains('-') || term.contains('_'))
+                && !term.bytes().any(|byte| byte.is_ascii_digit())))
+        .then(|| normalize_task_token(term))
+    }))
+}
+
+fn bounded_terms(values: impl IntoIterator<Item = String>, limit: usize) -> Vec<String> {
+    let mut terms = Vec::with_capacity(limit);
+    for term in values {
+        if !terms.contains(&term) {
+            terms.push(term);
+            if terms.len() == limit {
+                break;
+            }
+        }
+    }
+    terms
+}
+
+fn collect_global_constraints(segment: &str, marked: bool, constraints: &mut Vec<String>) {
+    if marked
+        || constraints.len() > MAX_QUERY_TERMS
+        || segment.lines().any(|line| question_line(line).is_some())
+    {
+        return;
+    }
+    for term in named_scope_constraints(segment) {
+        if !constraints.contains(&term) {
+            constraints.push(term);
+            if constraints.len() > MAX_QUERY_TERMS {
+                break;
+            }
+        }
+    }
 }
 
 fn identifier_regex() -> &'static Regex {
@@ -489,6 +1113,122 @@ mod tests {
     }
 
     #[test]
+    fn separate_scope_and_version_instructions_remain_required() {
+        let (_temp, cortex) = test_cortex();
+        for version in [7, 8] {
+            let mut trace = Trace::new(
+                format!("Willow routing version {version}"),
+                "fact",
+                "test",
+                vec![],
+                format!("Project Cedar willow routing owner for version {version} is a curator."),
+            );
+            cortex.add(&mut trace).unwrap();
+        }
+        let result = retrieve(
+            &cortex,
+            "For project Cedar. What is the willow routing owner? Use version 7.",
+            PrefetchOptions {
+                max_preferences: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.search_match_count, 1);
+        assert!(result.context.contains("Willow routing version 7"));
+        assert!(!result.context.contains("Willow routing version 8"));
+    }
+
+    #[test]
+    fn questions_keep_their_own_constraints_and_ignore_procedural_sentences() {
+        let plan = query_plan(
+            "Please respond concisely. Using local references, where is the willow routing owner? \
+             What is the juniper backup policy for project Cedar? Return a short answer.",
+        );
+        assert_eq!(plan.len(), 2);
+        assert!(plan[0].terms.iter().any(|term| term == "willow"));
+        assert!(
+            !plan[0]
+                .terms
+                .iter()
+                .any(|term| term == "where" || term == "juniper")
+        );
+        assert!(plan[1].required.iter().any(|term| term == "cedar"));
+        assert!(
+            !plan[1]
+                .terms
+                .iter()
+                .any(|term| term == "return" || term == "short")
+        );
+    }
+
+    #[test]
+    fn labels_and_continuation_clauses_do_not_mix_questions() {
+        let plan = query_plan(
+            "- Question A: What is the willow routing owner\nfor project Cedar?\n\
+             - Question B: Which juniper backup policy applies?",
+        );
+        assert_eq!(plan.len(), 2);
+        assert!(plan[0].required.iter().any(|term| term == "cedar"));
+        assert!(!plan[0].terms.iter().any(|term| term == "juniper"));
+        assert!(
+            !plan[1]
+                .terms
+                .iter()
+                .any(|term| term == "cedar" || term == "question")
+        );
+        let mixed = query_plan(
+            "- A: What is the willow routing owner\n- B: Which juniper backup policy applies?",
+        );
+        assert_eq!(mixed.len(), 2);
+        assert!(!mixed[0].terms.iter().any(|term| term == "juniper"));
+    }
+
+    #[test]
+    fn constraints_are_reserved_before_natural_term_truncation() {
+        let plan = query_plan(
+            "What amber birch cypress dogwood elm fir ginkgo hazel ivy juniper kapok \
+             larch maple nettle olive pine quince rowan spruce tamarind routing owner \
+             applies to meadow-73 in project Cedar version 2.4?",
+        );
+        assert_eq!(plan.len(), 1);
+        for term in ["meadow-73", "cedar", "2.4"] {
+            assert!(plan[0].required.iter().any(|value| value == term));
+            assert!(plan[0].terms.iter().any(|value| value == term));
+        }
+        assert!(plan[0].terms.len() <= MAX_QUERY_TERMS);
+    }
+
+    #[test]
+    fn identifier_lists_are_independent_but_relational_questions_are_not() {
+        let plan = query_plan("Return NR42 and LX73");
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].required, vec!["nr42"]);
+        assert_eq!(plan[1].required, vec!["lx73"]);
+        let relational = query_plan("Which NR42 decision superseded LX73?");
+        assert_eq!(relational.len(), 1);
+        assert_eq!(relational[0].required.len(), 2);
+    }
+
+    #[test]
+    fn planner_bounds_tasks_and_fails_closed_on_excess_constraints() {
+        let many = (0..20)
+            .map(|index| format!("What is the routing owner for meadow-{index}?"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(query_plan(&many).len(), MAX_QUERY_TASKS);
+        let constraints = (0..20)
+            .map(|index| format!("meadow-{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let plan = query_plan(&format!("Which routing owner covers {constraints}?"));
+        assert_eq!(plan.len(), 1);
+        assert!(plan[0].overconstrained);
+        assert_eq!(plan[0].required.len(), MAX_QUERY_TERMS);
+        assert_eq!(plan[0].terms.len(), MAX_QUERY_TERMS);
+    }
+
+    #[test]
     fn verification_word_forms_match_without_changing_identifiers() {
         let indexed = searchable_terms("verified policies satisfy requirements");
         assert!(
@@ -553,9 +1293,7 @@ mod tests {
         }
         let prompt = "Missing ultraviolet routing";
         let rows = cortex.list(&ListOptions::default()).unwrap();
-        let (qualified, rescue) =
-            qualify_search_rows(&cortex, prompt, &query_terms(prompt), rows.clone(), false)
-                .unwrap();
+        let (qualified, rescue) = qualify_search_rows(&cortex, &query_plan(prompt), rows).unwrap();
         assert!(qualified.is_empty());
         assert_eq!(rescue.len(), 6);
         let (_, trace) = cortex.get_trace(&rescue[0].id).unwrap();

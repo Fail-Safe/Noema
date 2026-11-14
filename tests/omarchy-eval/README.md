@@ -10,6 +10,12 @@ including limitations and product implications, is in
 [`docs/continuity-evaluation.md`](../../docs/continuity-evaluation.md). Raw run
 artifacts and detailed qualification records remain private.
 
+The separate [November public evidence bundle](published/continuity-2026-11/README.md)
+contains reviewed numerical snapshots and portable offline analysis, including
+unfavorable and aborted stages. It does not expose private raw evidence or change
+the September qualification. Fresh 8k-profile replication has its own explicit
+driver; the default benchmark profile remains unchanged.
+
 The harness uses Python's standard library only. It does not install packages, modify an existing
 Cortex, or edit user-level Codex, OpenCode, Noema, or `~/Work/AGENTS.md` configuration. Those files
 are snapshotted as guards and hash-checked at every checkpoint and restore.
@@ -119,9 +125,232 @@ The optional `coverage` phase exercises rationale/synthesis and sibling-workspac
 repeats outside-work retrieval with every rationale-scored question explicitly requesting its
 rationale. This keeps prompt wording aligned with the deterministic scorer.
 
+### Prefetch delivery budgets
+
+The checked-in adapter has distinct receiving-client limits:
+
+| Delivery path | Maximum context characters |
+|---|---:|
+| Codex `UserPromptSubmit` task evidence | 2,500 |
+| Codex `SessionStart` preferences | 32,000 |
+| OpenCode pre-request context | 8,000 |
+
+These caps include the preamble and provenance metadata, not just trace bodies.
+A positive hit count does not prove that complete values, rationales, or
+provenance survived rendering. Inspect native `truncated` output and run
+model-free checks at the actual receiving client's cap, not just the CLI default.
+For a private synthetic corpus, a direct budget check reads its prompt from stdin:
+
+```bash
+noema --cortex "$EVAL_CORTEX" prefetch --input raw --output json \
+  --max-results 8 --max-preferences 0 --max-chars 2500 < "$PRIVATE_PROMPT_FILE"
+```
+
+A budget-sensitivity run is a **separate descriptive profile**. Use a fresh run
+ID, fresh confirmation corpus, and an experiment-owned adapter; freeze and report
+both client limits and the adapter hash. Keep the checked-in defaults, historical
+configurations, and earlier unfavorable results unchanged. Larger bounds can
+recover evidence at additional context cost; they do not establish better search
+ranking or repair a historical qualification result.
+
 The private hook metrics contain only engine, client, success/error status, duration, hit count, and
 context size. They never contain prompts, search queries, trace IDs, or retrieved bodies. As with the MCP
 fast-path experiment, these results are descriptive and do not alter checkpoint evidence.
+
+### Equal-access Markdown gap decomposition (new descriptive experiment)
+
+This experiment adds a third condition without replacing hierarchical native
+continuity or reopening the September 2026 qualification:
+
+- `native`: the existing isolated hierarchical `AGENTS.md` tree, including its
+  sibling-workspace and outside-`~/Work` discovery boundaries.
+- `markdown`: shared Markdown supplied through a local `AGENTS.md` in each
+  receiving workspace, including the sibling and outside workspace. It contains
+  the full synthetic corpus reachable in the corresponding selected Cortex,
+  not an answer-key subset or Noema's prefetch output. No Cortex, Noema tools,
+  MCP configuration, or prefetch hooks are installed for this condition.
+- `noema`: the existing bounded prefetch condition, with no Noema retrieval
+  tools advertised to the receiving model.
+
+The extra Markdown exposure is intentional: it equalizes record reachability,
+not prompt size or retrieval work. The client reads the full Markdown memory;
+Noema selects and bounds its prompt-time evidence. Any remaining difference
+therefore measures the retrieval/delivery package, including context load and
+presentation, rather than isolating search-ranking quality.
+
+Corpus selection is explicit. The existing deterministic Cortex contains all 60
+records, including both project scopes and obsolete/current pairs. The Markdown
+arm exposes that same set, retaining scope and supersession labels. The sibling
+case must be able to reach project-A's record from project-B. The scoping case
+tests rejecting a wrong-scope answer, not hiding that record from the model:
+wrong-scope memories are reachable in both Markdown and the selected Cortex.
+This does not flatten unrelated Cortexes or other directions into shared memory.
+Neither condition establishes filesystem permission enforcement. Experiments
+requiring inaccessible project memories must select separate Cortexes and
+matching separate Markdown sets; that access-control design is not tested here.
+
+Markdown uses Noema's literal tokens, questions, and provenance, so the
+equal-access contrast has the same reachable records on each turn. Hierarchical
+native retains its equivalent counterbalanced alpha/beta assignment; directions
+swap the vocabularies and `--corpus-cycle 2` mirrors the assignment. Exact-value
+F1, rationale, provenance, stale/hallucination/scope scoring, model configuration,
+medium reasoning,
+isolated client homes, pinned executables, and guarded restoration are reused.
+The new experiment is deterministic only; it does not requalify natural capture.
+
+Use a **new run ID** and an ignored private model configuration as described
+above. Commands below are documentation for an operator-authorized live run;
+local mechanics tests do not execute them:
+
+```bash
+python3 tests/omarchy-eval/benchmark.py --config /absolute/path/to/local-config.json \
+  --run-id equal-access-YYYYMMDD preflight \
+  --track deterministic --retrieval-profile prefetch --corpus-cycle 1
+python3 tests/omarchy-eval/benchmark.py --config /absolute/path/to/local-config.json \
+  --run-id equal-access-YYYYMMDD experiment-equal-access --phase smoke --confirm-live
+python3 tests/omarchy-eval/benchmark.py --config /absolute/path/to/local-config.json \
+  --run-id equal-access-YYYYMMDD experiment-equal-access --phase campaign --confirm-live
+python3 tests/omarchy-eval/benchmark.py --config /absolute/path/to/local-config.json \
+  --run-id equal-access-YYYYMMDD restore
+```
+
+The six-turn experiment-specific smoke exercises all three conditions in both directions.
+The campaign requires that smoke's passing mechanics and restoration gates; a
+checkpoint smoke or imported smoke cannot substitute. The 36-turn campaign covers
+all six scenario families in both directions, including both boundary cases,
+same-workspace exact/rationale, supersession, and scoping/abstention. Each phase
+restores its managed runtime even on failure. Finish with `restore` to close the
+run and remove its pinned executables. For a mirrored replication, use another
+fresh run ID with `--corpus-cycle 2`; never edit an existing run configuration.
+An equal-access run cannot subsequently supply checkpoint qualification evidence.
+Condition order rotates across scenarios and reverses between directions. Smoke
+requires perfect exact/provenance scores and clean safety/mechanics; campaign
+completion requires mechanics and restoration, not an accuracy advantage.
+
+Each phase writes `equal-access-{phase}-experiment.json` and
+`equal-access-{phase}-turns.json` under `reports/<run-id>/`. The experiment report
+contains the decomposition under `summary` and local prefetch observations under
+`prefetch_metrics`; the turns file contains sanitized per-turn metrics. An
+interrupted phase marks its summary unavailable even if some triples completed.
+
+#### Reading the decomposition
+
+On the same matched scenario/direction/batch triples, let H be hierarchical
+native macro F1, M equal-access Markdown macro F1, and N Noema prefetch macro F1.
+The sanitized experiment report supplies aggregate metrics and these descriptive
+differences overall, for the boundary subset (`sibling_workspace`, `outside_work`),
+and by scenario/subset:
+
+| Component | Percentage-point difference | Interpretation |
+|---|---|---|
+| Total gap | 100 × (N − H) | Repeated hierarchy-to-prefetch contrast in this new run |
+| Access / reachability | 100 × (M − H) | Change after making shared Markdown evidence reachable |
+| Retrieval / evidence quality | 100 × (N − M) | Remaining retrieval/delivery package contrast |
+| Residual | Total − access − retrieval | Algebraic closure on the same triples |
+
+The summary schema uses `conditions.native`, `conditions.markdown`, and
+`conditions.noema` for existing accuracy, safety, token, and latency metrics.
+`decomposition` contains `total_pp`, `access_pp`, `retrieval_pp`, `residual_pp`,
+and descriptive paired `bootstrap_95_pp` intervals. The same structure appears
+under `subsets.boundary`, `subsets.update`, `subsets.scoping`,
+`subsets.same_workspace`, and each entry in `scenarios`. `matched_triples`,
+`available`, and `complete` distinguish scored comparisons from unavailable
+failure reports; no unavailable effect should be interpreted as zero.
+
+The residual is zero by construction apart from floating-point roundoff. It is
+not evidence that causal confounding vanished: Markdown auto-loading versus
+bounded prefetch, serialization, client discovery, and equivalent token swaps
+remain design differences. Negative components are possible; do not clip them
+or interpret the components as causal percentages of the historical 27.8-point
+gap. Missing, duplicate, or incomplete triples cannot support a complete
+decomposition; failed mechanics remain visible rather than being silently
+dropped to improve the comparison.
+
+Reports contain only sanitized condition/case metadata and numeric outcomes.
+Raw memory files, prompts, responses, Cortexes, and client events stay owner-only
+under `.private/`. This experiment has no formal superiority/success candidate,
+does not pool with checkpoint rows, and supplies no new numbers for the published
+September tables until a separately reviewed live campaign exists.
+
+### Independent-corpus, size-stratified campaign
+
+The separate [`independent-protocol.md`](independent-protocol.md) defines the
+expanded fixed-model target: 30 new synthetic corpus draws, 10 each at 60, 180,
+and 600 records; six scenario families, both directions, and all three arms
+produce 1,080 campaign retrieval turns. A separate 18-turn pilot smoke covers
+all three corpus sizes and is excluded from campaign statistics.
+
+Admission requires valid model/prefetch delivery, actual seed counts, successful
+direct-retrieval positive controls, and clean restoration/guards. Natural-query
+accuracy and safety errors remain outcomes for every arm, not admission criteria.
+This gate revision was operator-approved after an initial pilot failed its
+perfect-accuracy rule; that failed pilot and its source snapshot are preserved
+separately. Neither the corpus generator nor Noema is tuned to improve that
+pilot's natural-query result. The protocol records the revision before holdout
+collection.
+
+This is not 1,080 independent observations. The corpus is the uncertainty
+cluster: all correlated questions, directions, and conditions remain together
+in a size-stratified paired cluster bootstrap. Reports separate size strata,
+directions, scenario families, and boundary/update/scoping/same-workspace
+subsets. Within-stratum estimates have only 10 corpus clusters. All corpora are
+draws from the same frozen synthetic generator; they are not real project data
+or newly held-out scenario families.
+
+Generated entity/topic questions avoid literal memory-ID lookup. Seeded draws
+vary record selection and placement, wording, distractors, and multi-step
+supersession. Unlike the older alpha/beta comparison, this new campaign gives
+all arms identical literal records and questions within a task; vocabulary
+varies by corpus and direction. Shared Markdown still exposes the whole selected
+Cortex-equivalent corpus, not prefetch's selected records, and unrelated corpora
+remain isolated.
+
+Use a new private configuration with an explicit shared model and medium
+reasoning. The driver locks a privately generated plan, protocol, source hashes,
+configuration, and pinned executables before the live smoke:
+
+```bash
+python3 tests/omarchy-eval/independent_campaign.py --config /absolute/path/to/local-config.json \
+  --run-id independent-YYYYMMDD preflight
+python3 tests/omarchy-eval/independent_campaign.py --config /absolute/path/to/local-config.json \
+  --run-id independent-YYYYMMDD smoke --confirm-live
+python3 tests/omarchy-eval/independent_campaign.py --config /absolute/path/to/local-config.json \
+  --run-id independent-YYYYMMDD run --confirm-live
+python3 tests/omarchy-eval/independent_campaign.py --config /absolute/path/to/local-config.json \
+  --run-id independent-YYYYMMDD analyze
+python3 tests/omarchy-eval/independent_campaign.py --config /absolute/path/to/local-config.json \
+  --run-id independent-YYYYMMDD restore
+```
+
+Collection is sequential. Each corpus has isolated workspaces, Cortexes, client
+homes, raw records, and managed restoration. Accuracy and safety errors remain
+outcomes; failed integration/prefetch/event/schema/restoration gates stop
+collection and produce an explicit incomplete report, not a success-only
+headline. Durable evidence must never be silently overwritten or retried.
+
+Every arm uses the same explicit 1 MiB Codex instruction byte limit in its
+isolated configuration so larger Markdown is not silently capped by the
+ordinary default. Reports identify corpus sizes and materialized memory bytes;
+provider context-limit failures remain visible. This does not attest to model
+attention or undocumented upstream truncation. Full Markdown context versus
+bounded prefetch remains a retrieval/delivery-package contrast.
+
+The generated reports are `independent-smoke.json` and
+`independent-smoke-turns.json`, then `independent-campaign.json` and
+`independent-turns.json`, under `reports/<run-id>/`. The campaign report's
+`summary` contains condition metrics, corpus-cluster intervals, decomposition,
+coverage, per-corpus progress, size strata, directions, and scenario/subset
+breakdowns. `restoration.json` records the final managed-path and guard checks.
+Missing observations prevent a complete campaign headline; no single-corpus
+interval is reported.
+
+Holdout prompts, answers, seeds, plan contents, Cortexes, and event streams stay
+owner-only under `.private/`. Do not tune against the holdout after collection
+starts. This campaign has no formal superiority/equivalence decision and does
+not pool with the older qualification or two-vocabulary runs. Natural capture
+and additional models remain separate replications.
+
+
 
 Stop after reviewing checkpoint 1 together. If the operator explicitly chooses to continue:
 
