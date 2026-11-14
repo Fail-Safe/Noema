@@ -195,9 +195,16 @@ impl Target {
     }
 
     fn opencode_config(&self) -> PathBuf {
-        match self.scope {
-            Scope::User => self.opencode_root().join("opencode.jsonc"),
-            Scope::Project => self.project_root.join("opencode.jsonc"),
+        let root = match self.scope {
+            Scope::User => self.opencode_root(),
+            Scope::Project => self.project_root.clone(),
+        };
+        let jsonc = root.join("opencode.jsonc");
+        let json = root.join("opencode.json");
+        if !jsonc.exists() && json.exists() {
+            json
+        } else {
+            jsonc
         }
     }
 
@@ -511,15 +518,19 @@ pub fn print(request: &Request) -> Result<String> {
             ohmypi_rule_source()
         )),
         Client::OpenCode => {
-            require_opencode_v1(&request.target)?;
+            let version =
+                detect_opencode_version(&request.target.opencode_config(), Path::new("opencode"))?;
+            let server = opencode_mcp_value(request, version)?;
+            let mcp = match version {
+                OpenCodeVersion::V1 => json!({"mcp": {"noema": server}}),
+                OpenCodeVersion::V2 => json!({"mcp": {"servers": {"noema": server}}}),
+            };
             Ok(format!(
                 "# MCP target: {}\n{}\n\n# plugin target: {}\n{}",
                 request.target.opencode_config().display(),
-                serde_json::to_string_pretty(
-                    &json!({"mcp": {"noema": mcp_value(request, Client::OpenCode)?}})
-                )?,
+                serde_json::to_string_pretty(&mcp)?,
                 request.target.opencode_plugin().display(),
-                opencode_plugin_source()
+                opencode_plugin_source_for(version)
             ))
         }
     }
@@ -534,11 +545,25 @@ pub fn capture(
     if !matches!(target.client, Client::Codex | Client::OpenCode) {
         bail!("capture sessions are currently supported only for Codex and OpenCode");
     }
+    let default_program = Path::new(target.client.name());
+    let program = client_binary.unwrap_or(default_program);
+    let opencode = if target.client == Client::OpenCode {
+        if std::env::var_os("OPENCODE_CONFIG_CONTENT").is_some() {
+            bail!(
+                "OpenCode capture cannot safely replace an existing OPENCODE_CONFIG_CONTENT override"
+            );
+        }
+        let config = opencode_capture_config(target);
+        let version = detect_opencode_version(&config, program)?;
+        Some((config, version))
+    } else {
+        None
+    };
     let (base_state, base_transport) = match target.client {
         Client::Codex => inspect_codex_block(&codex_capture_config(target))?,
         Client::OpenCode => {
-            require_opencode_v1(target)?;
-            inspect_json_mcp(&opencode_capture_config(target), &["mcp"], "noema")?
+            let (config, version) = opencode.as_ref().unwrap();
+            inspect_json_mcp(config, version.mcp_path(), "noema")?
         }
         Client::ClaudeCode | Client::Cursor | Client::OhMyPi => unreachable!(),
     };
@@ -556,8 +581,6 @@ pub fn capture(
         );
     }
 
-    let default_program = Path::new(target.client.name());
-    let program = client_binary.unwrap_or(default_program);
     let mut command = Command::new(program);
     let mut client_args_forwarded = false;
     match target.client {
@@ -624,14 +647,10 @@ pub fn capture(
             }
         }
         Client::OpenCode => {
-            if std::env::var_os("OPENCODE_CONFIG_CONTENT").is_some() {
-                bail!(
-                    "OpenCode capture cannot safely replace an existing OPENCODE_CONFIG_CONTENT override"
-                );
-            }
+            let (config, version) = opencode.as_ref().unwrap();
             command.env(
                 "OPENCODE_CONFIG_CONTENT",
-                opencode_capture_override(request)?,
+                opencode_capture_override(request, config, *version)?,
             );
         }
         Client::ClaudeCode | Client::Cursor | Client::OhMyPi => unreachable!(),
@@ -661,37 +680,55 @@ fn opencode_capture_config(target: &Target) -> PathBuf {
         .unwrap_or_else(|| target.opencode_config())
 }
 
-fn opencode_capture_override(request: &Request) -> Result<String> {
-    let source = read_optional(&opencode_capture_config(&request.target))?
-        .context("capture requires an installed OpenCode MCP connection")?;
-    let container = find_object_path(&source, &["mcp"])?
+fn opencode_capture_override(
+    request: &Request,
+    config: &Path,
+    version: OpenCodeVersion,
+) -> Result<String> {
+    let source =
+        read_optional(config)?.context("capture requires an installed OpenCode MCP connection")?;
+    let container = find_object_path(&source, version.mcp_path())?
         .context("capture requires an installed OpenCode MCP connection")?;
     let member = find_member(&source, container, "noema")?
         .context("capture requires an installed OpenCode MCP connection")?;
     let base = parse_jsonc_value(&source[member.value_start..member.value_end])?;
-    let disabled = match base.get("type").and_then(Value::as_str) {
+    let mut disabled = match base.get("type").and_then(Value::as_str) {
         Some("local") => json!({
             "type": "local",
-            "command": ["noema", "serve"],
-            "enabled": false
+            "command": ["noema", "serve"]
         }),
         Some("remote") => json!({
             "type": "remote",
-            "url": "http://127.0.0.1/mcp",
-            "enabled": false
+            "url": "http://127.0.0.1/mcp"
         }),
-        _ => bail!("OpenCode capture requires a recognized v1 Noema MCP connection"),
+        _ => bail!("OpenCode capture requires a recognized Noema MCP connection"),
     };
-    let mut capture = mcp_value(request, Client::OpenCode)?;
+    let mut capture = match version {
+        OpenCodeVersion::V1 => {
+            disabled["enabled"] = json!(false);
+            mcp_value(request, Client::OpenCode)?
+        }
+        OpenCodeVersion::V2 => {
+            disabled["disabled"] = json!(true);
+            json!({
+                "type": "local",
+                "command": [request.connection.binary, "--cortex", request.connection.cortex, "serve", "--transport", "stdio"],
+                "disabled": false
+            })
+        }
+    };
     capture["environment"] = json!({
         "NOEMA_MCP_TOOL_PROFILE": "continuity-capture"
     });
-    Ok(serde_json::to_string(&json!({
-        "mcp": {
-            "noema": disabled,
-            "noema_capture": capture
-        }
-    }))?)
+    let servers = json!({
+        "noema": disabled,
+        "noema_capture": capture
+    });
+    let mcp = match version {
+        OpenCodeVersion::V1 => servers,
+        OpenCodeVersion::V2 => json!({"servers": servers}),
+    };
+    Ok(serde_json::to_string(&json!({"mcp": mcp}))?)
 }
 
 fn codex_status(target: &Target) -> Result<Report> {
@@ -1343,11 +1380,32 @@ fn cursor_remove(target: &Target, check: bool, force: bool) -> Result<Report> {
 }
 
 fn opencode_status(target: &Target) -> Result<Report> {
-    require_opencode_v1(target)?;
+    let config = target.opencode_config();
+    let version = detect_opencode_version(&config, Path::new("opencode"))?;
+    opencode_status_version(target, version)
+}
+
+fn opencode_status_version(target: &Target, version: OpenCodeVersion) -> Result<Report> {
     let config = target.opencode_config();
     let plugin = target.opencode_plugin();
-    let (mcp, transport) = inspect_json_mcp(&config, &["mcp"], "noema")?;
-    let plugin_state = inspect_opencode_plugin(&plugin)?;
+    let (mut mcp, mut transport) = inspect_json_mcp(&config, version.mcp_path(), "noema")?;
+    if version == OpenCodeVersion::V2 {
+        let source = read_optional(&config)?.unwrap_or_else(|| "{}".into());
+        if opencode_member(&source, &["mcp"])?.is_some() {
+            if opencode_member(&source, version.mcp_path())?.is_some() {
+                mcp = State::Conflict;
+            } else {
+                let legacy = opencode_member(&source, &["mcp"])?.unwrap();
+                mcp = if is_noema_mcp(&legacy) {
+                    State::Drift
+                } else {
+                    State::Conflict
+                };
+                transport = mcp_transport(&legacy);
+            }
+        }
+    }
+    let plugin_state = inspect_opencode_plugin(&plugin, version)?;
     Ok(report(
         target,
         vec![
@@ -1358,25 +1416,43 @@ fn opencode_status(target: &Target) -> Result<Report> {
 }
 
 fn opencode_install(request: &Request, check: bool, force: bool) -> Result<Report> {
-    require_opencode_v1(&request.target)?;
-    if !check {
-        let preview = opencode_install(request, true, force)?;
-        if preview.refused() {
-            return Ok(preview);
-        }
-    }
+    let version =
+        detect_opencode_version(&request.target.opencode_config(), Path::new("opencode"))?;
+    opencode_install_version(request, version, check, force)
+}
+
+fn opencode_install_version(
+    request: &Request,
+    version: OpenCodeVersion,
+    check: bool,
+    force: bool,
+) -> Result<Report> {
     let config = request.target.opencode_config();
     let plugin = request.target.opencode_plugin();
-    let mcp = install_json_member(
-        &config,
-        &["mcp"],
-        "noema",
-        &mcp_value(request, Client::OpenCode)?,
-        is_noema_mcp,
-        check,
-        force,
-    )?;
-    let plugin_state = install_opencode_plugin(&plugin, check, force)?;
+    let source = read_optional(&config)?.unwrap_or_else(|| "{}\n".into());
+    let (mcp, next) = opencode_mcp_install(&source, request, version, force)?;
+    let preview = install_opencode_plugin(&plugin, version, true, force)?;
+    if check
+        || matches!(mcp, State::Conflict | State::Drift)
+        || matches!(preview, State::Conflict | State::Drift)
+    {
+        return Ok(report(
+            &request.target,
+            vec![
+                ("mcp", config, mcp, Some(request.connection.transport)),
+                ("bootstrap", plugin, preview, None),
+            ],
+        ));
+    }
+    if next != source {
+        write_atomic(&config, next.as_bytes())?;
+    }
+    let mcp = match mcp {
+        State::WouldInstall => State::Installed,
+        State::WouldReplace => State::Replaced,
+        state => state,
+    };
+    let plugin_state = install_opencode_plugin(&plugin, version, false, force)?;
     Ok(report(
         &request.target,
         vec![
@@ -1387,23 +1463,266 @@ fn opencode_install(request: &Request, check: bool, force: bool) -> Result<Repor
 }
 
 fn opencode_remove(target: &Target, check: bool, force: bool) -> Result<Report> {
-    require_opencode_v1(target)?;
-    if !check {
-        let preview = opencode_remove(target, true, force)?;
-        if preview.refused() {
-            return Ok(preview);
-        }
-    }
+    let version = detect_opencode_version(&target.opencode_config(), Path::new("opencode"))?;
+    opencode_remove_version(target, version, check, force)
+}
+
+fn opencode_remove_version(
+    target: &Target,
+    version: OpenCodeVersion,
+    check: bool,
+    force: bool,
+) -> Result<Report> {
     let config = target.opencode_config();
     let plugin = target.opencode_plugin();
-    let mcp = remove_json_member(&config, &["mcp"], "noema", is_noema_mcp, check, force)?;
-    let plugin_state = remove_opencode_plugin(&plugin, check, force)?;
+    let source = read_optional(&config)?.unwrap_or_else(|| "{}\n".into());
+    let mut next = source.clone();
+    let mut mcp = State::Unchanged;
+    let paths: &[&[&str]] = match version {
+        OpenCodeVersion::V1 => &[&["mcp"]],
+        OpenCodeVersion::V2 => &[&["mcp", "servers"], &["mcp"]],
+    };
+    for path in paths {
+        if let Some(value) = opencode_member(&next, path)? {
+            if !is_noema_mcp(&value) && !force {
+                mcp = State::Conflict;
+                break;
+            }
+            next = opencode_remove_member(next, path)?;
+            mcp = State::WouldRemove;
+        }
+    }
+    let preview = remove_opencode_plugin(&plugin, true, force)?;
+    if check || mcp == State::Conflict || matches!(preview, State::Drift | State::Conflict) {
+        return Ok(report(
+            target,
+            vec![
+                ("mcp", config, mcp, None),
+                ("bootstrap", plugin, preview, None),
+            ],
+        ));
+    }
+    if next != source {
+        write_atomic(&config, next.as_bytes())?;
+        mcp = State::Removed;
+    }
+    let plugin_state = remove_opencode_plugin(&plugin, false, force)?;
     Ok(report(
         target,
         vec![
             ("mcp", config, mcp, None),
             ("bootstrap", plugin, plugin_state, None),
         ],
+    ))
+}
+
+fn opencode_mcp_value(request: &Request, version: OpenCodeVersion) -> Result<Value> {
+    let mut value = mcp_value(request, Client::OpenCode)?;
+    if version == OpenCodeVersion::V2 {
+        let object = value.as_object_mut().unwrap();
+        object.remove("enabled");
+        object.insert("disabled".into(), json!(false));
+    }
+    Ok(value)
+}
+
+fn opencode_member(source: &str, path: &[&str]) -> Result<Option<Value>> {
+    let member = find_object_path(source, path)?
+        .and_then(|container| find_member(source, container, "noema").transpose())
+        .transpose()?;
+    member
+        .map(|member| parse_jsonc_value(&source[member.value_start..member.value_end]))
+        .transpose()
+}
+
+fn opencode_remove_member(source: String, path: &[&str]) -> Result<String> {
+    let container = find_object_path(&source, path)?.context("missing MCP container")?;
+    let members = object_members(&source, container)?;
+    let index = members
+        .iter()
+        .position(|member| member.key == "noema")
+        .context("missing Noema server")?;
+    Ok(remove_member_at(source, &members, index))
+}
+
+fn opencode_active_contains(current: &Value, expected: &Value, version: OpenCodeVersion) -> bool {
+    if version == OpenCodeVersion::V2 && current.get("disabled").is_none() {
+        let mut expected = expected.clone();
+        expected.as_object_mut().unwrap().remove("disabled");
+        json_contains(current, &expected)
+    } else {
+        json_contains(current, expected)
+    }
+}
+
+fn opencode_migrate_value(mut value: Value) -> Result<Value> {
+    let object = value
+        .as_object_mut()
+        .context("legacy Noema server must be an object")?;
+    let local = object.get("type").and_then(Value::as_str) == Some("local");
+    let allowed: &[&str] = if local {
+        &[
+            "type",
+            "command",
+            "enabled",
+            "cwd",
+            "environment",
+            "disabled",
+            "codemode",
+            "timeout",
+            "protocol",
+        ]
+    } else {
+        &[
+            "type", "url", "enabled", "headers", "oauth", "disabled", "codemode", "timeout",
+            "protocol",
+        ]
+    };
+    let incompatible: Vec<&str> = object
+        .iter()
+        .filter_map(|(key, value)| {
+            let invalid = !allowed.contains(&key.as_str())
+                || match key.as_str() {
+                    "timeout" => !value.as_object().is_some_and(|fields| {
+                        fields.iter().all(|(key, value)| {
+                            ["startup", "catalog", "execution"].contains(&key.as_str())
+                                && value.as_u64().is_some()
+                        })
+                    }),
+                    "enabled" | "disabled" | "codemode" => !value.is_boolean(),
+                    "cwd" => !value.is_string(),
+                    "environment" | "headers" => !value
+                        .as_object()
+                        .is_some_and(|fields| fields.values().all(Value::is_string)),
+                    "protocol" => !value
+                        .as_str()
+                        .is_some_and(|value| ["legacy", "auto", "2026-07-28"].contains(&value)),
+                    _ => false,
+                };
+            invalid.then_some(key.as_str())
+        })
+        .collect();
+    if !incompatible.is_empty() {
+        bail!(
+            "legacy Noema server has V2-incompatible properties: {}",
+            incompatible.join(", ")
+        );
+    }
+    if let Some(enabled) = object.remove("enabled") {
+        let disabled = !enabled.as_bool().unwrap();
+        if object
+            .get("disabled")
+            .is_some_and(|value| value.as_bool() != Some(disabled))
+        {
+            bail!("legacy Noema server has inconsistent enabled and disabled properties");
+        }
+        object.insert("disabled".into(), json!(disabled));
+    }
+    Ok(value)
+}
+
+fn opencode_move_legacy(source: &str, replacement: &Value, preserve: bool) -> Result<String> {
+    let container = find_object_path(source, &["mcp"])?.unwrap();
+    let legacy = find_member(source, container, "noema")?.unwrap();
+    let mut raw = source[legacy.value_start..legacy.value_end].to_owned();
+    if preserve {
+        let members = object_members(&raw, 0)?;
+        if let Some(index) = members.iter().position(|member| member.key == "enabled") {
+            if members.iter().any(|member| member.key == "disabled") {
+                raw = remove_member_at(raw, &members, index);
+            } else {
+                let member = &members[index];
+                let enabled = parse_jsonc_value(&raw[member.value_start..member.value_end])?
+                    .as_bool()
+                    .unwrap();
+                raw.replace_range(
+                    member.value_start..member.value_end,
+                    if enabled { "false" } else { "true" },
+                );
+                let key_end = value_end(&raw, member.key_start)?;
+                raw.replace_range(member.key_start..key_end, "\"disabled\"");
+            }
+        }
+    }
+    let next = opencode_remove_member(source.into(), &["mcp"])?;
+    let mut next = insert_json_path_member(&next, &["mcp", "servers"], "noema", replacement)?;
+    if preserve {
+        let container = find_object_path(&next, &["mcp", "servers"])?.unwrap();
+        let destination = find_member(&next, container, "noema")?.unwrap();
+        let old_indent = line_indent(source, legacy.value_start);
+        let new_indent = line_indent(&next, destination.value_start);
+        let mut moved = String::with_capacity(raw.len());
+        for (index, line) in raw.split('\n').enumerate() {
+            if index > 0 {
+                moved.push('\n');
+                moved.push_str(&new_indent);
+                moved.push_str(line.strip_prefix(old_indent.as_str()).unwrap_or(line));
+            } else {
+                moved.push_str(line);
+            }
+        }
+        next.replace_range(destination.value_start..destination.value_end, &moved);
+    }
+    Ok(next)
+}
+
+fn opencode_mcp_install(
+    source: &str,
+    request: &Request,
+    version: OpenCodeVersion,
+    force: bool,
+) -> Result<(State, String)> {
+    let expected = opencode_mcp_value(request, version)?;
+    let current = opencode_member(source, version.mcp_path())?;
+    let legacy = if version == OpenCodeVersion::V2 {
+        opencode_member(source, &["mcp"])?
+    } else {
+        None
+    };
+    if legacy.is_some() && current.is_some() {
+        return Ok((State::Conflict, source.into()));
+    }
+    if let Some(legacy) = legacy {
+        if !is_noema_mcp(&legacy) {
+            return Ok((State::Conflict, source.into()));
+        }
+        let migrated = opencode_migrate_value(legacy)?;
+        let preserve = opencode_active_contains(&migrated, &expected, version);
+        let replacement = if preserve {
+            migrated
+        } else if force {
+            expected
+        } else {
+            return Ok((State::Drift, source.into()));
+        };
+        return Ok((
+            State::WouldReplace,
+            opencode_move_legacy(source, &replacement, preserve)?,
+        ));
+    }
+    if let Some(current) = current {
+        if opencode_active_contains(&current, &expected, version) {
+            return Ok((State::Unchanged, source.into()));
+        }
+        if !is_noema_mcp(&current) {
+            return Ok((State::Conflict, source.into()));
+        }
+        if !force {
+            return Ok((State::Drift, source.into()));
+        }
+        let container = find_object_path(source, version.mcp_path())?.unwrap();
+        let member = find_member(source, container, "noema")?.unwrap();
+        let encoded = indent_multiline(
+            &serde_json::to_string_pretty(&expected)?,
+            &line_indent(source, member.value_start),
+        );
+        let mut next = source.to_owned();
+        next.replace_range(member.value_start..member.value_end, &encoded);
+        return Ok((State::WouldReplace, next));
+    }
+    Ok((
+        State::WouldInstall,
+        insert_json_path_member(source, version.mcp_path(), "noema", &expected)?,
     ))
 }
 
@@ -1596,31 +1915,69 @@ fn opencode_plugin_source() -> String {
     )
 }
 
-fn require_opencode_v1(target: &Target) -> Result<()> {
-    if let Some(source) = read_optional(&target.opencode_config())?
-        && find_object_path(&source, &["mcp", "servers"])?.is_some()
-    {
-        bail!(
-            "OpenCode v2 configuration detected; its plugin API requires a separate Noema adapter"
-        );
+fn opencode_plugin_source_for(version: OpenCodeVersion) -> String {
+    match version {
+        OpenCodeVersion::V1 => opencode_plugin_source(),
+        OpenCodeVersion::V2 => format!(
+            "const bootstrap =\n  {}\n\nexport default {{\n  id: \"noema-session-bootstrap\",\n  async setup(ctx) {{\n    await ctx.session.hook(\"context\", (event) => {{\n      event.system.push({{ type: \"text\", text: bootstrap }})\n    }})\n  }},\n}}\n",
+            serde_json::to_string(BOOTSTRAP).unwrap()
+        ),
     }
-    let Ok(output) = std::process::Command::new("opencode")
+}
+
+fn is_managed_opencode_plugin(bytes: &[u8]) -> bool {
+    bytes == LEGACY_OPENCODE_PLUGIN_V1.as_bytes()
+        || bytes == opencode_plugin_source().as_bytes()
+        || bytes == opencode_plugin_source_for(OpenCodeVersion::V2).as_bytes()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenCodeVersion {
+    V1,
+    V2,
+}
+
+impl OpenCodeVersion {
+    fn mcp_path(self) -> &'static [&'static str] {
+        match self {
+            Self::V1 => &["mcp"],
+            Self::V2 => &["mcp", "servers"],
+        }
+    }
+}
+
+fn detect_opencode_version(config: &Path, program: &Path) -> Result<OpenCodeVersion> {
+    let source = read_optional(config)?;
+    let layout = source.as_deref().map(parse_jsonc_value).transpose()?;
+    let v2_layout = layout
+        .as_ref()
+        .and_then(|value| value.get("mcp"))
+        .and_then(|value| value.get("servers"))
+        .is_some_and(Value::is_object);
+    let major = Command::new(program)
         .arg("--version")
         .output()
-    else {
-        return Ok(());
-    };
-    if output.status.success()
-        && String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .split('.')
-            .next()
-            .and_then(|major| major.parse::<u32>().ok())
-            .is_some_and(|major| major >= 2)
-    {
-        bail!("OpenCode v2 detected; its plugin API requires a separate Noema adapter");
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let text = text.trim();
+            let text = text.strip_prefix("opencode ").unwrap_or(text).trim();
+            text.strip_prefix('v')
+                .unwrap_or(text)
+                .split('.')
+                .next()?
+                .parse::<u32>()
+                .ok()
+        });
+    match major {
+        Some(1) if v2_layout => bail!("OpenCode v1 cannot use a v2 mcp.servers configuration"),
+        Some(1) => Ok(OpenCodeVersion::V1),
+        Some(2) => Ok(OpenCodeVersion::V2),
+        Some(major) => bail!("unsupported OpenCode major version {major}"),
+        None if v2_layout => Ok(OpenCodeVersion::V2),
+        None => Ok(OpenCodeVersion::V1),
     }
-    Ok(())
 }
 
 fn is_noema_hook(value: &Value) -> bool {
@@ -2076,8 +2433,21 @@ fn managed_block_span(source: &str, start: &str, end: &str) -> Result<Option<(us
     Ok(Some((begin, finish)))
 }
 
-fn inspect_opencode_plugin(path: &Path) -> Result<State> {
-    let expected = opencode_plugin_source();
+fn opencode_plugin_directory_conflict(path: &Path) -> Result<bool> {
+    // Directory plugins are auto-discovered too, but are not owned by this installer.
+    let directory = path.with_extension("");
+    match fs::symlink_metadata(&directory) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("inspecting {}", directory.display())),
+    }
+}
+
+fn inspect_opencode_plugin(path: &Path, version: OpenCodeVersion) -> Result<State> {
+    if opencode_plugin_directory_conflict(path)? {
+        return Ok(State::Conflict);
+    }
+    let expected = opencode_plugin_source_for(version);
     match fs::read(path) {
         Ok(bytes) if bytes == expected.as_bytes() => Ok(State::UpToDate),
         Ok(_) => Ok(State::Drift),
@@ -2086,8 +2456,16 @@ fn inspect_opencode_plugin(path: &Path) -> Result<State> {
     }
 }
 
-fn install_opencode_plugin(path: &Path, check: bool, force: bool) -> Result<State> {
-    let expected = opencode_plugin_source();
+fn install_opencode_plugin(
+    path: &Path,
+    version: OpenCodeVersion,
+    check: bool,
+    force: bool,
+) -> Result<State> {
+    if opencode_plugin_directory_conflict(path)? {
+        return Ok(State::Conflict);
+    }
+    let expected = opencode_plugin_source_for(version);
     match fs::read(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && check => {
             Ok(State::WouldInstall)
@@ -2098,10 +2476,8 @@ fn install_opencode_plugin(path: &Path, check: bool, force: bool) -> Result<Stat
         }
         Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
         Ok(bytes) if bytes == expected.as_bytes() => Ok(State::Unchanged),
-        Ok(bytes) if bytes == LEGACY_OPENCODE_PLUGIN_V1.as_bytes() && check => {
-            Ok(State::WouldReplace)
-        }
-        Ok(bytes) if bytes == LEGACY_OPENCODE_PLUGIN_V1.as_bytes() => {
+        Ok(bytes) if is_managed_opencode_plugin(&bytes) && check => Ok(State::WouldReplace),
+        Ok(bytes) if is_managed_opencode_plugin(&bytes) => {
             write_atomic(path, expected.as_bytes())?;
             Ok(State::Replaced)
         }
@@ -2115,17 +2491,13 @@ fn install_opencode_plugin(path: &Path, check: bool, force: bool) -> Result<Stat
 }
 
 fn remove_opencode_plugin(path: &Path, check: bool, force: bool) -> Result<State> {
-    let expected = opencode_plugin_source();
+    if opencode_plugin_directory_conflict(path)? {
+        return Ok(State::Conflict);
+    }
     match fs::read(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(State::Unchanged),
         Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
-        Ok(bytes)
-            if bytes != expected.as_bytes()
-                && bytes != LEGACY_OPENCODE_PLUGIN_V1.as_bytes()
-                && !force =>
-        {
-            Ok(State::Drift)
-        }
+        Ok(bytes) if !is_managed_opencode_plugin(&bytes) && !force => Ok(State::Drift),
         Ok(_) if check => Ok(State::WouldRemove),
         Ok(_) => {
             fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
@@ -2999,6 +3371,54 @@ fn valid_env_name(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    #[cfg(unix)]
+    fn opencode_version_probe_and_offline_layout() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("opencode.jsonc");
+        let program = temp.path().join("client");
+        for prefix in ["", "v", "opencode ", "opencode v"] {
+            fs::write(
+                &program,
+                format!("#!/bin/sh\nprintf '%s\\n' '{prefix}2.1.4'\n"),
+            )
+            .unwrap();
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(
+                detect_opencode_version(&config, &program).unwrap(),
+                OpenCodeVersion::V2
+            );
+        }
+        fs::write(&program, "#!/bin/sh\necho 3.0.0\n").unwrap();
+        assert!(
+            detect_opencode_version(&config, &program)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported")
+        );
+        fs::remove_file(&program).unwrap();
+        assert_eq!(
+            detect_opencode_version(&config, &program).unwrap(),
+            OpenCodeVersion::V1
+        );
+        fs::write(&config, r#"{"mcp":{"noema":{"type":"local"}}}"#).unwrap();
+        assert_eq!(
+            detect_opencode_version(&config, &program).unwrap(),
+            OpenCodeVersion::V1
+        );
+        fs::write(&config, r#"{"mcp":{"servers":{}}}"#).unwrap();
+        assert_eq!(
+            detect_opencode_version(&config, &program).unwrap(),
+            OpenCodeVersion::V2
+        );
+        fs::write(&program, "#!/bin/sh\necho v1.9.0\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(detect_opencode_version(&config, &program).is_err());
+        fs::write(&config, "{invalid").unwrap();
+        assert!(detect_opencode_version(&config, &program).is_err());
+    }
+
     fn target(root: &Path, client: Client) -> Target {
         Target {
             client,
@@ -3324,11 +3744,16 @@ Authorization = "Bearer secret-that-must-remain-untouched"
         request.connection.transport = Transport::Http;
         request.connection.url = Some("https://memory.example.com/mcp".into());
         request.connection.validate().unwrap();
-        install(&request, false, false).unwrap();
+        opencode_install_version(&request, OpenCodeVersion::V1, false, false).unwrap();
 
         request.connection.transport = Transport::Stdio;
         request.connection.url = None;
-        let override_source = opencode_capture_override(&request).unwrap();
+        let override_source = opencode_capture_override(
+            &request,
+            &request.target.opencode_config(),
+            OpenCodeVersion::V1,
+        )
+        .unwrap();
         let value: Value = serde_json::from_str(&override_source).unwrap();
         assert_eq!(value["mcp"]["noema"]["enabled"], false);
         assert_eq!(value["mcp"]["noema"]["url"], "http://127.0.0.1/mcp");
@@ -3718,7 +4143,11 @@ bearer_token_env_var = "NOEMA_MCP_KEY"
         )
         .unwrap();
 
-        assert!(install(&request, false, false).unwrap().healthy());
+        assert!(
+            opencode_install_version(&request, OpenCodeVersion::V1, false, false)
+                .unwrap()
+                .healthy()
+        );
         let installed = fs::read_to_string(&path).unwrap();
         assert!(installed.contains("// keep this comment"));
         assert!(installed.contains("\"docs\""));
@@ -3730,7 +4159,6 @@ bearer_token_env_var = "NOEMA_MCP_KEY"
                 .opencode_plugin()
                 .ends_with("noema-session-bootstrap.ts")
         );
-        assert!(!opencode_plugin_source().contains("@opencode-ai/plugin"));
     }
 
     #[test]
@@ -3804,7 +4232,7 @@ bearer_token_env_var = "NOEMA_MCP_KEY"
         fs::write(&config, original).unwrap();
         fs::write(&plugin, LEGACY_OPENCODE_PLUGIN_V1).unwrap();
 
-        let preview = install(&request, true, false).unwrap();
+        let preview = opencode_install_version(&request, OpenCodeVersion::V1, true, false).unwrap();
         assert_eq!(preview.components[0].state, State::Unchanged);
         assert_eq!(preview.components[1].state, State::WouldReplace);
         assert_eq!(fs::read_to_string(&config).unwrap(), original);
@@ -3813,15 +4241,12 @@ bearer_token_env_var = "NOEMA_MCP_KEY"
             LEGACY_OPENCODE_PLUGIN_V1
         );
 
-        let installed = install(&request, false, false).unwrap();
+        let installed =
+            opencode_install_version(&request, OpenCodeVersion::V1, false, false).unwrap();
         assert_eq!(installed.components[0].state, State::Unchanged);
         assert_eq!(installed.components[1].state, State::Replaced);
         assert_eq!(fs::read_to_string(&config).unwrap(), original);
-        assert_eq!(
-            fs::read_to_string(&plugin).unwrap(),
-            opencode_plugin_source()
-        );
-        let report = status(&request.target).unwrap();
+        let report = opencode_status_version(&request.target, OpenCodeVersion::V1).unwrap();
         assert!(report.healthy());
         assert_eq!(report.components[0].transport, Some(Transport::Http));
 
@@ -3830,11 +4255,14 @@ bearer_token_env_var = "NOEMA_MCP_KEY"
             original.replace("memory.example.com", "other.example.com"),
         )
         .unwrap();
-        let report = status(&request.target).unwrap();
+        let report = opencode_status_version(&request.target, OpenCodeVersion::V1).unwrap();
         assert_eq!(report.components[0].state, State::Configured);
         assert_eq!(report.components[0].transport, Some(Transport::Http));
         assert_eq!(
-            install(&request, true, false).unwrap().components[0].state,
+            opencode_install_version(&request, OpenCodeVersion::V1, true, false)
+                .unwrap()
+                .components[0]
+                .state,
             State::Drift
         );
     }
@@ -3858,17 +4286,18 @@ bearer_token_env_var = "NOEMA_MCP_KEY"
     }
 
     #[test]
-    fn opencode_v2_fails_before_writing_legacy_configuration() {
+    fn opencode_v2_install_uses_servers_layout() {
         let temp = tempfile::tempdir().unwrap();
         let request = request(temp.path(), Client::OpenCode);
         let path = request.target.opencode_config();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let original = "{\n  \"mcp\": {\n    \"servers\": {}\n  }\n}\n";
-        fs::write(&path, original).unwrap();
-
-        let error = install(&request, false, false).unwrap_err().to_string();
-        assert!(error.contains("OpenCode v2"));
-        assert_eq!(fs::read_to_string(path).unwrap(), original);
+        fs::write(&path, "{\"mcp\":{\"servers\":{}}}").unwrap();
+        let installed =
+            opencode_install_version(&request, OpenCodeVersion::V2, false, false).unwrap();
+        assert!(installed.healthy());
+        let value = parse_jsonc_value(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(value["mcp"]["servers"]["noema"]["disabled"], false);
+        assert!(value["mcp"].get("noema").is_none());
     }
 
     #[test]
@@ -3897,3 +4326,11 @@ bearer_token_env_var = "NOEMA_MCP_KEY"
         assert!(request.connection.validate().is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "integrate/opencode_v2_tests.rs"]
+mod opencode_v2_tests;
+
+#[cfg(test)]
+#[path = "integrate/opencode_capture_tests.rs"]
+mod opencode_capture_tests;

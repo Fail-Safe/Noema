@@ -76,6 +76,9 @@ const AGENT_TOOLS: &[&str] = &[
     "cortex_identity",
 ];
 const MAINTAINER_TOOLS: &[&str] = &[
+    "tag_review_queue",
+    "tag_review_analyze",
+    "tag_review_decide",
     "tag_doctor",
     "rename_tag",
     "delete_tag",
@@ -577,6 +580,28 @@ struct TagsParam {
 struct TagStatsParams {
     /// Maximum tag rows to return (default 50, maximum 1000; 0 returns all)
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct TagReviewAnalyzeParams {
+    /// Explicit consent to send bounded trace excerpts to the configured model.
+    #[serde(default)]
+    model: bool,
+    /// Skip this many eligible traces; model batches contain at most 40.
+    #[serde(default)]
+    offset: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct TagReviewDecideParams {
+    id: String,
+    /// apply, undo, reject, defer, resume, or edit
+    action: String,
+    /// Set only after the user approves the exact preview (apply/undo).
+    #[serde(default)]
+    confirmed: bool,
+    /// Complete desired tag list, required for edit.
+    tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1292,6 +1317,92 @@ impl NoemaServer {
         };
         let report = self.open().await?.tag_stats(limit).map_err(mcp_error)?;
         Ok(json_text(json!({"schema_version":1,"report":report})))
+    }
+    #[tool(
+        description = "List local Tag Review proposals, exact before/after tags, evidence, and decision history. Does not change traces.",
+        annotations(read_only_hint = true)
+    )]
+    async fn tag_review_queue(&self) -> Result<String, ErrorData> {
+        Ok(json_text(
+            json!({"schema_version":1,"reviews":self.open().await?.tag_reviews().map_err(mcp_error)?}),
+        ))
+    }
+
+    #[tool(
+        description = "Queue Tag Review hygiene suggestions without changing trace tags. model=true explicitly reviews up to 40 trace excerpts in small requests to the configured model, splitting truncated requests. Check model.status, unfinished, and warning for partial completion; already queued proposals are retained. Requires a writable cortex; never applies proposals."
+    )]
+    async fn tag_review_analyze(
+        &self,
+        Parameters(p): Parameters<TagReviewAnalyzeParams>,
+    ) -> Result<String, ErrorData> {
+        self.ensure_writable()?;
+        let cx = self.open().await?;
+        let hygiene = cx.review_tag_hygiene().map_err(mcp_error)?;
+        let analysis_cx = if p.model {
+            Some(Cortex::open(cx.name.clone(), cx.dir.clone()).map_err(mcp_error)?)
+        } else {
+            None
+        };
+        drop(cx);
+        let model = if let Some(cx) = analysis_cx {
+            Some(
+                crate::tag_review::analyze(cx, p.offset)
+                    .await
+                    .map_err(mcp_error)?,
+            )
+        } else {
+            None
+        };
+        Ok(json_text(
+            json!({"schema_version":1,"hygiene_queued":hygiene,"model":model}),
+        ))
+    }
+
+    #[tool(
+        description = "Decide a Tag Review proposal: apply, undo, reject, defer, resume, or edit. Apply/undo require confirmed=true ONLY after human approval of the exact preview. Edit queues a new proposal; it does not change tags. Stale and protected-tag changes are blocked."
+    )]
+    async fn tag_review_decide(
+        &self,
+        Parameters(p): Parameters<TagReviewDecideParams>,
+    ) -> Result<String, ErrorData> {
+        self.ensure_writable()?;
+        let cx = self.open().await?;
+        let edited = match p.action.as_str() {
+            "apply" | "undo" => {
+                if !p.confirmed {
+                    return Err(ErrorData::invalid_params(
+                        "human approval of the exact preview is required",
+                        None,
+                    ));
+                }
+                cx.apply_tag_review(&p.id, p.action == "undo")
+                    .map_err(mcp_error)?;
+                None
+            }
+            "edit" => cx
+                .edit_tag_review(
+                    &p.id,
+                    p.tags
+                        .ok_or_else(|| ErrorData::invalid_params("edit requires tags", None))?,
+                )
+                .map_err(mcp_error)?,
+            "reject" | "defer" | "resume" => {
+                cx.set_tag_review_status(
+                    &p.id,
+                    match p.action.as_str() {
+                        "reject" => "rejected",
+                        "defer" => "deferred",
+                        _ => "pending",
+                    },
+                )
+                .map_err(mcp_error)?;
+                None
+            }
+            _ => return Err(ErrorData::invalid_params("unknown Tag Review action", None)),
+        };
+        Ok(json_text(
+            json!({"schema_version":1,"review":cx.tag_review(&p.id).map_err(mcp_error)?,"edited":edited}),
+        ))
     }
     #[tool(
         description = "Diagnose noncanonical or Obsidian-problematic tags. Read-only by default. Set fix=true to include a deterministic repair plan, then apply=true to execute it; numeric-only and other ambiguous findings are never auto-fixed."
@@ -3333,6 +3444,7 @@ mod tests {
             "cortex_usage",
             "list_traces",
             "tag_stats",
+            "tag_review_queue",
             "list_consolidation_candidates",
             "consolidation_health",
             "search_activity",
@@ -3343,7 +3455,7 @@ mod tests {
             "sync_read_signal",
             "federation_status",
         ];
-        assert_eq!(tools.len(), 35);
+        assert_eq!(tools.len(), 38);
         for tool in tools {
             let wire = serde_json::to_value(&tool).unwrap();
             let read_only = wire["annotations"]["readOnlyHint"]
@@ -3992,6 +4104,9 @@ mod tests {
 
 #[cfg(test)]
 mod http_role_tests;
+
+#[cfg(test)]
+mod tag_review_tests;
 
 #[cfg(test)]
 mod recall_cache_tests;

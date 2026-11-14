@@ -27,6 +27,8 @@ use crate::{
     trace::{Trace, VALID_TYPES},
 };
 
+mod tag_review;
+
 const LIST_PERCENT: u16 = 34;
 const FOLLOW_INTERVAL: Duration = Duration::from_secs(1);
 const NEW_ROW_HIGHLIGHT_TICKS: u8 = 2;
@@ -37,6 +39,7 @@ enum Mode {
     Search,
     Confirm,
     Help,
+    TagReview,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +106,7 @@ struct Model<'a> {
     status: String,
     error: String,
     light: bool,
+    review: tag_review::ReviewState,
 }
 
 impl<'a> Model<'a> {
@@ -130,6 +134,7 @@ impl<'a> Model<'a> {
             status: String::new(),
             error: String::new(),
             light: resolve_theme(theme) == "light",
+            review: tag_review::ReviewState::default(),
         };
         model.reload()?;
         Ok(model)
@@ -240,6 +245,7 @@ impl<'a> Model<'a> {
             Mode::Search => self.update_search(key),
             Mode::Confirm => self.update_confirm(key),
             Mode::Help => Ok(self.update_help(key)),
+            Mode::TagReview => self.update_tag_review(key),
         }
     }
 
@@ -261,6 +267,10 @@ impl<'a> Model<'a> {
         }
         match key.code {
             KeyCode::Char('q') => return Ok(InputAction::Quit),
+            KeyCode::Char('T') => {
+                self.reload_tag_reviews()?;
+                self.mode = Mode::TagReview;
+            }
             KeyCode::Tab => {
                 self.focus = match self.focus {
                     FocusPane::List => FocusPane::Detail,
@@ -506,7 +516,9 @@ impl<'a> Model<'a> {
             ])
             .split(area);
         self.render_header(frame, vertical[0], palette);
-        if self.mode == Mode::Help {
+        if self.mode == Mode::TagReview {
+            self.render_tag_review(frame, vertical[1], palette);
+        } else if self.mode == Mode::Help {
             self.render_help(frame, vertical[1], palette);
         } else {
             let (list_area, detail_area) = pane_areas(vertical[1]);
@@ -525,6 +537,7 @@ impl<'a> Model<'a> {
             Span::styled(".", palette.red.add_modifier(Modifier::BOLD)),
             Span::styled(format!("  {}", self.cortex.name), palette.dim),
         ];
+        spans.push(Span::styled("  T:Tag Review", palette.dim));
         if !self.query.is_empty() {
             spans.push(Span::styled(
                 format!("  search:\"{}\"", self.query),
@@ -732,6 +745,7 @@ impl<'a> Model<'a> {
 
     fn render_footer(&self, frame: &mut Frame, area: Rect, palette: Palette) {
         let (text, style) = match self.mode {
+            Mode::TagReview => self.tag_review_footer(palette),
             Mode::Search => (format!(" /{}", self.search_input), palette.surface),
             Mode::Confirm => (String::new(), palette.surface),
             Mode::Help => ("  ?/esc/enter:back  q:quit".into(), palette.dim),
@@ -778,6 +792,7 @@ impl<'a> Model<'a> {
             "    a / t              archived / trash view",
             "    /                  search",
             "    f / R              live follow / refresh",
+            "    T                  Tag Review (AI-assisted taxonomy maintenance)",
             "",
             "  ? / esc / enter      close help",
             "  q / ctrl+c           quit",
@@ -909,6 +924,7 @@ pub fn run(cortex: &Cortex, theme: &str) -> Result<()> {
     terminal.clear()?;
 
     loop {
+        model.poll_tag_review();
         terminal.draw(|frame| model.render(frame))?;
         if model.follow
             && model.last_refresh.elapsed() >= FOLLOW_INTERVAL
@@ -1258,6 +1274,34 @@ mod tests {
         assert_eq!(model.detail_scroll, 1);
         model.update(key(KeyCode::Esc)).unwrap();
         assert_eq!(model.focus, FocusPane::List);
+    }
+
+    #[test]
+    fn tag_review_requires_explicit_approval_and_supports_undo() {
+        let (_temp, cortex) = fixture();
+        let id = cortex.list(&ListOptions::default()).unwrap()[0].id.clone();
+        cortex
+            .propose_tag_review(&id, vec!["taxonomy".into()], "Fixture evidence", "fixture")
+            .unwrap();
+        let mut model = Model::new(&cortex, "dark").unwrap();
+        model.update(key(KeyCode::Char('T'))).unwrap();
+        assert_eq!(model.mode, Mode::TagReview);
+        model.update(key(KeyCode::Char('a'))).unwrap();
+        assert_eq!(cortex.get(&id).unwrap().tags, ["tui"]);
+        model.update(key(KeyCode::Esc)).unwrap();
+        assert_eq!(cortex.get(&id).unwrap().tags, ["tui"]);
+        model.update(key(KeyCode::Char('a'))).unwrap();
+        model.update(key(KeyCode::Char('y'))).unwrap();
+        assert_eq!(cortex.get(&id).unwrap().tags, ["taxonomy"]);
+        model.update(key(KeyCode::Char('u'))).unwrap();
+        model.update(key(KeyCode::Char('y'))).unwrap();
+        assert_eq!(cortex.get(&id).unwrap().tags, ["tui"]);
+        for (width, height) in [(120, 40), (40, 10), (10, 3)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| model.render(frame)).unwrap();
+        }
+        model.update(key(KeyCode::Esc)).unwrap();
+        assert_eq!(model.mode, Mode::List);
     }
 
     #[test]

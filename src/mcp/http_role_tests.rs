@@ -10,9 +10,9 @@ use rmcp::{
 fn role_profiles_are_explicit_and_preserve_continuity_profiles() {
     let full = NoemaServer::tool_router_for_profile("full").unwrap();
     let agent = NoemaServer::tool_router_for_profile("agent").unwrap();
-    assert_eq!(full.map.len(), 35);
+    assert_eq!(full.map.len(), 38);
     assert_eq!(agent.map.len(), 24);
-    for (role, count) in [("maintainer", 30), ("curator", 26), ("federation", 3)] {
+    for (role, count) in [("maintainer", 33), ("curator", 26), ("federation", 3)] {
         let router = NoemaServer::tool_router_for_profile(role).unwrap();
         assert_eq!(router.map.len(), count);
         assert!(router.map.keys().all(|name| full.map.contains_key(name)));
@@ -230,7 +230,7 @@ async fn role_endpoints_enforce_discovery_calls_and_share_usage() {
         let full = endpoints.iter().find(|e| e["profile"] == "full").unwrap();
         assert_eq!(
             full["additional_tool_count"],
-            35 - NoemaServer::tool_router_for_profile(profile)
+            38 - NoemaServer::tool_router_for_profile(profile)
                 .unwrap()
                 .map
                 .len()
@@ -319,7 +319,7 @@ fn stdio_endpoint_guidance_does_not_claim_an_http_connection() {
             .iter()
             .find(|e| e["profile"] == "maintainer")
             .unwrap()["additional_tool_count"],
-        6
+        9
     );
     assert_eq!(
         endpoints
