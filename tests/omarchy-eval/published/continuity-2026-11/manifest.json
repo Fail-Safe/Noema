@@ -1,0 +1,933 @@
+{
+  "bundle": "continuity-2026-11",
+  "files": [
+    {
+      "path": "data/equal-access-20261113T013424Z-c1/turns.json",
+      "rows": 36,
+      "sha256": "4b1f5c7d2a59306a521b15b82f3e1e010cfeff3ad8eef71b2b86b3b08bac761f"
+    },
+    {
+      "path": "data/equal-access-20261113T013424Z-c1/smoke-turns.json",
+      "rows": 6,
+      "sha256": "00b5ed30bf91192b827eb9b0731a100a21ce423006272e8c085197d1239056fa"
+    },
+    {
+      "path": "data/equal-access-20261113T013424Z-c2/turns.json",
+      "rows": 36,
+      "sha256": "2e3b62e0f59ac5f1582f1a0ca18a47dbd7c60a600bd0a6a86c5b5f814c775fe1"
+    },
+    {
+      "path": "data/equal-access-20261113T013424Z-c2/smoke-turns.json",
+      "rows": 6,
+      "sha256": "09be3bf06782347ede58ed234540574b71449594193a7673e5b016fd7e2966ac"
+    },
+    {
+      "path": "data/independent-20261113T020213Z/turns.json",
+      "rows": 0,
+      "sha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+    },
+    {
+      "path": "data/independent-20261113T020213Z/smoke-turns.json",
+      "rows": 18,
+      "sha256": "834b7e12b10337241dda93bd7ced329e7e9f3eb3b6f9dab7617d2ccef36adbe7"
+    },
+    {
+      "path": "data/independent-20261113T024138Z-g2/turns.json",
+      "rows": 0,
+      "sha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+    },
+    {
+      "path": "data/independent-20261113T024138Z-g2/smoke-turns.json",
+      "rows": 2,
+      "sha256": "8e9b03a3edf19fa199c66078e7ae65bd13fb49e328f01e8feccdbcdf2b5218d7"
+    },
+    {
+      "path": "data/independent-20261113T024831Z-g3/turns.json",
+      "rows": 1080,
+      "sha256": "e5d90c9c5c08a0acd3e964a470e33e06109180752af08c2261405f71adbdb761"
+    },
+    {
+      "path": "data/independent-20261113T024831Z-g3/smoke-turns.json",
+      "rows": 18,
+      "sha256": "08c9b6cbf44589f19574dd40b2bf918f7e435aa85bfe2062642e137741909794"
+    },
+    {
+      "path": "data/question-scope-20261113T071241Z-s1/turns.json",
+      "rows": 108,
+      "sha256": "56a1056471f42379a6f72074a5a990c7b81d4df37b2fe138ec75da515b8597e7"
+    },
+    {
+      "path": "data/question-scope-20261113T071241Z-s1/smoke-turns.json",
+      "rows": 18,
+      "sha256": "3f2ec09cde92d5db626d64fb8ce41fbeb8d38f061297eb96273e439263223d4d"
+    },
+    {
+      "path": "data/question-budget-20261113T075731Z-s2/turns.json",
+      "rows": 108,
+      "sha256": "73b2cc03fd44048e049e0070011d4dee539d64b530c6dd05d16acb0876738e89"
+    },
+    {
+      "path": "data/question-budget-20261113T075731Z-s2/smoke-turns.json",
+      "rows": 18,
+      "sha256": "4c0b6157e18ec4f1a3d00b6b359ae94b19fb6da68a116fc2a86ffd9ed36b23c8"
+    },
+    {
+      "path": "data/frozen-budget-validation-20261113T172425Z/turns.json",
+      "rows": 1080,
+      "sha256": "9efde9e80dd411a4bb47b6a56d3ef79ceec66a57ddb59a2c0c6d7f2798a9206e"
+    },
+    {
+      "path": "data/frozen-budget-validation-20261113T172425Z/smoke-turns.json",
+      "rows": 18,
+      "sha256": "96ce61976d166d14a43558c3d713e9e17fe3b687597df7448c129ba772086586"
+    }
+  ],
+  "portable_sources": "Public profile tools are portable reconstructions, not byte-identical private tested adapters/launchers.",
+  "public_harness_source_sha256": {
+    "Cargo.lock": "03603aca6cf5f357b7c9c57e0d202e73a3732f6a46ba67c6626ae923cc650a3f",
+    "Cargo.toml": "919ade20b32a8a5a746fae148fd604ac2f03a818db3d6b91423d06c981660aec",
+    "src/prefetch.rs": "be25bcaeec7efeb1cae586293312286aa3abf049342842e56ce813b8808b84c6",
+    "tests/omarchy-eval/benchmark.py": "9f8d0c8eec4e2f262cad157ee984cfd035a4fb2d197e0f2b55ff5743afda6225",
+    "tests/omarchy-eval/equal_access.py": "6d11efd0622d441ddd88d86cd771eac057a87401c19146f1b13c0ce9bcbaa6ae",
+    "tests/omarchy-eval/independent-protocol.md": "1064543f5c247d1713e55e77e3a1f7da98d1c795988de0ee6ff856fd2819ee73",
+    "tests/omarchy-eval/independent_campaign.py": "46e30939277a5161fe1437e76adf592485963cfeec53f1e370612b9ea53e4bbc",
+    "tests/omarchy-eval/independent_corpus.py": "3b9b8e92bc873798d515bcb2058b1279c835e59b832c61ff08d18a2264603f8f",
+    "tests/omarchy-eval/omarchy_eval_lib.py": "6fc4f38f9c683ada443e83edbd538ba6bead29bf1b6b10f312351294bc0b8e8a",
+    "tests/omarchy-eval/prefetch_hook.py": "e45d4e3c52cd03c4c6ea3179ca46e54db4cf9eecea0522e9fd9a31f7e8774f4f",
+    "tests/omarchy-eval/response-schema.json": "f62d8a880f7eb8aa5704efa9b6aa4401ab70d147f601a48511de81fb695387dc"
+  },
+  "raw_evidence": "Withheld: inputs, responses, event streams, Cortex records, reconstructive seeds, local configurations and private source archives.",
+  "reproducibility": "Public pre-scored rows support statistical reanalysis, not independent verification of individual grading or exact private instance replay.",
+  "row_projection": {
+    "boolean_fields": [
+      "context_limit_error",
+      "noema_bootstrap_observed",
+      "prefetch_observed",
+      "prefetch_success",
+      "recall_context_observed",
+      "valid_response"
+    ],
+    "categorical_fields": [
+      "case_id",
+      "condition",
+      "corpus_id",
+      "direction",
+      "error_code",
+      "scenario",
+      "status",
+      "stratum"
+    ],
+    "dimension_score_fields": [
+      "abstention",
+      "distractor_resistance",
+      "exact_recall",
+      "outside_work_retrieval",
+      "provenance",
+      "rationale",
+      "scope_isolation",
+      "supersession",
+      "synthesis"
+    ],
+    "numeric_fields": [
+      "answer_count",
+      "batch",
+      "cached_input_tokens",
+      "cost_usd",
+      "exact_accuracy",
+      "execution_order",
+      "hallucination_count",
+      "input_tokens",
+      "latency_seconds",
+      "leakage_count",
+      "macro_f1",
+      "max_inter_event_gap_ms",
+      "noema_tool_duration_ms",
+      "noncached_input_tokens",
+      "output_tokens",
+      "prefetch_context_chars",
+      "prefetch_hit_count",
+      "prefetch_latency_ms",
+      "provenance_accuracy",
+      "rationale_accuracy",
+      "record_count",
+      "stale_count",
+      "timed_span_count",
+      "tool_call_count",
+      "tool_duration_ms",
+      "total_tokens"
+    ],
+    "removed": "All unlisted fields, including condition_metadata and arbitrary free-text errors. No score modifications."
+  },
+  "runs": [
+    {
+      "admission_rule": "perfect_exact_and_provenance_with_clean_mechanics_and_safety",
+      "analysis_corpus_order": {},
+      "bootstrap_samples": 10000,
+      "corpus_contract": "equivalent alpha/beta assignment across hierarchical native versus Markdown/Noema; not an independent corpus draw",
+      "disposition": "Completed fixed main sample; no scored failures dropped or retried.",
+      "expected_corpora": 1,
+      "expected_turns": 36,
+      "export_annotations": {
+        "basis": "Single equivalent 60-record corpus from the public harness design; grouping annotation, not an original observed row field or independent draw.",
+        "derived_grouping_fields": [
+          "corpus_id",
+          "stratum",
+          "record_count"
+        ]
+      },
+      "main_turns_complete": true,
+      "observed_smoke_rows": 6,
+      "observed_turns": 36,
+      "pilot_rows_excluded_from_main": true,
+      "profile": {
+        "evaluator": "not_attested_in_export",
+        "executable_sha256": {
+          "codex": "39acf979729dd290f9a24ee38b2914e036c91b65952872e28ae2a6b88a7db7c1",
+          "codex-code-mode-host": "fd37051bfdce0b65cf22a7077e265720a7bd6709d5e400dcbc26197f3041400a",
+          "noema": "953732d0ef9a6919a40c998f1177136e7a72c729843e3495f776e2256d645dcc",
+          "opencode": "16c960ba77421da11b53e785f359b73f328a86118b48feb4af143db5d9afb198"
+        },
+        "models": {
+          "codex": "gpt-5.6-terra",
+          "opencode": "openai/gpt-5.6-terra",
+          "reasoning": "medium"
+        },
+        "project_doc_max_bytes": null,
+        "startup_preferences_max_chars": 32000,
+        "task_prefetch_max_chars": {
+          "codex": 2500,
+          "opencode": 8000
+        },
+        "versions": {
+          "codex": "0.166.0",
+          "noema": "0.23.2",
+          "opencode": "1.18.31"
+        }
+      },
+      "restoration": {
+        "changed_guard_count": 0,
+        "failure_count": 0,
+        "guard_files_unchanged": true,
+        "managed_restored": true,
+        "pinned_tools_removed": true
+      },
+      "role": "equivalent_token_equal_access_cycle_1",
+      "run_id": "equal-access-20261113T013424Z-c1",
+      "smoke_status": "passed",
+      "status": "completed"
+    },
+    {
+      "admission_rule": "perfect_exact_and_provenance_with_clean_mechanics_and_safety",
+      "analysis_corpus_order": {},
+      "bootstrap_samples": 10000,
+      "corpus_contract": "equivalent alpha/beta assignment across hierarchical native versus Markdown/Noema; not an independent corpus draw",
+      "disposition": "Completed fixed main sample; no scored failures dropped or retried.",
+      "expected_corpora": 1,
+      "expected_turns": 36,
+      "export_annotations": {
+        "basis": "Single equivalent 60-record corpus from the public harness design; grouping annotation, not an original observed row field or independent draw.",
+        "derived_grouping_fields": [
+          "corpus_id",
+          "stratum",
+          "record_count"
+        ]
+      },
+      "main_turns_complete": true,
+      "observed_smoke_rows": 6,
+      "observed_turns": 36,
+      "pilot_rows_excluded_from_main": true,
+      "profile": {
+        "evaluator": "not_attested_in_export",
+        "executable_sha256": {
+          "codex": "39acf979729dd290f9a24ee38b2914e036c91b65952872e28ae2a6b88a7db7c1",
+          "codex-code-mode-host": "fd37051bfdce0b65cf22a7077e265720a7bd6709d5e400dcbc26197f3041400a",
+          "noema": "953732d0ef9a6919a40c998f1177136e7a72c729843e3495f776e2256d645dcc",
+          "opencode": "16c960ba77421da11b53e785f359b73f328a86118b48feb4af143db5d9afb198"
+        },
+        "models": {
+          "codex": "gpt-5.6-terra",
+          "opencode": "openai/gpt-5.6-terra",
+          "reasoning": "medium"
+        },
+        "project_doc_max_bytes": null,
+        "startup_preferences_max_chars": 32000,
+        "task_prefetch_max_chars": {
+          "codex": 2500,
+          "opencode": 8000
+        },
+        "versions": {
+          "codex": "0.166.0",
+          "noema": "0.23.2",
+          "opencode": "1.18.31"
+        }
+      },
+      "restoration": {
+        "changed_guard_count": 0,
+        "failure_count": 0,
+        "guard_files_unchanged": true,
+        "managed_restored": true,
+        "pinned_tools_removed": true
+      },
+      "role": "equivalent_token_equal_access_cycle_2",
+      "run_id": "equal-access-20261113T013424Z-c2",
+      "smoke_status": "passed",
+      "status": "completed"
+    },
+    {
+      "admission_rule": "perfect_exact_and_provenance_with_clean_mechanics_and_safety",
+      "analysis_corpus_order": {
+        "large": [
+          "corpus-023",
+          "corpus-025",
+          "corpus-027",
+          "corpus-026",
+          "corpus-028",
+          "corpus-029",
+          "corpus-030",
+          "corpus-022",
+          "corpus-024",
+          "corpus-021"
+        ],
+        "medium": [
+          "corpus-014",
+          "corpus-019",
+          "corpus-012",
+          "corpus-011",
+          "corpus-017",
+          "corpus-020",
+          "corpus-016",
+          "corpus-018",
+          "corpus-013",
+          "corpus-015"
+        ],
+        "small": [
+          "corpus-004",
+          "corpus-001",
+          "corpus-006",
+          "corpus-007",
+          "corpus-005",
+          "corpus-008",
+          "corpus-002",
+          "corpus-010",
+          "corpus-009",
+          "corpus-003"
+        ]
+      },
+      "bootstrap_samples": 10000,
+      "corpus_contract": "identical literal records and questions across all three arms within a triple; independent draws from a known generator",
+      "disposition": "18 mechanically completed pilot turns; accuracy admission failed; zero campaign turns.",
+      "expected_corpora": 30,
+      "expected_turns": 1080,
+      "main_turns_complete": false,
+      "observed_smoke_rows": 18,
+      "observed_turns": 0,
+      "pilot_rows_excluded_from_main": true,
+      "profile": {
+        "evaluator": "not_attested_in_export",
+        "executable_sha256": {
+          "codex": "39acf979729dd290f9a24ee38b2914e036c91b65952872e28ae2a6b88a7db7c1",
+          "codex-code-mode-host": "fd37051bfdce0b65cf22a7077e265720a7bd6709d5e400dcbc26197f3041400a",
+          "noema": "953732d0ef9a6919a40c998f1177136e7a72c729843e3495f776e2256d645dcc",
+          "opencode": "16c960ba77421da11b53e785f359b73f328a86118b48feb4af143db5d9afb198"
+        },
+        "models": {
+          "codex": "gpt-5.6-terra",
+          "opencode": "openai/gpt-5.6-terra",
+          "reasoning": "medium"
+        },
+        "project_doc_max_bytes": 1048576,
+        "startup_preferences_max_chars": 32000,
+        "task_prefetch_max_chars": {
+          "codex": 2500,
+          "opencode": 8000
+        },
+        "versions": {
+          "codex": "0.166.0",
+          "noema": "0.23.2",
+          "opencode": "1.18.31"
+        }
+      },
+      "restoration": {
+        "changed_guard_count": 0,
+        "failure_count": 0,
+        "guard_files_unchanged": true,
+        "managed_restored": true,
+        "pinned_tools_removed": true
+      },
+      "role": "failed_accuracy_pilot_no_campaign",
+      "run_id": "independent-20261113T020213Z",
+      "smoke_status": "stopped",
+      "status": "campaign_not_run"
+    },
+    {
+      "admission_rule": "mechanics_actual_seed_counts_direct_retrieval_controls_and_clean_restoration;accuracy_and_safety_are_outcomes",
+      "analysis_corpus_order": {
+        "large": [
+          "corpus-029",
+          "corpus-030",
+          "corpus-026",
+          "corpus-021",
+          "corpus-023",
+          "corpus-025",
+          "corpus-027",
+          "corpus-024",
+          "corpus-022",
+          "corpus-028"
+        ],
+        "medium": [
+          "corpus-015",
+          "corpus-018",
+          "corpus-014",
+          "corpus-017",
+          "corpus-011",
+          "corpus-012",
+          "corpus-013",
+          "corpus-020",
+          "corpus-016",
+          "corpus-019"
+        ],
+        "small": [
+          "corpus-003",
+          "corpus-002",
+          "corpus-007",
+          "corpus-005",
+          "corpus-010",
+          "corpus-009",
+          "corpus-008",
+          "corpus-001",
+          "corpus-004",
+          "corpus-006"
+        ]
+      },
+      "bootstrap_samples": 10000,
+      "corpus_contract": "identical literal records and questions across all three arms within a triple; independent draws from a known generator",
+      "disposition": "One completed model turn and one failed seed-control attempt before the Noema model call; zero campaign turns. Read-only SQLite control was corrected before the next campaign.",
+      "expected_corpora": 30,
+      "expected_turns": 1080,
+      "main_turns_complete": false,
+      "observed_smoke_rows": 2,
+      "observed_turns": 0,
+      "pilot_rows_excluded_from_main": true,
+      "profile": {
+        "evaluator": "not_attested_in_export",
+        "executable_sha256": {
+          "codex": "39acf979729dd290f9a24ee38b2914e036c91b65952872e28ae2a6b88a7db7c1",
+          "codex-code-mode-host": "fd37051bfdce0b65cf22a7077e265720a7bd6709d5e400dcbc26197f3041400a",
+          "noema": "953732d0ef9a6919a40c998f1177136e7a72c729843e3495f776e2256d645dcc",
+          "opencode": "16c960ba77421da11b53e785f359b73f328a86118b48feb4af143db5d9afb198"
+        },
+        "models": {
+          "codex": "gpt-5.6-terra",
+          "opencode": "openai/gpt-5.6-terra",
+          "reasoning": "medium"
+        },
+        "project_doc_max_bytes": 1048576,
+        "startup_preferences_max_chars": 32000,
+        "task_prefetch_max_chars": {
+          "codex": 2500,
+          "opencode": 8000
+        },
+        "versions": {
+          "codex": "0.166.0",
+          "noema": "0.23.2",
+          "opencode": "1.18.31"
+        }
+      },
+      "restoration": {
+        "changed_guard_count": 0,
+        "failure_count": 0,
+        "guard_files_unchanged": true,
+        "managed_restored": true,
+        "pinned_tools_removed": true
+      },
+      "role": "aborted_seed_control_pilot_no_campaign",
+      "run_id": "independent-20261113T024138Z-g2",
+      "seed_and_direct_controls": [],
+      "smoke_status": "stopped",
+      "status": "campaign_not_run"
+    },
+    {
+      "admission_rule": "mechanics_actual_seed_counts_direct_retrieval_controls_and_clean_restoration;accuracy_and_safety_are_outcomes",
+      "analysis_corpus_order": {
+        "large": [
+          "corpus-025",
+          "corpus-030",
+          "corpus-024",
+          "corpus-026",
+          "corpus-029",
+          "corpus-027",
+          "corpus-023",
+          "corpus-022",
+          "corpus-028",
+          "corpus-021"
+        ],
+        "medium": [
+          "corpus-014",
+          "corpus-015",
+          "corpus-018",
+          "corpus-013",
+          "corpus-016",
+          "corpus-020",
+          "corpus-019",
+          "corpus-017",
+          "corpus-012",
+          "corpus-011"
+        ],
+        "small": [
+          "corpus-002",
+          "corpus-009",
+          "corpus-003",
+          "corpus-010",
+          "corpus-006",
+          "corpus-001",
+          "corpus-004",
+          "corpus-007",
+          "corpus-005",
+          "corpus-008"
+        ]
+      },
+      "bootstrap_samples": 10000,
+      "corpus_contract": "identical literal records and questions across all three arms within a triple; independent draws from a known generator",
+      "disposition": "Completed fixed main sample; no scored failures dropped or retried.",
+      "expected_corpora": 30,
+      "expected_turns": 1080,
+      "main_turns_complete": true,
+      "observed_smoke_rows": 18,
+      "observed_turns": 1080,
+      "pilot_rows_excluded_from_main": true,
+      "profile": {
+        "evaluator": "not_attested_in_export",
+        "executable_sha256": {
+          "codex": "39acf979729dd290f9a24ee38b2914e036c91b65952872e28ae2a6b88a7db7c1",
+          "codex-code-mode-host": "fd37051bfdce0b65cf22a7077e265720a7bd6709d5e400dcbc26197f3041400a",
+          "noema": "953732d0ef9a6919a40c998f1177136e7a72c729843e3495f776e2256d645dcc",
+          "opencode": "16c960ba77421da11b53e785f359b73f328a86118b48feb4af143db5d9afb198"
+        },
+        "models": {
+          "codex": "gpt-5.6-terra",
+          "opencode": "openai/gpt-5.6-terra",
+          "reasoning": "medium"
+        },
+        "project_doc_max_bytes": 1048576,
+        "startup_preferences_max_chars": 32000,
+        "task_prefetch_max_chars": {
+          "codex": 2500,
+          "opencode": 8000
+        },
+        "versions": {
+          "codex": "0.166.0",
+          "noema": "0.23.2",
+          "opencode": "1.18.31"
+        }
+      },
+      "restoration": {
+        "changed_guard_count": 0,
+        "failure_count": 0,
+        "guard_files_unchanged": true,
+        "managed_restored": true,
+        "pinned_tools_removed": true
+      },
+      "role": "original_negative_untouched_campaign",
+      "run_id": "independent-20261113T024831Z-g3",
+      "seed_and_direct_controls": [
+        {
+          "context_chars": 2735,
+          "expected_records": 60,
+          "hit_count": 3,
+          "observed_records": 60,
+          "success": true
+        },
+        {
+          "context_chars": 1947,
+          "expected_records": 60,
+          "hit_count": 2,
+          "observed_records": 60,
+          "success": true
+        },
+        {
+          "context_chars": 2755,
+          "expected_records": 180,
+          "hit_count": 3,
+          "observed_records": 180,
+          "success": true
+        },
+        {
+          "context_chars": 1913,
+          "expected_records": 180,
+          "hit_count": 2,
+          "observed_records": 180,
+          "success": true
+        },
+        {
+          "context_chars": 5905,
+          "expected_records": 600,
+          "hit_count": 7,
+          "observed_records": 600,
+          "success": true
+        },
+        {
+          "context_chars": 5130,
+          "expected_records": 600,
+          "hit_count": 6,
+          "observed_records": 600,
+          "success": true
+        }
+      ],
+      "smoke_status": "passed",
+      "status": "completed"
+    },
+    {
+      "admission_rule": "mechanics_actual_seed_counts_direct_retrieval_controls_and_clean_restoration;accuracy_and_safety_are_outcomes",
+      "analysis_corpus_order": {
+        "large": [
+          "corpus-103"
+        ],
+        "medium": [
+          "corpus-102"
+        ],
+        "small": [
+          "corpus-101"
+        ]
+      },
+      "bootstrap_samples": 10000,
+      "corpus_contract": "identical literal records and questions across all three arms within a triple; independent draws from a known generator",
+      "disposition": "Completed fixed main sample; no scored failures dropped or retried.",
+      "expected_corpora": 3,
+      "expected_turns": 108,
+      "main_turns_complete": true,
+      "observed_smoke_rows": 18,
+      "observed_turns": 108,
+      "pilot_rows_excluded_from_main": true,
+      "profile": {
+        "evaluator": "disabled",
+        "executable_sha256": {
+          "codex": "39acf979729dd290f9a24ee38b2914e036c91b65952872e28ae2a6b88a7db7c1",
+          "codex-code-mode-host": "fd37051bfdce0b65cf22a7077e265720a7bd6709d5e400dcbc26197f3041400a",
+          "noema": "27bcd6452e132dfacda71c9b6f089d4dd79ad5ac730ba47b8cb54c3d37c82fa8",
+          "opencode": "16c960ba77421da11b53e785f359b73f328a86118b48feb4af143db5d9afb198"
+        },
+        "models": {
+          "codex": "gpt-5.6-terra",
+          "opencode": "openai/gpt-5.6-terra",
+          "reasoning": "medium"
+        },
+        "project_doc_max_bytes": 1048576,
+        "startup_preferences_max_chars": 32000,
+        "task_prefetch_max_chars": {
+          "codex": 2500,
+          "opencode": 8000
+        },
+        "versions": {
+          "codex": "0.166.0",
+          "noema": "0.23.3",
+          "opencode": "1.18.31"
+        }
+      },
+      "restoration": {
+        "changed_guard_count": 0,
+        "failure_count": 0,
+        "guard_files_unchanged": true,
+        "managed_restored": true,
+        "pinned_tools_removed": true
+      },
+      "role": "original_budget_development_sample",
+      "run_id": "question-scope-20261113T071241Z-s1",
+      "seed_and_direct_controls": [
+        {
+          "context_chars": 1128,
+          "expected_records": 60,
+          "hit_count": 1,
+          "observed_records": 60,
+          "success": true
+        },
+        {
+          "context_chars": 1132,
+          "expected_records": 60,
+          "hit_count": 1,
+          "observed_records": 60,
+          "success": true
+        },
+        {
+          "context_chars": 5130,
+          "expected_records": 180,
+          "hit_count": 6,
+          "observed_records": 180,
+          "success": true
+        },
+        {
+          "context_chars": 1944,
+          "expected_records": 180,
+          "hit_count": 2,
+          "observed_records": 180,
+          "success": true
+        },
+        {
+          "context_chars": 6745,
+          "expected_records": 600,
+          "hit_count": 8,
+          "observed_records": 600,
+          "success": true
+        },
+        {
+          "context_chars": 6686,
+          "expected_records": 600,
+          "hit_count": 8,
+          "observed_records": 600,
+          "success": true
+        }
+      ],
+      "smoke_status": "passed",
+      "status": "completed"
+    },
+    {
+      "admission_rule": "mechanics_actual_seed_counts_direct_retrieval_controls_and_clean_restoration;accuracy_and_safety_are_outcomes",
+      "analysis_corpus_order": {
+        "large": [
+          "corpus-103"
+        ],
+        "medium": [
+          "corpus-102"
+        ],
+        "small": [
+          "corpus-101"
+        ]
+      },
+      "bootstrap_samples": 10000,
+      "corpus_contract": "identical literal records and questions across all three arms within a triple; independent draws from a known generator",
+      "disposition": "Completed fixed main sample; no scored failures dropped or retried.",
+      "expected_corpora": 3,
+      "expected_turns": 108,
+      "main_turns_complete": true,
+      "observed_smoke_rows": 18,
+      "observed_turns": 108,
+      "pilot_rows_excluded_from_main": true,
+      "profile": {
+        "evaluator": "disabled",
+        "executable_sha256": {
+          "codex": "39acf979729dd290f9a24ee38b2914e036c91b65952872e28ae2a6b88a7db7c1",
+          "codex-code-mode-host": "fd37051bfdce0b65cf22a7077e265720a7bd6709d5e400dcbc26197f3041400a",
+          "noema": "27bcd6452e132dfacda71c9b6f089d4dd79ad5ac730ba47b8cb54c3d37c82fa8",
+          "opencode": "16c960ba77421da11b53e785f359b73f328a86118b48feb4af143db5d9afb198"
+        },
+        "models": {
+          "codex": "gpt-5.6-terra",
+          "opencode": "openai/gpt-5.6-terra",
+          "reasoning": "medium"
+        },
+        "project_doc_max_bytes": 1048576,
+        "startup_preferences_max_chars": 32000,
+        "task_prefetch_max_chars": {
+          "codex": 8000,
+          "opencode": 8000
+        },
+        "versions": {
+          "codex": "0.166.0",
+          "noema": "0.23.3",
+          "opencode": "1.18.31"
+        }
+      },
+      "restoration": {
+        "changed_guard_count": 0,
+        "failure_count": 0,
+        "guard_files_unchanged": true,
+        "managed_restored": true,
+        "pinned_tools_removed": true
+      },
+      "role": "symmetric_budget_profile_selection_sample",
+      "run_id": "question-budget-20261113T075731Z-s2",
+      "seed_and_direct_controls": [
+        {
+          "context_chars": 2732,
+          "expected_records": 60,
+          "hit_count": 3,
+          "observed_records": 60,
+          "success": true
+        },
+        {
+          "context_chars": 1137,
+          "expected_records": 60,
+          "hit_count": 1,
+          "observed_records": 60,
+          "success": true
+        },
+        {
+          "context_chars": 5331,
+          "expected_records": 180,
+          "hit_count": 6,
+          "observed_records": 180,
+          "success": true
+        },
+        {
+          "context_chars": 5064,
+          "expected_records": 180,
+          "hit_count": 6,
+          "observed_records": 180,
+          "success": true
+        },
+        {
+          "context_chars": 6791,
+          "expected_records": 600,
+          "hit_count": 8,
+          "observed_records": 600,
+          "success": true
+        },
+        {
+          "context_chars": 4314,
+          "expected_records": 600,
+          "hit_count": 5,
+          "observed_records": 600,
+          "success": true
+        }
+      ],
+      "smoke_status": "passed",
+      "status": "completed"
+    },
+    {
+      "admission_rule": "mechanics_actual_seed_counts_direct_retrieval_controls_and_clean_restoration;accuracy_and_safety_are_outcomes",
+      "analysis_corpus_order": {
+        "large": [
+          "corpus-029",
+          "corpus-028",
+          "corpus-027",
+          "corpus-021",
+          "corpus-026",
+          "corpus-023",
+          "corpus-022",
+          "corpus-030",
+          "corpus-025",
+          "corpus-024"
+        ],
+        "medium": [
+          "corpus-012",
+          "corpus-011",
+          "corpus-017",
+          "corpus-018",
+          "corpus-014",
+          "corpus-016",
+          "corpus-013",
+          "corpus-020",
+          "corpus-015",
+          "corpus-019"
+        ],
+        "small": [
+          "corpus-004",
+          "corpus-002",
+          "corpus-001",
+          "corpus-007",
+          "corpus-009",
+          "corpus-003",
+          "corpus-006",
+          "corpus-008",
+          "corpus-005",
+          "corpus-010"
+        ]
+      },
+      "bootstrap_samples": 10000,
+      "corpus_contract": "identical literal records and questions across all three arms within a triple; independent draws from a known generator",
+      "disposition": "Completed fixed main sample; no scored failures dropped or retried.",
+      "expected_corpora": 30,
+      "expected_turns": 1080,
+      "main_turns_complete": true,
+      "observed_smoke_rows": 18,
+      "observed_turns": 1080,
+      "pilot_rows_excluded_from_main": true,
+      "profile": {
+        "evaluator": "disabled",
+        "executable_sha256": {
+          "codex": "39acf979729dd290f9a24ee38b2914e036c91b65952872e28ae2a6b88a7db7c1",
+          "codex-code-mode-host": "fd37051bfdce0b65cf22a7077e265720a7bd6709d5e400dcbc26197f3041400a",
+          "noema": "27bcd6452e132dfacda71c9b6f089d4dd79ad5ac730ba47b8cb54c3d37c82fa8",
+          "opencode": "16c960ba77421da11b53e785f359b73f328a86118b48feb4af143db5d9afb198"
+        },
+        "models": {
+          "codex": "gpt-5.6-terra",
+          "opencode": "openai/gpt-5.6-terra",
+          "reasoning": "medium"
+        },
+        "project_doc_max_bytes": 1048576,
+        "startup_preferences_max_chars": 32000,
+        "task_prefetch_max_chars": {
+          "codex": 8000,
+          "opencode": 8000
+        },
+        "versions": {
+          "codex": "0.166.0",
+          "noema": "0.23.3",
+          "opencode": "1.18.31"
+        }
+      },
+      "restoration": {
+        "changed_guard_count": 0,
+        "failure_count": 0,
+        "guard_files_unchanged": true,
+        "managed_restored": true,
+        "pinned_tools_removed": true
+      },
+      "role": "frozen_profile_untouched_validation",
+      "run_id": "frozen-budget-validation-20261113T172425Z",
+      "seed_and_direct_controls": [
+        {
+          "context_chars": 1120,
+          "expected_records": 60,
+          "hit_count": 1,
+          "observed_records": 60,
+          "success": true
+        },
+        {
+          "context_chars": 1124,
+          "expected_records": 60,
+          "hit_count": 1,
+          "observed_records": 60,
+          "success": true
+        },
+        {
+          "context_chars": 1921,
+          "expected_records": 180,
+          "hit_count": 2,
+          "observed_records": 180,
+          "success": true
+        },
+        {
+          "context_chars": 3542,
+          "expected_records": 180,
+          "hit_count": 4,
+          "observed_records": 180,
+          "success": true
+        },
+        {
+          "context_chars": 6671,
+          "expected_records": 600,
+          "hit_count": 8,
+          "observed_records": 600,
+          "success": true
+        },
+        {
+          "context_chars": 6715,
+          "expected_records": 600,
+          "hit_count": 8,
+          "observed_records": 600,
+          "success": true
+        }
+      ],
+      "smoke_status": "passed",
+      "status": "completed"
+    }
+  ],
+  "schema_version": 1,
+  "scope": "November descriptive follow-on only; September qualification tables unchanged",
+  "tested_final_profile": {
+    "adapter_sha256": "6b1d1a204adb7cfaf4c70e223f19d78584a73a737d3d3041f78a73515aeac31b",
+    "adapter_source_status": "Private tested bytes are not the portable public reconstruction; hashes must not be equated.",
+    "candidate_sha256": "27bcd6452e132dfacda71c9b6f089d4dd79ad5ac730ba47b8cb54c3d37c82fa8",
+    "client_prefetch_character_budgets": {
+      "codex": 8000,
+      "opencode": 8000
+    },
+    "models": {
+      "codex": "gpt-5.6-terra",
+      "opencode": "openai/gpt-5.6-terra",
+      "reasoning": "medium"
+    },
+    "protocol_sha256": "341c6851598cf832d9b59e1cb8d2901331191864edb33529473dac6519491541"
+  }
+}
