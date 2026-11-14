@@ -7,9 +7,9 @@ endpoints are optional views of the same cortex, not separate memory stores.
 
 | Path | Current tools | Intended use |
 | --- | ---: | --- |
-| `/mcp` | 35 | Complete interface and compatibility with existing clients |
+| `/mcp` | 38 | Complete interface and compatibility with existing clients |
 | `/mcp/agent` | 24 | Everyday agent memory work |
-| `/mcp/maintainer` | 30 | Everyday work plus diagnosis and maintenance |
+| `/mcp/maintainer` | 33 | Everyday work plus diagnosis and maintenance |
 | `/mcp/curator` | 26 | Everyday work plus deliberate memory consolidation |
 | `/mcp/federation` | 3 | Exchange between Noema instances |
 
@@ -31,7 +31,9 @@ The agent endpoint exposes:
   `recover_trace`, `trace_history`, `trace_lineage`, `resolve_divergence`.
 
 The maintainer endpoint includes all agent tools plus `tag_doctor`, `rename_tag`,
-`delete_tag`, `metrics_summary`, `consolidation_health`, and `federation_status`.
+`delete_tag`, `metrics_summary`, `consolidation_health`, `federation_status`,
+`tag_review_queue`, `tag_review_analyze`, and `tag_review_decide`.
+See [Tag Review](tag-review.md) for the on-demand analysis and human-approval workflow.
 
 The curator endpoint includes all agent tools plus `list_consolidation_candidates`
 and `record_consolidation_result`.

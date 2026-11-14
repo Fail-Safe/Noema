@@ -482,6 +482,11 @@ enum MetricsCommand {
 
 #[derive(Debug, Subcommand)]
 enum TagCommand {
+    /// AI-assisted taxonomy maintenance; suggestions require explicit approval
+    Review {
+        #[command(subcommand)]
+        command: TagReviewCommand,
+    },
     /// Show tag counts, visibility, tier, and engagement statistics
     Stats {
         /// Maximum tag rows to show (0 means all)
@@ -1050,7 +1055,7 @@ async fn execute_cortex_command(cx: &mut Cortex, command: Command) -> Result<()>
             println!("Trace recovered: {id}");
         }
         Command::Purge { days } => println!("Purged {} trace(s).", cx.purge_expired(days)?),
-        Command::Tags { command } => tag_command(cx, command)?,
+        Command::Tags { command } => tag_command(cx, command).await?,
         Command::Search {
             query,
             semantic,
@@ -1956,8 +1961,109 @@ fn remove_cortex(name: &str, purge: bool, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn tag_command(cx: &Cortex, command: TagCommand) -> Result<()> {
+async fn tag_command(cx: &Cortex, command: TagCommand) -> Result<()> {
     match command {
+        TagCommand::Review { command } => match command {
+            TagReviewCommand::Settings {
+                mode,
+                model,
+                endpoint,
+                api_key_env,
+            } => {
+                let original = cx.tag_review_settings()?;
+                let mut settings = original.clone();
+                let changed = mode.is_some()
+                    || model.is_some()
+                    || endpoint.is_some()
+                    || api_key_env.is_some();
+                if let Some(mode) = mode {
+                    settings.mode = if mode == "shared" {
+                        crate::tag_review::ModelMode::Shared
+                    } else {
+                        crate::tag_review::ModelMode::Separate
+                    };
+                }
+                if let Some(model) = model {
+                    settings.model_name = model;
+                }
+                if let Some(endpoint) = endpoint {
+                    settings.endpoint = endpoint;
+                }
+                if let Some(api_key_env) = api_key_env {
+                    settings.api_key_env = api_key_env;
+                }
+                if changed {
+                    cx.save_tag_review_settings(&settings, Some(&original))?;
+                }
+                let manifest = crate::cortex::read_manifest(&cx.dir)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "mode": settings.mode,
+                        "semantic_model": crate::tag_review::model_status(&manifest),
+                        "saved_separate_model": settings.model_name,
+                        "separate_endpoint_configured": !settings.endpoint.is_empty(),
+                        "separate_api_key_env": settings.api_key_env,
+                    }))?
+                );
+            }
+            TagReviewCommand::List => {
+                println!("{}", serde_json::to_string_pretty(&cx.tag_reviews()?)?)
+            }
+            TagReviewCommand::Analyze { model, offset } => {
+                let hygiene = cx.review_tag_hygiene()?;
+                println!("Queued {hygiene} new hygiene suggestions (no trace tags changed).");
+                if model {
+                    let result = crate::tag_review::analyze(
+                        Cortex::open(cx.name.clone(), cx.dir.clone())?,
+                        offset,
+                    )
+                    .await?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    if result.status == "partial" {
+                        bail!(
+                            "semantic Tag Review incomplete: {}/{} traces completed; {} proposals retained. Retry the same offset to finish.",
+                            result.analyzed,
+                            result.requested,
+                            result.queued
+                        );
+                    }
+                }
+            }
+            TagReviewCommand::Decide {
+                id,
+                action,
+                yes,
+                tags,
+            } => {
+                if matches!(action.as_str(), "apply" | "undo") {
+                    let proposal = cx.tag_review(&id)?;
+                    println!("{}", serde_json::to_string_pretty(&proposal)?);
+                    if !yes {
+                        bail!("inspect the proposal, then pass --yes to approve {action}");
+                    }
+                    cx.apply_tag_review(&id, action == "undo")?;
+                } else if action == "edit" {
+                    let tags: Vec<String> = serde_json::from_str(
+                        tags.as_deref()
+                            .context("edit requires --tags as a JSON string array")?,
+                    )?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&cx.edit_tag_review(&id, tags)?)?
+                    );
+                } else {
+                    cx.set_tag_review_status(
+                        &id,
+                        match action.as_str() {
+                            "reject" => "rejected",
+                            "defer" => "deferred",
+                            _ => "pending",
+                        },
+                    )?;
+                }
+            }
+        },
         TagCommand::Stats { limit, output } => {
             let report = cx.tag_stats(limit)?;
             if output == "json" {
@@ -2026,6 +2132,45 @@ fn tag_command(cx: &Cortex, command: TagCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Subcommand)]
+enum TagReviewCommand {
+    /// Show or configure shared/separate semantic review models (does not run analysis)
+    Settings {
+        #[arg(long, value_parser = ["shared", "separate"])]
+        mode: Option<String>,
+        /// Separate model identifier
+        #[arg(long)]
+        model: Option<String>,
+        /// Separate OpenAI-compatible base URL (without /chat/completions)
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Environment variable NAME, not a literal API key; empty clears it
+        #[arg(long)]
+        api_key_env: Option<String>,
+    },
+    /// Show the local review queue and decision history as JSON
+    List,
+    /// Queue hygiene suggestions; --model explicitly sends excerpts to the configured provider
+    Analyze {
+        #[arg(long)]
+        model: bool,
+        /// Skip this many eligible traces in the model's bounded batch (40 traces)
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    /// Act on a proposal; apply/undo require --yes after inspecting the preview
+    Decide {
+        id: String,
+        #[arg(value_parser = ["apply", "undo", "reject", "defer", "resume", "edit"])]
+        action: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Complete desired tag list as a JSON array (edit only)
+        #[arg(long)]
+        tags: Option<String>,
+    },
 }
 
 fn format_tag_stats_report(report: &TagStatsReport) -> String {

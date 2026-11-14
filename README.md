@@ -433,10 +433,35 @@ small startup bootstrap for memory retrieval and preference-revision reuse. An
 MCP entry without that bootstrap is callable but not reliably memory-aware after
 a fresh session or compaction.
 
-Supported clients are `codex`, `claude-code`, `cursor`, `opencode` (OpenCode v1),
+Supported clients are `codex`, `claude-code`, `cursor`, `opencode` (OpenCode v1 and v2),
 and `ohmypi` (Oh My Pi / OMP). Pi is listed as planned because it needs a
 first-class MCP extension rather than configuration alone; OMP has native MCP
 support.
+
+OpenCode integration selects the adapter from `opencode --version`, falling back
+to the target configuration when the executable cannot be probed. Unsupported
+major versions are refused before writing. V1 uses `mcp.noema`; V2 uses
+`mcp.servers.noema` and a default-exported context-hook plugin at the same
+`plugins/noema-session-bootstrap.ts` path. The hook supplies the canonical memory
+bootstrap on model requests, including after compaction. An existing
+`opencode.json` is reused when no `opencode.jsonc` exists.
+V1 retains its legacy system-transform hook, which also injects the bootstrap
+into compaction summary-generation requests (observed with OpenCode 1.18.31);
+its bootstrap is not limited to ordinary agent requests.
+
+On V2, installation migrates a recognized V1 Noema connection and exact managed
+bootstrap without changing unrelated servers or plugins. Matching V2 servers
+may omit the optional `disabled: false` field and are left untouched. Duplicate
+Noema entries in both layouts are a conflict, even with `--force`. Incompatible
+legacy options, including scalar `timeout`, must be resolved explicitly before
+migration; Noema does not discard options or guess timeout conversions.
+Customized bootstrap files are protected by drift detection. An existing
+`plugins/noema-session-bootstrap/` directory is an ownership conflict, even with
+`--force`: Noema neither overwrites it nor installs a duplicate flat plugin.
+Resolve that directory explicitly before installing or removing the integration.
+Preview migration with `noema integrate opencode install --scope user --check`
+and the same transport, URL, and bearer-token environment reference as the
+existing connection.
 
 ### Choosing an integration mode
 

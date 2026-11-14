@@ -19,6 +19,7 @@ pub mod prefetch;
 pub mod restore;
 pub mod storage;
 pub mod tag;
+pub mod tag_review;
 pub mod tlsutil;
 pub mod trace;
 pub mod tui;
