@@ -804,10 +804,11 @@ fn push_task(span: &str, tasks: &mut Vec<TaskQuery>) {
             {
                 continue;
             }
-            let task_identifiers = identifiers
-                .contains(&term)
-                .then(|| HashSet::from([term.clone()]))
-                .unwrap_or_default();
+            let task_identifiers = if identifiers.contains(&term) {
+                HashSet::from([term.clone()])
+            } else {
+                HashSet::new()
+            };
             tasks.push(TaskQuery {
                 terms: vec![term.clone()],
                 original_terms: vec![term.clone()],
