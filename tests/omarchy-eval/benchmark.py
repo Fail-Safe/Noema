@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -46,6 +47,7 @@ from omarchy_eval_lib import (
     write_json,
     write_tsv,
 )
+from equal_access import build_equal_access_cases, render_equal_access, summarize_equal_access
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -55,6 +57,7 @@ PREFETCH_HOOK = SCRIPT_DIR / "prefetch_hook.py"
 HARNESS_FILES = (
     Path(__file__).resolve(),
     SCRIPT_DIR / "omarchy_eval_lib.py",
+    SCRIPT_DIR / "equal_access.py",
     PREFETCH_HOOK,
     RESPONSE_SCHEMA,
 )
@@ -171,7 +174,23 @@ class Run:
             env["CODEX_HOME"] = str(
                 self.codex_home(case.batch, case.track, case.direction, case.condition)
             )
+        if case is not None and case.condition == "markdown":
+            client_root = self.markdown_client_root(case)
+            for name in tuple(env):
+                if name.startswith("NOEMA_"):
+                    env.pop(name)
+            env.pop("OPENCODE_CONFIG_CONTENT", None)
+            env["XDG_CONFIG_HOME"] = str(client_root / "xdg-config")
+            env["XDG_STATE_HOME"] = str(client_root / "xdg-state")
+            env["OPENCODE_CONFIG"] = str(client_root / "opencode.json")
+            env["OPENCODE_CONFIG_DIR"] = str(client_root / ".opencode")
+            env.pop("OPENCODE_DISABLE_PROJECT_CONFIG", None)
         return env
+
+    def markdown_client_root(self, case: Case) -> Path:
+        return self.runtime_root / "markdown-users" / self.context_key(
+            case.batch, case.track, case.direction, case.condition
+        )
 
     def context_key(self, batch: int, track: str, direction: str, condition: str) -> str:
         return f"b{batch:02d}-{track}-{direction}-{condition}"
@@ -525,8 +544,10 @@ def cmd_preflight(args: argparse.Namespace, config: dict[str, Any]) -> int:
     return 1 if failures else 0
 
 
-def require_preflight(run: Run) -> dict[str, Any]:
+def require_preflight(run: Run, *, allow_equal_access: bool = False) -> dict[str, Any]:
     state = run.load_state()
+    if state.get("experiment_kind") == "equal_access" and not allow_equal_access:
+        raise BenchmarkError("equal-access runs are descriptive-only and cannot be mixed with other commands; restore remains available")
     if state["status"] in {"restored", "restored_with_guard_drift"}:
         raise BenchmarkError("run has been restored and is closed")
     if state["status"] == "preflight_failed":
@@ -926,7 +947,12 @@ def execute_turn(
     retrieval_profile: str = "standard",
 ) -> tuple[ParsedEvents, float, int, str | None]:
     workspace = capture_workspace(run, case) if capture else case_workspace(run, case)
-    prompt = render_prompt(case, retrieval_profile)
+    prompt = render_prompt(
+        replace(case, condition="native") if case.condition == "markdown" else case,
+        retrieval_profile,
+    )
+    if case.condition == "markdown":
+        prompt += "\nThe full assigned Markdown memory is already loaded from AGENTS.md. Do not call tools.\n"
     if capture:
         prefix = f"{case.condition.upper()}-{case.source.upper()}"
         prompt = render_capture_prompt(case, build_corpus(case.corpus_variant, prefix))
@@ -1149,11 +1175,20 @@ def run_retrieval_case(
                 error_code = "prefetch_failed"
             elif parsed.tool_names:
                 error_code = "prefetch_tool_call_observed"
-    if case.condition == "native" and (bootstrap or recall or noema_retrieval):
-        error_code = "native_condition_contaminated"
+    if case.condition in {"native", "markdown"} and (
+        bootstrap or recall or noema_retrieval
+        or (case.condition == "markdown" and any(
+            "noema" in name.lower()
+            or any(marker in name for marker in ("create_trace", "create_traces", "update_trace", "cortex_usage"))
+            for name in parsed.tool_names
+        ))
+    ):
+        error_code = f"{case.condition}_condition_contaminated"
+    elif case.condition == "markdown" and parsed.tool_names:
+        error_code = "markdown_tool_call_observed"
     status = "completed" if error_code is None else "failed"
     row = sanitized_row(case, parsed, score, status=status, latency_seconds=latency, error_code=error_code)
-    row["retrieval_profile"] = retrieval_profile if case.condition == "noema" else "native"
+    row["retrieval_profile"] = retrieval_profile if case.condition == "noema" else case.condition
     row["recall_context_observed"] = recall
     row["prefetch_observed"] = prefetch_metrics is not None
     row["prefetch_success"] = prefetch_metrics.get("success") if prefetch_metrics else None
@@ -1733,6 +1768,258 @@ def cmd_prefetch_experiment(args: argparse.Namespace, config: dict[str, Any]) ->
     return 0 if result["status"] == "passed" else 1
 
 
+def prepare_equal_access_markdown(
+    run: Run, state: dict[str, Any], case: Case
+) -> dict[str, Path]:
+    """Materialize only this direction's full shared memory, without integrations."""
+    if case.condition != "markdown" or case.track != "deterministic":
+        raise BenchmarkError("shared Markdown preparation requires a deterministic markdown case")
+    key = run.context_key(case.batch, case.track, case.direction, case.condition)
+    paths = run.context_paths(case.batch, case.track, case.direction, case.condition)
+    if state.setdefault("contexts", {}).get(key, {}).get("prepared"):
+        return paths
+    for path in paths.values():
+        path.mkdir(parents=True, exist_ok=True)
+    (paths["common"] / ".git").mkdir(exist_ok=True)
+    (paths["outside"] / ".git").mkdir(exist_ok=True)
+    memory = render_equal_access(case).encode()
+    for role in ("project-a", "project-b", "outside"):
+        atomic_write(paths[role] / "AGENTS.md", memory, 0o644)
+    codex_home = run.codex_home(case.batch, case.track, case.direction, case.condition)
+    codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    auth_source = Path.home() / ".codex/auth.json"
+    if auth_source.exists():
+        (codex_home / "auth.json").symlink_to(auth_source)
+    client_root = run.markdown_client_root(case)
+    for relative in ("xdg-config", "xdg-state", ".opencode"):
+        (client_root / relative).mkdir(parents=True, exist_ok=True, mode=0o700)
+    write_json(client_root / "opencode.json", {"mcp": {}, "plugin": []}, 0o600)
+    state["contexts"][key] = {
+        "prepared": True,
+        "batch": case.batch,
+        "track": case.track,
+        "direction": case.direction,
+        "condition": "markdown",
+        "retrieval_profile": "markdown",
+        "corpus_variant": case.corpus_variant,
+        "cortex": None,
+        "record_count": len(build_corpus(case.corpus_variant, "COUNT")),
+        "delivery": "full_workspace_agents",
+    }
+    run.save_state(state)
+    return paths
+
+
+def equal_access_cases_for_phase(
+    state: Mapping[str, Any], phase: str
+) -> list[Case]:
+    cases = build_equal_access_cases(1, corpus_cycle_for(state) - 1)
+    if phase == "smoke":
+        cases = [case for case in cases if case.scenario == "same_workspace_exact"]
+    scenarios = list(dict.fromkeys(case.scenario for case in cases))
+    directions = list(dict.fromkeys(case.direction for case in cases))
+    planned: list[Case] = []
+    for direction_index, direction in enumerate(directions):
+        for scenario_index, scenario in enumerate(scenarios):
+            order = ["native", "markdown", "noema"]
+            shift = scenario_index % len(order)
+            order = order[shift:] + order[:shift]
+            if direction_index % 2:
+                order.reverse()
+            for condition in order:
+                case = next(
+                    case for case in cases
+                    if case.direction == direction and case.scenario == scenario
+                    and case.condition == condition
+                )
+                planned.append(replace(case, case_id=f"equal-access-{phase}-{case.case_id}"))
+    return planned
+
+
+def reserve_equal_access_phase(
+    run: Run, state: dict[str, Any], phase: str
+) -> None:
+    if track_for(state) != "deterministic" or retrieval_profile_for(state) != "prefetch":
+        raise BenchmarkError("equal-access requires a deterministic/prefetch preflight")
+    if state.get("batches") or state.get("checkpoints") or state.get("continuation_authorizations"):
+        raise BenchmarkError("equal-access requires a fresh run without batches or checkpoints")
+    if state.get("smoke", {}).get("status") != "not_run" or state.get("smoke_history"):
+        raise BenchmarkError("equal-access cannot reuse ordinary or historical smoke evidence")
+    experiments = state.get("experiments", {})
+    if any(key != "equal_access" for key in experiments):
+        raise BenchmarkError("equal-access cannot share a run with other experiments")
+    if state.get("natural_evidence") or state.get("contexts"):
+        raise BenchmarkError("equal-access requires clean deterministic contexts")
+    if any(
+        snapshot.get("kind") != "absent"
+        for snapshot in state.get("managed_snapshots", [])
+    ) or any(path.exists() or path.is_symlink() for path in (
+        run.work_root, run.outside_root, run.runtime_root
+    )):
+        raise BenchmarkError("equal-access requires restored, originally absent managed paths")
+    if guard_drift(state):
+        raise BenchmarkError("guard hashes changed; restore this run before continuing")
+    own = experiments.get("equal_access", {})
+    if phase == "smoke":
+        if state.get("status") != "preflight_passed" or state.get("experiment_kind") or experiments:
+            raise BenchmarkError("equal-access smoke requires a new preflight-only run")
+        allowed_raw = {"preflight-probes.json", "guard-snapshots.json"}
+        if any(path.name not in allowed_raw for path in run.raw_dir.iterdir()):
+            raise BenchmarkError("equal-access requires a fresh run without historical raw data")
+        if run.report_dir.exists() and any(
+            path.name != "preflight.json" for path in run.report_dir.iterdir()
+        ):
+            raise BenchmarkError("equal-access requires a fresh run without historical reports")
+    else:
+        smoke = own.get("smoke", {})
+        restoration = smoke.get("restoration", {})
+        if (
+            state.get("experiment_kind") != "equal_access"
+            or state.get("status") != "equal_access_smoke_passed"
+            or smoke.get("status") != "passed"
+            or smoke.get("retrieval_turns") != 6
+            or not restoration.get("managed_restored")
+            or not restoration.get("guard_files_unchanged")
+            or restoration.get("failures")
+            or restoration.get("guard_drift")
+        ):
+            raise BenchmarkError("campaign requires this run's passed equal-access smoke and clean restoration")
+    if phase in own:
+        raise BenchmarkError(f"equal-access {phase} was already reserved; start a fresh run")
+    state["experiment_kind"] = "equal_access"
+    state.setdefault("experiments", {}).setdefault("equal_access", {})[phase] = {
+        "status": "running", "started_at": utc_now(), "descriptive_only": True,
+    }
+    state["status"] = f"equal_access_{phase}_running"
+    run.save_state(state)
+
+
+def cmd_equal_access_experiment(args: argparse.Namespace, config: dict[str, Any]) -> int:
+    phase = args.phase
+    expected_turns = 6 if phase == "smoke" else 36
+    if not args.confirm_live:
+        raise BenchmarkError(
+            f"experiment-equal-access {phase} starts {expected_turns} live model turns; "
+            "rerun with --confirm-live"
+        )
+    if not args.run_id:
+        raise BenchmarkError("experiment-equal-access requires an explicit --run-id")
+    run = resolve_run(args, config)
+    state = require_preflight(run, allow_equal_access=True)
+    reserve_equal_access_phase(run, state, phase)
+    cases: list[Case] = []
+    rows: list[dict[str, Any]] = []
+    execution_error = None
+    try:
+        cases = equal_access_cases_for_phase(state, phase)
+        for order, case in enumerate(cases, 1):
+            if case.condition == "markdown":
+                prepare_equal_access_markdown(run, state, case)
+            else:
+                prepare_context(
+                    run, state, case.batch, case.track, case.direction, case.condition,
+                    retrieval_profile="prefetch",
+                )
+            row = run_retrieval_case(run, state, case, retrieval_profile="prefetch")
+            row["execution_order"] = order
+            rows.append(row)
+            write_json(run.raw_dir / "results" / f"{case.case_id}.json", row)
+            if row["status"] != "completed" or row.get("error_code") or not row["valid_response"]:
+                break
+            if phase == "smoke" and (
+                row["exact_accuracy"] != 1.0 or row["provenance_accuracy"] != 1.0
+                or any(row[field] for field in ("stale_count", "hallucination_count", "leakage_count"))
+            ):
+                break
+    except (Exception, KeyboardInterrupt) as error:
+        execution_error = type(error).__name__
+    finally:
+        try:
+            restoration = restore_managed(run, state, archive_runtime=True)
+        except (Exception, KeyboardInterrupt) as error:
+            execution_error = execution_error or type(error).__name__
+            try:
+                restoration = restore_managed(run, state, archive_runtime=False)
+                restoration["archive_error_type"] = type(error).__name__
+            except (Exception, KeyboardInterrupt) as restore_error:
+                restoration = {
+                    "managed_restored": False, "guard_files_unchanged": False,
+                    "failures": ["restoration_error"], "guard_drift": [],
+                    "error_type": type(restore_error).__name__,
+                }
+        state["contexts"] = {}
+        mechanics = (
+            execution_error is None and len(rows) == expected_turns
+            and all(
+                row["status"] == "completed" and not row.get("error_code")
+                and row["valid_response"] for row in rows
+            )
+        )
+        gates = {
+            "all_turns_completed": mechanics,
+            "restoration": restoration["managed_restored"] and restoration["guard_files_unchanged"],
+        }
+        if phase == "smoke":
+            gates["exact_and_provenance"] = len(rows) == expected_turns and all(
+                row["exact_accuracy"] == 1.0 and row["provenance_accuracy"] == 1.0
+                for row in rows
+            )
+            gates["no_safety_errors"] = len(rows) == expected_turns and all(
+                not row[field] for row in rows
+                for field in ("stale_count", "hallucination_count", "leakage_count")
+            )
+        try:
+            if len(rows) != expected_turns:
+                raise BenchmarkError("the planned experiment phase is incomplete")
+            summary = summarize_equal_access(rows, int(config["limits"]["bootstrap_samples"]))
+        except BenchmarkError:
+            summary = {
+                "available": False, "complete": False,
+                "reason": "incomplete_or_invalid_matched_rows",
+            }
+            gates["matched_summary"] = False
+        except (Exception, KeyboardInterrupt) as error:
+            execution_error = execution_error or type(error).__name__
+            summary = {"available": False, "complete": False, "reason": "summary_error"}
+            gates["matched_summary"] = False
+        passed = all(gates.values())
+        result = {
+            "run_id": run.run_id, "phase": phase,
+            "status": ("passed" if phase == "smoke" else "completed") if passed else "failed",
+            "completed_at": utc_now(), "retrieval_turns": len(rows),
+            "expected_retrieval_turns": expected_turns,
+            "track": "deterministic", "retrieval_profile": "prefetch",
+            "corpus_cycle": corpus_cycle_for(state),
+            "descriptive_only": True, "superiority_candidate": False,
+            "qualification_evidence": False,
+            "summary": summary, "prefetch_metrics": summarize_prefetch_metrics(rows),
+            "gates": gates, "execution_error_type": execution_error,
+            "execution_order": [
+                {"case_id": case.case_id, "condition": case.condition, "direction": case.direction,
+                 "scenario": case.scenario} for case in cases
+            ],
+            "failures": [
+                {"case_id": row["case_id"], "error_code": row.get("error_code")}
+                for row in rows if row["status"] != "completed" or row.get("error_code")
+            ],
+            "restoration": restoration, "raw_data_private": True,
+            "interpretation": {
+                "markdown_delivery": "All 60 records from the selected Noema corpus are loaded via each assigned workspace AGENTS.md; no question filtering.",
+                "scope": "Project-a and project-b distractors remain reachable in Markdown and the full selected Cortex. Scoping measures answer behavior, not filesystem ACLs.",
+                "confounding": "Access and retrieval package differ: full Markdown injection versus bounded Noema prefetch, including selection, ranking, compression, and delivery.",
+                "residual": "The algebraic residual is descriptive, not causal proof of retrieval quality.",
+                "replication": "One 36-turn campaign; use a fresh preflight --corpus-cycle 2 run for mirrored vocabulary replication.",
+            },
+        }
+        state["experiments"]["equal_access"][phase] = result
+        state["status"] = f"equal_access_{phase}_{'passed' if passed else 'failed'}"
+        run.save_state(state)
+        write_json(run.report_dir / f"equal-access-{phase}-experiment.json", result, 0o644)
+        write_json(run.report_dir / f"equal-access-{phase}-turns.json", rows, 0o644)
+    print(json.dumps(result, indent=2))
+    return 0 if passed else 1
+
+
 def next_batch_number(state: Mapping[str, Any], track: str) -> int:
     completed = sorted(
         int(number) for number, item in state.get("batches", {}).get(track, {}).items()
@@ -2305,6 +2592,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="compare absent versus pre-created empty native AGENTS.md capture targets",
     )
     native_capture_target.add_argument("--confirm-live", action="store_true")
+    equal_access = subparsers.add_parser(
+        "experiment-equal-access",
+        help="run separate descriptive native/shared-Markdown/Noema prefetch turns",
+    )
+    equal_access.add_argument("--confirm-live", action="store_true")
+    equal_access.add_argument("--phase", choices=("smoke", "campaign"), default="smoke")
     batch = subparsers.add_parser("run-batch", help="run one 24-retrieval-turn balanced batch")
     batch.add_argument("--batch", type=int)
     batch.add_argument("--track", choices=TRACKS)
@@ -2327,6 +2620,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "experiment-fastpath": cmd_fastpath_experiment,
             "experiment-prefetch": cmd_prefetch_experiment,
             "experiment-native-capture-target": cmd_native_capture_target_experiment,
+            "experiment-equal-access": cmd_equal_access_experiment,
             "run-batch": cmd_run_batch,
             "analyze": cmd_analyze,
             "restore": cmd_restore,

@@ -169,6 +169,45 @@ This eight-turn check used a development build and does not qualify Linux
 boundary behavior, repeated capture sessions, or comparative efficiency.
 It is separate from the macOS campaign and is not added to its sample count.
 
+## Draft methods addition: equal-access Markdown comparison
+
+The September comparison above measured the product-realistic native hierarchy,
+including its workspace discovery boundaries. It did not separate the benefit
+of reaching evidence from the benefit of selecting and presenting that evidence.
+The published results and qualification status remain unchanged.
+
+A new, separately gated descriptive experiment adds an equal-access Markdown
+condition: each receiving workspace can read the full synthetic record set
+reachable in the selected Noema Cortex, including sibling and outside-workspace
+memories. It uses Markdown only, with no Cortex or Noema retrieval tools. The
+original native hierarchy and bounded Noema prefetch remain separate conditions.
+The [harness README](../tests/omarchy-eval/README.md#equal-access-markdown-gap-decomposition-new-descriptive-experiment)
+documents the design, private run configuration, operator-gated commands, and
+report interpretation.
+
+On matched new cases, the difference from hierarchical native to shared Markdown
+describes the access/reachability component. The difference from shared Markdown
+to Noema describes the remaining retrieval/evidence-delivery component. Reports
+include the boundary subset, where the published advantage was concentrated,
+alongside same-workspace, update, and scoping cases. Their algebraic residual is
+not an estimate of unmeasured causal effects.
+
+The selected deterministic Cortex includes both project scopes. The shared
+Markdown condition mirrors that reachability and preserves scope labels; scoping
+still tests answer behavior, not workspace access control. Neither condition
+exposes other isolated Cortexes or directions. Separate Cortexes and matching
+Markdown sets would be required to test inaccessible project memories.
+
+Full Markdown context versus bounded prefetch still differs in selection,
+serialization, and prompt load. The contrast is not a pure test of search ranking,
+and its synthetic corpora and fixed model limit generalization. The methods above
+do not add rows to the September tables. A separately curated
+[November numerical evidence bundle](../tests/omarchy-eval/published/continuity-2026-11/README.md)
+now reports the follow-on stages, including failed pilots, the original negative
+campaign, budget/profile selection, and larger untouched validation. It provides
+portable statistical reanalysis with explicit limits: private responses and
+grading inputs are not released, and near-parity is not a superiority claim.
+
 ## Product use
 
 For general continuity, install prompt-time prefetch while retaining the normal
