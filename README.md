@@ -63,6 +63,57 @@ A Trace has a **type** that describes its intent:
 
 ## Installation
 
+### Install script (Linux + macOS)
+
+Install the latest stable release for amd64 or arm64 without sudo:
+
+```sh
+curl -fsSL https://noemacortex.com/install.sh | sh
+```
+
+To download and inspect the script first:
+
+```sh
+curl -fsSL https://noemacortex.com/install.sh -o install.sh
+less install.sh
+sh install.sh
+```
+
+The script prefers static musl builds on Linux, which avoid a system glibc
+requirement and support distributions such as Debian 12, Ubuntu 22.04,
+RHEL/Rocky 9, and Alpine. For older releases without a musl archive, it falls
+back to the glibc archive and warns about potentially incompatible systems.
+On macOS it selects the native archive and ad-hoc signs the binary when
+`codesign` is available. It does not reconcile launchd services.
+
+The installer uses curl or wget and verifies the archive against the release's
+`checksums.txt` using `sha256sum` or `shasum -a 256`. It installs to
+`$HOME/.local/bin`, prints PATH instructions when needed, and never edits shell
+startup files. Run `sh install.sh --help` for usage.
+
+| Environment variable | Purpose |
+| --- | --- |
+| `NOEMA_VERSION` | Pin a version, with or without `v`, including prereleases (for example `0.24.1` or `v0.24.1-rc.1`). Default: latest stable via GitHub's release redirect. |
+| `NOEMA_INSTALL_DIR` | Override the destination directory. Default: `$HOME/.local/bin`. |
+| `NOEMA_SKIP_VERIFY` | Set to `1` to permit installation when neither SHA-256 tool exists. Available verification tools still verify and reject mismatches. |
+
+Apply environment overrides to `sh`, for example:
+
+```sh
+curl -fsSL https://noemacortex.com/install.sh | NOEMA_VERSION=0.24.1 NOEMA_INSTALL_DIR="$HOME/bin" sh
+```
+
+After installing:
+
+```sh
+noema init --name my-cortex
+noema serve --transport stdio
+```
+
+See [agent setup](https://noemacortex.com/#agent-setup) to connect your client.
+The repository's separate zsh `./install` script builds from source; `install.sh`
+downloads published release binaries.
+
 ### With Homebrew (macOS + Linux)
 
 The fastest path. One command taps `Fail-Safe/homebrew-tap` and

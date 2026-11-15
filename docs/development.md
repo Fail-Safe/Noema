@@ -104,3 +104,11 @@ To qualify the host artifact locally without publishing:
 make test
 make release-check
 ```
+
+The release includes the repository-root `install.sh` and its SHA-256 entry in
+`checksums.txt`. After publishing a stable release, automation sends a
+`noema-release` repository dispatch with the release tag to `Fail-Safe/Noema-web`.
+Configure the `NOEMA_WEB_DISPATCH_TOKEN` repository secret with a fine-grained PAT
+or app token granting **Contents: read and write** on Noema-web. An empty secret
+warns and skips the dispatch without failing the release. Prereleases do not
+trigger website deployments.
