@@ -40,6 +40,15 @@ class RenderHomebrewTest(unittest.TestCase):
         self.assertIn('arch arm: "arm64", intel: "amd64"', cask)
         self.assertNotIn("noema-beta", formula)
 
+    def test_musl_archives_do_not_change_homebrew_metadata(self):
+        self.write_archives("0.24.0")
+        written = MODULE.render("0.24.0", "https://example.test/download", self.dist, self.tap)
+        original = [path.read_text() for path in written]
+        for arch in ("amd64", "arm64"):
+            (self.dist / f"noema_0.24.0_linux_{arch}_musl.tar.gz").write_bytes(b"musl")
+        written = MODULE.render("0.24.0", "https://example.test/download", self.dist, self.tap)
+        self.assertEqual(original, [path.read_text() for path in written])
+
     def test_prerelease_updates_only_beta_formula(self):
         self.write_archives("0.20.0-beta.1")
         written = MODULE.render(

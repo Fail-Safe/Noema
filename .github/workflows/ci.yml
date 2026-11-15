@@ -96,7 +96,11 @@ jobs:
         run: python -m unittest tests/render_homebrew_test.py
 
       - name: Test repository scripts
-        run: bash tests/sync-brand-assets_test.sh
+        run: |
+          bash tests/sync-brand-assets_test.sh
+          sh -n install.sh
+          shellcheck -s sh install.sh
+          python -m unittest tests/install_script_test.py
 
       - name: Set up Node
         uses: actions/setup-node@v7
