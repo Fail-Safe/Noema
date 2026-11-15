@@ -140,7 +140,9 @@ HELP
     fi
 
     tar -xzf "$tmp_dir/archive.tar.gz" -C "$tmp_dir" noema
-    [ -f "$tmp_dir/noema" ] && [ ! -L "$tmp_dir/noema" ] || fail 'archive does not contain a regular noema binary'
+    if [ ! -f "$tmp_dir/noema" ] || [ -L "$tmp_dir/noema" ]; then
+        fail 'archive does not contain a regular noema binary'
+    fi
     install_dir=${NOEMA_INSTALL_DIR:-"$HOME/.local/bin"}
     mkdir -p "$install_dir"
     install_dir=$(cd "$install_dir" && pwd -P)
