@@ -93,14 +93,14 @@ startup files. Run `sh install.sh --help` for usage.
 
 | Environment variable | Purpose |
 | --- | --- |
-| `NOEMA_VERSION` | Pin a version, with or without `v`, including prereleases (for example `0.24.0` or `v0.24.0-beta.1`). Default: latest stable via GitHub's release redirect. |
+| `NOEMA_VERSION` | Pin a version, with or without `v`, including prereleases (for example `0.24.1` or `v0.24.1-rc.1`). Default: latest stable via GitHub's release redirect. |
 | `NOEMA_INSTALL_DIR` | Override the destination directory. Default: `$HOME/.local/bin`. |
 | `NOEMA_SKIP_VERIFY` | Set to `1` to permit installation when neither SHA-256 tool exists. Available verification tools still verify and reject mismatches. |
 
 Apply environment overrides to `sh`, for example:
 
 ```sh
-curl -fsSL https://noemacortex.com/install.sh | NOEMA_VERSION=0.24.0 NOEMA_INSTALL_DIR="$HOME/bin" sh
+curl -fsSL https://noemacortex.com/install.sh | NOEMA_VERSION=0.24.1 NOEMA_INSTALL_DIR="$HOME/bin" sh
 ```
 
 After installing:
