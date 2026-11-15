@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    name: ${{ matrix.os }} ${{ matrix.arch }}
+    name: ${{ matrix.os }} ${{ matrix.arch }} ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
@@ -21,6 +21,16 @@ jobs:
           - runner: ubuntu-24.04-arm
             os: linux
             arch: arm64
+          - runner: ubuntu-24.04
+            os: linux
+            arch: amd64
+            target: x86_64-unknown-linux-musl
+            suffix: _musl
+          - runner: ubuntu-24.04-arm
+            os: linux
+            arch: arm64
+            target: aarch64-unknown-linux-musl
+            suffix: _musl
           - runner: macos-15-intel
             os: darwin
             arch: amd64
@@ -44,6 +54,13 @@ jobs:
           rustup toolchain install 1.88.0 --profile minimal
           rustup default 1.88.0
 
+      - name: Set up native musl toolchain
+        if: matrix.target != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools cmake clang
+          rustup target add "${{ matrix.target }}"
+
       - name: Validate tag and package version
         shell: bash
         run: |
@@ -57,13 +74,34 @@ jobs:
       - name: Build release binary
         env:
           RUSTFLAGS: -D warnings
-        run: cargo build --release --locked
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.target }}" ]; then
+            linker_var="CARGO_TARGET_$(echo '${{ matrix.target }}' | tr '[:lower:]-' '[:upper:]_')_LINKER"
+            export "$linker_var=musl-gcc"
+            CC=musl-gcc cargo build --release --locked --target "${{ matrix.target }}"
+          else
+            cargo build --release --locked
+          fi
 
       - name: Smoke-test version output
         shell: bash
         run: |
           if [ "${{ matrix.os }}" = windows ]; then
             target/release/noema.exe version
+          elif [ -n "${{ matrix.target }}" ]; then
+            binary="target/${{ matrix.target }}/release/noema"
+            "$binary" version
+            file "$binary"
+            file "$binary" | grep -E 'statically linked|static-pie linked'
+            if readelf -l "$binary" | grep -q INTERP; then
+              echo "error: musl binary has a dynamic interpreter" >&2
+              exit 1
+            fi
+            if readelf -d "$binary" | grep -q NEEDED; then
+              echo "error: musl binary has shared library dependencies" >&2
+              exit 1
+            fi
           else
             target/release/noema version
           fi
@@ -73,8 +111,14 @@ jobs:
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
-          archive="noema_${version}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz"
-          tar -czf "$archive" -C target/release noema -C ../../ LICENSE README.md
+          archive="noema_${version}_${{ matrix.os }}_${{ matrix.arch }}${{ matrix.suffix }}.tar.gz"
+          binary_dir=target/release
+          if [ -n "${{ matrix.target }}" ]; then
+            binary_dir="target/${{ matrix.target }}/release"
+          fi
+          mkdir -p release-package
+          cp "$binary_dir/noema" LICENSE README.md release-package/
+          tar -czf "$archive" -C release-package noema LICENSE README.md
 
       - name: Package Windows archive
         if: matrix.os == 'windows'
@@ -89,7 +133,7 @@ jobs:
       - name: Upload archive
         uses: actions/upload-artifact@v7
         with:
-          name: noema-${{ matrix.os }}-${{ matrix.arch }}
+          name: noema-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.suffix }}
           path: noema_*
           if-no-files-found: error
 
