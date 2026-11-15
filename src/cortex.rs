@@ -30,6 +30,8 @@ use crate::{
 };
 
 mod embedding_backfill;
+pub mod tag_review;
+mod tag_review_settings;
 mod trace_body_cache;
 
 pub const MANIFEST_VERSION: u32 = 2;
@@ -58,6 +60,8 @@ pub struct Manifest {
     pub watch: Option<WatchConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consolidation: Option<serde_yaml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_review: Option<crate::tag_review::TagReviewConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<SearchConfig>,
     #[serde(skip)]
@@ -1473,6 +1477,15 @@ impl Cortex {
             return database("");
         }
         let _trace_lock = self.acquire_trace_mutation_lock(path)?;
+        self.replace_trace_under_lock(path, trace, database)
+    }
+
+    // Caller owns the per-trace mutation lock. Also used by Tag Review to
+    // validate its snapshot inside that same lock before replacing the file.
+    fn replace_trace_under_lock<F>(&self, path: &Path, trace: &Trace, database: F) -> Result<()>
+    where
+        F: FnOnce(&str) -> Result<()>,
+    {
         let snapshot = FileSnapshot::capture(path)?;
         let replacement = trace.encoded()?;
         let pending = self.begin_pending_replace(path, &snapshot, &replacement)?;
