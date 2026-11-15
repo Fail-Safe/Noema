@@ -150,10 +150,16 @@ HELP
     cp "$tmp_dir/noema" "$staged"
     chmod 755 "$staged"
     if [ "$os" = darwin ] && command -v codesign >/dev/null 2>&1; then
-        codesign --force --sign - "$staged"
+        if ! codesign_output=$(codesign --force --sign - "$staged" 2>&1); then
+            printf '%s\n' "$codesign_output" >&2
+            fail 'could not sign the downloaded binary'
+        fi
     fi
     # Check compatibility before replacing an existing installation.
-    "$staged" version
+    if ! version_output=$("$staged" version 2>&1); then
+        printf '%s\n' "$version_output" >&2
+        fail 'downloaded binary failed the compatibility check'
+    fi
     mv -f "$staged" "$install_dir/noema"
     staged=''
     printf 'Installed: %s/noema\n' "$install_dir"
