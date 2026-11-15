@@ -175,9 +175,12 @@ jobs:
             .release-obsidian/noema/
           tar -czf dist/noema-obsidian-plugin.tar.gz -C .release-obsidian noema
 
+      - name: Stage installer asset
+        run: cp install.sh dist/install.sh
+
       - name: Generate checksums
         working-directory: dist
-        run: sha256sum noema_* > checksums.txt
+        run: sha256sum noema_* install.sh > checksums.txt
 
       - name: Publish GitHub release
         env:
@@ -198,6 +201,19 @@ jobs:
             gh release create "$GITHUB_REF_NAME" dist/* \
               --title "Noema $GITHUB_REF_NAME" "${notes_flags[@]}" "${release_flags[@]}"
           fi
+
+      - name: Notify website of stable release
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          GH_TOKEN: ${{ secrets.NOEMA_WEB_DISPATCH_TOKEN }}
+        shell: bash
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::NOEMA_WEB_DISPATCH_TOKEN is empty; skipping website dispatch"
+            exit 0
+          fi
+          gh api --method POST repos/Fail-Safe/Noema-web/dispatches \
+            -f event_type=noema-release -f "client_payload[tag]=$GITHUB_REF_NAME"
 
       - name: Update Homebrew tap
         if: env.HOMEBREW_TAP_TOKEN != '' && !contains(github.ref_name, '-')
