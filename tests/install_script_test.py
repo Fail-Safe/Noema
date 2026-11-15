@@ -33,7 +33,7 @@ class InstallScriptTest(unittest.TestCase):
                         MOCK_OS="Linux", MOCK_ARCH="x86_64")
         self.env.pop("NOEMA_SKIP_VERIFY", None)
         for command in ("awk", "cat", "chmod", "cp", "grep", "mkdir", "mktemp", "mv",
-                        "rm", "sed", "tail", "tar", "tr", "shasum"):
+                        "gzip", "rm", "sed", "tail", "tar", "tr", "shasum"):
             path = shutil.which(command)
             if path:
                 (self.bin / command).symlink_to(path)
