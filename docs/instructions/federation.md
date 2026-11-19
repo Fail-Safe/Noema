@@ -176,7 +176,11 @@ noema --cortex my-cortex federation sync host-b
 noema --cortex my-cortex federation status
 ```
 
-Without a name, `federation sync` pulls all configured peers. Do not confuse it with plain `noema sync`, which reindexes local trace files. Automatic polling normally uses the configured interval (default `30s`) while an HTTP server owns background work. A successful zero-event pull can mean already caught up; it is not proof that new content crossed hosts. Manual pulls do not themselves provide an ongoing supervisor.
+Without a name, `federation sync` pulls all configured peers. Do not confuse it with plain `noema sync`, which reindexes local trace files. Automatic polling normally uses the configured interval (default `30s`) while one process owns background work. A successful zero-event pull can mean already caught up; it is not proof that new content crossed hosts. Manual pulls do not themselves provide an ongoing supervisor.
+
+Background work is federation polling, the file watcher, trash expiry, consolidation, and embedding maintenance. Exactly one process per cortex runs it. The lock is `.noema-background.lock` inside that cortex directory, so separate `XDG_RUNTIME_DIR` or temporary directories do not elect a second owner. `flock` releases the lock when the owner exits or is killed; a PID written in the file is only a diagnostic.
+
+HTTP `noema serve` and stdio MCP use the same lock. The first process to acquire it wins, whichever transport it is. A process that loses still serves MCP and logs `another process owns cortex background work; serving MCP only`. It does not take the lock later. After the owner exits, the next process to start acquires it. Start the long-running HTTP server before stdio clients when the server should poll. If a stdio process already owns the lock, stop it and start the server again; the running MCP-only server keeps serving tools only. A current process also holds the older runtime-directory lock when that directory is shared, so it still defers to a 0.24 process in the same runtime directory. Upgrade local servers together: a 0.24 process using a different runtime directory cannot see the cortex lock.
 
 Ask permission for one uniquely named, non-sensitive test note and its intended replication scope. Choose a fresh title/body nonce so old replicas cannot produce a false positive. For host-b → host-a, create locally **on host-b**:
 
