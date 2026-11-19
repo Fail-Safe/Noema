@@ -288,6 +288,45 @@ pub fn new_id(title: &str) -> String {
     format!("{date}-{value}")
 }
 
+/// Append a stable discriminator while keeping the public `YYYYMMDD-slug` shape.
+///
+/// The suffix is slugified and the original slug is truncated so the combined
+/// slug stays within [`MAX_SLUG_LEN`].
+pub(crate) fn id_with_suffix(base_id: &str, suffix: &str) -> String {
+    let Some((date, slug)) = base_id.split_once('-') else {
+        return base_id.to_owned();
+    };
+    if date.len() != 8 || !date.bytes().all(|byte| byte.is_ascii_digit()) {
+        return base_id.to_owned();
+    }
+    let suffix = slug_fragment(suffix);
+    if suffix.is_empty() {
+        return base_id.to_owned();
+    }
+    let mut slug = slug.to_owned();
+    let extra = suffix.len() + 1;
+    if slug.len() + extra > MAX_SLUG_LEN {
+        let keep = MAX_SLUG_LEN.saturating_sub(extra);
+        slug.truncate(keep);
+        while slug.ends_with('-') {
+            slug.pop();
+        }
+    }
+    if slug.is_empty() {
+        format!("{date}-{suffix}")
+    } else {
+        format!("{date}-{slug}-{suffix}")
+    }
+}
+
+fn slug_fragment(input: &str) -> String {
+    let mut fragment = slug(input);
+    while fragment.ends_with('-') {
+        fragment.pop();
+    }
+    fragment
+}
+
 fn slug(input: &str) -> String {
     let mut out = String::new();
     let mut previous_hyphen = true;
@@ -369,6 +408,25 @@ mod tests {
             assert_eq!(id, new_id(title));
             assert!(ids.insert(id), "different titles must not share a fallback");
         }
+    }
+
+    #[test]
+    fn suffixed_ids_remain_valid_and_distinct() {
+        let base = new_id("Divergence: USER-LEVEL: Always include Noema in the memory system");
+        let first = id_with_suffix(&base, "a1b2c3d4");
+        let second = id_with_suffix(&base, "ff00ee11");
+        assert_ne!(first, second);
+        assert_ne!(first, base);
+        assert!(is_valid_id(&first), "{first}");
+        assert!(is_valid_id(&second), "{second}");
+        assert!(first.ends_with("-a1b2c3d4"));
+        assert_eq!(&first[..8], &base[..8]);
+
+        let long = new_id(&format!("Divergence: {}", "A".repeat(MAX_SLUG_LEN + 40)));
+        let suffixed = id_with_suffix(&long, "abc123ef");
+        assert!(is_valid_id(&suffixed), "{suffixed}");
+        assert!(suffixed.ends_with("-abc123ef"));
+        assert!(suffixed.len() <= 8 + 1 + MAX_SLUG_LEN);
     }
 
     #[test]

@@ -1226,7 +1226,7 @@ Every event carries a **vector clock** snapshot. Each Cortex tracks one counter 
 
 ### Divergence traces
 
-When two peers update the same trace concurrently (their vector clocks neither dominate nor are dominated), neither edit overwrites the other. Instead, Noema creates a **divergence trace** with `type: divergence`, tags `[divergence, needs-resolution]`, and `derived_from: [<original-id>]`. Its body lists every conflicting version under `### Version from <origin>` headers, deterministically rendered (origins sorted by name) so every replica produces identical content.
+When two peers update the same trace concurrently (their vector clocks neither dominate nor are dominated), neither edit overwrites the other. The cortex that holds the applied version records a **divergence trace** with `type: divergence`, tags `[divergence, needs-resolution]`, and `derived_from: [<original-id>]`. Its body lists every conflicting version under `### Version from <origin>` headers, deterministically rendered (origins sorted by name) so every replica produces identical content. A cortex catching up on history replays that note from the log instead of writing another one. A later conflict on the same trace the same day keeps the same body format and adds a stable id suffix, so the second note cannot collide with the first.
 
 Find unresolved divergences:
 
