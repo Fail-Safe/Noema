@@ -1389,7 +1389,7 @@ mod tests {
         let client = Client {
             token: "synthetic-token".into(),
             model: "clef-flash".into(),
-            timeout: Duration::from_millis(100),
+            timeout: Duration::from_secs(5),
             endpoint: format!("http://{address}/"),
         };
         let q = BTreeMap::from([("a".into(), question("noul", "Relevant?", json!({})))]);
@@ -1405,7 +1405,7 @@ mod tests {
         let app = Router::new().route(
             "/",
             post(|| async {
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
                 "late"
             }),
         );
@@ -1413,6 +1413,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let client = Client {
             endpoint: format!("http://{address}/"),
+            timeout: Duration::from_secs(1),
             ..client
         };
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1426,7 +1427,7 @@ mod tests {
                 .to_string()
                 .contains("deadline")
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(3));
         server.abort();
     }
 

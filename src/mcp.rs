@@ -1897,56 +1897,58 @@ pub async fn serve_stdio(
             cortex.manifest.clone(),
         )
     };
-    let background_lock = CortexLock::try_acquire_background(&cortex_id)?;
     let cancellation = CancellationToken::new();
+    let background_cancellation = cancellation.child_token();
+    let background_lock = CortexLock::try_acquire_background(&path, &cortex_id)?;
+    let lock_monitor =
+        background_lock.map(|lock| monitor_background_lock(lock, background_cancellation.clone()));
     let registry = Arc::new(crate::consolidation::InFlightRegistry::default());
-    let (scheduler, eligibility, cadence, watchdog, watcher, embedder) =
-        if background_lock.is_some() {
-            (
-                Some(crate::federation::FederationScheduler::start(
-                    name.clone(),
-                    path.clone(),
-                    federation,
-                    cancellation.clone(),
-                )?),
-                crate::consolidation::EligibilityScheduler::start(
-                    name.clone(),
-                    path.clone(),
-                    cancellation.clone(),
-                )?,
-                crate::consolidation::CadenceScheduler::start(
-                    name.clone(),
-                    path.clone(),
-                    cancellation.clone(),
-                    Arc::clone(&registry),
-                )?,
-                crate::consolidation::WatchdogScheduler::start(
-                    name.clone(),
-                    path.clone(),
-                    cancellation.clone(),
-                    registry,
-                )?,
-                watcher_settings
-                    .map(|settings| {
-                        crate::watch::WatchScheduler::start(
-                            name.clone(),
-                            path.clone(),
-                            settings,
-                            cancellation.clone(),
-                        )
-                    })
-                    .transpose()?,
-                crate::embedding::Maintainer::start(
-                    name.clone(),
-                    path.clone(),
-                    &manifest,
-                    cancellation.clone(),
-                ),
-            )
-        } else {
-            eprintln!("another process owns cortex background work; serving MCP only");
-            (None, None, None, None, None, None)
-        };
+    let (scheduler, eligibility, cadence, watchdog, watcher, embedder) = if lock_monitor.is_some() {
+        (
+            Some(crate::federation::FederationScheduler::start(
+                name.clone(),
+                path.clone(),
+                federation,
+                background_cancellation.clone(),
+            )?),
+            crate::consolidation::EligibilityScheduler::start(
+                name.clone(),
+                path.clone(),
+                background_cancellation.clone(),
+            )?,
+            crate::consolidation::CadenceScheduler::start(
+                name.clone(),
+                path.clone(),
+                background_cancellation.clone(),
+                Arc::clone(&registry),
+            )?,
+            crate::consolidation::WatchdogScheduler::start(
+                name.clone(),
+                path.clone(),
+                background_cancellation.clone(),
+                registry,
+            )?,
+            watcher_settings
+                .map(|settings| {
+                    crate::watch::WatchScheduler::start(
+                        name.clone(),
+                        path.clone(),
+                        settings,
+                        background_cancellation.clone(),
+                    )
+                })
+                .transpose()?,
+            crate::embedding::Maintainer::start(
+                name.clone(),
+                path.clone(),
+                &manifest,
+                background_cancellation.clone(),
+            ),
+        )
+    } else {
+        eprintln!("another process owns cortex background work; serving MCP only");
+        (None, None, None, None, None, None)
+    };
     let result = server
         .serve(rmcp::transport::stdio())
         .await?
@@ -1971,8 +1973,41 @@ pub async fn serve_stdio(
     if let Some(embedder) = embedder {
         embedder.stop().await;
     }
+    if let Some(monitor) = lock_monitor {
+        let _ = monitor.await;
+    }
     result?;
     Ok(())
+}
+
+fn monitor_background_lock(
+    mut lock: CortexLock,
+    cancellation: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => break,
+                _ = interval.tick() => {}
+            }
+            if cancellation.is_cancelled() {
+                break;
+            }
+            match lock.refresh_if_replaced() {
+                Ok(crate::lock::LockRefresh::Held | crate::lock::LockRefresh::Reacquired) => {}
+                Ok(crate::lock::LockRefresh::Lost) => {
+                    eprintln!(
+                        "another process owns cortex background work; stopping background tasks"
+                    );
+                    cancellation.cancel();
+                    break;
+                }
+                Err(error) => eprintln!("background lock check failed: {error:#}"),
+            }
+        }
+    })
 }
 
 pub struct HttpListenConfig {
@@ -2172,7 +2207,11 @@ pub async fn serve_http(
             cortex.manifest.clone(),
         )
     };
-    let background_lock = CortexLock::try_acquire_background(&cortex_id)?;
+    let cancellation = CancellationToken::new();
+    let background_cancellation = cancellation.child_token();
+    let background_lock = CortexLock::try_acquire_background(&path, &cortex_id)?;
+    let lock_monitor =
+        background_lock.map(|lock| monitor_background_lock(lock, background_cancellation.clone()));
     let http_router = build_http_tool_router(
         &server,
         allowed_http_hosts(&hosts, &dynamic_hosts, &allowed_hosts),
@@ -2185,56 +2224,54 @@ pub async fn serve_http(
         None => None,
     };
     let listeners = bind_static_listeners(&hosts, port).await?;
-    let cancellation = CancellationToken::new();
     let registry = Arc::new(crate::consolidation::InFlightRegistry::default());
-    let (scheduler, eligibility, cadence, watchdog, watcher, embedder) =
-        if background_lock.is_some() {
-            (
-                Some(crate::federation::FederationScheduler::start(
-                    name.clone(),
-                    path.clone(),
-                    federation,
-                    cancellation.clone(),
-                )?),
-                crate::consolidation::EligibilityScheduler::start(
-                    name.clone(),
-                    path.clone(),
-                    cancellation.clone(),
-                )?,
-                crate::consolidation::CadenceScheduler::start(
-                    name.clone(),
-                    path.clone(),
-                    cancellation.clone(),
-                    Arc::clone(&registry),
-                )?,
-                crate::consolidation::WatchdogScheduler::start(
-                    name.clone(),
-                    path.clone(),
-                    cancellation.clone(),
-                    registry,
-                )?,
-                watcher_settings
-                    .map(|settings| {
-                        crate::watch::WatchScheduler::start(
-                            name.clone(),
-                            path.clone(),
-                            settings,
-                            cancellation.clone(),
-                        )
-                    })
-                    .transpose()?,
-                crate::embedding::Maintainer::start(
-                    name.clone(),
-                    path.clone(),
-                    &manifest,
-                    cancellation.clone(),
-                ),
-            )
-        } else {
-            eprintln!("another process owns cortex background work; serving MCP only");
-            (None, None, None, None, None, None)
-        };
-    let cert_monitor = if background_lock.is_some() {
+    let (scheduler, eligibility, cadence, watchdog, watcher, embedder) = if lock_monitor.is_some() {
+        (
+            Some(crate::federation::FederationScheduler::start(
+                name.clone(),
+                path.clone(),
+                federation,
+                background_cancellation.clone(),
+            )?),
+            crate::consolidation::EligibilityScheduler::start(
+                name.clone(),
+                path.clone(),
+                background_cancellation.clone(),
+            )?,
+            crate::consolidation::CadenceScheduler::start(
+                name.clone(),
+                path.clone(),
+                background_cancellation.clone(),
+                Arc::clone(&registry),
+            )?,
+            crate::consolidation::WatchdogScheduler::start(
+                name.clone(),
+                path.clone(),
+                background_cancellation.clone(),
+                registry,
+            )?,
+            watcher_settings
+                .map(|settings| {
+                    crate::watch::WatchScheduler::start(
+                        name.clone(),
+                        path.clone(),
+                        settings,
+                        background_cancellation.clone(),
+                    )
+                })
+                .transpose()?,
+            crate::embedding::Maintainer::start(
+                name.clone(),
+                path.clone(),
+                &manifest,
+                background_cancellation,
+            ),
+        )
+    } else {
+        eprintln!("another process owns cortex background work; serving MCP only");
+        (None, None, None, None, None, None)
+    };
+    let cert_monitor = if lock_monitor.is_some() {
         certificate_path
             .as_deref()
             .map(crate::tlsutil::CertMonitor::start)
@@ -2429,6 +2466,9 @@ pub async fn serve_http(
     }
     if let Some(cert_monitor) = cert_monitor {
         cert_monitor.stop().await;
+    }
+    if let Some(monitor) = lock_monitor {
+        let _ = monitor.await;
     }
     signal_task.abort();
     shutdown_task.abort();
