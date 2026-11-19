@@ -3751,6 +3751,16 @@ impl Cortex {
             |row| row.get(0),
         )?;
         if exists {
+            // A previous replay can commit the purge event and still leave the
+            // Markdown behind. Cleaning it here does not author a new event.
+            // A later recreation has a live row, so its file is left alone.
+            if matches!(
+                event.action.as_str(),
+                "purge" | "purge_hard" | "purge_long_term"
+            ) && self.trace_must_stay_fileless(&event.trace_id)?
+            {
+                self.remove_trace_files_best_effort(&event.trace_id);
+            }
             return Ok(());
         }
         if matches!(
@@ -4122,8 +4132,17 @@ impl Cortex {
     }
 
     fn replay_purge(&self, event: &Event) -> Result<()> {
-        let path = self.trash_dir().join(format!("{}.md", event.trace_id));
-        self.delete_trace_transactionally(&path, |pending_key| {
+        // Permanent deletion removes the row wherever the file currently sits.
+        // Catch-up materializes `create` into traces/ first. A purge that never
+        // had a trash event, or that followed recover, used to delete only
+        // trash/<id>.md and leave that active file behind for the watcher.
+        let locations = self.trace_locations(&event.trace_id);
+        let primary = locations
+            .iter()
+            .find(|path| path.exists())
+            .cloned()
+            .unwrap_or_else(|| locations[0].clone());
+        self.delete_trace_transactionally(&primary, |pending_key| {
             let tx = self.connection.unchecked_transaction()?;
             tx.execute("DELETE FROM traces_fts WHERE id=?1", [&event.trace_id])?;
             tx.execute("DELETE FROM traces WHERE id=?1", [&event.trace_id])?;
@@ -4133,7 +4152,9 @@ impl Cortex {
             }
             tx.commit()?;
             Ok(())
-        })
+        })?;
+        self.remove_trace_files_best_effort(&event.trace_id);
+        Ok(())
     }
 
     fn replay_purge_db_only(&self, event: &Event) -> Result<()> {
@@ -4232,12 +4253,51 @@ impl Cortex {
         Ok(())
     }
 
-    fn remove_trace_files_best_effort(&self, id: &str) {
-        for path in [
+    fn trace_locations(&self, id: &str) -> [PathBuf; 3] {
+        [
             self.trace_file(id, false),
             self.trace_file(id, true),
             self.trash_dir().join(format!("{id}.md")),
-        ] {
+        ]
+    }
+
+    /// A purged trace must not regain a Markdown file. Tombstones keep a row
+    /// with `purged_at`. Trash expiry and hard purge delete the row and keep
+    /// the purge event. A later live row means the id was created again.
+    fn trace_must_stay_fileless(&self, id: &str) -> Result<bool> {
+        if !trace::is_valid_id(id) {
+            return Ok(false);
+        }
+        let row: Option<Option<String>> = self
+            .connection
+            .query_row("SELECT purged_at FROM traces WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        match row {
+            Some(Some(purged_at)) if !purged_at.is_empty() => Ok(true),
+            Some(_) => Ok(false),
+            None => Ok(self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE trace_id=?1 AND action IN ('purge','purge_hard','purge_long_term'))",
+                [id],
+                |row| row.get(0),
+            )?),
+        }
+    }
+
+    pub(crate) fn discard_reappeared_purged_file(&self, id: &str, path: &Path) -> Result<bool> {
+        if !self.trace_must_stay_fileless(id)? {
+            return Ok(false);
+        }
+        if path.exists() {
+            remove_file_durable(path)?;
+        }
+        self.remove_trace_files_best_effort(id);
+        Ok(true)
+    }
+
+    fn remove_trace_files_best_effort(&self, id: &str) {
+        for path in self.trace_locations(id) {
             if path.exists() {
                 let _ = remove_file_durable(&path);
             }
@@ -4869,6 +4929,15 @@ impl Cortex {
                 if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
                     continue;
                 }
+                if let Some(id) = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .filter(|id| trace::is_valid_id(id))
+                    && self.trace_must_stay_fileless(id)?
+                    && self.discard_reappeared_purged_file(id, &path)?
+                {
+                    continue;
+                }
                 let relative_path = path
                     .strip_prefix(&self.dir)
                     .unwrap_or(&path)
@@ -4895,6 +4964,11 @@ impl Cortex {
                 let id = trace.frontmatter.id.clone();
                 if trace::is_valid_id(&id) {
                     found.insert(id.clone());
+                }
+                if self.trace_must_stay_fileless(&id)?
+                    && self.discard_reappeared_purged_file(&id, &path)?
+                {
+                    continue;
                 }
                 let existing = trace::is_valid_id(&id)
                     .then(|| self.get(&id).ok())
@@ -7791,12 +7865,70 @@ mod tests {
         purge.signature = eventsig::sign(alpha.signing_key.as_ref().unwrap(), &purge);
         beta.replay_event(&purge).unwrap();
         assert!(beta.get(&id).is_err());
+        assert!(!beta.trace_file(&id, false).exists());
+        assert!(!beta.trace_file(&id, true).exists());
+        assert!(!beta.trash_dir().join(format!("{id}.md")).exists());
         assert!(
             beta.history(&id)
                 .unwrap()
                 .iter()
                 .any(|event| event.id == purge.id)
         );
+    }
+
+    #[test]
+    fn replay_purge_removes_an_active_archive_or_trash_file() {
+        let temp = tempfile::tempdir().unwrap();
+        for (name, prepare) in [
+            ("active", "active" as &str),
+            ("archive", "archive"),
+            ("trash", "trash"),
+        ] {
+            let parent = temp.path().join(name);
+            fs::create_dir_all(&parent).unwrap();
+            let mut alpha = signed_cortex(&parent, "alpha");
+            let beta = signed_cortex(&parent, "beta");
+            let mut trace = Trace::new("Purged without resurrection", "fact", "", vec![], "body");
+            alpha.add(&mut trace).unwrap();
+            let id = trace.frontmatter.id.clone();
+            match prepare {
+                "archive" => alpha.archive(&id).unwrap(),
+                "trash" => alpha.trash(&id).unwrap(),
+                _ => {}
+            }
+            if prepare != "trash" {
+                alpha
+                    .admin_purge(&id, "retention request", "short", false)
+                    .unwrap();
+            } else {
+                alpha
+                    .connection
+                    .execute(
+                        "UPDATE traces SET trashed_at='2000-01-01T00:00:00Z' WHERE id=?1",
+                        [&id],
+                    )
+                    .unwrap();
+                assert_eq!(alpha.purge_expired(30).unwrap(), 1);
+            }
+            for event in alpha.history(&id).unwrap() {
+                beta.replay_event(&event).unwrap();
+            }
+            assert!(beta.get(&id).is_err(), "{name}");
+            for path in [
+                beta.trace_file(&id, false),
+                beta.trace_file(&id, true),
+                beta.trash_dir().join(format!("{id}.md")),
+            ] {
+                assert!(!path.exists(), "{name}: {}", path.display());
+            }
+            assert!(
+                beta.events_since("", 100)
+                    .unwrap()
+                    .iter()
+                    .all(|event| event.cortex_id != beta.id),
+                "{name}"
+            );
+        }
     }
 
     #[test]
