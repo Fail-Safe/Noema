@@ -1857,6 +1857,10 @@ impl Cortex {
     }
 
     pub fn add(&self, trace: &mut Trace) -> Result<()> {
+        self.add_recording(trace, None)
+    }
+
+    fn add_recording(&self, trace: &mut Trace, remote: Option<&Event>) -> Result<()> {
         trace.validate()?;
         if trace.frontmatter.origin.is_empty() {
             trace.frontmatter.origin = self.name.clone();
@@ -1867,6 +1871,9 @@ impl Cortex {
         trace.frontmatter.content_hash = trace::content_hash(&trace.body);
         if let Some((content_hash, state)) = self.trace_id_collision(&trace.frontmatter.id)? {
             if content_hash == trace.frontmatter.content_hash {
+                if let Some(remote) = remote {
+                    return self.store_remote_event(remote);
+                }
                 return Ok(());
             }
             return Err(TraceIdExists {
@@ -1879,11 +1886,11 @@ impl Cortex {
         trace.frontmatter.updated = trace::now_rfc3339();
         if path.exists() {
             return self.replace_trace_transactionally(&path, trace, |pending_key| {
-                self.insert_trace_with_pending(trace, true, Some(pending_key))
+                self.insert_trace_with_pending(trace, true, Some(pending_key), remote)
             });
         }
         self.create_trace_transactionally(&path, trace, |pending_key| {
-            self.insert_trace_with_pending(trace, true, Some(pending_key))
+            self.insert_trace_with_pending(trace, true, Some(pending_key), remote)
         })
     }
 
@@ -1915,6 +1922,7 @@ impl Cortex {
         trace: &Trace,
         emit: bool,
         pending_key: Option<&str>,
+        remote: Option<&Event>,
     ) -> Result<()> {
         let f = &trace.frontmatter;
         let tx = self.connection.unchecked_transaction()?;
@@ -1928,6 +1936,9 @@ impl Cortex {
         insert_fts(&tx, &f.id, &f.title, &trace.body, &f.tags)?;
         if emit {
             self.emit_event(&tx, "create", &f.id, &f.created, trace_snapshot(trace))?;
+        }
+        if let Some(remote) = remote {
+            self.store_remote_event_tx(&tx, remote)?;
         }
         if let Some(pending_key) = pending_key {
             Self::clear_pending_in_transaction(&tx, pending_key)?;
@@ -3462,9 +3473,9 @@ impl Cortex {
     pub fn purge_expired(&mut self, days: u32) -> Result<usize> {
         let days = if days == 0 { 30 } else { days };
         let cutoff = (Utc::now() - Duration::days(days.into())).to_rfc3339();
-        let ids: Vec<String> = {
+        let ids: Vec<(String, String)> = {
             let mut statement = self.connection.prepare(
-                "SELECT id FROM traces
+                "SELECT id, trashed_at FROM traces
                  WHERE trashed_at IS NOT NULL
                    AND trashed_at < ?1
                    AND tier != 'long'
@@ -3472,11 +3483,15 @@ impl Cortex {
                  ORDER BY id",
             )?;
             statement
-                .query_map([cutoff], |row| row.get(0))?
+                .query_map([cutoff], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?
         };
         let now = trace::now_rfc3339();
-        for id in &ids {
+        let mut purged = 0;
+        for (id, trashed_at) in &ids {
+            if self.remote_trash_predates_cortex(id, trashed_at)? {
+                continue;
+            }
             let path = self.trash_dir().join(format!("{id}.md"));
             self.delete_trace_transactionally(&path, |pending_key| {
                 let tx = self.connection.unchecked_transaction()?;
@@ -3488,8 +3503,35 @@ impl Cortex {
                 tx.commit()?;
                 Ok(())
             })?;
+            purged += 1;
         }
-        Ok(ids.len())
+        Ok(purged)
+    }
+
+    /// Trash authored by another cortex before this one existed is waiting on
+    /// that cortex's own purge event. Expiring it here would publish a new
+    /// purge for history this cortex did not create.
+    fn remote_trash_predates_cortex(&self, id: &str, trashed_at: &str) -> Result<bool> {
+        let created = self.manifest.created.trim();
+        if created.is_empty() {
+            return Ok(false);
+        }
+        let author: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT cortex_id FROM events WHERE trace_id=?1 AND action='trash' ORDER BY id DESC LIMIT 1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(author) = author else {
+            return Ok(false);
+        };
+        if author == self.id {
+            return Ok(false);
+        }
+        let bound = format!("{created}T00:00:00Z");
+        Ok(trashed_at < bound.as_str())
     }
 
     pub fn promote(&self, id: &str, to: &str) -> Result<()> {
@@ -3863,21 +3905,53 @@ impl Cortex {
         let Ok(row) = self.get(&event.trace_id) else {
             return self.materialize_remote_snapshot(event, None);
         };
-        if let Some(local) = self
-            .history(&event.trace_id)?
-            .into_iter()
-            .rev()
-            .find(is_trace_snapshot_event)
+        if let Some(local) = self.latest_applied_snapshot(&event.trace_id)?
             && !local.vclock.is_empty()
             && !event.vclock.is_empty()
         {
             match federation::compare_for_replay(&local.vclock, &event.vclock) {
-                Relation::Concurrent => return self.create_divergence(&row, event),
+                Relation::Concurrent => {
+                    // Historical catch-up already contains the divergence note
+                    // the participants wrote. Minting another one amplifies the
+                    // log, and a second same-day note collides on the title slug
+                    // and wedges the cursor. Only the author of the applied
+                    // snapshot still records a live conflict.
+                    if local.cortex_id == self.id {
+                        return self.create_divergence(&row, &local, event);
+                    }
+                    return self.store_remote_event(event);
+                }
                 Relation::After | Relation::Equal => return self.store_remote_event(event),
                 Relation::Before => {}
             }
         }
         self.materialize_remote_snapshot(event, Some(row))
+    }
+
+    /// Newest create/update that replay actually materialized.
+    ///
+    /// Stored concurrent updates stay in the log but must not become the
+    /// baseline. Comparing against them makes a later causal successor look
+    /// concurrent and drops the body the originating peer kept.
+    fn latest_applied_snapshot(&self, trace_id: &str) -> Result<Option<Event>> {
+        let mut applied: Option<Event> = None;
+        for event in self.history(trace_id)? {
+            if !matches!(event.action.as_str(), "create" | "update") {
+                continue;
+            }
+            let Some(current) = &applied else {
+                applied = Some(event);
+                continue;
+            };
+            if current.vclock.is_empty()
+                || event.vclock.is_empty()
+                || federation::compare_for_replay(&current.vclock, &event.vclock)
+                    == Relation::Before
+            {
+                applied = Some(event);
+            }
+        }
+        Ok(applied)
     }
 
     fn replay_tag_update(&self, event: &Event) -> Result<()> {
@@ -4274,20 +4348,14 @@ impl Cortex {
         Ok(())
     }
 
-    fn create_divergence(&self, local: &Row, remote: &Event) -> Result<()> {
+    fn create_divergence(&self, local: &Row, local_event: &Event, remote: &Event) -> Result<()> {
         let (_, local_trace) = self.get_trace(&local.id)?;
         let data: TraceEventData = serde_json::from_value(remote.data.clone())?;
-        let local_event = self
-            .history(&local.id)?
-            .into_iter()
-            .rev()
-            .find(is_trace_snapshot_event)
-            .ok_or_else(|| anyhow::anyhow!("local trace has no mutation event"))?;
         let mut versions = vec![
             (
                 self.id.clone(),
                 self.name.clone(),
-                local_event.vclock,
+                local_event.vclock.clone(),
                 local_trace.body,
             ),
             (
@@ -4316,16 +4384,55 @@ impl Cortex {
                 version_body.trim_end()
             ));
         }
+        let body = body.trim_end();
+        let title = format!("Divergence: {}", local.title);
         let mut divergence = Trace::new(
-            format!("Divergence: {}", local.title),
+            title.clone(),
             "divergence",
             "system",
             vec!["divergence".into(), "needs-resolution".into()],
-            body.trim_end(),
+            body,
         );
+        divergence.frontmatter.id =
+            self.divergence_id(&title, body, &local_event.id, &remote.id)?;
         divergence.frontmatter.derived_from = vec![local.id.clone()];
-        self.add(&mut divergence)?;
-        self.store_remote_event(remote)
+        // The note and the remote event commit together. A crash between them
+        // used to leave the note in place and retry the same insert forever.
+        self.add_recording(&mut divergence, Some(remote))
+    }
+
+    fn divergence_id(
+        &self,
+        title: &str,
+        body: &str,
+        local_event_id: &str,
+        remote_event_id: &str,
+    ) -> Result<String> {
+        let base = trace::new_id(title);
+        let content_hash = trace::content_hash(body);
+        if self.divergence_id_reusable(&base, &content_hash)? {
+            return Ok(base);
+        }
+        let mut parts = [local_event_id, remote_event_id];
+        parts.sort_unstable();
+        let digest = format!("{:x}", Sha256::digest(parts.join("\n").as_bytes()));
+        for len in [8usize, 16, 32] {
+            let candidate = trace::id_with_suffix(&base, &digest[..len]);
+            if self.divergence_id_reusable(&candidate, &content_hash)? {
+                return Ok(candidate);
+            }
+        }
+        bail!("unable to allocate a unique divergence id for trace title {title:?}")
+    }
+
+    fn divergence_id_reusable(&self, id: &str, content_hash: &str) -> Result<bool> {
+        if !trace::is_valid_id(id) {
+            return Ok(false);
+        }
+        match self.trace_id_collision(id)? {
+            None => Ok(true),
+            Some((existing, _)) => Ok(existing == content_hash),
+        }
     }
 
     fn store_remote_event(&self, event: &Event) -> Result<()> {
@@ -7329,6 +7436,251 @@ mod tests {
         let (_, mut foreign) = beta.get_trace(&locked_id).unwrap();
         foreign.body = "unauthorized".into();
         assert!(beta.update_trace(&locked_id, &mut foreign, false).is_err());
+    }
+
+    fn open_named(parent: &Path, name: &str) -> Cortex {
+        Cortex::create(name, parent).unwrap();
+        let mut cortex = Cortex::open(name, parent.join(name)).unwrap();
+        cortex.durability = DurabilityProfile::Strong;
+        cortex
+    }
+
+    fn divergence_ids(cx: &Cortex) -> BTreeSet<String> {
+        cx.list(&ListOptions {
+            trace_type: "divergence".into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .map(|row| row.id)
+        .collect()
+    }
+
+    fn authored_events(cx: &Cortex) -> Vec<Event> {
+        cx.events_since("", 100_000)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.cortex_id == cx.id)
+            .collect()
+    }
+
+    #[test]
+    fn joiner_replays_same_day_conflicts_without_authoring_notes_or_purges() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut alpha = open_named(temp.path(), "alpha");
+        let beta = open_named(temp.path(), "beta");
+        let title = "USER-LEVEL: Always include Noema in the memory system";
+        let mut trace = Trace::new(title, "preference", "", vec![], "initial");
+        alpha.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        beta.replay_event(&event_for(&alpha, &id, "create", &alpha.id))
+            .unwrap();
+
+        let (_, mut alpha_trace) = alpha.get_trace(&id).unwrap();
+        alpha_trace.body = "alpha version one".into();
+        alpha.update_trace(&id, &mut alpha_trace, false).unwrap();
+        let (_, mut beta_trace) = beta.get_trace(&id).unwrap();
+        beta_trace.body = "beta version one".into();
+        beta.update_trace(&id, &mut beta_trace, false).unwrap();
+        let beta_one = beta
+            .history(&id)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|event| event.action == "update")
+            .unwrap();
+        let alpha_one = alpha
+            .history(&id)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|event| event.action == "update")
+            .unwrap();
+        assert_eq!(
+            federation::compare_for_replay(&alpha_one.vclock, &beta_one.vclock),
+            Relation::Concurrent
+        );
+        alpha.replay_event(&beta_one).unwrap();
+
+        alpha_trace.body = "alpha version two".into();
+        alpha.update_trace(&id, &mut alpha_trace, false).unwrap();
+        beta_trace.body = "beta version two".into();
+        beta.update_trace(&id, &mut beta_trace, false).unwrap();
+        let beta_two = beta
+            .history(&id)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|event| event.action == "update" && event.id != beta_one.id)
+            .unwrap();
+        alpha.replay_event(&beta_two).unwrap();
+
+        let notes = divergence_ids(&alpha);
+        assert_eq!(notes.len(), 2);
+        let base = trace::new_id(&format!("Divergence: {title}"));
+        assert!(
+            notes.contains(&base),
+            "first live divergence keeps the historical id"
+        );
+        assert!(notes.iter().any(|id| id != &base));
+        for note in &notes {
+            assert!(trace::is_valid_id(note), "{note}");
+            let body = alpha.get_trace(note).unwrap().1.body;
+            let mentions_first =
+                body.contains("alpha version one") && body.contains("beta version one");
+            let mentions_second =
+                body.contains("alpha version two") && body.contains("beta version two");
+            assert!(mentions_first || mentions_second, "{body}");
+        }
+        assert_eq!(alpha.get_trace(&id).unwrap().1.body, "alpha version two");
+
+        let mut expired = Trace::new("Historical trash", "note", "", vec![], "old");
+        alpha.add(&mut expired).unwrap();
+        let expired_id = expired.frontmatter.id.clone();
+        alpha.trash(&expired_id).unwrap();
+        alpha
+            .connection
+            .execute(
+                "UPDATE events SET timestamp='2000-01-01T00:00:00Z' WHERE trace_id=?1 AND action='trash'",
+                [&expired_id],
+            )
+            .unwrap();
+        alpha
+            .connection
+            .execute(
+                "UPDATE traces SET trashed_at='2000-01-01T00:00:00Z' WHERE id=?1",
+                [&expired_id],
+            )
+            .unwrap();
+
+        let log = alpha.events_since("", 100_000).unwrap();
+        let joiner = open_named(temp.path(), "joiner");
+        for event in &log {
+            joiner.replay_event(event).unwrap();
+        }
+        for event in &log {
+            joiner.replay_event(event).unwrap();
+        }
+
+        assert_eq!(joiner.get_trace(&id).unwrap().1.body, "alpha version two");
+        assert_eq!(divergence_ids(&joiner), notes);
+        for note in &notes {
+            assert_eq!(
+                joiner.get_trace(note).unwrap().1.body,
+                alpha.get_trace(note).unwrap().1.body
+            );
+        }
+        assert!(authored_events(&joiner).is_empty());
+        assert_eq!(joiner.events_since("", 100_000).unwrap().len(), log.len());
+        assert!(!joiner.get(&expired_id).unwrap().trashed_at.is_empty());
+
+        let root = joiner.dir.clone();
+        drop(joiner);
+        let mut reopened = Cortex::open("joiner", &root).unwrap();
+        assert_eq!(reopened.purge_expired(30).unwrap(), 0);
+        assert!(reopened.get(&expired_id).is_ok());
+        assert!(
+            reopened
+                .history(&expired_id)
+                .unwrap()
+                .iter()
+                .all(|event| event.action != "purge")
+        );
+        assert!(authored_events(&reopened).is_empty());
+
+        assert_eq!(alpha.purge_expired(30).unwrap(), 1);
+        assert!(alpha.get(&expired_id).is_err());
+    }
+
+    #[test]
+    fn replay_retry_after_partial_divergence_failure_advances() {
+        let temp = tempfile::tempdir().unwrap();
+        let alpha = open_named(temp.path(), "alpha");
+        let beta = open_named(temp.path(), "beta");
+        let title = "USER-LEVEL: Always include Noema in the memory system";
+        let mut trace = Trace::new(title, "preference", "", vec![], "initial");
+        alpha.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        let create = event_for(&alpha, &id, "create", &alpha.id);
+        beta.replay_event(&create).unwrap();
+
+        let (_, mut alpha_trace) = alpha.get_trace(&id).unwrap();
+        alpha_trace.body = "alpha version one".into();
+        alpha.update_trace(&id, &mut alpha_trace, false).unwrap();
+        let alpha_one = event_for(&alpha, &id, "update", &alpha.id);
+        let (_, mut beta_trace) = beta.get_trace(&id).unwrap();
+        beta_trace.body = "beta version one".into();
+        beta.update_trace(&id, &mut beta_trace, false).unwrap();
+        let beta_one = event_for(&beta, &id, "update", &beta.id);
+
+        let joiner = open_named(temp.path(), "joiner");
+        joiner.replay_event(&create).unwrap();
+        joiner.replay_event(&alpha_one).unwrap();
+        let mut seeded = Trace::new(
+            format!("Divergence: {title}"),
+            "divergence",
+            "system",
+            vec!["divergence".into(), "needs-resolution".into()],
+            "partial failure body that must not wedge the cursor",
+        );
+        seeded.frontmatter.derived_from = vec![id.clone()];
+        joiner.add(&mut seeded).unwrap();
+        let authored_before = authored_events(&joiner).len();
+        assert_eq!(authored_before, 1);
+
+        joiner.replay_event(&beta_one).unwrap();
+        joiner.replay_event(&beta_one).unwrap();
+        assert_eq!(authored_events(&joiner).len(), authored_before);
+        assert_eq!(
+            joiner
+                .history(&id)
+                .unwrap()
+                .iter()
+                .filter(|event| event.id == beta_one.id)
+                .count(),
+            1
+        );
+        assert_eq!(divergence_ids(&joiner).len(), 1);
+
+        alpha.replay_event(&beta_one).unwrap();
+        alpha
+            .connection
+            .execute("DELETE FROM events WHERE id=?1", [&beta_one.id])
+            .unwrap();
+        alpha.replay_event(&beta_one).unwrap();
+        alpha.replay_event(&beta_one).unwrap();
+        assert_eq!(divergence_ids(&alpha).len(), 1);
+        assert!(
+            alpha
+                .history(&id)
+                .unwrap()
+                .iter()
+                .any(|event| event.id == beta_one.id)
+        );
+
+        alpha_trace.body = "alpha version two".into();
+        alpha.update_trace(&id, &mut alpha_trace, false).unwrap();
+        beta_trace.body = "beta version two".into();
+        beta.update_trace(&id, &mut beta_trace, false).unwrap();
+        let beta_two = beta
+            .history(&id)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|event| event.action == "update" && event.id != beta_one.id)
+            .unwrap();
+        alpha.replay_event(&beta_two).unwrap();
+        assert_eq!(divergence_ids(&alpha).len(), 2);
+
+        for event in alpha.events_since("", 100_000).unwrap() {
+            joiner.replay_event(&event).unwrap();
+        }
+        for event in alpha.events_since("", 100_000).unwrap() {
+            joiner.replay_event(&event).unwrap();
+        }
+        assert_eq!(joiner.get_trace(&id).unwrap().1.body, "alpha version two");
+        assert_eq!(authored_events(&joiner).len(), authored_before);
+        assert_eq!(divergence_ids(&joiner).len(), 2);
     }
 
     #[test]
