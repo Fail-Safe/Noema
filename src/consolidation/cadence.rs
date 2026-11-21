@@ -68,6 +68,16 @@ struct CronRetry {
     target_day: String,
 }
 
+/// Process-local memory for consolidation scheduling.
+///
+/// None of this state is written to the cortex. `last_cron_day` and any
+/// federated cron retry therefore start empty in every `noema serve` process.
+/// Once the local clock is at or past today's cron time, a process that has
+/// not yet fired that cron does so on its first poll. A start after the
+/// scheduled minute still runs that day's pass. A later restart the same day
+/// has empty state again and catches up again, including when an earlier
+/// process already completed the pass. That same-day catch-up is the current
+/// behavior of the in-memory schedule.
 #[derive(Debug, Default)]
 pub struct CadenceState {
     last_run: Option<DateTime<Utc>>,
@@ -429,6 +439,18 @@ mod tests {
         for value in ["", "3:00", "25:00", "03:60", "0300", "three"] {
             assert!(parse_cron_hhmm(value).is_none(), "{value}");
         }
+    }
+
+    #[test]
+    fn restarted_cadence_catches_up_later_the_same_day() {
+        let mut state = CadenceState::default();
+        let afternoon = LocalClock::at("2026-04-19", 15, 0);
+        assert!(state.cron_should_fire("03:00", &afternoon));
+        state.mark_fired("cron", utc(19, 15, 0), &afternoon, false);
+        assert!(!state.cron_should_fire("03:00", &afternoon));
+
+        let restarted = CadenceState::default();
+        assert!(restarted.cron_should_fire("03:00", &afternoon));
     }
 
     #[test]
