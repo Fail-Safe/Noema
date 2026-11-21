@@ -173,17 +173,45 @@ async fn external_edits_invalidate_revision_before_index_reconciliation() {
         let cx = server.open().await.unwrap();
         cx.file_path(&cx.get(&trace.frontmatter.id).unwrap())
     };
-    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-    let bytes = std::fs::read_to_string(&path)
-        .unwrap()
-        .replace("Original policy", "Modified policy");
-    std::fs::write(&path, bytes).unwrap();
-    std::fs::File::options()
-        .write(true)
-        .open(&path)
-        .unwrap()
-        .set_modified(modified)
-        .unwrap();
+    let before = std::fs::metadata(&path).unwrap();
+    let modified = before.modified().unwrap();
+    // Same-length writes can land inside one timestamp tick. Retry until ctime
+    // advances while length and mtime stay put, matching the trace-body cache test.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let bytes = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("Original policy", "Modified policy");
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let after = std::fs::metadata(&path).unwrap();
+        let identity_changed = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                (after.ctime(), after.ctime_nsec()) != (before.ctime(), before.ctime_nsec())
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        };
+        if after.len() == before.len() && after.modified().unwrap() == modified && identity_changed
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "filesystem did not publish a new file identity while preserving length and mtime"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     let changed = recall(&server, first.preferences_revision).await;
     assert!(!changed.preferences_unchanged);
     assert_eq!(changed.preferences[0].body, "Modified policy");
