@@ -1112,7 +1112,9 @@ Changes take effect on the next `noema serve` restart.
 
 ### Consolidation coordination in a federation
 
-When multiple peers have `consolidation.enabled`, `consolidation.llm_enabled`, and a reachable `local_llm_endpoint`, only one peer runs each consolidation cycle — without any additional configuration. Each peer advertises a random rank (1..99) on the `cortex_identity` heartbeat; the highest-ranked eligible peer wins (cortex ID breaks ties), runs the pass, and emits `consolidation_success`/`fail` events that replicate through the standard event log. `subscribe`-mode cortexes advertise rank 0 and can never win; `paused` peers naturally drop out via staleness. `federation_status` shows each peer's current rank.
+When multiple peers have `consolidation.enabled`, `consolidation.llm_enabled`, and a reachable `local_llm_endpoint`, only one peer runs each consolidation cycle — without any additional configuration. Each peer advertises a random rank (1..99) on the `cortex_identity` heartbeat and refreshes it every 15 minutes. The highest-ranked eligible peer wins (cortex ID breaks ties), runs the pass, and emits `consolidation_success`/`fail` events that replicate through the standard event log. A rank has to be at least one quiet period old (twice the federation interval) and no older than that quiet period plus 30 minutes. Older ranks are ignored, so a peer that stops refreshing — a paused peer, or a machine that slept — cannot keep winning. Subscribe-mode cortexes, cortexes with consolidation disabled, and cortexes with no cron, idle, or threshold trigger advertise rank 0 and cannot win. `federation_status` shows each peer's current rank.
+
+The cron day is remembered only in the running `noema serve` process. A start after the scheduled time still runs that day's pass, and a later restart the same day catches up again.
 
 ### Mid → long graduation
 

@@ -389,7 +389,9 @@ mod tests {
         RankEntry {
             cortex_id: id.into(),
             rank: value,
-            observed_at: (Utc::now() - chrono::Duration::hours(1))
+            // Old enough for a zero quiet period, and inside the freshness
+            // window (quiet period plus two 15-minute refreshes).
+            observed_at: (Utc::now() - chrono::Duration::minutes(1))
                 .to_rfc3339_opts(SecondsFormat::Secs, true),
         }
     }

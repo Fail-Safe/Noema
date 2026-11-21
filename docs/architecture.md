@@ -107,3 +107,9 @@ Preference traces are excluded from automatic mid-to-long graduation because
 startup reads and mutable user defaults are not enough evidence to lock a trace
 into the immutable long tier. Operators can still promote a preference manually
 when they intend to curate it as long-term policy.
+
+Federated passes elect one peer by advertised rank. Ranks refresh every 15
+minutes and are ignored once they are older than the quiet period plus 30
+minutes, so an offline peer's last rank cannot win. The cron schedule is
+process memory: restarting `noema serve` after the scheduled time runs that
+day's pass, and another restart later the same day catches up again.
