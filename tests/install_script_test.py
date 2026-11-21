@@ -85,7 +85,8 @@ pathlib.Path(args[args.index("-O") + 1]).write_bytes(asset.read_bytes())
     def archive(self, os_name="linux", arch="amd64", musl=True, version="0.24.0", broken=False):
         suffix = "_musl" if musl else ""
         name = f"noema_{version}_{os_name}_{arch}{suffix}.tar.gz"
-        body = b"#!/bin/sh\nexit 7\n" if broken else b'#!/bin/sh\necho "noema fixture version"\n'
+        body = (b'#!/bin/sh\necho "compatibility stdout"\necho "compatibility stderr" >&2\nexit 7\n'
+                if broken else b'#!/bin/sh\necho "noema fixture version"\n')
         with tarfile.open(self.assets / name, "w:gz") as archive:
             info = tarfile.TarInfo("noema")
             info.size = len(body)
@@ -112,6 +113,9 @@ pathlib.Path(args[args.index("-O") + 1]).write_bytes(asset.read_bytes())
         result = self.run_script()
         self.assertTrue((self.destination / "noema").exists())
         self.assertIn("my-cortex", result.stdout)
+        self.assertEqual(1, result.stdout.count("noema fixture version"))
+        self.assertIn(f"Installed: {self.destination.resolve()}/noema\nnoema fixture version\n",
+                      result.stdout)
         line = next(line.strip() for line in result.stdout.splitlines() if "export PATH=" in line)
         checked = subprocess.run(["/bin/sh", "-c", line + '; printf "%s" "$PATH"'],
                                  env={"PATH": "/usr/bin"}, capture_output=True, text=True, check=True)
@@ -174,7 +178,11 @@ pathlib.Path(args[args.index("-O") + 1]).write_bytes(asset.read_bytes())
         self.archive(broken=True)
         self.destination.mkdir()
         (self.destination / "noema").write_text("original")
-        self.run_script(success=False)
+        result = self.run_script(success=False)
+        self.assertIn("compatibility stdout\ncompatibility stderr\n", result.stderr)
+        self.assertIn("failed the compatibility check", result.stderr)
+        self.assertNotIn("compatibility", result.stdout)
+        self.assertNotIn("Installed:", result.stdout)
         self.assertEqual("original", (self.destination / "noema").read_text())
 
     def test_other_supported_platforms(self):
@@ -189,9 +197,27 @@ pathlib.Path(args[args.index("-O") + 1]).write_bytes(asset.read_bytes())
     def test_macos_arm64_signing_and_prerelease(self):
         self.archive(os_name="darwin", arch="arm64", musl=False, version="0.24.0-rc.1")
         self.env.update(MOCK_OS="Darwin", MOCK_ARCH="aarch64", NOEMA_VERSION="v0.24.0-rc.1")
-        self.write_command("codesign", 'printf "%s\\n" "$*" > "$ASSETS/codesign"')
-        self.run_script()
+        self.write_command("codesign", 'printf "%s\\n" "$*" > "$ASSETS/codesign"; echo "signing stdout"; echo "replacing existing signature" >&2')
+        result = self.run_script()
+        self.assertEqual("", result.stderr)
+        self.assertNotIn("signing stdout", result.stdout)
+        self.assertNotIn("replacing existing signature", result.stdout)
+        self.assertEqual(1, result.stdout.count("noema fixture version"))
         self.assertIn("--force --sign -", (self.assets / "codesign").read_text())
+
+    def test_codesign_failure_preserves_existing_install(self):
+        self.archive(os_name="darwin", musl=False)
+        self.env["MOCK_OS"] = "Darwin"
+        self.destination.mkdir()
+        installed = self.destination / "noema"
+        installed.write_text("original")
+        self.write_command("codesign", 'echo "signing stdout"; echo "signing stderr" >&2; exit 1')
+        result = self.run_script(success=False)
+        self.assertIn("signing stdout\nsigning stderr\n", result.stderr)
+        self.assertIn("could not sign the downloaded binary", result.stderr)
+        self.assertNotIn("signing", result.stdout)
+        self.assertNotIn("Installed:", result.stdout)
+        self.assertEqual("original", installed.read_text())
 
     def test_latest_stable_for_both_downloaders(self):
         self.archive()

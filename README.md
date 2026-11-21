@@ -774,6 +774,8 @@ The `--cortex` flag, `NOEMA_CORTEX` env, and config default are all respected, s
 
 **Log destination.** In stdio mode, operational logs (watcher events, federation sync status, startup messages) are written to `$XDG_STATE_HOME/noema/<cortex>.log` — defaulting to `~/.local/state/noema/<cortex>.log` — so MCP clients that inherit the spawning terminal's stderr (Claude Code, Copilot, Zed, Cursor, Aider, etc.) don't dump logs into your active terminal. The single `[serve] logs -> <path>` line printed at startup tells you exactly where to `tail -f`. Override the destination with `--log-file <path>`, or force logs back to stderr with `--log-stderr` for interactive triage.
 
+**Background work.** Federation polling, the file watcher, trash expiry, consolidation, and embedding maintenance run in one process per cortex. The lock file is `.noema-background.lock` in the cortex directory, so HTTP `noema serve` and stdio clients share it even when each process has its own runtime directory. The first process to start owns that work. Later processes still serve MCP and log `another process owns cortex background work; serving MCP only`. They do not take over while they are running. When the owner exits or crashes, the next process to start acquires the lock. Start the HTTP server first when it should own polling.
+
 ### Streamable HTTP (remote clients, GitHub Copilot, federation peers)
 
 Noema speaks the **Streamable HTTP** transport from the [MCP 2025-03-26 spec](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http) — a single endpoint at `/mcp` that handles JSON-RPC requests and optional SSE streaming on the same path. This is the transport native MCP clients (Zed, Claude Desktop's HTTP support, GitHub Copilot's MCP integration) speak today; the older two-endpoint legacy SSE transport has been removed.
@@ -1110,7 +1112,9 @@ Changes take effect on the next `noema serve` restart.
 
 ### Consolidation coordination in a federation
 
-When multiple peers have `consolidation.enabled`, `consolidation.llm_enabled`, and a reachable `local_llm_endpoint`, only one peer runs each consolidation cycle — without any additional configuration. Each peer advertises a random rank (1..99) on the `cortex_identity` heartbeat; the highest-ranked eligible peer wins (cortex ID breaks ties), runs the pass, and emits `consolidation_success`/`fail` events that replicate through the standard event log. `subscribe`-mode cortexes advertise rank 0 and can never win; `paused` peers naturally drop out via staleness. `federation_status` shows each peer's current rank.
+When multiple peers have `consolidation.enabled`, `consolidation.llm_enabled`, and a reachable `local_llm_endpoint`, only one peer runs each consolidation cycle — without any additional configuration. Each peer advertises a random rank (1..99) on the `cortex_identity` heartbeat and refreshes it every 15 minutes. The highest-ranked eligible peer wins (cortex ID breaks ties), runs the pass, and emits `consolidation_success`/`fail` events that replicate through the standard event log. A rank has to be at least one quiet period old (twice the federation interval) and no older than that quiet period plus 30 minutes. Older ranks are ignored, so a peer that stops refreshing — a paused peer, or a machine that slept — cannot keep winning. Subscribe-mode cortexes, cortexes with consolidation disabled, and cortexes with no cron, idle, or threshold trigger advertise rank 0 and cannot win. `federation_status` shows each peer's current rank.
+
+The cron day is remembered only in the running `noema serve` process. A start after the scheduled time still runs that day's pass, and a later restart the same day catches up again.
 
 ### Mid → long graduation
 
@@ -1226,7 +1230,7 @@ Every event carries a **vector clock** snapshot. Each Cortex tracks one counter 
 
 ### Divergence traces
 
-When two peers update the same trace concurrently (their vector clocks neither dominate nor are dominated), neither edit overwrites the other. Instead, Noema creates a **divergence trace** with `type: divergence`, tags `[divergence, needs-resolution]`, and `derived_from: [<original-id>]`. Its body lists every conflicting version under `### Version from <origin>` headers, deterministically rendered (origins sorted by name) so every replica produces identical content.
+When two peers update the same trace concurrently (their vector clocks neither dominate nor are dominated), neither edit overwrites the other. The cortex that holds the applied version records a **divergence trace** with `type: divergence`, tags `[divergence, needs-resolution]`, and `derived_from: [<original-id>]`. Its body lists every conflicting version under `### Version from <origin>` headers, deterministically rendered (origins sorted by name) so every replica produces identical content. A cortex catching up on history replays that note from the log instead of writing another one. A later conflict on the same trace the same day keeps the same body format and adds a stable id suffix, so the second note cannot collide with the first.
 
 Find unresolved divergences:
 

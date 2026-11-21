@@ -136,6 +136,31 @@ mod tests {
         trace.write_preserving_updated(path).unwrap();
     }
 
+    fn rewrite_preserving_length_and_mtime(path: &Path, rewrite: impl Fn(&Path)) {
+        let before = FileVersion::read(path).unwrap();
+        let mtime = fs::metadata(path).unwrap().modified().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            rewrite(path);
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+            let after = FileVersion::read(path).unwrap();
+            if after.len == before.len && after.modified == before.modified && after != before {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "filesystem did not publish a new file identity while preserving length and mtime"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
     #[test]
     fn cache_detects_external_edits_with_preserved_length_and_mtime() {
         let temp = tempfile::tempdir().unwrap();
@@ -145,30 +170,18 @@ mod tests {
         let hash = trace::content_hash("original");
         assert_eq!(&*cache.read(&path, &hash).unwrap(), "original");
         assert_eq!(&*cache.read(&path, &hash).unwrap(), "original");
-        let modified = fs::metadata(&path).unwrap().modified().unwrap();
-        write(&path, "modified");
-        fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(modified)
-            .unwrap();
+        rewrite_preserving_length_and_mtime(&path, |path| write(path, "modified"));
         assert_eq!(&*cache.read(&path, &hash).unwrap(), "modified");
         assert_eq!(&*cache.read(&path, &hash).unwrap(), "modified");
         assert!(cache.entries.is_empty());
         let hash = trace::content_hash("modified");
         cache.read(&path, &hash).unwrap();
-        let modified = fs::metadata(&path).unwrap().modified().unwrap();
-        let bytes = fs::read_to_string(&path)
-            .unwrap()
-            .replace("modified", "original");
-        fs::write(&path, bytes).unwrap();
-        fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(modified)
-            .unwrap();
+        rewrite_preserving_length_and_mtime(&path, |path| {
+            let bytes = fs::read_to_string(path)
+                .unwrap()
+                .replace("modified", "original");
+            fs::write(path, bytes).unwrap();
+        });
         assert_eq!(&*cache.read(&path, &hash).unwrap(), "original");
         assert!(cache.entries.is_empty());
         fs::write(&path, "malformed frontmatter").unwrap();

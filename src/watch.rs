@@ -246,6 +246,15 @@ impl Reconciler {
             }
         }
 
+        if exists
+            && trace::is_valid_id(id)
+            && self.cortex.discard_reappeared_purged_file(id, path)?
+        {
+            self.last_skip.remove(path);
+            eprintln!("[watch] removed reappeared purged trace: {id}");
+            return Ok(());
+        }
+
         if exists {
             self.reconcile_existing(path, id, directory, row.take())
         } else {
@@ -1227,5 +1236,67 @@ Clipped body
         assert!(stored.frontmatter.extra.contains_key("published"));
         assert!(stored.body.contains("Clipped body"));
         assert!(!dropped.exists());
+    }
+
+    #[test]
+    fn watcher_does_not_resurrect_a_replayed_purge_of_an_active_trace() {
+        let temp = tempfile::tempdir().unwrap();
+        Cortex::create("alpha", temp.path()).unwrap();
+        Cortex::create("beta", temp.path()).unwrap();
+        let alpha = Cortex::open("alpha", temp.path().join("alpha")).unwrap();
+        let mut trace = Trace::new("Foreign locked policy", "fact", "", vec![], "body\n");
+        alpha.add(&mut trace).unwrap();
+        let id = trace.frontmatter.id.clone();
+        let beta = Cortex::open("beta", temp.path().join("beta")).unwrap();
+        let mut history = alpha.history(&id).unwrap();
+        let create = history.remove(0);
+        beta.replay_event(&create).unwrap();
+        let orphan = fs::read(beta.trace_file(&id, false)).unwrap();
+        alpha
+            .admin_purge(&id, "retention request", "short", false)
+            .unwrap();
+        let mut history = alpha.history(&id).unwrap();
+        let purge = history.pop().unwrap();
+        assert_eq!(purge.action, "purge");
+        beta.replay_event(&purge).unwrap();
+
+        let mut reconciler = Reconciler::new(
+            beta,
+            Settings {
+                debounce: Duration::from_millis(1),
+                auto_onboard: true,
+            },
+        );
+        let active = reconciler.cortex.trace_file(&id, false);
+        assert!(!active.exists());
+        assert!(reconciler.cortex.get(&id).is_err());
+        reconciler
+            .reconcile(&active, &CancellationToken::new())
+            .unwrap();
+
+        fs::write(&active, orphan).unwrap();
+        reconciler
+            .reconcile(&active, &CancellationToken::new())
+            .unwrap();
+
+        assert!(!active.exists());
+        assert!(!reconciler.cortex.trace_file(&id, true).exists());
+        assert!(
+            !reconciler
+                .cortex
+                .trash_dir()
+                .join(format!("{id}.md"))
+                .exists()
+        );
+        assert!(reconciler.cortex.get(&id).is_err());
+        let joiner = reconciler.cortex.id.clone();
+        assert!(
+            reconciler
+                .cortex
+                .events_since("", 50)
+                .unwrap()
+                .iter()
+                .all(|event| event.cortex_id != joiner)
+        );
     }
 }
