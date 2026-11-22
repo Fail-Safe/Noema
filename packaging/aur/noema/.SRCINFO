@@ -8,6 +8,7 @@ pkgbase = noema
 	license = MIT
 	makedepends = cargo
 	makedepends = cmake
+	options = !lto
 	source = noema-0.24.2.tar.gz::https://github.com/Fail-Safe/Noema/archive/refs/tags/v0.24.2.tar.gz
 	sha256sums = f6de01cf468b61145e43f276920b4ca45c2d38968db5d47f58f5184277e4a5ca
 

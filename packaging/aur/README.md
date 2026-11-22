@@ -23,12 +23,28 @@ uploaded assets):
    (`noema_X.Y.Z_linux_amd64.tar.gz`, `noema_X.Y.Z_linux_arm64.tar.gz`)
    → update `pkgver` and `sha256sums_{x86_64,aarch64}` in `noema-bin/PKGBUILD`.
 3. Regenerate `.SRCINFO` in each package directory: `makepkg --printsrcinfo > .SRCINFO`.
-4. Verify a clean build (macOS host, Docker; `--platform linux/amd64` and
-   `--security-opt seccomp=unconfined` are needed because the official image is
-   amd64-only and pacman's sandbox needs syscalls Docker's default profile blocks):
-   `docker run --rm --platform linux/amd64 --security-opt seccomp=unconfined -v "$PWD:/build" -w /build archlinux bash -c 'pacman -Syu --noconfirm base-devel rust cmake && useradd -m build && chown -R build /build && runuser -u build -- bash -c "cd /build/noema && makepkg -sc --noconfirm"'`
+4. Verify a clean build (on Linux: `makepkg -sc --noconfirm` directly, or in
+   an `archlinux` container). On a macOS Docker host the official image is
+   amd64-only and pacman's sandbox fails under the default seccomp profile —
+   pass `--disable-sandbox` to every `pacman` call (not `--security-opt
+   seccomp=unconfined`, which does not fix it):
+   `docker run --rm -v "$PWD:/build" -w /build archlinux bash -c 'pacman -Syu --noconfirm --disable-sandbox base-devel rust cmake && useradd -m build && chown -R build /build && runuser -u build -- bash -c "cd /build/noema && makepkg -sc --noconfirm"'`
 5. Push both directories to their AUR repos (`ssh://aur@aur.archlinux.org/noema.git`,
    `.../noema-bin.git`).
+
+## Verification matrix (v0.24.2-1)
+
+| Environment | noema (source) | noema-bin |
+| --- | --- | --- |
+| Omarchy VM, native aarch64 | built, 14 tests pass, packaged binary runs `v0.24.2` | built (arm64 hash validated), packaged binary runs `v0.24.2` |
+| `archlinux` container, native x86_64 | built, packaged binary runs `v0.24.2` | built, `pacman -U` install, `noema version` OK, completions + license present |
+
+The source PKGBUILD sets `options=('!lto')`: Arch `makepkg` enables LTO by
+default, injecting `-flto` into `CFLAGS`, which the `cc` crate propagates into
+the `aws-lc-sys` and `libsqlite3-sys` static archives. The final rustc link
+(both `rust-lld` and GNU `ld`) then fails with undefined `aws_lc_0_44_0_*` and
+`sqlite3_*` symbols. `build()` also omits `--target` — AUR builds are native,
+and the flag adds nothing; upstream CI builds the glibc artifacts the same way.
 
 The `archlinux` Docker image sets `NoExtract = usr/share/doc/*` in its
 `pacman.conf`, so `/usr/share/doc/noema/README.md` is absent after installing
