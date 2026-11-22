@@ -1,0 +1,27 @@
+# Maintainer: Mark B <mark@vpost.net>
+pkgname=noema-bin
+pkgver=0.24.2
+pkgrel=1
+pkgdesc="The intentional memory layer for your AI agents (prebuilt binary)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Fail-Safe/Noema"
+license=('MIT')
+provides=('noema')
+conflicts=('noema')
+options=('!strip')
+source_x86_64=("noema_${pkgver}_linux_amd64.tar.gz::https://github.com/Fail-Safe/Noema/releases/download/v${pkgver}/noema_${pkgver}_linux_amd64.tar.gz")
+source_aarch64=("noema_${pkgver}_linux_arm64.tar.gz::https://github.com/Fail-Safe/Noema/releases/download/v${pkgver}/noema_${pkgver}_linux_arm64.tar.gz")
+sha256sums_x86_64=('d7d3be67b516df0d50153bec804c053877dce74f1097d1d673e2e99c74d9ded3')
+sha256sums_aarch64=('b3fc4bad9dc72bb62f79c2c0f3bdab79a7640baca554701e8e97bb7d1620821d')
+
+package() {
+  install -Dm755 noema "$pkgdir/usr/bin/noema"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/noema/README.md"
+  install -Dm644 <("$pkgdir/usr/bin/noema" completion bash) \
+    "$pkgdir/usr/share/bash-completion/completions/noema"
+  install -Dm644 <("$pkgdir/usr/bin/noema" completion zsh) \
+    "$pkgdir/usr/share/zsh/site-functions/_noema"
+  install -Dm644 <("$pkgdir/usr/bin/noema" completion fish) \
+    "$pkgdir/usr/share/fish/vendor_completions.d/noema.fish"
+}

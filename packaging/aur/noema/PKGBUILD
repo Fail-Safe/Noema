@@ -1,0 +1,46 @@
+# Maintainer: Mark B <mark@vpost.net>
+pkgname=noema
+pkgver=0.24.2
+pkgrel=1
+pkgdesc="The intentional memory layer for your AI agents"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Fail-Safe/Noema"
+license=('MIT')
+makedepends=('cargo' 'cmake')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/Fail-Safe/Noema/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('f6de01cf468b61145e43f276920b4ca45c2d38968db5d47f58f5184277e4a5ca')
+
+prepare() {
+  cd "$srcdir/Noema-$pkgver"
+  export CARGO_HOME="$srcdir/cargo-home"
+  cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
+}
+
+build() {
+  cd "$srcdir/Noema-$pkgver"
+  export CARGO_HOME="$srcdir/cargo-home"
+  export CARGO_NET_OFFLINE=true
+  cargo build --release --locked --target "$CARCH-unknown-linux-gnu"
+}
+
+check() {
+  cd "$srcdir/Noema-$pkgver"
+  export CARGO_HOME="$srcdir/cargo-home"
+  export CARGO_NET_OFFLINE=true
+  cargo test --release --locked --target "$CARCH-unknown-linux-gnu" \
+    --test nosync_layout --test database_maintenance
+}
+
+package() {
+  cd "$srcdir/Noema-$pkgver"
+  install -Dm755 "target/$CARCH-unknown-linux-gnu/release/noema" "$pkgdir/usr/bin/noema"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  local bin="target/$CARCH-unknown-linux-gnu/release/noema"
+  install -Dm644 <("$bin" completion bash) \
+    "$pkgdir/usr/share/bash-completion/completions/noema"
+  install -Dm644 <("$bin" completion zsh) \
+    "$pkgdir/usr/share/zsh/site-functions/_noema"
+  install -Dm644 <("$bin" completion fish) \
+    "$pkgdir/usr/share/fish/vendor_completions.d/noema.fish"
+}

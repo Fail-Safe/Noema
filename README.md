@@ -166,6 +166,19 @@ brew install Fail-Safe/tap/noema-beta   # (or noema)
 `brew upgrade` on `noema-beta` pulls the newest prerelease; stable tags
 (`v0.21.0` vs `v0.21.0-rc.1`) stay on their respective channels.
 
+### With the AUR (Arch Linux, Omarchy)
+
+Arch users get two packages (sources in
+[`packaging/aur`](packaging/aur), with a per-release update checklist):
+
+```bash
+yay -S noema      # builds from the release source tarball
+yay -S noema-bin  # prebuilt release binary, same as install.sh
+```
+
+Both install `/usr/bin/noema` plus bash/zsh/fish completions; `noema-bin`
+provides/conflicts with `noema`.
+
 ### Download a pre-built binary
 
 Grab the archive for your OS/arch from the

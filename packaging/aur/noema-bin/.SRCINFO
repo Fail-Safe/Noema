@@ -1,0 +1,17 @@
+pkgbase = noema-bin
+	pkgdesc = The intentional memory layer for your AI agents (prebuilt binary)
+	pkgver = 0.24.2
+	pkgrel = 1
+	url = https://github.com/Fail-Safe/Noema
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	provides = noema
+	conflicts = noema
+	options = !strip
+	source_x86_64 = noema_0.24.2_linux_amd64.tar.gz::https://github.com/Fail-Safe/Noema/releases/download/v0.24.2/noema_0.24.2_linux_amd64.tar.gz
+	sha256sums_x86_64 = d7d3be67b516df0d50153bec804c053877dce74f1097d1d673e2e99c74d9ded3
+	source_aarch64 = noema_0.24.2_linux_arm64.tar.gz::https://github.com/Fail-Safe/Noema/releases/download/v0.24.2/noema_0.24.2_linux_arm64.tar.gz
+	sha256sums_aarch64 = b3fc4bad9dc72bb62f79c2c0f3bdab79a7640baca554701e8e97bb7d1620821d
+
+pkgname = noema-bin
