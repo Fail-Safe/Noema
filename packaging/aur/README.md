@@ -11,6 +11,20 @@ Both install `/usr/bin/noema`, the MIT license, `README.md` under
 `/usr/share/doc/noema/`, and shell completions for bash, zsh, and fish.
 `noema-bin` declares `provides=('noema')` / `conflicts=('noema')`.
 
+## Publication status
+
+AUR new-account registration is paused (since 2026-06, Arch malicious-packages
+incident; see archlinux.org/news and aur-general), so these packages are not
+yet published. Until registration reopens, Arch/Omarchy users can install
+directly from this repo:
+
+```bash
+git clone https://github.com/Fail-Safe/Noema && cd Noema/packaging/aur/noema-bin
+makepkg -si   # or the noema/ directory to build from source
+```
+
+Both directories are push-ready (`ssh://aur@aur.archlinux.org/noema{,-bin}.git`).
+
 ## Release update checklist
 
 When a new version `X.Y.Z` is published (after the release workflow has

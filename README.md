@@ -177,7 +177,10 @@ yay -S noema-bin  # prebuilt release binary, same as install.sh
 ```
 
 Both install `/usr/bin/noema` plus bash/zsh/fish completions; `noema-bin`
-provides/conflicts with `noema`.
+provides/conflicts with `noema`. AUR publication is pending: Arch has paused
+new AUR accounts, so until the packages land, build them from
+`packaging/aur/` with `makepkg -si` (see
+[packaging/aur/README.md](packaging/aur/README.md)).
 
 ### Download a pre-built binary
 
